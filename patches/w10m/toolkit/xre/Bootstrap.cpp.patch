@@ -1,0 +1,66 @@
+diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
+index fe113c825c..61707d41a6 100644
+--- a/toolkit/xre/Bootstrap.cpp
++++ b/toolkit/xre/Bootstrap.cpp
+@@ -18,6 +18,61 @@ extern "C" int __llvm_profile_dump(void);
+ #  endif
+ #endif
+ 
++#if defined(GECKO_W10M)
++#  include <windows.h>
++
++#  include <cstring>
++
++#  include <delayimp.h>
++
++namespace {
++
++// Windows 10 Mobile ships a reduced version of the desktop libraries: the DLL
++// is there and loads, but not every function in it exists. Gecko reaches those
++// through delay-load thunks, and a thunk that cannot resolve reports it by
++// raising -- which on 32-bit ARM, where clang emits no exception handling at
++// all, nothing catches. One missing function takes the thread down, and the
++// process with it.
++//
++// The delay-load machinery offers a failure hook for exactly this, so the ones
++// that are both missing and harmless get answered with a stub. Anything not
++// listed here still raises, and so still shows up in the log rather than being
++// quietly papered over.
++
++// No key is down, which on a device with no keyboard is not a lie.
++SHORT WINAPI GeckoW10mGetKeyState(int) { return 0; }
++
++struct Substitute {
++  const char* name;
++  FARPROC stub;
++};
++
++const Substitute kSubstitutes[] = {
++    {"GetKeyState", reinterpret_cast<FARPROC>(&GeckoW10mGetKeyState)},
++};
++
++FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
++                                       PDelayLoadInfo info) {
++  if (notification != dliFailGetProc || !info || !info->dlp.fImportByName) {
++    return nullptr;
++  }
++  for (const Substitute& substitute : kSubstitutes) {
++    if (std::strcmp(info->dlp.szProcName, substitute.name) == 0) {
++      return substitute.stub;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++// The hook is const -- it was made so deliberately, a writable global function
++// pointer being an obvious thing to attack -- so it is defined here rather than
++// assigned at run time. delayimp.lib supplies a null default only when nothing
++// else defines it.
++extern "C" const PfnDliHook __pfnDliFailureHook2 = &GeckoW10mDelayLoadFailure;
++#endif  // GECKO_W10M
++
+ namespace mozilla {
+ 
+ class BootstrapImpl final : public Bootstrap {
