@@ -360,6 +360,110 @@ int HookImports(HMODULE module) {
   return hooked;
 }
 
+// --------------------------------------------------------- delay-load audit
+//
+// The engine delay-loads some forty desktop libraries, and this device ships
+// reduced versions of most of them: the library is there, a given function is
+// not. Each such miss ends the thread, because a delay-load thunk reports
+// failure by raising and 32-bit ARM has no exception handling to catch it.
+//
+// Finding them one per build, one crash at a time, is no way to spend a day.
+// This walks the delay-load directory and asks after every function in it at
+// once, so the whole list arrives in a single run and the stubs can be written
+// against it.
+
+// delayimp's own descriptor, spelled out rather than including delayimp.h for
+// it: the header's definition drags in the helper machinery too.
+struct DelayDescriptor {
+  DWORD attributes;
+  DWORD nameRva;
+  DWORD moduleHandleRva;
+  DWORD iatRva;
+  DWORD intRva;
+  DWORD boundIatRva;
+  DWORD unloadIatRva;
+  DWORD timestamp;
+};
+
+void ProbeDelayLoads(HMODULE module) {
+  auto* base = reinterpret_cast<unsigned char*>(module);
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+
+  DWORD rva = nt->OptionalHeader
+                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+                  .VirtualAddress;
+  if (!rva) {
+    Log::Write(L"delay-probe: no delay-load directory");
+    return;
+  }
+
+  auto* desc = reinterpret_cast<DelayDescriptor*>(base + rva);
+
+  int modules = 0;
+  int imports = 0;
+  int missing = 0;
+  int named = 0;
+  constexpr int kMaxNamed = 120;
+
+  for (; desc->nameRva; ++desc) {
+    // The first attribute bit says the fields are RVAs. Anything older stores
+    // absolute addresses, which no linker has produced in twenty years.
+    if (!(desc->attributes & 1)) continue;
+
+    const char* moduleName =
+        reinterpret_cast<const char*>(base + desc->nameRva);
+    ++modules;
+
+    HMODULE target = ::LoadLibraryExW(Widen(moduleName).c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                                          LOAD_LIBRARY_SEARCH_SYSTEM32 |
+                                          LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!target) {
+      ++missing;
+      if (named < kMaxNamed) {
+        ++named;
+        Log::Write(L"delay-probe: " + Widen(moduleName) + L" absent entirely");
+      }
+      continue;
+    }
+
+    if (!desc->intRva) continue;
+    auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->intRva);
+    for (; thunk->u1.AddressOfData; ++thunk) {
+      ++imports;
+      FARPROC proc = nullptr;
+      std::wstring label;
+      if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
+        WORD ordinal = static_cast<WORD>(IMAGE_ORDINAL32(thunk->u1.Ordinal));
+        proc = ::GetProcAddress(
+            target, reinterpret_cast<LPCSTR>(static_cast<ULONG_PTR>(ordinal)));
+        label = L"#" + std::to_wstring(ordinal);
+      } else {
+        auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+            base + thunk->u1.AddressOfData);
+        proc = ::GetProcAddress(target, byName->Name);
+        label = Widen(byName->Name);
+      }
+      if (proc) continue;
+
+      ++missing;
+      if (named < kMaxNamed) {
+        ++named;
+        Log::Write(L"delay-probe: " + Widen(moduleName) + L"!" + label);
+      }
+    }
+    ::FreeLibrary(target);
+  }
+
+  Log::Write(L"delay-probe: " + std::to_wstring(modules) + L" modules, " +
+             std::to_wstring(imports) + L" delayed imports, " +
+             std::to_wstring(missing) + L" unavailable" +
+             (missing > named ? L" (" + std::to_wstring(missing - named) +
+                                    L" past the reporting limit)"
+                              : L""));
+}
+
 // ------------------------------------------------------------- pc sampling
 
 // SuspendThread and GetThreadContext are outside the app partition of the
@@ -667,6 +771,8 @@ void InstallEngineProbes() {
 
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
   if (!xul) return;
+
+  ProbeDelayLoads(xul);
 
   // Whether the loader is enforcing Control Flow Guard on the engine decides
   // whether an indirect call can end the process outright, so it is worth

@@ -1,8 +1,8 @@
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..61707d41a6 100644
+index fe113c825c..45df676fbe 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -18,6 +18,61 @@ extern "C" int __llvm_profile_dump(void);
+@@ -18,6 +18,66 @@ extern "C" int __llvm_profile_dump(void);
  #  endif
  #endif
  
@@ -30,6 +30,10 @@ index fe113c825c..61707d41a6 100644
 +// No key is down, which on a device with no keyboard is not a lie.
 +SHORT WINAPI GeckoW10mGetKeyState(int) { return 0; }
 +
++// No such window. Gecko looks for an existing instance to hand a URL to; a
++// packaged app has no desktop window to find and does not want one.
++HWND WINAPI GeckoW10mFindWindowW(LPCWSTR, LPCWSTR) { return nullptr; }
++
 +struct Substitute {
 +  const char* name;
 +  FARPROC stub;
@@ -37,6 +41,7 @@ index fe113c825c..61707d41a6 100644
 +
 +const Substitute kSubstitutes[] = {
 +    {"GetKeyState", reinterpret_cast<FARPROC>(&GeckoW10mGetKeyState)},
++    {"FindWindowW", reinterpret_cast<FARPROC>(&GeckoW10mFindWindowW)},
 +};
 +
 +FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
