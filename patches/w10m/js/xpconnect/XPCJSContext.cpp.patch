@@ -1,0 +1,52 @@
+diff --git a/js/xpconnect/src/XPCJSContext.cpp b/js/xpconnect/src/XPCJSContext.cpp
+index 93645d0826..4ac30056ae 100644
+--- a/js/xpconnect/src/XPCJSContext.cpp
++++ b/js/xpconnect/src/XPCJSContext.cpp
+@@ -1233,6 +1233,12 @@ static AtomicLogLevel& GetLevelRef(JS::OpaqueLogger aLogger) {
+ static JS::LoggingInterface loggingInterface = {GetLoggerByName, LogPrintVA,
+                                                 LogPrintFMT, GetLevelRef};
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ nsresult XPCJSContext::Initialize() {
+   if (StaticPrefs::javascript_options_external_thread_pool_DoNotUseDirectly()) {
+     size_t threadCount = TaskController::GetPoolThreadCount();
+@@ -1407,6 +1413,11 @@ nsresult XPCJSContext::Initialize() {
+   // Initialize the MIME type used for the bytecode cache, after calling
+   // SetProcessBuildIdOp and loading JS prefs.
+   if (!nsContentUtils::InitJSBytecodeMimeType()) {
++#if defined(GECKO_W10M)
++    // Both aborts in this function report OOM without a size, so from a crash
++    // address alone there is no telling which one fired.
++    GeckoW10mNote("xpc: InitJSBytecodeMimeType failed");
++#endif
+     NS_ABORT_OOM(0);  // Size is unknown.
+   }
+ 
+@@ -1433,7 +1444,22 @@ nsresult XPCJSContext::Initialize() {
+     }
+   }
+ 
++#if defined(GECKO_W10M)
++  GeckoW10mNote("xpc: InitSelfHostedCode starting");
++#endif
+   if (!JS::InitSelfHostedCode(cx, shm.Content(), writer)) {
++#if defined(GECKO_W10M)
++    // "Failure is due to OOM" is an inference, not a report: it is what is
++    // left when nothing was thrown. On a fresh port that inference is worth
++    // doubting, and 22 MB of a 2 GB allowance is not out of memory.
++    {
++      nsPrintfCString note(
++          "xpc: InitSelfHostedCode failed, exception=%d oom=%d shm=%d",
++          int(JS_IsExceptionPending(cx)), int(JS_IsThrowingOutOfMemory(cx)),
++          int(!shm.Content().IsEmpty()));
++      GeckoW10mNote(note.get());
++    }
++#endif
+     // Note: If no exception is pending, failure is due to OOM.
+     if (!JS_IsExceptionPending(cx) || JS_IsThrowingOutOfMemory(cx)) {
+       NS_ABORT_OOM(0);  // Size is unknown.
