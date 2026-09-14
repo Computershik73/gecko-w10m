@@ -1,5 +1,5 @@
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..3caad7fc35 100644
+index fe113c825c..050409d0db 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
 @@ -18,6 +18,115 @@ extern "C" int __llvm_profile_dump(void);
@@ -118,3 +118,15 @@ index fe113c825c..3caad7fc35 100644
  namespace mozilla {
  
  class BootstrapImpl final : public Bootstrap {
+@@ -42,6 +151,11 @@ class BootstrapImpl final : public Bootstrap {
+ 
+   virtual int XRE_main(int argc, char* argv[],
+                        const BootstrapConfig& aConfig) override {
++#if defined(GECKO_W10M)
++    // First line in the file, so its absence means the channel is broken
++    // rather than the code being instrumented never running.
++    GeckoW10mNote("XRE_main entered");
++#endif
+     return ::XRE_main(argc, argv, aConfig);
+   }
+ 

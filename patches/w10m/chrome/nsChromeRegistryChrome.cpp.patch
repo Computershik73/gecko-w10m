@@ -1,5 +1,5 @@
 diff --git a/chrome/nsChromeRegistryChrome.cpp b/chrome/nsChromeRegistryChrome.cpp
-index b28f2b7ff8..1713ca59de 100644
+index b28f2b7ff8..cec98bf34f 100644
 --- a/chrome/nsChromeRegistryChrome.cpp
 +++ b/chrome/nsChromeRegistryChrome.cpp
 @@ -8,6 +8,8 @@
@@ -11,7 +11,7 @@ index b28f2b7ff8..1713ca59de 100644
  #if defined(XP_WIN)
  #  include <windows.h>
  #elif defined(XP_MACOSX)
-@@ -414,11 +416,31 @@ void nsChromeRegistryChrome::nsProviderArray::EnumerateToArray(
+@@ -414,11 +416,37 @@ void nsChromeRegistryChrome::nsProviderArray::EnumerateToArray(
    }
  }
  
@@ -37,9 +37,33 @@ index b28f2b7ff8..1713ca59de 100644
 +                         static_cast<uint32_t>(rv),
 +                         static_cast<void*>(mManifestURI.get()));
 +    GeckoW10mNote(note.get());
++  } else {
++    // Reaching this branch at all is the finding: the member was not null
++    // before anyone had a chance to set it.
++    nsPrintfCString note("manifest uri: already set to %p, skipping",
++                         static_cast<void*>(mManifestURI.get()));
++    GeckoW10mNote(note.get());
 +#else
      NS_NewURI(getter_AddRefs(mManifestURI), uri);
 +#endif
    }
    return mManifestURI;
  }
+@@ -491,6 +519,17 @@ void nsChromeRegistryChrome::ManifestContent(ManifestProcessingContext& cx,
+ void nsChromeRegistryChrome::ManifestLocale(ManifestProcessingContext& cx,
+                                             int lineno, char* const* argv,
+                                             int flags) {
++#if defined(GECKO_W10M)
++  {
++    nsPrintfCString note(
++        "locale: cx=%p size=%u offset=%u uri=%p",
++        static_cast<void*>(&cx), static_cast<unsigned>(sizeof(cx)),
++        static_cast<unsigned>(reinterpret_cast<char*>(&cx.mManifestURI) -
++                              reinterpret_cast<char*>(&cx)),
++        static_cast<void*>(cx.mManifestURI.get()));
++    GeckoW10mNote(note.get());
++  }
++#endif
+   char* package = argv[0];
+   char* provider = argv[1];
+   char* uri = argv[2];

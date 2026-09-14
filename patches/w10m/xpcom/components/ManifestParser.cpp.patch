@@ -1,0 +1,42 @@
+diff --git a/xpcom/components/ManifestParser.cpp b/xpcom/components/ManifestParser.cpp
+index 170e6b3683..1c119542dc 100644
+--- a/xpcom/components/ManifestParser.cpp
++++ b/xpcom/components/ManifestParser.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "mozilla/Services.h"
+ #include "nsCRT.h"
++#include "nsPrintfCString.h"
+ #include "nsConsoleMessage.h"
+ #include "nsIConsoleService.h"
+ #include "nsIScriptError.h"
+@@ -369,11 +370,29 @@ struct CachedDirective {
+ 
+ }  // namespace
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ void ParseManifest(NSLocationType aType, FileLocation& aFile, char* aBuf,
+                    bool aChromeOnly) {
+   nsComponentManagerImpl::ManifestProcessingContext mgrcx(aType, aFile,
+                                                           aChromeOnly);
+   nsChromeRegistry::ManifestProcessingContext chromecx(aType, aFile);
++#if defined(GECKO_W10M)
++  {
++    nsPrintfCString note(
++        "parse: chromecx=%p size=%u offset=%u uri=%p",
++        static_cast<void*>(&chromecx),
++        static_cast<unsigned>(sizeof(chromecx)),
++        static_cast<unsigned>(reinterpret_cast<char*>(&chromecx.mManifestURI) -
++                              reinterpret_cast<char*>(&chromecx)),
++        static_cast<void*>(chromecx.mManifestURI.get()));
++    GeckoW10mNote(note.get());
++  }
++#endif
+   nsresult rv;
+ 
+   constexpr auto kContentAccessible = u"contentaccessible"_ns;
