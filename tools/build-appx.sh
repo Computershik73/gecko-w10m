@@ -64,10 +64,39 @@ cp "$APP/Package.appxmanifest" "$STAGE/AppxManifest.xml"
 mkdir -p "$STAGE/Assets"
 cp "$APP/Assets/"*.png "$STAGE/Assets/"
 
-# The C runtime matching the toolset that built both the shell and the engine.
-for c in msvcp140.dll msvcp140_1.dll msvcp140_2.dll vcruntime140.dll concrt140.dll; do
-  [ -f "$VS/bin/Hostx64/arm/$c" ] && cp "$VS/bin/Hostx64/arm/$c" "$STAGE/"
-done
+# The C runtime. $VS/bin/Hostx64/arm holds the x64 binaries the cross-compiler
+# itself runs on, NOT the ARM runtime -- staging from there shipped an x64
+# vcruntime140.dll, and the device's loader answered mozglue.dll with
+# ERROR_BAD_EXE_FORMAT (193) and then xul.dll with ERROR_MOD_NOT_FOUND (126).
+#
+# The right source is the UWP runtime out of the VCLibs framework package:
+# ARM32 and built with /APPCONTAINER, unlike the desktop redist. Its DLLs carry
+# an _app suffix and reference each other by that name, while mozglue and xul
+# import the plain names, so both spellings go in the package.
+VCLIBS="C:/Program Files (x86)/Microsoft SDKs/Windows Kits/10/ExtensionSDKs/Microsoft.VCLibs/14.0/Appx/Retail/ARM/Microsoft.VCLibs.arm.14.00.appx"
+if [ -f "$VCLIBS" ]; then
+  CRTTMP="$APP/AppPackages/crt"
+  rm -rf "$CRTTMP" && mkdir -p "$CRTTMP"
+  powershell.exe -NoProfile -Command "
+    Add-Type -AssemblyName System.IO.Compression.FileSystem;
+    \$zip = [System.IO.Compression.ZipFile]::OpenRead('$(cygpath -w "$VCLIBS")');
+    \$zip.Entries | Where-Object { \$_.Name -like '*.dll' } | ForEach-Object {
+      [System.IO.Compression.ZipFileExtensions]::ExtractToFile(\$_,
+        (Join-Path '$(cygpath -w "$CRTTMP")' \$_.Name), \$true) };
+    \$zip.Dispose()" >/dev/null
+  for f in "$CRTTMP"/*.dll; do
+    b=$(basename "$f")
+    cp "$f" "$STAGE/$b"
+    # Same bytes under the name the engine imports: vcruntime140_app.dll also
+    # answers to vcruntime140.dll.
+    plain=$(echo "$b" | sed 's/_app\.dll$/.dll/')
+    [ "$plain" != "$b" ] && cp "$f" "$STAGE/$plain"
+  done
+  rm -rf "$CRTTMP"
+  echo "    CRT from VCLibs 14.00 ARM (UWP, appcontainer)"
+else
+  echo "    WARNING: VCLibs ARM package not found, no CRT staged" >&2
+fi
 
 # The ported engine.
 if [ -d "$DIST" ]; then

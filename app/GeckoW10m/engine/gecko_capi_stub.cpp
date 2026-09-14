@@ -74,17 +74,101 @@ bool ProbeJit(std::string& detail) {
   return true;
 }
 
+// Walks xul.dll's import table on the device and reports which of its
+// dependencies will not load. xul.dll is built against the desktop Win32
+// surface, and Windows 10 Mobile does not carry all of it -- urlmon, msi,
+// credui and friends. ERROR_MOD_NOT_FOUND from the loader names nothing, so
+// this asks each dependency individually and lets the device tell us what is
+// actually missing instead of guessing from a desktop SDK.
+//
+// The image is mapped with LOAD_LIBRARY_AS_DATAFILE, which maps the raw file
+// rather than a laid-out image, so every RVA has to be walked back to a file
+// offset through the section table.
+void ProbeDependencies(const std::wstring& xulPath, std::string& detail) {
+  HMODULE data = ::LoadLibraryExW(xulPath.c_str(), nullptr,
+                                  LOAD_LIBRARY_AS_DATAFILE);
+  if (!data) {
+    detail = "could not map xul.dll to read its imports (err " +
+             std::to_string(::GetLastError()) + ")";
+    return;
+  }
+
+  // LOAD_LIBRARY_AS_DATAFILE tags the low bits of the handle.
+  auto* base = reinterpret_cast<const unsigned char*>(
+      reinterpret_cast<ULONG_PTR>(data) & ~static_cast<ULONG_PTR>(0xF));
+
+  auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+  auto* sections = IMAGE_FIRST_SECTION(nt);
+  const WORD sectionCount = nt->FileHeader.NumberOfSections;
+
+  auto rvaToOffset = [&](DWORD rva) -> DWORD {
+    for (WORD i = 0; i < sectionCount; ++i) {
+      DWORD start = sections[i].VirtualAddress;
+      DWORD size = sections[i].Misc.VirtualSize;
+      if (rva >= start && rva < start + size) {
+        return sections[i].PointerToRawData + (rva - start);
+      }
+    }
+    return 0;
+  };
+
+  DWORD importRva =
+      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+          .VirtualAddress;
+  DWORD importOff = rvaToOffset(importRva);
+  if (!importOff) {
+    detail = "xul.dll has no readable import directory";
+    ::FreeLibrary(data);
+    return;
+  }
+
+  auto* desc =
+      reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + importOff);
+
+  int total = 0;
+  int missing = 0;
+  std::string missingList;
+  for (; desc->Name; ++desc) {
+    DWORD nameOff = rvaToOffset(desc->Name);
+    if (!nameOff) continue;
+    const char* name = reinterpret_cast<const char*>(base + nameOff);
+    ++total;
+
+    // The package's own payload is next to the exe; everything else has to
+    // come from the system. Ask for both, the way the real load will.
+    HMODULE m = ::LoadLibraryExW(Widen(name).c_str(), nullptr,
+                                 LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                                     LOAD_LIBRARY_SEARCH_SYSTEM32 |
+                                     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (m) {
+      ::FreeLibrary(m);
+      continue;
+    }
+    ++missing;
+    if (!missingList.empty()) missingList += ", ";
+    missingList += name;
+    missingList += "(" + std::to_string(::GetLastError()) + ")";
+  }
+
+  ::FreeLibrary(data);
+
+  detail = std::to_string(total) + " imports, " + std::to_string(missing) +
+           " unavailable";
+  if (missing) detail += ": " + missingList;
+}
+
 // Tries to load the ported engine and resolve its entry point, in stages, so a
 // failure says which stage failed. The engine links against the desktop Win32
 // surface, which the ARM32 SDK provides and Windows 10 Mobile exports; whether
 // the app container lets those calls through at run time is the open question
 // this answers on the device.
-void ProbeXul(std::string& detail) {
+void ProbeXul(std::string& detail, std::wstring& xulPath) {
   // Stage 1: is the file even in the package? A missing payload and a blocked
   // load look identical from LoadPackagedLibrary's error code alone.
+  std::wstring& path = xulPath;
   wchar_t dir[MAX_PATH] = {};
   DWORD n = ::GetModuleFileNameW(nullptr, dir, MAX_PATH);
-  std::wstring path;
   if (n > 0 && n < MAX_PATH) {
     path.assign(dir, n);
     auto slash = path.find_last_of(L'\\');
@@ -179,8 +263,19 @@ gecko_runtime* gecko_runtime_create(const gecko_runtime_config* config) {
   // this runs either way -- gating it behind the JIT setting meant one flag
   // hid the answer to the only question that matters right now.
   std::string xul_detail;
-  ProbeXul(xul_detail);
+  std::wstring xul_path;
+  ProbeXul(xul_detail, xul_path);
   gecko_w10m::client::Log::Write(L"probe xul", Widen(xul_detail));
+
+  // When the engine does not load, the interesting question is which of its
+  // dependencies the device lacks -- so ask only then, and only if the file
+  // was found in the first place.
+  if (xul_detail.find("loaded, XRE_GetBootstrap resolved") == std::string::npos &&
+      !xul_path.empty()) {
+    std::string deps;
+    ProbeDependencies(xul_path, deps);
+    gecko_w10m::client::Log::Write(L"probe deps", Widen(deps));
+  }
 
   rt->jit_detail += "  |  " + xul_detail;
   return rt;
