@@ -1,0 +1,28 @@
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index cd9485c344..60d8609d1f 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -2338,7 +2338,23 @@ static void RegisterApplicationRestartChanged(const char* aPref, void* aData) {
+                                    RESTART_NO_CRASH | RESTART_NO_HANG);
+     }
+   } else if (wasRegistered) {
++#  ifdef GECKO_W10M
++    // Windows 10 Mobile's kernel32 exports RegisterApplicationRestart and
++    // GetApplicationRestartSettings but not UnregisterApplicationRestart, and
++    // one unresolvable import is enough to stop the whole 132 MB xul.dll from
++    // loading -- the loader answers ERROR_PROC_NOT_FOUND and names nothing.
++    // Resolving it at run time costs nothing where it exists and lets the
++    // engine load where it does not.
++    if (HMODULE kernel32 = ::GetModuleHandleW(L"kernel32.dll")) {
++      using UnregisterFn = HRESULT(WINAPI*)();
++      if (auto unregister = reinterpret_cast<UnregisterFn>(::GetProcAddress(
++              kernel32, "UnregisterApplicationRestart"))) {
++        unregister();
++      }
++    }
++#  else
+     ::UnregisterApplicationRestart();
++#  endif
+   }
+ }
+ 
