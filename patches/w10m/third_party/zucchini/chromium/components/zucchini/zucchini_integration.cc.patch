@@ -1,0 +1,38 @@
+diff --git a/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc b/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
+index d70e85a620..7c8dfd5d5b 100644
+--- a/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
++++ b/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
+@@ -105,6 +105,14 @@ status::Code GenerateCommon(base::File old_file,
+   return status::kStatusSuccess;
+ }
+ 
++#if BUILDFLAG(IS_WIN) && defined(_M_ARM) && defined(__clang__)
++// clang implements no structured exception handling on 32-bit ARM
++// Windows. Without it an EXCEPTION_IN_PAGE_ERROR on one of the mapped
++// files terminates the process instead of being reported as
++// kStatusIoError; patching itself is unaffected.
++#  define ZUCCHINI_NO_SEH 1
++#endif
++
+ status::Code ApplyCommon(base::File old_file,
+                          base::File patch_file,
+                          base::File new_file,
+@@ -112,7 +120,9 @@ status::Code ApplyCommon(base::File old_file,
+                          bool force_keep) {
+ #if BUILDFLAG(IS_WIN)
+   ExceptionFilterHelper exception_filter_helper;
++#  if !defined(ZUCCHINI_NO_SEH)
+   __try {
++#  endif
+ #endif
+     MappedFileReader mapped_patch(std::move(patch_file));
+     if (mapped_patch.HasError()) {
+@@ -168,7 +178,7 @@ status::Code ApplyCommon(base::File old_file,
+     // Successfully patch |mapped_new|. Explicitly request file to be kept.
+     return mapped_new.Keep() ? status::kStatusSuccess
+                              : status::kStatusFileWriteError;
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !defined(ZUCCHINI_NO_SEH)
+   } __except (exception_filter_helper.FilterPageError(
+       GetExceptionInformation()->ExceptionRecord)) {
+     LOG(ERROR) << "EXCEPTION_IN_PAGE_ERROR while "

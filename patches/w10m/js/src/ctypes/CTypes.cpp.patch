@@ -1,0 +1,44 @@
+diff --git a/js/src/ctypes/CTypes.cpp b/js/src/ctypes/CTypes.cpp
+index ed9f43ded1..11e3109e39 100644
+--- a/js/src/ctypes/CTypes.cpp
++++ b/js/src/ctypes/CTypes.cpp
+@@ -6552,7 +6552,13 @@ static bool GetABI(JSContext* cx, HandleValue abiType, ffi_abi* result) {
+ #  endif
+       return true;
+ #elif defined(_WIN32)
++#  if defined(_M_ARM)
++      // 32-bit ARM Windows has a single calling convention, so thiscall is an
++      // alias for the default one, as it already is on the 64-bit targets.
++      *result = FFI_DEFAULT_ABI;
++#  else
+       *result = FFI_THISCALL;
++#  endif
+       return true;
+ #else
+       break;
+@@ -6560,7 +6566,12 @@ static bool GetABI(JSContext* cx, HandleValue abiType, ffi_abi* result) {
+     case ABI_STDCALL:
+     case ABI_WINAPI:
+ #if (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
++#  if defined(_M_ARM)
++      // Single calling convention; see the ABI_THISCALL case above.
++      *result = FFI_DEFAULT_ABI;
++#  else
+       *result = FFI_STDCALL;
++#  endif
+       return true;
+ #elif (defined(_WIN64))
+       // We'd like the same code to work across Win32 and Win64, so stdcall_api
+@@ -6718,7 +6729,11 @@ void FunctionType::BuildSymbolName(JSContext* cx, JSString* name,
+       break;
+ 
+     case ABI_STDCALL: {
+-#if (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
++#if defined(_M_ARM)
++      // 32-bit ARM Windows has a single calling convention and no stdcall name
++      // decoration, so the symbol name is used as-is.
++      AppendString(cx, result, name);
++#elif (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
+       // On WIN32, stdcall functions look like:
+       //   _foo@40
+       // where 'foo' is the function name, and '40' is the aligned size of the

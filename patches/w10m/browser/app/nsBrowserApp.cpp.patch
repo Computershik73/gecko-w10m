@@ -1,0 +1,32 @@
+diff --git a/browser/app/nsBrowserApp.cpp b/browser/app/nsBrowserApp.cpp
+index 36e7517b4a..9d4ef3bc9f 100644
+--- a/browser/app/nsBrowserApp.cpp
++++ b/browser/app/nsBrowserApp.cpp
+@@ -29,8 +29,10 @@
+ 
+ #ifdef XP_WIN
+ #  include "mozilla/PreXULSkeletonUI.h"
+-#  include "freestanding/SharedSection.h"
+-#  include "LauncherProcessWin.h"
++#  if !defined(MOZ_UWP)
++#    include "freestanding/SharedSection.h"
++#    include "LauncherProcessWin.h"
++#  endif
+ #  include "mozilla/GeckoArgs.h"
+ #  include "mozilla/mscom/ProcessRuntime.h"
+ #  include "mozilla/WindowsDllBlocklist.h"
+@@ -514,10 +516,13 @@ int main(int argc, char* argv[], char* envp[]) {
+     (void)result;  // Ignore errors since some tools block DPI calls
+   }
+ 
++#if !defined(MOZ_UWP)
+   // Once the browser process hits the main function, we no longer need
+   // a writable section handle because all dependent modules have been
+-  // loaded.
++  // loaded. The shared section belongs to the launcher process, which the
++  // app-container build does not have.
+   mozilla::freestanding::gSharedSection.ConvertToReadOnly();
++#endif
+ 
+   mozilla::CreateAndStorePreXULSkeletonUI(GetModuleHandle(nullptr), argc, argv);
+ 

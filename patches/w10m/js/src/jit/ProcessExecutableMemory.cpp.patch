@@ -1,0 +1,16 @@
+diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
+index cea7d764ca..9bdc91a379 100644
+--- a/js/src/jit/ProcessExecutableMemory.cpp
++++ b/js/src/jit/ProcessExecutableMemory.cpp
+@@ -67,7 +67,10 @@ static void* ComputeRandomAllocationAddress() {
+ #  ifdef HAVE_64BIT_BUILD
+   static const uintptr_t base = 0x0000000080000000;
+   static const uintptr_t mask = 0x000003ffffff0000;
+-#  elif defined(_M_IX86) || defined(__i386__)
++#  elif defined(_M_IX86) || defined(__i386__) || defined(_M_ARM) || \
++      defined(__arm__)
++  // 32-bit x86 and 32-bit ARM (Windows 10 Mobile) share the same randomized
++  // executable-memory address range.
+   static const uintptr_t base = 0x04000000;
+   static const uintptr_t mask = 0x3fff0000;
+ #  else

@@ -1,0 +1,41 @@
+# Build output
+obj-arm-uwp/
+/app/**/Generated Files/
+/app/**/ARM/
+/app/**/Win32/
+/app/**/Debug/
+/app/**/Release/
+/app/**/BundleArtifacts/
+/app/**/AppPackages/
+*.user
+*.aps
+*.appx
+*.appxbundle
+*.appxupload
+*.pfx
+*.cer
+
+# Test project build output + signing material
+/test/**/ARM/
+/test/**/Win32/
+/test/**/Debug/
+/test/**/Release/
+/test/**/AppPackages/
+/test/**/*.pfx
+/test/**/*.cer
+/test/**/thumbprint.txt
+
+# JsSmoke build outputs
+/test/JsSmoke/*.o
+/test/JsSmoke/*.obj
+/test/JsSmoke/JsSmoke.exe
+/test/JsSmoke/pkg/
+
+# Gecko object directories (the browser objdir lives at C:/rw-obj and is
+# reachable here through a junction; see docs/ENGINE-BUILD-STATUS.md).
+/engine/obj-arm-uwp/
+/engine/obj-arm-uwp-browser/
+
+# Vendored windows-rs, fetched separately and patched by
+# tools/patch-windows-rs-arm32.py.
+/engine/third_party/

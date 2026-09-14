@@ -1,0 +1,17 @@
+diff --git a/gfx/graphite2/src/inc/Machine.h b/gfx/graphite2/src/inc/Machine.h
+index 5ceedc296d..67b20e2a1d 100644
+--- a/gfx/graphite2/src/inc/Machine.h
++++ b/gfx/graphite2/src/inc/Machine.h
+@@ -58,6 +58,12 @@ typedef Slot * slotref;
+ 
+ enum {VARARGS = 0xff, MAX_NAME_LEN=32};
+ 
++// <winnt.h> defines DELETE as an access-mask constant; the opcode names
++// below are graphite2's own and must win inside this enum.
++#ifdef DELETE
++#  undef DELETE
++#endif
++
+ enum opcode {
+     NOP = 0,
+ 

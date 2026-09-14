@@ -1,0 +1,36 @@
+diff --git a/gfx/pixman/pixman/pixman/moz.build b/gfx/pixman/pixman/pixman/moz.build
+index 9699e3186c..088f2388c3 100644
+--- a/gfx/pixman/pixman/pixman/moz.build
++++ b/gfx/pixman/pixman/pixman/moz.build
+@@ -78,7 +78,13 @@ elif CONFIG['TARGET_CPU'] == 'aarch64' and CONFIG['OS_TARGET'] in ('Android', 'L
+     ]
+     SOURCES['pixman-arm-neon.c'].flags += ['-march=armv8-a']
+ elif CONFIG['TARGET_CPU'] == 'arm':
+-    if CONFIG['HAVE_ARM_NEON']:
++    # pixman's hand-written 32-bit ARM assembly is A32 (ARM mode). Windows on
++    # ARM32 is Thumb-2 only -- the assembler rejects it outright with "target
++    # does not support ARM mode" -- so those fast paths are unavailable there
++    # and pixman falls back to its generic C implementations.
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        pass
++    elif CONFIG['HAVE_ARM_NEON']:
+         DEFINES['USE_ARM_NEON'] = True
+         SOURCES += [
+             'pixman-arm-neon-asm-bilinear.S',
+@@ -86,14 +92,14 @@ elif CONFIG['TARGET_CPU'] == 'arm':
+             'pixman-arm-neon.c',
+         ]
+         SOURCES['pixman-arm-neon.c'].flags += CONFIG['NEON_FLAGS']
+-    if CONFIG['HAVE_ARM_SIMD']:
++    if CONFIG['HAVE_ARM_SIMD'] and CONFIG['OS_TARGET'] != 'WINNT':
+         DEFINES['USE_ARM_SIMD'] = True
+         SOURCES += [
+             'pixman-arm-simd-asm-scaled.S',
+             'pixman-arm-simd-asm.S',
+             'pixman-arm-simd.c',
+         ]
+-    if CONFIG['HAVE_ARM_NEON'] or CONFIG['HAVE_ARM_SIMD']:
++    if (CONFIG['HAVE_ARM_NEON'] or CONFIG['HAVE_ARM_SIMD']) and CONFIG['OS_TARGET'] != 'WINNT':
+         DEFINES['ASM_HAVE_SYNTAX_UNIFIED'] = True
+     if CONFIG['OS_TARGET'] == 'Android':
+         # For cpu-features.h

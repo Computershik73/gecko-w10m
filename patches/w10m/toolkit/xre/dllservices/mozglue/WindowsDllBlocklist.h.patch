@@ -1,0 +1,13 @@
+diff --git a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h b/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
+index 8702b227d2..173176c637 100644
+--- a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
++++ b/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
+@@ -6,7 +6,7 @@
+ #define mozilla_windowsdllblocklist_h
+ 
+ #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
+-    (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64))
++    (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64) || defined(_M_ARM))
+ 
+ #  include <windows.h>
+ #  include "mozilla/ProcessType.h"

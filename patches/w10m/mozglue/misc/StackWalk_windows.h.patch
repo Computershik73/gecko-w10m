@@ -1,0 +1,21 @@
+diff --git a/mozglue/misc/StackWalk_windows.h b/mozglue/misc/StackWalk_windows.h
+index 5e5105ddf4..5dc215fbb0 100644
+--- a/mozglue/misc/StackWalk_windows.h
++++ b/mozglue/misc/StackWalk_windows.h
+@@ -8,7 +8,7 @@
+ #include "mozilla/Array.h"
+ #include "mozilla/Types.h"
+ 
+-#if defined(_M_AMD64) || defined(_M_ARM64)
++#if defined(_M_AMD64) || defined(_M_ARM64) || defined(_M_ARM)
+ /**
+  * This function enables strategy (1) for avoiding deadlocks between the stack
+  * walking thread and the suspended thread. In aStackWalkLocks the caller must
+@@ -45,6 +45,6 @@ void DesuppressStackWalking();
+ MFBT_API void RegisterJitCodeRegion(uint8_t* aStart, size_t size);
+ 
+ MFBT_API void UnregisterJitCodeRegion(uint8_t* aStart, size_t size);
+-#endif  // _M_AMD64 || _M_ARM64
++#endif  // _M_AMD64 || _M_ARM64 || _M_ARM
+ 
+ #endif  // mozilla_StackWalk_windows_h

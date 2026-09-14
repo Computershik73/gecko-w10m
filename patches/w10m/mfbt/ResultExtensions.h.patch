@@ -1,0 +1,15 @@
+diff --git a/mfbt/ResultExtensions.h b/mfbt/ResultExtensions.h
+index c7c2543888..c44afa26c7 100644
+--- a/mfbt/ResultExtensions.h
++++ b/mfbt/ResultExtensions.h
+@@ -279,7 +279,9 @@ auto ToResultInvokeMember(const SmartPtr<const T>& aObj,
+   return ToResultInvokeMember<E>(*aObj, aFunc, std::forward<Args>(aArgs)...);
+ }
+ 
+-#if defined(XP_WIN) && !defined(_WIN64)
++// 32-bit ARM Windows, like Win64, has a single calling convention: __stdcall
++// is ignored there, so these overloads would redeclare the plain ones.
++#if defined(XP_WIN) && !defined(_WIN64) && !defined(_M_ARM)
+ template <typename E = nsresult, typename T, typename U, typename... XArgs,
+           typename... Args,
+           typename = std::enable_if_t<std::is_base_of_v<U, T>>>

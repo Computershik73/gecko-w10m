@@ -1,0 +1,26 @@
+diff --git a/xpcom/reflect/xptcall/md/win32/moz.build b/xpcom/reflect/xptcall/md/win32/moz.build
+index 2c1845f51d..0f92afa3c2 100644
+--- a/xpcom/reflect/xptcall/md/win32/moz.build
++++ b/xpcom/reflect/xptcall/md/win32/moz.build
+@@ -25,6 +25,21 @@ elif CONFIG["TARGET_CPU"] == "x86":
+             "xptcstubs.cpp",
+         ]
+         SOURCES["xptcinvoke_asm_x86_msvc.asm"].flags += ["-safeseh"]
++elif CONFIG["TARGET_CPU"] == "arm":
++    # Windows on ARM32: AAPCS, hard-float. The invoke side is the VFP half
++    # of the shared ARM implementation; the stubs need Windows name
++    # mangling and so are their own files.
++    SOURCES += [
++        "xptcinvoke_arm.cpp",
++        "xptcstubs_arm.cpp",
++    ]
++    GeneratedFile(
++        "xptcstubs_arm_gen.asm",
++        script="preprocess.py",
++        entry_point="preprocess",
++        inputs=["xptcstubs_asm_arm.asm"],
++    )
++    SOURCES += ["!xptcstubs_arm_gen.asm"]
+ elif CONFIG["TARGET_CPU"] == "aarch64":
+     SOURCES += [
+         "xptcinvoke_aarch64.cpp",

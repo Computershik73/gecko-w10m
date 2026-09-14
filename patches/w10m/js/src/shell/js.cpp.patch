@@ -1,0 +1,52 @@
+diff --git a/js/src/shell/js.cpp b/js/src/shell/js.cpp
+index 414e277ea1..0bbef16c1a 100644
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -7059,7 +7059,11 @@ class AutoPipe {
+ 
+   bool init() {
+ #  ifdef XP_WIN
++#    if defined(GECKO_W10M)
++    return false;  // _pipe is unavailable in the app container
++#    else
+     return !_pipe(fds_, 4096, O_BINARY);
++#    endif
+ #  else
+     return !pipe(fds_);
+ #  endif
+@@ -7168,7 +7172,11 @@ static bool CompileAndSerializeInSeparateProcess(JSContext* cx,
+     return false;
+   }
+ 
++#if defined(GECKO_W10M)
++  int childPid = -1;  // process spawning is unavailable in the app container
++#else
+   int childPid = _spawnv(P_NOWAIT, sArgv[0], argv.get());
++#endif
+   if (childPid == -1) {
+     return false;
+   }
+@@ -7216,7 +7224,11 @@ static bool CompileAndSerializeInSeparateProcess(JSContext* cx,
+ 
+   int status;
+ #  ifdef XP_WIN
++#if defined(GECKO_W10M)
++  if (true) {  // _cwait unavailable in the app container
++#else
+   if (_cwait(&status, childPid, WAIT_CHILD) == -1) {
++#endif
+     return false;
+   }
+ #  else
+@@ -12584,9 +12596,11 @@ static void PreInit() {
+   if (crash_option && crash_option[0] == '1') {
+     // Disable the segfault dialog. We want to fail the tests immediately
+     // instead of hanging automation.
++#if !defined(GECKO_W10M)
+     UINT newMode = SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+     UINT prevMode = SetErrorMode(newMode);
+     SetErrorMode(prevMode | newMode);
++#endif
+   }
+ #endif
+ }

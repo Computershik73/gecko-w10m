@@ -1,0 +1,17 @@
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index eb1251f51f..adb978283c 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -3163,6 +3163,12 @@ def as_info(target, c_compiler):
+     if c_compiler.type == "clang-cl":
+         if target.cpu == "aarch64":
+             return namespace(type="armasm", names=("armasm64.exe",))
++        # GeckoW10m: ARM32 (Windows 10 Mobile) uses the 32-bit ARM assembler.
++        # Nothing in the tree currently feeds it -- every in-tree 32-bit ARM
++        # assembly source is A32 (ARM mode), which this Thumb-2-only platform
++        # cannot use, so those are excluded per library.
++        if target.cpu == "arm":
++            return namespace(type="armasm", names=("armasm.exe",))
+         ml = {
+             "x86": "ml.exe",
+             "x86_64": "ml64.exe",

@@ -1,0 +1,13 @@
+diff --git a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h b/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
+index 78afb068c4..5ad6bf23a5 100644
+--- a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
++++ b/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
+@@ -49,6 +49,8 @@ static const size_t kExceptionAppMemoryRegions = 33;
+ using RegisterValueType = DWORD;
+ #elif defined(_M_AMD64) || defined(_M_ARM64)
+ using RegisterValueType = DWORD64;
++#elif defined(_M_ARM)
++using RegisterValueType = DWORD;
+ #else
+ #error Unsupported platform
+ #endif

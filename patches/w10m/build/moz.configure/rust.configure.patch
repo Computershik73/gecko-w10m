@@ -1,0 +1,24 @@
+diff --git a/build/moz.configure/rust.configure b/build/moz.configure/rust.configure
+index ea19412890..6896109c66 100644
+--- a/build/moz.configure/rust.configure
++++ b/build/moz.configure/rust.configure
+@@ -525,10 +525,16 @@ def rust_host_triple(rustc, host, rustc_host, rust_supported_targets, arm_target
+     return rustc_target
+ 
+ 
+-@depends(rustc, target, rust_supported_targets, arm_target, when=rust_compiler)
++@depends(rustc, target, rust_supported_targets, arm_target, uwp, when=rust_compiler)
+ @checking("for rust target triplet")
+-def rust_target_triple(rustc, target, rust_supported_targets, arm_target):
+-    rustc_target = detect_rustc_target(target, arm_target, rust_supported_targets)
++def rust_target_triple(rustc, target, rust_supported_targets, arm_target, uwp):
++    # GeckoW10m: for the ARM32 UWP (app container) build, use the -uwp Rust target
++    # (app-container-safe std) rather than the desktop -pc variant that the
++    # vendor-based detection would otherwise select.
++    if uwp and target.cpu == "arm":
++        rustc_target = "thumbv7a-uwp-windows-msvc"
++    else:
++        rustc_target = detect_rustc_target(target, arm_target, rust_supported_targets)
+     assert_rust_compile(target, rustc_target, rustc)
+     return rustc_target
+ 

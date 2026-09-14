@@ -1,0 +1,15 @@
+diff --git a/dom/media/webrtc/transport/build/moz.build b/dom/media/webrtc/transport/build/moz.build
+index b85d03a786..0fa0822f98 100644
+--- a/dom/media/webrtc/transport/build/moz.build
++++ b/dom/media/webrtc/transport/build/moz.build
+@@ -40,3 +40,10 @@ include("/tools/fuzzing/libfuzzer-config.mozbuild")
+ SOURCES += transport_cppsrcs
+ 
+ FINAL_LIBRARY = "xul"
++
++if CONFIG["OS_TARGET"] == "WINNT":
++    # See gecko_w10m_nrappkit_win_types.h: nrappkit's INT8/UINT8 (8 byte) collide
++    # with the Windows SDK's (1 byte) unless the Windows spellings are renamed
++    # out of the way before <basetsd.h> is first parsed. Forcing that header in
++    # ahead of everything else makes the order deterministic.
++    CXXFLAGS += ["-FI", "gecko_w10m_nrappkit_win_types.h"]

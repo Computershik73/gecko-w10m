@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- JitProbe: the only capability that matters here is codeGeneration. -->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap mp rescap">
+
+  <Identity Name="GeckoW10m.JitProbe" Publisher="CN=GeckoW10m" Version="0.1.0.0"
+            ProcessorArchitecture="arm" />
+
+  <mp:PhoneIdentity PhoneProductId="1c42dda2-b778-4032-9f94-8f852c3ad653"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>GeckoW10m JIT Probe</DisplayName>
+    <PublisherDisplayName>GeckoW10m</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Mobile" MinVersion="10.0.10586.0"
+                        MaxVersionTested="10.0.15254.0" />
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.10586.0"
+                        MaxVersionTested="10.0.15254.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="JitProbe.exe" EntryPoint="JitProbe.App">
+      <uap:VisualElements DisplayName="JIT Probe"
+          Description="Verifies UWP codeGeneration executable memory"
+          BackgroundColor="transparent"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- The one under test. -->
+    <rescap:Capability Name="codeGeneration" />
+  </Capabilities>
+</Package>

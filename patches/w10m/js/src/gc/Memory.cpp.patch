@@ -1,0 +1,21 @@
+diff --git a/js/src/gc/Memory.cpp b/js/src/gc/Memory.cpp
+index 475ba17963..a138116ecb 100644
+--- a/js/src/gc/Memory.cpp
++++ b/js/src/gc/Memory.cpp
+@@ -1102,9 +1102,16 @@ void* AllocateMappedContent(int fd, size_t offset, size_t length,
+     }
+     UnmapInternal(reinterpret_cast<void*>(region), mappedLength);
+     // If the offset or length are out of bounds, this call will fail.
++#if defined(GECKO_W10M)
++    // MapViewOfFileEx (fixed-address mapping) is not available in the app
++    // container; fail this last-ditch aligned mapping so the caller falls back.
++    (void)region;
++    map = nullptr;
++#else
+     map = static_cast<uint8_t*>(
+         MapViewOfFileEx(hMap, FILE_MAP_COPY, offsetH, offsetL, alignedLength,
+                         reinterpret_cast<void*>(region)));
++#endif
+     if (map) {
+       break;
+     }

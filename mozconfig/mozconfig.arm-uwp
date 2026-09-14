@@ -1,0 +1,86 @@
+# mozconfig for GeckoW10m on Windows 10 Mobile (arm-uwp), JIT-enabled, single-process.
+#
+# Consumed by tools/build-gecko-uwp.ps1, which also exports the VS2017 and
+# Windows 10 SDK paths that mozbuild needs.
+
+# ---- Target -----------------------------------------------------------------
+# 32-bit ARM, the only ISA W10M ships on (Snapdragon 2xx/4xx/8xx phones).
+ac_add_options --host=x86_64-pc-windows-msvc   # we build on x64 Windows (msys2)
+ac_add_options --target=arm-pc-windows-msvc
+ac_add_options --enable-project=js        # engine core first; full browser later
+
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/../obj-arm-uwp
+
+# ---- UWP app container ------------------------------------------------------
+# Adds MOZ_UWP + WINAPI_FAMILY=WINAPI_FAMILY_APP + GECKO_W10M, links the
+# /store CRT, skips ATL/MFC, forces single-process. See build/moz.configure/
+# uwp.configure (added by patches/w10m).
+ac_add_options --enable-uwp
+
+# ---- JIT --------------------------------------------------------------------
+# Keep the JIT (Baseline + Ion) and Wasm. codeGeneration + the *FromApp
+# allocators make executable memory legal in the container; ACG stays off.
+ac_add_options --enable-jit
+
+# ---- Rust (tier-3 UWP target, built from source) ----------------------------
+# thumbv7a-uwp-windows-msvc is a tier-3 Rust target: no prebuilt std ships, so
+# std/core/alloc are compiled from source with -Z build-std. Requires a nightly
+# toolchain with the rust-src component (rustup component add rust-src).
+export RUST_TARGET="thumbv7a-uwp-windows-msvc"
+export CARGO_BUILD_FLAGS="-Z build-std=std,panic_abort"
+export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort"
+ac_add_options --disable-rust-simd
+
+# ---- Single-process (no e10s) ----------------------------------------------
+export MOZ_FORCE_DISABLE_E10S=1
+
+# ---- Mark target binaries as app-container (UWP) ----------------------------
+# lld-link accepts /APPCONTAINER; sets IMAGE_DLL_CHARACTERISTICS_APPCONTAINER so
+# the DLL/exe loads cleanly inside the UWP app process. Target links only
+# (HOST_LDFLAGS is separate and stays desktop).
+export LDFLAGS="-APPCONTAINER"
+
+# ---- Compiler: clang-cl (Firefox 155 compiles with clang, MSVC only supplies
+# headers/libs). clang-cl cross-targets thumbv7 from the --target above.
+# +hwdiv: use the ARMv7 hardware integer-divide instruction (mandatory on
+# Windows-on-ARM32 / W10M hardware) so clang does not emit calls to the
+# __aeabi_uidivmod/__aeabi_idiv helpers, which have no compiler-rt provider
+# (the LLVM Windows package ships no ARM32 builtins lib).
+export CC="clang-cl --target=thumbv7-windows-msvc -Xclang -target-feature -Xclang +hwdiv"
+export CXX="clang-cl --target=thumbv7-windows-msvc -Xclang -target-feature -Xclang +hwdiv"
+export HOST_CC="clang-cl"
+export HOST_CXX="clang-cl"
+
+# ---- JIT executable-memory remap (VirtualAlloc/VirtualProtect -> *FromApp)
+# Applied by including gecko_w10m_winuwp_compat.h directly in the two JIT memory
+# source files (see patches/w10m/js/src/jit/*), not via a tree-wide /FI, which
+# msys2 mangles and which would touch unrelated VirtualAlloc call sites.
+
+# Force-include VS2022's <intrin0.h> so the ARM MSVC intrinsics (e.g.
+# _CountLeadingZeros) are declared for clang-cl. VS2022's STL routes clang to
+# clang's own <intrin.h>, which lacks the ARM32 intrinsics that <bit> uses;
+# intrin0.h declares them (guarded on _M_ARM). Bare filename => no msys2 path
+# mangling.
+# gecko_w10m_arm_intrin.h lives in obj/dist/include (on the -I path); it defines
+# _CountLeadingZeros{,64} for clang. Bare filename => no msys2 path mangling.
+# -DU_PLATFORM_HAS_WINUWP_API=1 makes ICU take its UWP code paths (CreateFile2
+# etc.) instead of the desktop-only CreateFileA/GetFileSize.
+# -DGECKO_W10M: set_define only reaches js-confdefs.h, not mozglue's
+# mozilla-config.h, so define it globally for every translation unit.
+export CFLAGS="-FIgecko_w10m_arm_intrin.h -DU_PLATFORM_HAS_WINUWP_API=1 -DGECKO_W10M=1"
+export CXXFLAGS="-FIgecko_w10m_arm_intrin.h -DU_PLATFORM_HAS_WINUWP_API=1 -DGECKO_W10M=1"
+
+# ---- Trim / optimize (js standalone knows only these) -----------------------
+# NOTE: --disable-crashreporter/updater/maintenance-service/webrtc are browser
+# (--enable-project=browser) options and are NOT valid for --enable-project=js.
+ac_add_options --disable-tests
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+ac_add_options --enable-release
+# Cross-language LTO can't consume the build-std rlibs (built without embedded
+# bitcode); disable LTO for this bring-up.
+ac_add_options --disable-lto
+
+# ---- Toolchain (paths exported by build-gecko-uwp.ps1) ----------------------
+# CC / CXX must be clang-cl targeting thumbv7 (the Mozilla clang toolchain from
+# `mach bootstrap`); MSVC cl.exe cannot target ARM with the flags Gecko uses.

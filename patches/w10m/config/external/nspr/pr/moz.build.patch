@@ -1,0 +1,14 @@
+diff --git a/config/external/nspr/pr/moz.build b/config/external/nspr/pr/moz.build
+index bb691f97dd..33338c1a70 100644
+--- a/config/external/nspr/pr/moz.build
++++ b/config/external/nspr/pr/moz.build
+@@ -98,6 +98,9 @@ elif CONFIG["OS_TARGET"] == "WINNT":
+         DEFINES["_X86_"] = True
+     elif CONFIG["TARGET_CPU"] == "aarch64":
+         DEFINES["_ARM64_"] = True
++    elif CONFIG["TARGET_CPU"] == "arm":
++        # GeckoW10m: 32-bit ARM (Windows 10 Mobile).
++        DEFINES["_ARM_"] = True
+     else:
+         error("Unsupported TARGET_CPU value: %s" % CONFIG["TARGET_CPU"])
+ else:

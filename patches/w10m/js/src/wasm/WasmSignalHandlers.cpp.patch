@@ -1,0 +1,57 @@
+diff --git a/js/src/wasm/WasmSignalHandlers.cpp b/js/src/wasm/WasmSignalHandlers.cpp
+index c06cefcce0..6852f93dc7 100644
+--- a/js/src/wasm/WasmSignalHandlers.cpp
++++ b/js/src/wasm/WasmSignalHandlers.cpp
+@@ -69,9 +69,16 @@ using namespace js::wasm;
+ #    define RSP_sig(p) ((p)->Rsp)
+ #    define RBP_sig(p) ((p)->Rbp)
+ #    define R11_sig(p) ((p)->R11)
+-#    define R13_sig(p) ((p)->R13)
+-#    define R14_sig(p) ((p)->R14)
+-#    define R15_sig(p) ((p)->R15)
++#    if defined(_M_ARM)
++// 32-bit ARM Windows CONTEXT names these Sp/Lr/Pc, not R13/R14/R15.
++#      define R13_sig(p) ((p)->Sp)
++#      define R14_sig(p) ((p)->Lr)
++#      define R15_sig(p) ((p)->Pc)
++#    else
++#      define R13_sig(p) ((p)->R13)
++#      define R14_sig(p) ((p)->R14)
++#      define R15_sig(p) ((p)->R15)
++#    endif
+ #    define EPC_sig(p) ((p)->Pc)
+ #    define RFP_sig(p) ((p)->Fp)
+ #    define R31_sig(p) ((p)->Sp)
+@@ -584,6 +591,11 @@ struct AutoHandlingTrap {
+ // =============================================================================
+ 
+ #  if defined(XP_WIN)
++// UWP has no vectored exception handler; the whole Windows async-trap handler
++// is compiled out and wasm uses explicit bounds checks (see the early return in
++// EnsureEagerProcessSignalHandlers). Keeping the XP_WIN arm avoids falling
++// through to the POSIX signal path.
++#    if !defined(GECKO_W10M)
+ // Obtained empirically from thread_local codegen on x86/x64/arm64.
+ // Compiled in all user binaries, so should be stable over time.
+ static const unsigned sThreadLocalArrayPointerIndex = 11;
+@@ -617,6 +629,7 @@ static LONG WINAPI WasmTrapHandler(LPEXCEPTION_POINTERS exception) {
+ 
+   return EXCEPTION_CONTINUE_EXECUTION;
+ }
++#    endif  // !GECKO_W10M
+ 
+ #  elif defined(XP_DARWIN)
+ // On OSX we are forced to use the lower-level Mach exception mechanism instead
+@@ -879,7 +892,11 @@ void wasm::EnsureEagerProcessSignalHandlers() {
+   sAlreadyHandlingTrap.infallibleInit();
+ 
+   // Install whatever exception/signal handler is appropriate for the OS.
+-#  if defined(XP_WIN)
++#  if defined(XP_WIN) && defined(GECKO_W10M)
++  // UWP has no AddVectoredExceptionHandler; run wasm with explicit bounds
++  // checks instead of the async trap handler.
++  return;
++#  elif defined(XP_WIN)
+ 
+ #    if defined(MOZ_ASAN)
+   // Under ASan we need to let the ASan runtime's ShadowExceptionHandler stay

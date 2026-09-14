@@ -1,0 +1,31 @@
+diff --git a/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h b/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
+index 0513edfdf1..ba3f093d42 100644
+--- a/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
++++ b/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
+@@ -318,7 +318,7 @@ class MOZ_STACK_CLASS WritableTargetFunction final {
+     mOffset += sizeof(int32_t);
+   }
+ 
+-#if defined(_M_X64) || defined(_M_ARM64)
++#if defined(_M_X64) || defined(_M_ARM64) || defined(_M_ARM)
+   void WriteLong(const uint32_t aValue) {
+     if (!mLocalBytes.append(reinterpret_cast<const uint8_t*>(&aValue),
+                             sizeof(uint32_t))) {
+@@ -391,6 +391,8 @@ class MOZ_STACK_CLASS WritableTargetFunction final {
+   static const size_t kInlineStorage = 16;
+ #elif defined(_M_X64) || defined(_M_ARM64)
+   static const size_t kInlineStorage = 32;
++#elif defined(_M_ARM)
++  static const size_t kInlineStorage = 16;
+ #endif
+   Vector<uint8_t, kInlineStorage> mLocalBytes;
+   bool mAccumulatedStatus;
+@@ -610,6 +612,8 @@ class ReadOnlyTargetBytes<MMPolicyOutOfProcess> {
+   static const size_t kInlineStorage = 16;
+ #elif defined(_M_X64) || defined(_M_ARM64)
+   static const size_t kInlineStorage = 32;
++#elif defined(_M_ARM)
++  static const size_t kInlineStorage = 16;
+ #endif
+ 
+   const MMPolicyOutOfProcess& mMMPolicy;

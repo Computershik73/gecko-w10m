@@ -1,0 +1,141 @@
+diff --git a/build/moz.configure/windows.configure b/build/moz.configure/windows.configure
+index e15e758b20..994c4c9514 100644
+--- a/build/moz.configure/windows.configure
++++ b/build/moz.configure/windows.configure
+@@ -9,20 +9,21 @@ def valid_ucrt_sdk_dir_result(value):
+         return "%s in %s" % (value.version, quote(value.path))
+ 
+ 
+-@depends(windows_sdk_dir, "WINDOWSSDKDIR", target.abi, host.abi)
++@depends(windows_sdk_dir, "WINDOWSSDKDIR", target, target.abi, host.abi)
+ @checking("for Universal CRT SDK", valid_ucrt_sdk_dir_result)
+ @imports("os")
+ @imports(_import="mozpack.path", _as="mozpath")
+ def valid_ucrt_sdk_dir(
+-    windows_sdk_dir, windows_sdk_dir_env, target_windows_abi, host_windows_abi
++    windows_sdk_dir, windows_sdk_dir_env, target, target_windows_abi, host_windows_abi
+ ):
+     if target_windows_abi != "msvc" and host_windows_abi != "msvc":
+         return None
+     if windows_sdk_dir_env:
+         windows_sdk_dir_env = windows_sdk_dir_env[0]
++    require_arch = "arm" if target.cpu == "arm" else None
+     sdks = {}
+     for d in windows_sdk_dir:
+-        sdklist = get_sdk_dirs(d, "ucrt")
++        sdklist = get_sdk_dirs(d, "ucrt", require_arch)
+         for sdk in sdklist:
+             version = os.path.basename(sdk.include)
+             # We're supposed to always find a version in the directory, because
+@@ -94,13 +95,14 @@ def valid_ucrt_sdk_dir(
+     )
+ 
+ 
+-@depends(vc_path, valid_windows_sdk_dir, valid_ucrt_sdk_dir)
++@depends(vc_path, valid_windows_sdk_dir, valid_ucrt_sdk_dir, uwp)
+ @imports("os")
+-def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir):
++def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir, uwp):
+     if not vc_path:
+         return
++    # UWP (app container) builds do not use ATL/MFC.
+     atlmfc_dir = os.path.join(vc_path, "atlmfc", "include")
+-    if not os.path.isdir(atlmfc_dir):
++    if not uwp and not os.path.isdir(atlmfc_dir):
+         die(
+             "Cannot find the ATL/MFC headers in the Visual C++ directory (%s). "
+             "Please install them." % vc_path
+@@ -124,7 +126,8 @@ def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir):
+         normalize_path_list_entry(p)
+         for p in (
+             os.path.join(vc_path, "include"),
+-            atlmfc_dir,
++            # atlmfc_dir omitted for UWP (no ATL/MFC).
++            *([] if uwp else [atlmfc_dir]),
+             os.path.join(windows_sdk_dir.include, "shared"),
+             os.path.join(windows_sdk_dir.include, "um"),
+             winrt_dir,
+@@ -177,9 +180,10 @@ def lib_path_for(host_or_target):
+         valid_windows_sdk_dir,
+         valid_ucrt_sdk_dir,
+         c_compiler,
++        uwp,
+     )
+     @imports("os")
+-    def lib_path(target, is_host, vc_path, windows_sdk_dir, ucrt_sdk_dir, compiler):
++    def lib_path(target, is_host, vc_path, windows_sdk_dir, ucrt_sdk_dir, compiler, uwp):
+         if not vc_path or target.os != "WINNT":
+             return
+         sdk_target = {
+@@ -189,26 +193,31 @@ def lib_path_for(host_or_target):
+             "aarch64": "arm64",
+         }.get(target.cpu)
+ 
+-        # MSVC2017 switched to use the same target naming as the sdk.
+-        atlmfc_dir = os.path.join(vc_path, "atlmfc", "lib", sdk_target)
+-        if not os.path.isdir(atlmfc_dir):
+-            die(
+-                "Cannot find the ATL/MFC libraries in the Visual C++ directory "
+-                "(%s). Please install them." % vc_path
+-            )
++        # The UWP target builds against the desktop Win32 partition (Windows 10
++        # Mobile ships the full NT API surface), so it links the ordinary CRT,
++        # not the /store variant. ATL/MFC is skipped: this Visual Studio has no
++        # 32-bit ARM ATL, and Gecko's UWP configuration does not use it.
++        skip_atl = bool(uwp)
+ 
+         libs = []
+         lib_env = os.environ.get("LIB")
+         if lib_env and not is_host:
+             libs.extend(lib_env.split(";"))
+-        libs.extend(
+-            (
+-                os.path.join(vc_path, "lib", sdk_target),
+-                atlmfc_dir,
+-                os.path.join(windows_sdk_dir.lib, "um", sdk_target),
+-                os.path.join(ucrt_sdk_dir.lib, "ucrt", sdk_target),
+-            )
+-        )
++
++        vc_lib = os.path.join(vc_path, "lib", sdk_target)
++        entries = [vc_lib]
++        if not skip_atl:
++            # MSVC2017 switched to use the same target naming as the sdk.
++            atlmfc_dir = os.path.join(vc_path, "atlmfc", "lib", sdk_target)
++            if not os.path.isdir(atlmfc_dir):
++                die(
++                    "Cannot find the ATL/MFC libraries in the Visual C++ directory "
++                    "(%s). Please install them." % vc_path
++                )
++            entries.append(atlmfc_dir)
++        entries.append(os.path.join(windows_sdk_dir.lib, "um", sdk_target))
++        entries.append(os.path.join(ucrt_sdk_dir.lib, "ucrt", sdk_target))
++        libs.extend(entries)
+         if compiler.type == "clang-cl":
+             runtime_dir = check_cmd_output(
+                 compiler.compiler,
+@@ -386,6 +395,8 @@ def cpu_arch_macro_definition(target):
+         return "_AMD64_"
+     elif target.cpu == "aarch64":
+         return "_ARM64_"
++    elif target.cpu == "arm":
++        return "_ARM_"
+     else:
+         return "_CPU_ARCH_NOT_DEFINED"
+ 
+@@ -463,7 +474,14 @@ with only_when(depends(c_compiler)(lambda c: c.type == "clang-cl")):
+     # Work around issues with newer STL and older runtimes, see bug 1994496.
+     set_define("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR", True)
+ 
+-    set_define("HAVE_SEH_EXCEPTIONS", True)
++    # clang implements no structured exception handling on 32-bit ARM
++    # Windows ("cannot select: cleanupret"), so MOZ_SEH_TRY has to fall back to
++    # plain blocks there.
++    set_define(
++        "HAVE_SEH_EXCEPTIONS",
++        True,
++        when=depends(target)(lambda target: target.cpu != "arm"),
++    )
+     set_define("HAVE_IO_H", True)
+ 
+     def win32_subsystem_version():

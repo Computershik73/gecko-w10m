@@ -1,0 +1,66 @@
+diff --git a/accessible/interfaces/ia2/moz.build b/accessible/interfaces/ia2/moz.build
+index 6db32c5c05..1792f877ed 100644
+--- a/accessible/interfaces/ia2/moz.build
++++ b/accessible/interfaces/ia2/moz.build
+@@ -2,20 +2,28 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-GeckoSharedLibrary("IA2Marshal", linkage=None)
+-DEFINES["REGISTER_PROXY_DLL"] = True
+-# {F9A6CC32-B0EF-490B-B102-179DDEEB08ED}
+-DEFINES["PROXY_CLSID_IS"] = (
+-    "{0xF9A6CC32,0xB0EF,0x490B,{0xB1,0x02,0x17,0x9D,0xDE,0xEB,0x08,0xED}}"
+-)
+-DEFFILE = "IA2Marshal.def"
+-OS_LIBS += [
+-    "uuid",
+-    "kernel32",
+-    "rpcrt4",
+-    "ole32",
+-    "oleaut32",
+-]
++# MIDL's 32-bit Windows proxy/stub output guards its whole body with
++# !defined(_ARM_), so on Windows/ARM32 these files compile to nothing and
++# there is no marshaller to put in a DLL. The generated headers and IID
++# definitions are still produced and exported: those are what the rest of
++# accessible/ consumes.
++build_marshal_dll = CONFIG["TARGET_CPU"] != "arm"
++
++if build_marshal_dll:
++    GeckoSharedLibrary("IA2Marshal", linkage=None)
++    DEFINES["REGISTER_PROXY_DLL"] = True
++    # {F9A6CC32-B0EF-490B-B102-179DDEEB08ED}
++    DEFINES["PROXY_CLSID_IS"] = (
++        "{0xF9A6CC32,0xB0EF,0x490B,{0xB1,0x02,0x17,0x9D,0xDE,0xEB,0x08,0xED}}"
++    )
++    DEFFILE = "IA2Marshal.def"
++    OS_LIBS += [
++        "uuid",
++        "kernel32",
++        "rpcrt4",
++        "ole32",
++        "oleaut32",
++    ]
+ 
+ midl_enums = [
+     "AccessibleEventId",
+@@ -78,6 +86,8 @@ for iface in midl_interfaces:
+     EXPORTS += ["!" + iface + ".h", "!" + iface + "_i.c"]
+ 
+     for p in [iface + "_p.c", iface + "_i.c"]:
++        if not build_marshal_dll:
++            continue
+         SOURCES += ["!%s" % p]
+ 
+         # Give some symbols a unique name in each translation unit, to avoid
+@@ -110,7 +120,8 @@ GeneratedFile(
+     script="/build/midl.py",
+     entry_point="merge_dlldata",
+ )
+-SOURCES += ["!dlldata.c"]
++if build_marshal_dll:
++    SOURCES += ["!dlldata.c"]
+ 
+ # Suppress warnings from the MIDL generated code.
+ if CONFIG["CC_TYPE"] == "clang-cl":

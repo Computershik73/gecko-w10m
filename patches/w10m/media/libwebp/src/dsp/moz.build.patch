@@ -1,0 +1,15 @@
+diff --git a/media/libwebp/src/dsp/moz.build b/media/libwebp/src/dsp/moz.build
+index f924eb3402..110543db8d 100644
+--- a/media/libwebp/src/dsp/moz.build
++++ b/media/libwebp/src/dsp/moz.build
+@@ -27,7 +27,9 @@ include('/media/libwebp/libwebp-config.mozbuild')
+ # and enabled by what src/dsp/cpu.h does. So just removing the defines here may do
+ # nothing.
+ 
+-if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['BUILD_ARM_NEON']:
++if CONFIG['TARGET_CPU'] == 'arm' and (
++    CONFIG['BUILD_ARM_NEON'] or CONFIG['OS_TARGET'] == 'WINNT'
++):
+     SOURCES += [
+         'alpha_processing_neon.c',
+         'cost_neon.c',

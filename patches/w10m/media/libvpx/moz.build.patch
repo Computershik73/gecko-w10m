@@ -1,0 +1,49 @@
+diff --git a/media/libvpx/moz.build b/media/libvpx/moz.build
+index 76685b5fcc..6bdfe5a9f8 100644
+--- a/media/libvpx/moz.build
++++ b/media/libvpx/moz.build
+@@ -45,14 +45,42 @@ elif CONFIG['TARGET_CPU'] == 'x86':
+         LOCAL_INCLUDES += [ '/media/libvpx/config/linux/ia32/' ]
+ elif CONFIG['TARGET_CPU'] == 'arm':
+     EXPORTS.vpx += files['LINUX_ARM_EXPORTS']
++    # Windows on ARM32 uses the same sources as Linux/arm, but has no
++    # <pthread.h>: vpx_pthread.h falls back to the Win32 SRW/condition-variable
++    # implementation when HAVE_PTHREAD_H is 0.
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        arm_config_dir = 'win/arm'
++    else:
++        arm_config_dir = 'linux/arm'
+     ASFLAGS += [
+-        '-I%s/media/libvpx/config/linux/arm/' % TOPSRCDIR,
++        '-I%s/media/libvpx/config/%s/' % (TOPSRCDIR, arm_config_dir),
+         '-I%s/libvpx' % OBJDIR,
+     ]
+-    LOCAL_INCLUDES += [ '/media/libvpx/config/linux/arm/' ]
++    LOCAL_INCLUDES += [ '/media/libvpx/config/%s/' % arm_config_dir ]
+ 
+     arm_asm_files = files['LINUX_ARM_SOURCES']
+ 
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        # libvpx's hand-written 32-bit ARM assembly is A32 (ARM mode) and
++        # Windows on ARM32 is Thumb-2 only, so it cannot be built here.
++        # config/win/arm is generated with HAVE_NEON_ASM=0 (see
++        # tools/gen-libvpx-win-arm-rtcd.sh), and the routines that exist only
++        # in assembly for arm32 are taken from the NEON-intrinsics sources
++        # libvpx uses on arm64. vpx_convolve8_neon_asm.c goes too: it is the
++        # C shim that calls the assembly filter_type entry points.
++        _drop = ('.asm', 'vpx_dsp/arm/vpx_convolve8_neon_asm.c')
++        arm_asm_files = [
++            f for f in arm_asm_files if not f.endswith(_drop)
++        ]
++        arm_asm_files += [
++            'libvpx/vpx_dsp/arm/idct4x4_1_add_neon.c',
++            'libvpx/vpx_dsp/arm/idct4x4_add_neon.c',
++            'libvpx/vpx_dsp/arm/loopfilter_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve8_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve_avg_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve_copy_neon.c',
++        ]
++
+     if CONFIG['GNU_AS']:
+         for f in arm_asm_files:
+             if not f.endswith('.asm'):

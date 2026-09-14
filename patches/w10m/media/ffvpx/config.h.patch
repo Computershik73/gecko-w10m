@@ -1,0 +1,18 @@
+diff --git a/media/ffvpx/config.h b/media/ffvpx/config.h
+index baf1fa959a..696a05163b 100644
+--- a/media/ffvpx/config.h
++++ b/media/ffvpx/config.h
+@@ -27,6 +27,13 @@
+ #    endif
+ #    if defined(_ARM64_)
+ #      include "config_win64_aarch64.h"
++#    elif defined(_ARM_)
++// 32-bit ARM Windows: ffvpx ships no configuration for it. config_win32.h
++// is an x86 configuration, and config_generic.h assumes pthreads, so this
++// is the Windows configuration with every x86 (and ARM) assembly switch
++// turned off -- ffvpx's 32-bit ARM assembly is A32, and this platform is
++// Thumb-2 only. Regenerate with tools/gen-ffvpx-win32-arm-config.py.
++#      include "config_win32_arm.h"
+ #    else
+ #      if defined(HAVE_64BIT_BUILD)
+ #        include "config_win64.h"
