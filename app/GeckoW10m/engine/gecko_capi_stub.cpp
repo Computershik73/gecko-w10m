@@ -74,12 +74,13 @@ bool ProbeJit(std::string& detail) {
   return true;
 }
 
-// Walks xul.dll's import table on the device and reports which of its
-// dependencies will not load. xul.dll is built against the desktop Win32
-// surface, and Windows 10 Mobile does not carry all of it -- urlmon, msi,
-// credui and friends. ERROR_MOD_NOT_FOUND from the loader names nothing, so
-// this asks each dependency individually and lets the device tell us what is
-// actually missing instead of guessing from a desktop SDK.
+// Walks xul.dll's import table on the device and reports what will not
+// resolve -- whole modules the device lacks, and individual functions missing
+// from modules that do exist. xul.dll is built against the desktop Win32
+// surface and Windows 10 Mobile carries a reduced version of it. The loader
+// answers a failed load with ERROR_MOD_NOT_FOUND or ERROR_PROC_NOT_FOUND and
+// names neither the module nor the function, so this asks for each one
+// individually and lets the device say what it is actually missing.
 //
 // The image is mapped with LOAD_LIBRARY_AS_DATAFILE, which maps the raw file
 // rather than a laid-out image, so every RVA has to be walked back to a file
@@ -126,36 +127,93 @@ void ProbeDependencies(const std::wstring& xulPath, std::string& detail) {
   auto* desc =
       reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + importOff);
 
-  int total = 0;
-  int missing = 0;
-  std::string missingList;
+  int modules = 0;
+  int modulesMissing = 0;
+  int functions = 0;
+  int functionsMissing = 0;
+  std::string missingModules;
+  std::string missingFunctions;
+
+  // A long list would be truncated by the log anyway, and the first handful is
+  // enough to act on.
+  const int kMaxNamed = 25;
+  int named = 0;
+
   for (; desc->Name; ++desc) {
     DWORD nameOff = rvaToOffset(desc->Name);
     if (!nameOff) continue;
-    const char* name = reinterpret_cast<const char*>(base + nameOff);
-    ++total;
+    const char* moduleName = reinterpret_cast<const char*>(base + nameOff);
+    ++modules;
 
     // The package's own payload is next to the exe; everything else has to
     // come from the system. Ask for both, the way the real load will.
-    HMODULE m = ::LoadLibraryExW(Widen(name).c_str(), nullptr,
+    HMODULE m = ::LoadLibraryExW(Widen(moduleName).c_str(), nullptr,
                                  LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
                                      LOAD_LIBRARY_SEARCH_SYSTEM32 |
                                      LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (m) {
-      ::FreeLibrary(m);
+    if (!m) {
+      ++modulesMissing;
+      if (!missingModules.empty()) missingModules += ", ";
+      missingModules += moduleName;
+      missingModules += "(" + std::to_string(::GetLastError()) + ")";
       continue;
     }
-    ++missing;
-    if (!missingList.empty()) missingList += ", ";
-    missingList += name;
-    missingList += "(" + std::to_string(::GetLastError()) + ")";
+
+    // The import name table survives binding, unlike the address table, so it
+    // is the one to read for names.
+    DWORD thunkRva =
+        desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+    DWORD thunkOff = rvaToOffset(thunkRva);
+    if (thunkOff) {
+      auto* thunk =
+          reinterpret_cast<const IMAGE_THUNK_DATA32*>(base + thunkOff);
+      for (; thunk->u1.AddressOfData; ++thunk) {
+        ++functions;
+        FARPROC proc = nullptr;
+        std::string label;
+
+        if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
+          WORD ordinal = static_cast<WORD>(IMAGE_ORDINAL32(thunk->u1.Ordinal));
+          proc = ::GetProcAddress(m, reinterpret_cast<LPCSTR>(
+                                         static_cast<ULONG_PTR>(ordinal)));
+          label = "#" + std::to_string(ordinal);
+        } else {
+          DWORD byNameOff = rvaToOffset(thunk->u1.AddressOfData);
+          if (!byNameOff) continue;
+          auto* byName =
+              reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + byNameOff);
+          proc = ::GetProcAddress(m, byName->Name);
+          label = byName->Name;
+        }
+
+        if (proc) continue;
+        ++functionsMissing;
+        if (named < kMaxNamed) {
+          ++named;
+          if (!missingFunctions.empty()) missingFunctions += ", ";
+          missingFunctions += moduleName;
+          missingFunctions += "!";
+          missingFunctions += label;
+        }
+      }
+    }
+
+    ::FreeLibrary(m);
   }
 
   ::FreeLibrary(data);
 
-  detail = std::to_string(total) + " imports, " + std::to_string(missing) +
-           " unavailable";
-  if (missing) detail += ": " + missingList;
+  detail = std::to_string(modules) + " modules (" +
+           std::to_string(modulesMissing) + " missing), " +
+           std::to_string(functions) + " imports (" +
+           std::to_string(functionsMissing) + " missing)";
+  if (modulesMissing) detail += "; modules: " + missingModules;
+  if (functionsMissing) {
+    detail += "; functions: " + missingFunctions;
+    if (functionsMissing > named) {
+      detail += ", +" + std::to_string(functionsMissing - named) + " more";
+    }
+  }
 }
 
 // Tries to load the ported engine and resolve its entry point, in stages, so a
