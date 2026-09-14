@@ -1,0 +1,28 @@
+diff --git a/gfx/2d/Factory.cpp b/gfx/2d/Factory.cpp
+index d52f761dc9..b3f77fe4f3 100644
+--- a/gfx/2d/Factory.cpp
++++ b/gfx/2d/Factory.cpp
+@@ -639,9 +639,20 @@ RefPtr<IDWriteFactory> Factory::EnsureDWriteFactory() {
+     return nullptr;
+   }
+ 
+-  HRESULT hr =
+-      createDWriteFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+-                          reinterpret_cast<IUnknown**>(&mDWriteFactory));
++  HRESULT hr = createDWriteFactory(
++#if defined(GECKO_W10M)
++      // Shared means shared with the app host. A packaged app draws its own
++      // text through this very factory, and a guest that registers font
++      // collections and fallbacks on it corrupts the host's next text layout
++      // -- which is how XAML came to fault inside CoreUIComponents with no
++      // Gecko frame anywhere on its stack. An isolated factory is the same
++      // DirectWrite with none of the sharing.
++      DWRITE_FACTORY_TYPE_ISOLATED,
++#else
++      DWRITE_FACTORY_TYPE_SHARED,
++#endif
++      __uuidof(IDWriteFactory),
++      reinterpret_cast<IUnknown**>(&mDWriteFactory));
+ 
+   if (FAILED(hr)) {
+     gfxWarning() << "Failed to create DWrite Factory.";

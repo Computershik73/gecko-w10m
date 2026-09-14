@@ -1,0 +1,20 @@
+diff --git a/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp b/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
+index 7834485f3e..94b9595a06 100644
+--- a/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
++++ b/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
+@@ -92,7 +92,14 @@ public:
+ #endif
+ 	    if (createDWriteFactory) {
+ 		HRESULT hr = createDWriteFactory(
+-		    DWRITE_FACTORY_TYPE_SHARED,
++#if defined(GECKO_W10M)
++                    // Isolated, not shared: see gfx/2d/Factory.cpp. The host
++                    // app owns the shared factory and lays out its own text
++                    // with it.
++                    DWRITE_FACTORY_TYPE_ISOLATED,
++#else
++                    DWRITE_FACTORY_TYPE_SHARED,
++#endif
+ 		    __uuidof(IDWriteFactory),
+ 		    reinterpret_cast<IUnknown**>(&mFactoryInstance));
+ 		assert(SUCCEEDED(hr));

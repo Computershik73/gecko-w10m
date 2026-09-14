@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <winrt/Windows.System.h>
 
+#include <delayimp.h>
+
 #include <atomic>
 #include <cstring>
 #include <string>
@@ -23,6 +25,15 @@ namespace gecko_w10m::engine {
 namespace {
 
 using gecko_w10m::client::Log;
+
+std::wstring Widen(const char* s) {
+  if (!s) return std::wstring();
+  int n = ::MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+  if (n <= 1) return std::wstring();
+  std::wstring out(static_cast<size_t>(n - 1), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), n);
+  return out;
+}
 
 std::wstring Hex(uintptr_t v) {
   wchar_t buf[19];
@@ -221,9 +232,33 @@ constexpr DWORD kThreadNameException = 0x406D1388;
 
 std::atomic<int> gRaiseReports{0};
 
+// The delay-load helper reports a missing library or function by raising, and
+// the argument it raises with names both. Without reading it, all a delay-load
+// failure says is that something somewhere was not there.
+constexpr DWORD kDelayLoadModuleMissing = 0xC06D007E;
+constexpr DWORD kDelayLoadProcMissing = 0xC06D007F;
+
+void LogDelayLoadFailure(DWORD code, DWORD count, const ULONG_PTR* args) {
+  if (!count || !args) return;
+  auto* info = reinterpret_cast<const DelayLoadInfo*>(args[0]);
+  if (!info) return;
+
+  std::wstring dll = info->szDll ? Widen(info->szDll) : L"(unnamed)";
+  std::wstring what =
+      code == kDelayLoadModuleMissing
+          ? L" did not load"
+          : (info->dlp.fImportByName
+                 ? L"!" + Widen(info->dlp.szProcName) + L" not found"
+                 : L" ordinal not found");
+  Log::Write(L"delay-load: " + dll + what + L", err " +
+             std::to_wstring(info->dwLastError));
+}
+
 void WINAPI HookRaiseException(DWORD code, DWORD flags, DWORD count,
                                const ULONG_PTR* args) {
-  if (code != kThreadNameException && gRaiseReports.fetch_add(1) < 12) {
+  if (code == kDelayLoadModuleMissing || code == kDelayLoadProcMissing) {
+    LogDelayLoadFailure(code, count, args);
+  } else if (code != kThreadNameException && gRaiseReports.fetch_add(1) < 12) {
     Log::Write(L"raise: the engine raised " + Hex(code));
     LogBacktrace(L"raise:");
   }
