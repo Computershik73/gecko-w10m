@@ -5,6 +5,7 @@
 #include <winrt/Windows.UI.Xaml.Interop.h>
 
 #include "MainPage.h"
+#include "client/Log.h"
 
 using namespace winrt;
 using namespace winrt::Windows::ApplicationModel;
@@ -19,6 +20,39 @@ namespace gecko_w10m {
 // custom XAML types, so the implementations return empties.
 struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataProvider> {
   std::shared_ptr<MainPage> page_;
+
+  App() {
+    // A XAML app does not die of a Win32 exception; it dies when an error
+    // reaches the framework with nobody to answer for it. Those two events are
+    // the only place that is visible, and neither leaves a trace in the Win32
+    // handlers -- which is why an entire crash could look like a fault in
+    // CoreUIComponents that the process then happily survived.
+    UnhandledException([](auto const&, UnhandledExceptionEventArgs const& e) {
+      client::Log::Write(L"FATAL: XAML unhandled exception",
+                         std::wstring(e.Message()));
+    });
+
+    CoreApplication::UnhandledErrorDetected(
+        [](auto const&, UnhandledErrorDetectedEventArgs const& e) {
+          // Propagating it is what turns the error back into an exception this
+          // process can report on; without it the framework reports nothing.
+          try {
+            e.UnhandledError().Propagate();
+          } catch (winrt::hresult_error const& error) {
+            client::Log::Write(L"FATAL: unhandled WinRT error",
+                               std::wstring(error.message()));
+          } catch (...) {
+            client::Log::Write(L"FATAL: unhandled WinRT error, no detail");
+          }
+        });
+
+    Suspending([](auto const&, auto const&) {
+      client::Log::Write(L"app: suspending");
+    });
+    Resuming([](auto const&, auto const&) {
+      client::Log::Write(L"app: resuming");
+    });
+  }
 
   void OnLaunched(LaunchActivatedEventArgs const&) {
     EnsureContent();

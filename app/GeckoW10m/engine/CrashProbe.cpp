@@ -148,10 +148,12 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
   if (gReported.fetch_add(1) >= kMaxReports) return EXCEPTION_CONTINUE_SEARCH;
 
-  Log::Write(L"crash: code " + Hex(code) + L" at " +
+  // First chance means exactly that: the process may well have a handler for
+  // this and carry on. Said plainly so it is not read as a cause of death.
+  Log::Write(L"first-chance: code " + Hex(code) + L" at " +
              DescribeAddress(info->ExceptionRecord->ExceptionAddress));
-  LogMemory(L"crash:");
-  LogStack(L"crash:", *info->ContextRecord);
+  LogMemory(L"first-chance:");
+  LogStack(L"first-chance:", *info->ContextRecord);
 
   // Not ours to handle -- only to record.
   return EXCEPTION_CONTINUE_SEARCH;
@@ -471,6 +473,16 @@ DWORD WINAPI SamplerThread(LPVOID param) {
   return 0;
 }
 
+// Reached only when nothing in the process handled the exception, which makes
+// this the one report that names a cause rather than an event.
+LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
+  Log::Write(L"FATAL: unhandled " + Hex(info->ExceptionRecord->ExceptionCode) +
+             L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress));
+  LogMemory(L"FATAL:");
+  LogStack(L"FATAL:", *info->ContextRecord);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 }  // namespace
 
 void StartLastLocationSampler(void* thread) {
@@ -484,7 +496,7 @@ void StartLastLocationSampler(void* thread) {
   ::CloseHandle(sampler);
 }
 
-void InstallCrashProbes(const std::wstring& localStatePath) {
+void InstallProcessProbes(const std::wstring& localStatePath) {
   ResolveUnwindApis();
   ReportPreviousTrace(localStatePath);
 
@@ -501,7 +513,10 @@ void InstallCrashProbes(const std::wstring& localStatePath) {
   PVOID handler = ::AddVectoredExceptionHandler(1, &OnException);
   Log::Write(L"probe crash: vectored handler",
              handler ? L"installed" : L"REFUSED");
+  ::SetUnhandledExceptionFilter(&OnUnhandledException);
+}
 
+void InstallEngineProbes() {
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
   if (!xul) {
     Log::WriteNum(L"probe crash: xul.dll not loaded, err", ::GetLastError());

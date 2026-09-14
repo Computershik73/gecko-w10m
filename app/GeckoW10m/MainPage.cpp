@@ -5,6 +5,7 @@
 #include <winrt/Windows.Foundation.Metadata.h>
 
 #include "client/Log.h"
+#include "engine/CrashProbe.h"
 #include "engine/GeckoRuntimeHost.h"
 #include "client/SearchEngines.h"
 
@@ -52,6 +53,11 @@ MainPage::MainPage() {
   Log::Init(std::wstring(localState));
   Log::Write(L"shell starting");
   Log::Write(L"LocalState", std::wstring(localState));
+
+  // Before the engine, before the UI: a fault reported only once Gecko is
+  // running looks like Gecko's fault, and there was no way to tell that from
+  // something this device does on every launch.
+  engine::InstallProcessProbes(std::wstring(localState));
 
   bool jit = BrowserPreferences::Shared().IsJitEnabled();
   Log::Write(L"jit preference", jit ? L"enabled" : L"disabled");

@@ -140,9 +140,9 @@ bool StartGeckoRuntime(const std::wstring& localStatePath) {
   const std::wstring profileDir = localStatePath + L"\\profile";
   ::CreateDirectoryW(profileDir.c_str(), nullptr);
 
-  // Before anything of Gecko's runs: whatever takes the process down, this is
-  // the only record that survives it.
-  InstallCrashProbes(localStatePath);
+  // The rest of the probes went in when the shell started; these need the
+  // engine loaded, so they wait until now.
+  InstallEngineProbes();
 
   gecko_w10m_gecko_set_logger(&BridgeLog);
 
