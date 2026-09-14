@@ -53,6 +53,24 @@ for s in $SRCS; do
   OBJS="$OBJS $OBJDIR_W\\$name"
 done
 
+echo "=== compat stubs ==="
+# Windows 10 Mobile does not carry every desktop module xul.dll imports, and a
+# single missing one stops the whole engine from loading. Each stub here stands
+# in for one such module; see the source for what it replaces and why failing
+# is the right answer. They are linked /NODEFAULTLIB against kernel32 alone so
+# a stub never drags in a runtime of its own.
+for stub in ktmw32; do
+  "$CL" /nologo /c "$(cygpath -w "$APP/compat/$stub.c")" \
+        "/Fo:$OBJDIR_W\\$stub.obj" /O2 /MT /GS- \
+        /D_ARM_ /DWIN32 /D_WIN32 /DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP
+  "$LLVM/lld-link.exe" "$OBJDIR_W\\$stub.obj" /DLL /APPCONTAINER \
+    /MACHINE:ARM /NODEFAULTLIB /ENTRY:DllMain \
+    "/DEF:$(cygpath -w "$APP/compat/$stub.def")" \
+    "/OUT:$STAGE_W\\$stub.dll" \
+    kernel32.lib
+  echo "    $stub.dll ($(stat -c%s "$STAGE/$stub.dll") bytes)"
+done
+
 echo "=== link GeckoW10m.exe ==="
 "$LLVM/lld-link.exe" $OBJS "/OUT:$STAGE_W\\GeckoW10m.exe" /APPCONTAINER \
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \

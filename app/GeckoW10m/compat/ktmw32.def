@@ -1,0 +1,4 @@
+LIBRARY ktmw32
+EXPORTS
+  CreateTransaction
+  CommitTransaction
