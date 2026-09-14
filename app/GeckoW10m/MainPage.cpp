@@ -2,6 +2,9 @@
 #include "pch.h"
 #include "MainPage.h"
 
+#include <winrt/Windows.Foundation.Metadata.h>
+
+#include "client/Log.h"
 #include "client/SearchEngines.h"
 
 using namespace winrt;
@@ -10,36 +13,93 @@ using namespace winrt::Windows::UI::Xaml::Controls;
 using namespace winrt::Windows::UI::Xaml::Input;
 using namespace winrt::Windows::UI::Xaml::Media;
 using namespace winrt::Windows::UI::Text;
+using namespace winrt::Windows::UI::ViewManagement;
 using namespace winrt::Windows::Foundation;
+using namespace winrt::Windows::Foundation::Metadata;
 using namespace winrt::Windows::Storage;
 
 namespace gecko_w10m {
+namespace {
+
+using winrt::Windows::UI::Color;
+using winrt::Windows::UI::ColorHelper;
+
+// A deliberately high-contrast scheme. The first build used near-white chrome
+// with grey text on a white page, which on a phone screen in daylight is
+// simply unreadable.
+Color ChromeBg() { return ColorHelper::FromArgb(255, 32, 32, 36); }
+Color ChromeFg() { return ColorHelper::FromArgb(255, 245, 245, 245); }
+Color ContentBg() { return ColorHelper::FromArgb(255, 255, 255, 255); }
+Color ContentFg() { return ColorHelper::FromArgb(255, 24, 24, 28); }
+Color Accent() { return ColorHelper::FromArgb(255, 224, 108, 31); }
+Color LogBg() { return ColorHelper::FromArgb(242, 16, 16, 18); }
+Color LogFg() { return ColorHelper::FromArgb(255, 190, 235, 190); }
+
+SolidColorBrush Brush(Color c) {
+  SolidColorBrush b;
+  b.Color(c);
+  return b;
+}
+
+}  // namespace
 
 MainPage::MainPage() {
   using client::BrowserPreferences;
+  using client::Log;
 
-  // Runtime: profile is the app's LocalState (reachable via broadFileSystemAccess).
   auto localState = ApplicationData::Current().LocalFolder().Path();
+  Log::Init(std::wstring(localState));
+  Log::Write(L"shell starting");
+  Log::Write(L"LocalState", std::wstring(localState));
+
   bool jit = BrowserPreferences::Shared().IsJitEnabled();
+  Log::Write(L"jit preference", jit ? L"enabled" : L"disabled");
+
   runtime_ = engine::Runtime::Create(std::wstring(localState), jit, 96);
+  Log::Write(L"runtime", runtime_ ? L"created" : L"FAILED to create");
+
   tabManager_ = std::make_unique<client::TabManager>(runtime_);
 
   BuildUi();
   WireEngine();
+  WireLog();
 
-  // Open the first tab (homepage / blank).
   tabManager_->AddTab(/*isPrivate*/ false, L"about:home");
+  Log::WriteNum(L"tabs after first AddTab", tabManager_->Count());
   RebuildTabStrip();
   RefreshChrome();
+
+  // The engine only reports anything in response to a load. Without this the
+  // shell sat on a static placeholder and never told us whether the runtime,
+  // the JIT probe or xul.dll had worked.
+  Navigate(L"about:home");
+}
+
+void MainPage::ApplyVisibleBounds() {
+  auto view = ApplicationView::GetForCurrentView();
+  auto visible = view.VisibleBounds();
+  auto window = Window::Current().Bounds();
+
+  double left = visible.X - window.X;
+  double top = visible.Y - window.Y;
+  double right = (window.X + window.Width) - (visible.X + visible.Width);
+  double bottom = (window.Y + window.Height) - (visible.Y + visible.Height);
+
+  // Negative or absurd values mean the two rectangles are not comparable;
+  // padding nothing is better than padding wrongly.
+  auto sane = [](double v) { return (v > 0 && v < 400) ? v : 0.0; };
+  root_.Padding(
+      ThicknessHelper::FromLengths(sane(left), sane(top), sane(right), sane(bottom)));
 }
 
 void MainPage::BuildUi() {
   using client::BrowserPreferences;
   using client::ChromePosition;
+  using client::Log;
 
   root_ = Grid();
+  root_.Background(Brush(ChromeBg()));
 
-  // Rows: [tab strip][content][chrome] or [chrome][content][tab strip]
   auto rTop = RowDefinition();
   rTop.Height(GridLengthHelper::Auto());
   auto rMid = RowDefinition();
@@ -55,33 +115,50 @@ void MainPage::BuildUi() {
   tabScroller.HorizontalScrollBarVisibility(ScrollBarVisibility::Auto);
   tabScroller.VerticalScrollBarVisibility(ScrollBarVisibility::Disabled);
   tabScroller.HorizontalScrollMode(ScrollMode::Auto);
+  tabScroller.Background(Brush(ChromeBg()));
   tabStrip_ = StackPanel();
   tabStrip_.Orientation(Orientation::Horizontal);
   tabScroller.Content(tabStrip_);
 
   // --- Content host (engine SwapChainPanel would attach here) ---
   contentHost_ = Border();
-  contentHost_.Background(SolidColorBrush(winrt::Windows::UI::Colors::White()));
+  contentHost_.Background(Brush(ContentBg()));
   statusText_ = TextBlock();
   statusText_.Text(L"GeckoW10m for Windows 10 Mobile");
   statusText_.HorizontalAlignment(HorizontalAlignment::Center);
   statusText_.VerticalAlignment(VerticalAlignment::Center);
   statusText_.TextWrapping(TextWrapping::Wrap);
-  statusText_.Foreground(SolidColorBrush(winrt::Windows::UI::Colors::Gray()));
+  statusText_.TextAlignment(TextAlignment::Center);
+  statusText_.Margin(ThicknessHelper::FromUniformLength(16));
+  statusText_.Foreground(Brush(ContentFg()));
   contentHost_.Child(statusText_);
+
+  // --- Diagnostics overlay, hidden until asked for ---
+  logPanel_ = Border();
+  logPanel_.Background(Brush(LogBg()));
+  logPanel_.Visibility(Visibility::Collapsed);
+  logScroller_ = ScrollViewer();
+  logScroller_.VerticalScrollBarVisibility(ScrollBarVisibility::Auto);
+  logText_ = TextBlock();
+  logText_.Foreground(Brush(LogFg()));
+  logText_.FontFamily(FontFamily(L"Consolas"));
+  logText_.FontSize(11);
+  logText_.TextWrapping(TextWrapping::Wrap);
+  logText_.Margin(ThicknessHelper::FromUniformLength(8));
+  logScroller_.Content(logText_);
+  logPanel_.Child(logScroller_);
 
   // --- Chrome (address bar + nav buttons + progress) ---
   auto chrome = Grid();
-  chrome.Padding(ThicknessHelper::FromUniformLength(6));
-  auto chromeBg = SolidColorBrush();
-  chromeBg.Color(winrt::Windows::UI::ColorHelper::FromArgb(255, 245, 245, 247));
-  chrome.Background(chromeBg);
+  chrome.Padding(ThicknessHelper::FromLengths(6, 4, 6, 4));
+  chrome.Background(Brush(ChromeBg()));
 
   progress_ = ProgressBar();
   progress_.Minimum(0);
   progress_.Maximum(1);
   progress_.Value(0);
-  progress_.Height(2);
+  progress_.Height(3);
+  progress_.Foreground(Brush(Accent()));
   progress_.VerticalAlignment(VerticalAlignment::Top);
 
   auto row = StackPanel();
@@ -92,16 +169,23 @@ void MainPage::BuildUi() {
     FontIcon icon;
     icon.Glyph(winrt::hstring(glyph));
     icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+    icon.FontSize(16);
+    icon.Foreground(Brush(ChromeFg()));
     b.Content(icon);
-    b.Margin(ThicknessHelper::FromLengths(2, 0, 2, 0));
-    b.MinWidth(40);
+    b.Margin(ThicknessHelper::FromLengths(1, 0, 1, 0));
+    b.Padding(ThicknessHelper::FromLengths(6, 6, 6, 6));
+    b.MinWidth(38);
+    b.Background(Brush(ColorHelper::FromArgb(255, 52, 52, 58)));
+    b.Foreground(Brush(ChromeFg()));
+    b.BorderThickness(ThicknessHelper::FromUniformLength(0));
     return b;
   };
 
-  backButton_ = makeButton(L"");     // Back
-  forwardButton_ = makeButton(L"");  // Forward
-  reloadButton_ = makeButton(L"");   // Refresh
-  newTabButton_ = makeButton(L"");   // Add
+  backButton_ = makeButton(L"\uE72B");     // Back
+  forwardButton_ = makeButton(L"\uE72A");  // Forward
+  reloadButton_ = makeButton(L"\uE72C");   // Refresh
+  newTabButton_ = makeButton(L"\uE710");   // Add
+  logButton_ = makeButton(L"\uE7BA");      // Warning/diagnostics
 
   addressBar_ = TextBox();
   addressBar_.PlaceholderText(L"Search or enter address");
@@ -112,14 +196,16 @@ void MainPage::BuildUi() {
     s.Names().Append(n);
     return s;
   }());
-  addressBar_.Width(180);
   addressBar_.Margin(ThicknessHelper::FromLengths(4, 0, 4, 0));
+  addressBar_.MinWidth(140);
+  addressBar_.FontSize(14);
 
   row.Children().Append(backButton_);
   row.Children().Append(forwardButton_);
   row.Children().Append(reloadButton_);
   row.Children().Append(addressBar_);
   row.Children().Append(newTabButton_);
+  row.Children().Append(logButton_);
 
   auto chromeStack = StackPanel();
   chromeStack.Children().Append(progress_);
@@ -130,77 +216,140 @@ void MainPage::BuildUi() {
   bool barOnTop =
       BrowserPreferences::Shared().AddressBarPosition() == ChromePosition::Top;
 
-  Grid::SetRow(tabScroller, barOnTop ? 0 : 2);
-  Grid::SetRow(contentHost_, 1);
   Grid::SetRow(chrome, barOnTop ? 0 : 2);
-  // If bar on top, tab strip goes bottom and vice versa; keep them distinct.
   Grid::SetRow(tabScroller, barOnTop ? 2 : 0);
+  Grid::SetRow(contentHost_, 1);
+  Grid::SetRow(logPanel_, 1);
 
   root_.Children().Append(tabScroller);
   root_.Children().Append(contentHost_);
+  root_.Children().Append(logPanel_);
   root_.Children().Append(chrome);
+
+  // The status bar exists only on mobile; tint it to match so the chrome does
+  // not look like it is floating under a foreign strip.
+  if (ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar")) {
+    auto status = StatusBar::GetForCurrentView();
+    status.BackgroundColor(ChromeBg());
+    status.BackgroundOpacity(1.0);
+    status.ForegroundColor(ChromeFg());
+  }
+
+  auto view = ApplicationView::GetForCurrentView();
+  view.SetDesiredBoundsMode(ApplicationViewBoundsMode::UseVisible);
+  view.VisibleBoundsChanged(
+      [this](auto&&, auto&&) { ApplyVisibleBounds(); });
+  ApplyVisibleBounds();
 
   // --- Events ---
   backButton_.Click([this](auto&&, auto&&) {
+    client::Log::Write(L"ui: back");
     if (auto* t = tabManager_->SelectedTab(); t && t->session)
       t->session->GoBack();
   });
   forwardButton_.Click([this](auto&&, auto&&) {
+    client::Log::Write(L"ui: forward");
     if (auto* t = tabManager_->SelectedTab(); t && t->session)
       t->session->GoForward();
   });
   reloadButton_.Click([this](auto&&, auto&&) {
+    client::Log::Write(L"ui: reload");
     if (auto* t = tabManager_->SelectedTab(); t && t->session)
       t->session->Reload();
   });
   newTabButton_.Click([this](auto&&, auto&&) {
+    client::Log::Write(L"ui: new tab");
     tabManager_->AddTab(false, L"about:home");
     RebuildTabStrip();
     RefreshChrome();
+  });
+  logButton_.Click([this](auto&&, auto&&) {
+    bool showing = logPanel_.Visibility() == Visibility::Visible;
+    logPanel_.Visibility(showing ? Visibility::Collapsed : Visibility::Visible);
+    if (!showing) {
+      std::wstring all;
+      for (auto const& line : client::Log::Recent()) {
+        all += line;
+        all += L"\n";
+      }
+      all += L"\nlog file: " + client::Log::Path();
+      logText_.Text(winrt::hstring(all));
+      logScroller_.UpdateLayout();
+      logScroller_.ChangeView(nullptr, logScroller_.ScrollableHeight(), nullptr);
+    }
   });
   addressBar_.KeyDown([this](auto&&, KeyRoutedEventArgs const& e) {
     if (e.Key() == winrt::Windows::System::VirtualKey::Enter) {
       Navigate(std::wstring(addressBar_.Text()));
     }
   });
+
+  Log::Write(L"ui built");
 }
 
 void MainPage::WireEngine() {
   tabManager_->OnChanged([this] { RefreshChrome(); });
 }
 
+void MainPage::WireLog() {
+  auto dispatcher = root_.Dispatcher();
+  client::Log::OnLine([this, dispatcher](std::wstring line) {
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Low,
+                        [this, line] { AppendLogLine(line); });
+  });
+}
+
+void MainPage::AppendLogLine(std::wstring line) {
+  if (logPanel_.Visibility() != Visibility::Visible) return;
+  logText_.Text(logText_.Text() + winrt::hstring(line + L"\n"));
+  logScroller_.ChangeView(nullptr, logScroller_.ScrollableHeight(), nullptr);
+}
+
 void MainPage::Navigate(std::wstring_view entry) {
+  using client::Log;
+
   auto* tab = tabManager_->SelectedTab();
   if (!tab) {
+    Log::Write(L"navigate: no selected tab, creating one");
     tabManager_->AddTab(false, L"");
     tab = tabManager_->SelectedTab();
   }
+  if (!tab) {
+    Log::Write(L"navigate: still no tab, giving up");
+    return;
+  }
+
   auto url = client::SearchEngines::ResolveEntry(entry);
   tab->url = url;
+  Log::Write(L"navigate", url);
 
-  if (tab->session) {
-    engine::SessionObserver obs;
-    auto dispatcher = root_.Dispatcher();
-    obs.LocationChanged = [this, dispatcher](std::wstring u) {
-      dispatcher.RunAsync(
-          winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-          [this, u] { addressBar_.Text(winrt::hstring(u)); });
-    };
-    obs.TitleChanged = [this, dispatcher](std::wstring t) {
-      dispatcher.RunAsync(
-          winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-          [this, t] { statusText_.Text(winrt::hstring(t)); });
-    };
-    obs.ProgressChanged = [this, dispatcher](float p) {
-      dispatcher.RunAsync(
-          winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-          [this, p] { progress_.Value(p); });
-    };
-    obs.CanGoBackChanged = [](bool) {};
-    obs.CanGoForwardChanged = [](bool) {};
-    tab->session->Observe(std::move(obs));
-    tab->session->LoadUri(url);
+  if (!tab->session) {
+    Log::Write(L"navigate: tab has no engine session (runtime create failed?)");
+    statusText_.Text(L"No engine session.\nOpen the log for details.");
+    RefreshChrome();
+    return;
   }
+
+  engine::SessionObserver obs;
+  auto dispatcher = root_.Dispatcher();
+  obs.LocationChanged = [this, dispatcher](std::wstring u) {
+    client::Log::Write(L"engine: location", u);
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [this, u] { addressBar_.Text(winrt::hstring(u)); });
+  };
+  obs.TitleChanged = [this, dispatcher](std::wstring t) {
+    client::Log::Write(L"engine: title", t);
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [this, t] { statusText_.Text(winrt::hstring(t)); });
+  };
+  obs.ProgressChanged = [this, dispatcher](float p) {
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [this, p] { progress_.Value(p); });
+  };
+  obs.CanGoBackChanged = [](bool) {};
+  obs.CanGoForwardChanged = [](bool) {};
+  tab->session->Observe(std::move(obs));
+  tab->session->LoadUri(url);
   RefreshChrome();
 }
 
@@ -224,9 +373,18 @@ void MainPage::RebuildTabStrip() {
   for (int i = 0; i < tabManager_->Count(); ++i) {
     auto* tab = tabManager_->At(i);
     Button b;
-    b.Content(winrt::box_value(
-        winrt::hstring(tab->title.empty() ? L"New Tab" : tab->title)));
+    TextBlock label;
+    label.Text(winrt::hstring(tab->title.empty() ? L"New Tab" : tab->title));
+    label.Foreground(Brush(ChromeFg()));
+    label.FontSize(13);
+    b.Content(label);
+    b.Background(Brush(ColorHelper::FromArgb(
+        255, i == tabManager_->SelectedIndex() ? 70 : 44,
+        i == tabManager_->SelectedIndex() ? 70 : 44,
+        i == tabManager_->SelectedIndex() ? 78 : 50)));
+    b.BorderThickness(ThicknessHelper::FromUniformLength(0));
     b.Margin(ThicknessHelper::FromLengths(2, 4, 2, 4));
+    b.Padding(ThicknessHelper::FromLengths(10, 4, 10, 4));
     int index = i;
     b.Click([this, index](auto&&, auto&&) {
       tabManager_->SelectTab(index);

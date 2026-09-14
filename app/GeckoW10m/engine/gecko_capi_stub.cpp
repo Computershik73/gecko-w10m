@@ -21,6 +21,15 @@
 #include <cstring>
 #include <string>
 
+#include "../client/Log.h"
+
+namespace {
+// The probe details are plain ASCII; widen them for the log.
+std::wstring Widen(const std::string& s) {
+  return std::wstring(s.begin(), s.end());
+}
+}  // namespace
+
 namespace {
 
 // Runs the JIT probe. Returns true if executable memory works end-to-end.
@@ -116,11 +125,16 @@ gecko_runtime* gecko_runtime_create(const gecko_runtime_config* config) {
   rt->jit = config && config->jit_enabled;
   if (rt->jit) {
     ProbeJit(rt->jit_detail);
+    gecko_w10m::client::Log::Write(L"probe jit", Widen(rt->jit_detail));
+
     std::string xul_detail;
     ProbeXul(xul_detail);
+    gecko_w10m::client::Log::Write(L"probe xul", Widen(xul_detail));
+
     rt->jit_detail += "  |  " + xul_detail;
   } else {
     rt->jit_detail = "JIT disabled by config";
+    gecko_w10m::client::Log::Write(L"probe jit: disabled by config");
   }
   return rt;
 }

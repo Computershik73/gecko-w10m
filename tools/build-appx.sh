@@ -41,12 +41,12 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/SearchEngines.cpp client/TabManager.cpp engine/GeckoEngine.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/GeckoEngine.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
   "$CL" /nologo /c "$(cygpath -w "$APP/$s")" "/Fo:$OBJDIR_W\\$name" \
-        /std:c++20 /EHsc /GR- /O2 \
+        /std:c++20 /EHsc /GR- /O2 /utf-8 \
         /DGECKO_W10M_USE_ENGINE_STUB /D_ARM_ /DWIN32 /D_WIN32 /DNOMINMAX \
         /DUNICODE /D_UNICODE /DWINAPI_FAMILY=WINAPI_FAMILY_APP \
         "/I$(cygpath -w "$APP")" "/I$(cygpath -w "$SDK/Include/$SDKV/cppwinrt")"
@@ -84,29 +84,15 @@ rm -f "$PKG"
 "$BIN/makeappx.exe" pack /d "$STAGE_W" /p "$(cygpath -w "$PKG")" /o /nv
 
 echo "=== sign ==="
+# Signing runs through PowerShell because msys2 leaves TEMP and TMP empty in
+# the environment it hands to children, and signtool needs a temp directory to
+# repack an appx. See tools/sign-appx.ps1.
 CERT="$APP/GeckoW10m.pfx"
-if [ ! -f "$CERT" ]; then
-  echo "    creating a self-signed certificate (CN=GeckoW10m)"
-  powershell.exe -NoProfile -Command "
-    \$c = New-SelfSignedCertificate -Type Custom -Subject 'CN=GeckoW10m' \
-           -KeyUsage DigitalSignature -FriendlyName 'GeckoW10m W10M' \
-           -CertStoreLocation 'Cert:\\CurrentUser\\My' \
-           -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3','2.5.29.19={text}');
-    \$p = ConvertTo-SecureString -String 'gecko_w10m' -Force -AsPlainText;
-    Export-PfxCertificate -cert \$c -FilePath '$(cygpath -w "$CERT")' -Password \$p | Out-Null;
-    Write-Output ('    thumbprint ' + \$c.Thumbprint)" | tail -2
-fi
-# /a must not be combined with /f: signtool then rejects the package outright.
-# makeappx can still be holding the file when signtool opens it, which shows
-# up as "this file format cannot be signed"; retry a few times.
-for attempt in 1 2 3 4 5; do
-  if "$BIN/signtool.exe" sign /fd SHA256 /f "$(cygpath -w "$CERT")" /p gecko_w10m \n       "$(cygpath -w "$PKG")"; then
-    break
-  fi
-  echo "    sign attempt $attempt failed, retrying"
-  sleep 3
-  [ "$attempt" = 5 ] && exit 1
-done
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File "$(cygpath -w "$ROOT/tools/sign-appx.ps1")" \
+  -Package "$(cygpath -w "$PKG")" \
+  -Certificate "$(cygpath -w "$CERT")" \
+  -SdkBin "$(cygpath -w "$BIN")"
 
 echo
 echo "PACKAGE: $PKG"

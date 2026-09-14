@@ -20,10 +20,16 @@ class MainPage {
  private:
   void BuildUi();
   void WireEngine();
+  void WireLog();
+
+  // Windows 10 Mobile draws the status bar and the (retractable) navigation
+  // bar over the app window. Keep the chrome inside the visible area.
+  void ApplyVisibleBounds();
 
   void Navigate(std::wstring_view entry);
   void RefreshChrome();
   void RebuildTabStrip();
+  void AppendLogLine(std::wstring line);
 
   // Engine
   std::shared_ptr<engine::Runtime> runtime_;
@@ -36,10 +42,17 @@ class MainPage {
   winrt::Windows::UI::Xaml::Controls::Button forwardButton_{nullptr};
   winrt::Windows::UI::Xaml::Controls::Button reloadButton_{nullptr};
   winrt::Windows::UI::Xaml::Controls::Button newTabButton_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::Button logButton_{nullptr};
   winrt::Windows::UI::Xaml::Controls::ProgressBar progress_{nullptr};
   winrt::Windows::UI::Xaml::Controls::Border contentHost_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBlock statusText_{nullptr};
   winrt::Windows::UI::Xaml::Controls::StackPanel tabStrip_{nullptr};
+
+  // Diagnostics overlay: on a phone this is usually the only way to read
+  // what the engine did.
+  winrt::Windows::UI::Xaml::Controls::Border logPanel_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::TextBlock logText_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::ScrollViewer logScroller_{nullptr};
 };
 
 }  // namespace gecko_w10m
