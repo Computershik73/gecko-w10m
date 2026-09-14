@@ -1155,6 +1155,63 @@ index 4f989de2d1..531c706ae8 100644
  #endif  // _MSC_VER
  }
  
+diff --git a/js/src/vm/JSContext.cpp b/js/src/vm/JSContext.cpp
+index 2cbeec9ce6..4daae22dc0 100644
+--- a/js/src/vm/JSContext.cpp
++++ b/js/src/vm/JSContext.cpp
+@@ -298,9 +298,39 @@ void JSContext::onOutOfMemory() {
+   reportResourceExhaustion();
+ }
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++
++// InitSelfHostedCode fails here with the engine genuinely reporting out of
++// memory, on a device using 23 MB of the 2048 MB it is allowed. Something is
++// failing an allocation that has room to succeed, and an OOM report says
++// nothing about which. The return address does: run it through
++// tools/symbolize.py against the build's map and it names the caller.
++//
++// Only the first few are reported. Once the engine is out of memory it says so
++// repeatedly, and the first one is the one that has not yet been caused by the
++// others.
++static mozilla::Atomic<uint32_t> gGeckoW10mOomReports{0};
++
++static void GeckoW10mNoteOom(const char* kind, void* from) {
++  if (gGeckoW10mOomReports++ >= 8) {
++    return;
++  }
++  char note[96];
++  SprintfLiteral(note, "js: %s out of memory, reported from %p", kind, from);
++  GeckoW10mNote(note);
++}
++#endif
++
+ JS_PUBLIC_API void js::ReportOutOfMemory(JSContext* cx) {
+   MaybeReportOutOfMemoryForDifferentialTesting();
+ 
++#if defined(GECKO_W10M)
++  GeckoW10mNoteOom("context", __builtin_return_address(0));
++#endif
++
+   cx->onOutOfMemory();
+ }
+ 
+@@ -311,6 +341,12 @@ JS_PUBLIC_API void js::ReportLargeOutOfMemory(JSContext* cx) {
+ JS_PUBLIC_API void js::ReportOutOfMemory(FrontendContext* fc) {
+   MaybeReportOutOfMemoryForDifferentialTesting();
+ 
++#if defined(GECKO_W10M)
++  // The parser and bytecode emitter report through this one, which is the
++  // likelier of the two while self-hosted code is being compiled.
++  GeckoW10mNoteOom("frontend", __builtin_return_address(0));
++#endif
++
+   fc->onOutOfMemory();
+ }
+ 
 diff --git a/js/src/vm/SharedArrayObject.cpp b/js/src/vm/SharedArrayObject.cpp
 index b27860a878..fbc48a2cb9 100644
 --- a/js/src/vm/SharedArrayObject.cpp
