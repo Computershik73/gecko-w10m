@@ -496,6 +496,42 @@ void StartLastLocationSampler(void* thread) {
   ::CloseHandle(sampler);
 }
 
+// The trace and the crash reports are full of offsets into ntdll and
+// KERNELBASE, and there is no map for either. Asking the loader where a
+// handful of interesting functions live turns those offsets into names -- and
+// in particular says whether an address is a wait, which is a thread doing
+// nothing wrong, or a process-ending call, which is not.
+void LogKnownOffsets() {
+  struct Wanted {
+    const wchar_t* module;
+    const char* names[10];
+  };
+  const Wanted wanted[] = {
+      {L"ntdll.dll",
+       {"RtlExitUserProcess", "NtTerminateProcess", "RtlRaiseStatus",
+        "RtlRaiseException", "NtWaitForSingleObject",
+        "RtlWaitOnAddress", "RtlUserThreadStart", nullptr}},
+      {L"KERNELBASE.dll",
+       {"TerminateProcess", "ExitProcess", "RaiseFailFastException",
+        "RaiseException", "WaitForSingleObjectEx", "WaitForMultipleObjectsEx",
+        "SleepEx", nullptr}},
+  };
+
+  for (const Wanted& entry : wanted) {
+    HMODULE module = ::GetModuleHandleW(entry.module);
+    if (!module) continue;
+    for (const char* const* name = entry.names; *name; ++name) {
+      FARPROC proc = ::GetProcAddress(module, *name);
+      if (!proc) continue;
+      uintptr_t offset = reinterpret_cast<uintptr_t>(proc) -
+                         reinterpret_cast<uintptr_t>(module);
+      std::wstring wide(*name, *name + std::strlen(*name));
+      Log::Write(std::wstring(L"known: ") + entry.module + L"+" + Hex(offset) +
+                 L" " + wide);
+    }
+  }
+}
+
 void InstallProcessProbes(const std::wstring& localStatePath) {
   ResolveUnwindApis();
   ReportPreviousTrace(localStatePath);
@@ -514,6 +550,7 @@ void InstallProcessProbes(const std::wstring& localStatePath) {
   Log::Write(L"probe crash: vectored handler",
              handler ? L"installed" : L"REFUSED");
   ::SetUnhandledExceptionFilter(&OnUnhandledException);
+  LogKnownOffsets();
 }
 
 void InstallEngineProbes() {

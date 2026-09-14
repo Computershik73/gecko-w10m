@@ -49,6 +49,45 @@ std::wstring AttemptsPath(const std::wstring& localState) {
   return localState + L"\\gecko-attempts.txt";
 }
 
+// Every other launch leaves the engine alone.
+//
+// The device has been faulting inside XAML's own dispatcher shortly after
+// Gecko starts, at the same address every run. Whether Gecko has anything to
+// do with that cannot be told from a log in which Gecko always starts -- and
+// until now it always did, so there was no control to compare against.
+// Alternating gives both cases in one log file, from one device, minutes
+// apart.
+bool IsControlLaunch(const std::wstring& localState) {
+  const std::wstring path = localState + L"\\gecko-control.txt";
+
+  CREATEFILE2_EXTENDED_PARAMETERS params{};
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+  char previous = '0';
+  HANDLE h = ::CreateFile2(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           OPEN_EXISTING, &params);
+  if (h != INVALID_HANDLE_VALUE) {
+    DWORD read = 0;
+    ::ReadFile(h, &previous, 1, &read, nullptr);
+    ::CloseHandle(h);
+    if (!read) previous = '0';
+  }
+
+  const bool control = previous == '1';
+  const char next = control ? '0' : '1';
+
+  h = ::CreateFile2(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS,
+                    &params);
+  if (h != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    ::WriteFile(h, &next, 1, &written, nullptr);
+    ::FlushFileBuffers(h);
+    ::CloseHandle(h);
+  }
+  return control;
+}
+
 int ReadAttempts(const std::wstring& localState, const std::wstring& installDir) {
   CREATEFILE2_EXTENDED_PARAMETERS params{};
   params.dwSize = sizeof(params);
@@ -125,6 +164,12 @@ bool StartGeckoRuntime(const std::wstring& localStatePath) {
   const std::wstring installDir = InstallDirectory();
   if (installDir.empty()) {
     Log::Write(L"gecko: could not determine the install directory");
+    return false;
+  }
+
+  if (IsControlLaunch(localStatePath)) {
+    Log::Write(L"control run: leaving the engine alone this launch");
+    Log::Write(L"control run: anything that faults now is not Gecko's doing");
     return false;
   }
 
