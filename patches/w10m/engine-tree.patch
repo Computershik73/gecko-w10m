@@ -271,6 +271,22 @@ index ea19412890..6896109c66 100644
      assert_rust_compile(target, rustc_target, rustc)
      return rustc_target
  
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index eb1251f51f..32267ecebb 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -3163,6 +3163,11 @@ def as_info(target, c_compiler):
+     if c_compiler.type == "clang-cl":
+         if target.cpu == "aarch64":
+             return namespace(type="armasm", names=("armasm64.exe",))
++        # 32-bit ARM has its own assembler, and clang cannot stand in for it:
++        # the xptcall stubs are hand-written in armasm syntax, and clang has no
++        # SEH on this target to compile them with anyway.
++        if target.cpu == "arm":
++            return namespace(type="armasm", names=("armasm.exe",))
+         ml = {
+             "x86": "ml.exe",
+             "x86_64": "ml64.exe",
 diff --git a/build/moz.configure/windows-toolchain.configure b/build/moz.configure/windows-toolchain.configure
 index 54a9fd07bb..ce6f865e42 100644
 --- a/build/moz.configure/windows-toolchain.configure
@@ -15297,7 +15313,7 @@ index 0513edfdf1..ba3f093d42 100644
  
    const MMPolicyOutOfProcess& mMMPolicy;
 diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
-index cd9485c344..60d8609d1f 100644
+index cd9485c344..c30430251b 100644
 --- a/toolkit/xre/nsAppRunner.cpp
 +++ b/toolkit/xre/nsAppRunner.cpp
 @@ -2338,7 +2338,23 @@ static void RegisterApplicationRestartChanged(const char* aPref, void* aData) {
@@ -15324,6 +15340,28 @@ index cd9485c344..60d8609d1f 100644
    }
  }
  
+@@ -6768,6 +6784,21 @@ bool XRE_IsE10sParentProcess() {
+ #undef GECKO_PROCESS_TYPE
+ 
+ bool XRE_UseNativeEventProcessing() {
++#if defined(GECKO_W10M)
++  // A packaged app has a CoreWindow, not a desktop window station. The Windows
++  // app shell builds its event loop around a message-only window, and neither
++  // RegisterClassW nor CreateWindowW exists on this device -- nsAppShell::Init
++  // reaches StaticCreateEventWindow and dies on the release assert that the
++  // window class registered.
++  //
++  // Gecko already supports running without any of that: it is the same path
++  // win32k lockdown takes. nsBaseAppShell then never installs itself as a
++  // thread observer, ScheduleNativeEventCallback is never reached, and the
++  // runtime drives its own event queue -- which is what an engine embedded in
++  // someone else's message loop should be doing regardless.
++  return false;
++#endif
++
+ #if defined(XP_WIN)
+   // If win32k is locked down we can't use native event processing.
+   if (IsWin32kLockedDown()) {
 diff --git a/tools/profiler/public/ETWTools.h b/tools/profiler/public/ETWTools.h
 index 2e0f09cbfd..f6217dfe47 100644
 --- a/tools/profiler/public/ETWTools.h
