@@ -828,6 +828,16 @@ void InstallEngineProbes() {
 
   ProbeDelayLoads(xul);
 
+  // Anything the engine reports as a raw address -- and it has no way to
+  // report anything else -- is only meaningful against the base it was loaded
+  // at, which ASLR changes every run.
+  for (const wchar_t* name : {L"xul.dll", L"mozglue.dll", L"nss3.dll"}) {
+    if (HMODULE module = ::GetModuleHandleW(name)) {
+      Log::Write(std::wstring(L"base: ") + name + L" at " +
+                 Hex(reinterpret_cast<uintptr_t>(module)));
+    }
+  }
+
   // Whether the loader is enforcing Control Flow Guard on the engine decides
   // whether an indirect call can end the process outright, so it is worth
   // stating in the log next to the crash it might explain.

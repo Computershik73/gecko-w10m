@@ -1,8 +1,8 @@
 diff --git a/js/src/vm/JSContext.cpp b/js/src/vm/JSContext.cpp
-index 2cbeec9ce6..4daae22dc0 100644
+index 2cbeec9ce6..75056dcd70 100644
 --- a/js/src/vm/JSContext.cpp
 +++ b/js/src/vm/JSContext.cpp
-@@ -298,9 +298,39 @@ void JSContext::onOutOfMemory() {
+@@ -298,9 +298,48 @@ void JSContext::onOutOfMemory() {
    reportResourceExhaustion();
  }
  
@@ -26,8 +26,17 @@ index 2cbeec9ce6..4daae22dc0 100644
 +  if (gGeckoW10mOomReports++ >= 8) {
 +    return;
 +  }
-+  char note[96];
-+  SprintfLiteral(note, "js: %s out of memory, reported from %p", kind, from);
++  // A raw address means nothing in the next process -- ASLR moves the module
++  // between runs and the log is read afterwards. Measuring against a symbol in
++  // the same library makes it portable: look ReportLargeOutOfMemory up in the
++  // build's map, add the offset, and symbolize that.
++  auto* anchor = reinterpret_cast<const char*>(
++      static_cast<void (*)(JSContext*)>(js::ReportLargeOutOfMemory));
++  ptrdiff_t offset = reinterpret_cast<const char*>(from) - anchor;
++
++  char note[128];
++  SprintfLiteral(note, "js: %s out of memory, reported from ReportLargeOutOfMemory%+td",
++                 kind, offset);
 +  GeckoW10mNote(note);
 +}
 +#endif
@@ -42,7 +51,7 @@ index 2cbeec9ce6..4daae22dc0 100644
    cx->onOutOfMemory();
  }
  
-@@ -311,6 +341,12 @@ JS_PUBLIC_API void js::ReportLargeOutOfMemory(JSContext* cx) {
+@@ -311,6 +350,12 @@ JS_PUBLIC_API void js::ReportLargeOutOfMemory(JSContext* cx) {
  JS_PUBLIC_API void js::ReportOutOfMemory(FrontendContext* fc) {
    MaybeReportOutOfMemoryForDifferentialTesting();
  
