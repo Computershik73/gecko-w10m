@@ -97,6 +97,7 @@ echo "=== link GeckoW10m.exe ==="
 # the package, so this adds an import and no new payload.
 "$LLVM/lld-link.exe" $OBJS "/OUT:$STAGE_W\\GeckoW10m.exe" /APPCONTAINER \
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
+  "/MAP:$OBJDIR_W\\GeckoW10m.map" \
   "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
   WindowsApp.lib
 echo "    $(stat -c%s "$STAGE/GeckoW10m.exe") bytes"

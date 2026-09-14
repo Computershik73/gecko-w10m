@@ -1,6 +1,7 @@
 #include "CrashProbe.h"
 
 #include <windows.h>
+#include <winrt/Windows.System.h>
 
 #include <atomic>
 #include <cstring>
@@ -52,12 +53,70 @@ std::wstring DescribeAddress(const void* addr) {
   return name + L"+" + Hex(rva);
 }
 
-void LogBacktrace(const wchar_t* tag) {
-  void* frames[28] = {};
-  USHORT count = ::RtlCaptureStackBackTrace(0, 28, frames, nullptr);
-  for (USHORT i = 0; i < count; ++i) {
-    Log::Write(std::wstring(tag) + L"   " + DescribeAddress(frames[i]));
+// RtlCaptureStackBackTrace returns one frame here and stops: 32-bit ARM
+// Windows unwinds from tables rather than a frame pointer chain, and without
+// consulting them there is no second frame to find. Walking those tables gives
+// a real trace -- and, unlike the capture, one that can start from the context
+// of the thread that faulted rather than from the handler's own stack.
+using LookupFunctionEntryFn = PVOID(WINAPI*)(DWORD, PDWORD, PVOID);
+using VirtualUnwindFn = PVOID(WINAPI*)(DWORD, DWORD, DWORD, PVOID, PCONTEXT,
+                                       PVOID*, PDWORD, PVOID);
+
+LookupFunctionEntryFn gLookupFunctionEntry = nullptr;
+VirtualUnwindFn gVirtualUnwind = nullptr;
+
+void ResolveUnwindApis() {
+  HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) return;
+  gLookupFunctionEntry = reinterpret_cast<LookupFunctionEntryFn>(
+      ::GetProcAddress(ntdll, "RtlLookupFunctionEntry"));
+  gVirtualUnwind = reinterpret_cast<VirtualUnwindFn>(
+      ::GetProcAddress(ntdll, "RtlVirtualUnwind"));
+}
+
+// Takes the context by value: unwinding rewrites it, and the caller's copy
+// belongs to the exception record.
+void LogStack(const wchar_t* tag, CONTEXT context) {
+  if (!gLookupFunctionEntry || !gVirtualUnwind) {
+    Log::Write(std::wstring(tag) + L"   (no unwind support)");
+    return;
   }
+
+  for (int depth = 0; depth < 32; ++depth) {
+    if (!context.Pc) return;
+    Log::Write(std::wstring(tag) + L"   " +
+               DescribeAddress(reinterpret_cast<void*>(context.Pc)));
+
+    DWORD imageBase = 0;
+    PVOID entry = gLookupFunctionEntry(context.Pc, &imageBase, nullptr);
+    if (!entry) return;
+
+    PVOID handlerData = nullptr;
+    DWORD establisher = 0;
+    DWORD previous = context.Pc;
+    gVirtualUnwind(0 /*UNW_FLAG_NHANDLER*/, imageBase, context.Pc, entry,
+                   &context, &handlerData, &establisher, nullptr);
+    // A frame that does not move is a frame that will not move again.
+    if (context.Pc == previous) return;
+  }
+}
+
+// For the hooks, which have no exception context of their own.
+// A phone gives an app a hard memory ceiling, and 132 MB of engine plus
+// everything Gecko allocates on startup is a real candidate for reaching it.
+// Whatever else a crash report says, it should say how close this was.
+void LogMemory(const wchar_t* tag) {
+  auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+  auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+  Log::Write(std::wstring(tag) + L" memory " +
+             std::to_wstring(used / (1024 * 1024)) + L" MB of " +
+             std::to_wstring(limit / (1024 * 1024)) + L" MB");
+}
+
+void LogBacktrace(const wchar_t* tag) {
+  CONTEXT context{};
+  ::RtlCaptureContext(&context);
+  LogStack(tag, context);
 }
 
 // ---------------------------------------------------------------- exceptions
@@ -91,7 +150,8 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
 
   Log::Write(L"crash: code " + Hex(code) + L" at " +
              DescribeAddress(info->ExceptionRecord->ExceptionAddress));
-  LogBacktrace(L"crash:");
+  LogMemory(L"crash:");
+  LogStack(L"crash:", *info->ContextRecord);
 
   // Not ours to handle -- only to record.
   return EXCEPTION_CONTINUE_SEARCH;
@@ -376,7 +436,13 @@ DWORD WINAPI SamplerThread(LPVOID param) {
   }
 
   unsigned last = 0;
+  DWORD nextReport = ::GetTickCount();
   while (::WaitForSingleObject(target, 0) != WAIT_OBJECT_0) {
+    // Often enough to show a climb, rarely enough that the log stays readable.
+    if (::GetTickCount() >= nextReport) {
+      nextReport = ::GetTickCount() + 500;
+      LogMemory(L"gecko:");
+    }
     if (gSuspendThread(target) == static_cast<DWORD>(-1)) break;
 
     // CONTEXT wants 8-byte alignment on ARM and GetThreadContext refuses it
@@ -419,6 +485,7 @@ void StartLastLocationSampler(void* thread) {
 }
 
 void InstallCrashProbes(const std::wstring& localStatePath) {
+  ResolveUnwindApis();
   ReportPreviousTrace(localStatePath);
 
   gTrace = MapTrace(localStatePath, /*createNew*/ true);

@@ -32,6 +32,18 @@ TIMESTAMP = re.compile(r"Timestamp is \w+ \((.+)\)")
 ADDRESS = re.compile(r"([A-Za-z0-9_.\-]+\.(?:dll|exe))\+0x([0-9a-fA-F]+)")
 
 
+def image_name(path):
+    """The image a map belongs to, taken from its first line.
+
+    Maps name the image without an extension ("xul", "GeckoW10m"), and nothing in
+    the file says whether it linked a .dll or an .exe -- so everything is keyed
+    on the stem and addresses are matched the same way.
+    """
+    with open(path, "r", errors="replace") as f:
+        first = f.readline().strip()
+    return (first or path.stem).lower()
+
+
 def load_map(path):
     """Returns (sorted rvas, symbols, objects, timestamp)."""
     rvas, names, objects = [], [], []
@@ -86,9 +98,10 @@ def main(argv):
         print(__doc__)
         return 2
 
-    map_path = Path(argv[2]) if len(argv) > 2 else DEFAULT_MAP
-    if not map_path.exists():
-        print(f"no map at {map_path}; build xul.dll to produce one")
+    map_paths = [Path(a) for a in argv[2:]] or [DEFAULT_MAP]
+    missing = [p for p in map_paths if not p.exists()]
+    if missing:
+        print("no map at " + ", ".join(str(p) for p in missing))
         return 1
 
     target = argv[1]
@@ -99,15 +112,23 @@ def main(argv):
         print("no module+offset addresses found")
         return 1
 
-    rvas, names, objects, stamp = load_map(map_path)
-    print(f"map: {map_path}  ({len(rvas)} symbols, linked {stamp})")
+    # A map names its own image on the first line, so several can be passed at
+    # once and each address goes to the one it belongs to.
+    maps = {}
+    for path in map_paths:
+        stem = image_name(path)
+        maps[stem] = load_map(path)
+        rvas, _, _, stamp = maps[stem]
+        print(f"map: {stem} <- {path}  ({len(rvas)} symbols, linked {stamp})")
     print()
 
     for module, offset in wanted:
         rva = int(offset, 16)
-        if module.lower() != "xul.dll":
+        key = module.lower().rsplit(".", 1)[0]
+        if key not in maps:
             print(f"{module}+0x{rva:08x}  (no map for this module)")
             continue
+        rvas, names, objects, _ = maps[key]
         hit = resolve(rvas, names, objects, rva)
         if not hit:
             print(f"{module}+0x{rva:08x}  (below the first symbol)")
