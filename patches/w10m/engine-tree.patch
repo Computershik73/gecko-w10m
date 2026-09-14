@@ -15328,10 +15328,10 @@ index e313d971ec..38cdd933a9 100644
          env="MOZ_WINDOWS_APP_SDK_DIR",
          nargs=1,
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..050409d0db 100644
+index fe113c825c..b80d727a1a 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -18,6 +18,115 @@ extern "C" int __llvm_profile_dump(void);
+@@ -18,6 +18,176 @@ extern "C" int __llvm_profile_dump(void);
  #  endif
  #endif
  
@@ -15404,6 +15404,59 @@ index fe113c825c..050409d0db 100644
 +// valid body for every signature the thunks can ask for.
 +int WINAPI GeckoW10mMissingProc() { return 0; }
 +
++// Zero is the wrong answer for some of them, and the substitution log says
++// which -- it records what the engine actually reached for rather than what it
++// might. Two of those were being answered with something worse than nothing.
++//
++// MsgWaitForMultipleObjectsEx was returning zero, which reads as "the first
++// handle is signalled", so the event loop stopped waiting and spun at full
++// speed: hundreds of consecutive calls in the log. There is no message queue
++// here to wait on, but the handles are real, and waiting on those is the whole
++// of what this call means on a device with no messages.
++DWORD WINAPI GeckoW10mMsgWaitForMultipleObjectsEx(DWORD aCount,
++                                                const HANDLE* aHandles,
++                                                DWORD aMilliseconds,
++                                                DWORD aWakeMask, DWORD aFlags) {
++  constexpr DWORD kWaitAll = 0x0001;    // MWMO_WAITALL
++  constexpr DWORD kAlertable = 0x0002;  // MWMO_ALERTABLE
++
++  if (!aCount) {
++    // WaitForMultipleObjectsEx rejects an empty set, and a caller with no
++    // handles was only ever waiting for messages.
++    ::SleepEx(aMilliseconds, (aFlags & kAlertable) != 0);
++    return WAIT_TIMEOUT;
++  }
++  return ::WaitForMultipleObjectsEx(aCount, aHandles, (aFlags & kWaitAll) != 0,
++                                    aMilliseconds, (aFlags & kAlertable) != 0);
++}
++
++// And zero is S_OK. A function returning an HRESULT that claims success while
++// leaving its out parameter untouched hands the caller whatever was already
++// there -- for DwmGetCompositionTimingInfo, a composition clock made of noise,
++// feeding the refresh driver. Failing is both true and useful: Gecko has a
++// fallback for a machine with no compositor, and this is one.
++HRESULT WINAPI GeckoW10mFailingHresult() { return E_FAIL; }
++
++struct Substitute {
++  const char* name;
++  FARPROC stub;
++};
++
++const Substitute kSubstitutes[] = {
++    {"MsgWaitForMultipleObjectsEx",
++     reinterpret_cast<FARPROC>(&GeckoW10mMsgWaitForMultipleObjectsEx)},
++    {"DwmGetCompositionTimingInfo",
++     reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"DwmIsCompositionEnabled",
++     reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"DwmFlush", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeColor", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeMetric", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemePartSize", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeSysFont", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"CloseThemeData", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++};
++
 +FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
 +                                       PDelayLoadInfo info) {
 +  if (!info) return nullptr;
@@ -15421,6 +15474,14 @@ index fe113c825c..050409d0db 100644
 +
 +  RecordSubstitution(info->szDll, info->dlp.fImportByName ? info->dlp.szProcName
 +                                                          : nullptr);
++
++  if (info->dlp.fImportByName) {
++    for (const Substitute& substitute : kSubstitutes) {
++      if (std::strcmp(info->dlp.szProcName, substitute.name) == 0) {
++        return substitute.stub;
++      }
++    }
++  }
 +  return reinterpret_cast<FARPROC>(&GeckoW10mMissingProc);
 +}
 +
@@ -15447,7 +15508,7 @@ index fe113c825c..050409d0db 100644
  namespace mozilla {
  
  class BootstrapImpl final : public Bootstrap {
-@@ -42,6 +151,11 @@ class BootstrapImpl final : public Bootstrap {
+@@ -42,6 +212,11 @@ class BootstrapImpl final : public Bootstrap {
  
    virtual int XRE_main(int argc, char* argv[],
                         const BootstrapConfig& aConfig) override {
