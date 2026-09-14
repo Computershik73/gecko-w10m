@@ -1,8 +1,8 @@
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..45df676fbe 100644
+index fe113c825c..48fc612c97 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -18,6 +18,66 @@ extern "C" int __llvm_profile_dump(void);
+@@ -18,6 +18,102 @@ extern "C" int __llvm_profile_dump(void);
  #  endif
  #endif
  
@@ -15,46 +15,82 @@ index fe113c825c..45df676fbe 100644
 +
 +namespace {
 +
-+// Windows 10 Mobile ships a reduced version of the desktop libraries: the DLL
-+// is there and loads, but not every function in it exists. Gecko reaches those
-+// through delay-load thunks, and a thunk that cannot resolve reports it by
-+// raising -- which on 32-bit ARM, where clang emits no exception handling at
-+// all, nothing catches. One missing function takes the thread down, and the
-+// process with it.
++// Windows 10 Mobile ships a reduced version of the desktop libraries: a
++// library may be absent entirely, or present and missing most of its
++// functions. Of the 470 functions Gecko delay-loads, this device has 221 of
++// them missing. Gecko reaches them through delay-load thunks, and a thunk that
++// cannot resolve reports it by raising -- which on 32-bit ARM, where clang
++// emits no exception handling at all, nothing catches. One absent function
++// ends the thread and takes the process with it.
 +//
-+// The delay-load machinery offers a failure hook for exactly this, so the ones
-+// that are both missing and harmless get answered with a stub. Anything not
-+// listed here still raises, and so still shows up in the log rather than being
-+// quietly papered over.
++// The delay-load machinery offers a failure hook for exactly this. Answering
++// with a stub is only safe because of the architecture: 32-bit ARM has one
++// calling convention and the caller removes its own arguments, so a single
++// nullary function can stand in for any signature at all. The same trick on
++// x86 would corrupt the stack on the first call, every stdcall stub having to
++// match its victim's argument count exactly.
++//
++// What a stub cannot do is be correct. Returning zero reads as failure to most
++// callers and as "none" to the rest, which is the truth here -- there is no
++// window to find, no theme to open, no MIDI device to enumerate -- but a
++// caller that expected success will misbehave rather than crash. So every
++// substitution is written down, and GECKO_W10M_DELAYLOAD_LOG says where.
 +
-+// No key is down, which on a device with no keyboard is not a lie.
-+SHORT WINAPI GeckoW10mGetKeyState(int) { return 0; }
++void RecordSubstitution(const char* dll, const char* proc) {
++  wchar_t path[MAX_PATH] = {};
++  if (!::GetEnvironmentVariableW(L"GECKO_W10M_DELAYLOAD_LOG", path, MAX_PATH)) {
++    return;
++  }
 +
-+// No such window. Gecko looks for an existing instance to hand a URL to; a
-+// packaged app has no desktop window to find and does not want one.
-+HWND WINAPI GeckoW10mFindWindowW(LPCWSTR, LPCWSTR) { return nullptr; }
++  CREATEFILE2_EXTENDED_PARAMETERS params{};
++  params.dwSize = sizeof(params);
++  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++  HANDLE file = ::CreateFile2(path, FILE_APPEND_DATA, FILE_SHARE_READ,
++                              OPEN_ALWAYS, &params);
++  if (file == INVALID_HANDLE_VALUE) return;
 +
-+struct Substitute {
-+  const char* name;
-+  FARPROC stub;
-+};
++  char line[256];
++  int length = 0;
++  auto append = [&](const char* text) {
++    while (*text && length < static_cast<int>(sizeof(line)) - 2) {
++      line[length++] = *text++;
++    }
++  };
++  append(dll ? dll : "?");
++  append("!");
++  append(proc ? proc : "(ordinal)");
++  line[length++] = '\r';
++  line[length++] = '\n';
 +
-+const Substitute kSubstitutes[] = {
-+    {"GetKeyState", reinterpret_cast<FARPROC>(&GeckoW10mGetKeyState)},
-+    {"FindWindowW", reinterpret_cast<FARPROC>(&GeckoW10mFindWindowW)},
-+};
++  ::SetFilePointer(file, 0, nullptr, FILE_END);
++  DWORD written = 0;
++  ::WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
++  ::FlushFileBuffers(file);
++  ::CloseHandle(file);
++}
++
++// Zero in r0. Any caller's arguments are its own to clean up, so this is a
++// valid body for every signature the thunks can ask for.
++int WINAPI GeckoW10mMissingProc() { return 0; }
 +
 +FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
 +                                       PDelayLoadInfo info) {
-+  if (notification != dliFailGetProc || !info || !info->dlp.fImportByName) {
-+    return nullptr;
++  if (!info) return nullptr;
++
++  if (notification == dliFailLoadLib) {
++    // The library is not on the device at all. Handing back a module that is
++    // -- this executable will do -- sends every function in it down the path
++    // below, where each gets a stub of its own, rather than failing the whole
++    // group here.
++    RecordSubstitution(info->szDll, "(entire library)");
++    return reinterpret_cast<FARPROC>(::GetModuleHandleW(nullptr));
 +  }
-+  for (const Substitute& substitute : kSubstitutes) {
-+    if (std::strcmp(info->dlp.szProcName, substitute.name) == 0) {
-+      return substitute.stub;
-+    }
-+  }
-+  return nullptr;
++
++  if (notification != dliFailGetProc) return nullptr;
++
++  RecordSubstitution(info->szDll, info->dlp.fImportByName ? info->dlp.szProcName
++                                                          : nullptr);
++  return reinterpret_cast<FARPROC>(&GeckoW10mMissingProc);
 +}
 +
 +}  // namespace

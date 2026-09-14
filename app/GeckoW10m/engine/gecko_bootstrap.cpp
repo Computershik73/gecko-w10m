@@ -83,6 +83,11 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   ::SetEnvironmentVariableW(L"MOZ_HEADLESS", L"1");
   ::SetEnvironmentVariableW(L"MOZ_FORCE_DISABLE_E10S", L"1");
 
+  // Where libxul writes the delay-load substitutions it had to make. See the
+  // failure hook in toolkit/xre/Bootstrap.cpp.
+  ::SetEnvironmentVariableW(L"GECKO_W10M_DELAYLOAD_LOG",
+                            (profile + L"\\delay-load-used.log").c_str());
+
   // Gecko's own logging, next to ours, so a failure inside the engine says
   // more than a return code.
   const std::wstring geckoLog = profile + L"\\gecko.log";

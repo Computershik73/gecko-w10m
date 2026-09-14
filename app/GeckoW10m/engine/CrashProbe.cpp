@@ -403,9 +403,6 @@ void ProbeDelayLoads(HMODULE module) {
   int modules = 0;
   int imports = 0;
   int missing = 0;
-  int named = 0;
-  constexpr int kMaxNamed = 120;
-
   for (; desc->nameRva; ++desc) {
     // The first attribute bit says the fields are RVAs. Anything older stores
     // absolute addresses, which no linker has produced in twenty years.
@@ -421,17 +418,18 @@ void ProbeDelayLoads(HMODULE module) {
                                           LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!target) {
       ++missing;
-      if (named < kMaxNamed) {
-        ++named;
-        Log::Write(L"delay-probe: " + Widen(moduleName) + L" absent entirely");
-      }
+      Log::Write(L"delay-probe: " + Widen(moduleName) + L" absent entirely");
       continue;
     }
+
+    int moduleImports = 0;
+    int moduleMissing = 0;
 
     if (!desc->intRva) continue;
     auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->intRva);
     for (; thunk->u1.AddressOfData; ++thunk) {
       ++imports;
+      ++moduleImports;
       FARPROC proc = nullptr;
       std::wstring label;
       if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
@@ -446,22 +444,24 @@ void ProbeDelayLoads(HMODULE module) {
         label = Widen(byName->Name);
       }
       if (proc) continue;
-
       ++missing;
-      if (named < kMaxNamed) {
-        ++named;
-        Log::Write(L"delay-probe: " + Widen(moduleName) + L"!" + label);
-      }
+      ++moduleMissing;
+    }
+
+    // One line per library rather than one per function: 221 names bury the
+    // shape of it, and the shape is what matters -- whole subsystems this
+    // device does not have.
+    if (moduleMissing) {
+      Log::Write(L"delay-probe: " + Widen(moduleName) + L" missing " +
+                 std::to_wstring(moduleMissing) + L" of " +
+                 std::to_wstring(moduleImports));
     }
     ::FreeLibrary(target);
   }
 
   Log::Write(L"delay-probe: " + std::to_wstring(modules) + L" modules, " +
              std::to_wstring(imports) + L" delayed imports, " +
-             std::to_wstring(missing) + L" unavailable" +
-             (missing > named ? L" (" + std::to_wstring(missing - named) +
-                                    L" past the reporting limit)"
-                              : L""));
+             std::to_wstring(missing) + L" unavailable");
 }
 
 // ------------------------------------------------------------- pc sampling
