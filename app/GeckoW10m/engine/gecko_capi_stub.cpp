@@ -74,31 +74,76 @@ bool ProbeJit(std::string& detail) {
   return true;
 }
 
-// Tries to load the ported engine and resolve its entry point. The engine
-// links against the desktop Win32 surface, which the ARM32 SDK provides and
-// Windows 10 Mobile exports; whether the app container actually lets those
-// calls through at run time is the open question this answers on the device.
+// Tries to load the ported engine and resolve its entry point, in stages, so a
+// failure says which stage failed. The engine links against the desktop Win32
+// surface, which the ARM32 SDK provides and Windows 10 Mobile exports; whether
+// the app container lets those calls through at run time is the open question
+// this answers on the device.
 void ProbeXul(std::string& detail) {
+  // Stage 1: is the file even in the package? A missing payload and a blocked
+  // load look identical from LoadPackagedLibrary's error code alone.
+  wchar_t dir[MAX_PATH] = {};
+  DWORD n = ::GetModuleFileNameW(nullptr, dir, MAX_PATH);
+  std::wstring path;
+  if (n > 0 && n < MAX_PATH) {
+    path.assign(dir, n);
+    auto slash = path.find_last_of(L'\\');
+    if (slash != std::wstring::npos) path.resize(slash + 1);
+    path += L"xul.dll";
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+      unsigned long long size =
+          (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) |
+          fad.nFileSizeLow;
+      detail = "xul.dll present (" + std::to_string(size / (1024 * 1024)) +
+               " MB); ";
+    } else {
+      detail = "xul.dll NOT found next to the exe (err " +
+               std::to_string(::GetLastError()) + "); ";
+    }
+  }
+
+  // Stage 2: mozglue must be in memory before xul on Windows -- Gecko's
+  // allocator lives there and xul imports from it.
+  HMODULE glue = ::LoadPackagedLibrary(L"mozglue.dll", 0);
+  if (!glue) {
+    detail += "mozglue.dll did not load (err " +
+              std::to_string(::GetLastError()) + "); ";
+  }
+
+  // Stage 3: the real load, which resolves every import.
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
   if (!xul) {
-    DWORD err = ::GetLastError();
-    xul = ::LoadLibraryExW(L"xul.dll", nullptr, 0);
-    if (!xul) {
-      detail = "xul.dll did not load (LoadPackagedLibrary err " +
-               std::to_string(err) + ", LoadLibrary err " +
-               std::to_string(::GetLastError()) + ")";
-      return;
+    DWORD packagedErr = ::GetLastError();
+
+    // As a datafile the loader maps the image without resolving imports. If
+    // this succeeds where the real load failed, the file is reachable and the
+    // problem is an API the app container refuses.
+    HMODULE asData = ::LoadLibraryExW(path.empty() ? L"xul.dll" : path.c_str(),
+                                      nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (asData) {
+      ::FreeLibrary(asData);
+      detail += "load failed with an unresolved import or blocked API "
+                "(LoadPackagedLibrary err " +
+                std::to_string(packagedErr) +
+                "); the file itself maps fine as a datafile";
+    } else {
+      detail += "xul.dll did not load (LoadPackagedLibrary err " +
+                std::to_string(packagedErr) + ", datafile err " +
+                std::to_string(::GetLastError()) + ")";
     }
+    return;
   }
 
   // XRE_GetBootstrap is how a Gecko host normally gets hold of the runtime.
   auto bootstrap = ::GetProcAddress(xul, "XRE_GetBootstrap");
   if (!bootstrap) {
-    detail = "xul.dll loaded but XRE_GetBootstrap is missing (err " +
-             std::to_string(::GetLastError()) + ")";
+    detail += "xul.dll loaded but XRE_GetBootstrap is missing (err " +
+              std::to_string(::GetLastError()) + ")";
     return;
   }
-  detail = "xul.dll loaded, XRE_GetBootstrap resolved";
+  detail += "xul.dll loaded, XRE_GetBootstrap resolved";
 }
 
 }  // namespace
@@ -125,17 +170,19 @@ gecko_runtime* gecko_runtime_create(const gecko_runtime_config* config) {
   rt->jit = config && config->jit_enabled;
   if (rt->jit) {
     ProbeJit(rt->jit_detail);
-    gecko_w10m::client::Log::Write(L"probe jit", Widen(rt->jit_detail));
-
-    std::string xul_detail;
-    ProbeXul(xul_detail);
-    gecko_w10m::client::Log::Write(L"probe xul", Widen(xul_detail));
-
-    rt->jit_detail += "  |  " + xul_detail;
   } else {
     rt->jit_detail = "JIT disabled by config";
-    gecko_w10m::client::Log::Write(L"probe jit: disabled by config");
   }
+  gecko_w10m::client::Log::Write(L"probe jit", Widen(rt->jit_detail));
+
+  // Whether the engine loads has nothing to do with the JIT preference, so
+  // this runs either way -- gating it behind the JIT setting meant one flag
+  // hid the answer to the only question that matters right now.
+  std::string xul_detail;
+  ProbeXul(xul_detail);
+  gecko_w10m::client::Log::Write(L"probe xul", Widen(xul_detail));
+
+  rt->jit_detail += "  |  " + xul_detail;
   return rt;
 }
 

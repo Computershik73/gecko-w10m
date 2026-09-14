@@ -128,7 +128,10 @@ std::wstring BrowserPreferences::CustomNewTabUrl() const {
 }
 
 bool BrowserPreferences::IsJitEnabled() const {
-  return GetBool(L"JITSettings", L"isJITEnabled", false);
+  // GeckoW10m defaults this off on iOS, where no app may generate code. Here the
+  // package declares the codeGeneration capability, so the JIT is available and
+  // a browser without it is not worth shipping -- default it on.
+  return GetBool(L"JITSettings", L"isJITEnabled", true);
 }
 void BrowserPreferences::SetJitEnabled(bool v) {
   SetBool(L"JITSettings", L"isJITEnabled", v);
