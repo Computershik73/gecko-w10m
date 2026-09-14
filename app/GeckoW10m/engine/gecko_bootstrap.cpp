@@ -91,7 +91,10 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // Gecko's own logging, next to ours, so a failure inside the engine says
   // more than a return code.
   const std::wstring geckoLog = profile + L"\\gecko.log";
-  ::SetEnvironmentVariableW(L"MOZ_LOG", L"timestamp,sync,nsAppRunner:5,XRE:5");
+  ::SetEnvironmentVariableW(
+      L"MOZ_LOG",
+      L"timestamp,sync,nsAppRunner:5,XRE:5,nsComponentManager:5,"
+      L"nsChromeRegistry:5,nsIOService:5,URILoader:5");
   ::SetEnvironmentVariableW(L"MOZ_LOG_FILE", geckoLog.c_str());
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 

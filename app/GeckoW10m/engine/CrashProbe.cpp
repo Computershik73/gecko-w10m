@@ -151,6 +151,23 @@ bool IsFatal(DWORD code) {
   }
 }
 
+// An access violation carries the address it was reaching for and whether it
+// was reading or writing. Null says a missing object; a small offset off null
+// says a field of one; an address that looks like data says something worse.
+// The exception address alone distinguishes none of those.
+std::wstring FaultDetail(const EXCEPTION_RECORD& record) {
+  if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+      record.NumberParameters < 2) {
+    return std::wstring();
+  }
+  const ULONG_PTR kind = record.ExceptionInformation[0];
+  const wchar_t* verb = kind == 0   ? L"reading "
+                        : kind == 1 ? L"writing "
+                                    : L"executing ";
+  return std::wstring(L", ") + verb +
+         Hex(static_cast<uintptr_t>(record.ExceptionInformation[1]));
+}
+
 std::atomic<int> gReported{0};
 constexpr int kMaxReports = 4;
 
@@ -162,7 +179,8 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   // First chance means exactly that: the process may well have a handler for
   // this and carry on. Said plainly so it is not read as a cause of death.
   Log::Write(L"first-chance: code " + Hex(code) + L" at " +
-             DescribeAddress(info->ExceptionRecord->ExceptionAddress));
+             DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
+             FaultDetail(*info->ExceptionRecord));
   LogMemory(L"first-chance:");
   LogStack(L"first-chance:", *info->ContextRecord);
 
@@ -679,7 +697,8 @@ DWORD WINAPI SamplerThread(LPVOID param) {
 // this the one report that names a cause rather than an event.
 LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
   Log::Write(L"FATAL: unhandled " + Hex(info->ExceptionRecord->ExceptionCode) +
-             L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress));
+             L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
+             FaultDetail(*info->ExceptionRecord));
   LogMemory(L"FATAL:");
   LogStack(L"FATAL:", *info->ContextRecord);
   return EXCEPTION_CONTINUE_SEARCH;
