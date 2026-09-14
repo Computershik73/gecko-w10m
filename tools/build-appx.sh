@@ -144,6 +144,11 @@ fi
 if [ -d "$DIST" ]; then
   cp -r "$DIST/." "$STAGE/"
   echo "    engine payload from $DIST"
+  # Diagnostic: Control Flow Guard turns a failed indirect call into a
+  # __fastfail, which ends the process with nothing written down anywhere --
+  # the exact death this port sees inside XRE_main. Clearing the flag on the
+  # packaged copy tells the loader not to enforce it. See tools/strip-cfg.py.
+  python "$(cygpath -w "$ROOT/tools/strip-cfg.py")" "$(cygpath -w "$STAGE/xul.dll")"     | sed 's/^/    /'
 else
   echo "    WARNING: $DIST not found, packaging the shell alone" >&2
 fi

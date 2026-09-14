@@ -226,50 +226,181 @@ bool ResolveSamplingApis() {
   return gSuspendThread && gResumeThread && gGetThreadContext;
 }
 
-// Long enough to cover a startup that has been dying in tens of milliseconds,
-// short enough that a runtime which survives stops paying for it.
-constexpr int kMaxSamples = 1200;
+// The trace file. A raw address is worthless in the next process -- ASLR moves
+// every module -- so each sample is stored as a module index and an offset,
+// with the names written alongside them.
+constexpr unsigned kTraceMagic = 0x31525452;  // "RTR1"
+constexpr unsigned kMaxModules = 16;
+constexpr unsigned kCapacity = 8192;
+
+struct TraceModule {
+  char name[40];
+  unsigned base;
+};
+
+struct TraceSample {
+  unsigned module;  // index into modules, or kMaxModules when unknown
+  unsigned offset;
+};
+
+struct TraceFile {
+  unsigned magic;
+  unsigned moduleCount;
+  unsigned written;  // total samples ever written; the ring holds the last few
+  unsigned capacity;
+  TraceModule modules[kMaxModules];
+  TraceSample samples[kCapacity];
+};
+
+TraceFile* gTrace = nullptr;
+HANDLE gTraceMapping = nullptr;
+HANDLE gTraceFile = INVALID_HANDLE_VALUE;
+
+std::wstring TracePath(const std::wstring& localState) {
+  return localState + L"\\pc-trace.bin";
+}
+
+TraceFile* MapTrace(const std::wstring& localState, bool createNew) {
+  CREATEFILE2_EXTENDED_PARAMETERS params{};
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+  gTraceFile = ::CreateFile2(TracePath(localState).c_str(),
+                             GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                             createNew ? OPEN_ALWAYS : OPEN_EXISTING, &params);
+  if (gTraceFile == INVALID_HANDLE_VALUE) return nullptr;
+
+  gTraceMapping = ::CreateFileMappingFromApp(gTraceFile, nullptr, PAGE_READWRITE,
+                                             sizeof(TraceFile), nullptr);
+  if (!gTraceMapping) {
+    ::CloseHandle(gTraceFile);
+    gTraceFile = INVALID_HANDLE_VALUE;
+    return nullptr;
+  }
+
+  auto* view = static_cast<TraceFile*>(::MapViewOfFileFromApp(
+      gTraceMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, sizeof(TraceFile)));
+  if (!view) {
+    ::CloseHandle(gTraceMapping);
+    ::CloseHandle(gTraceFile);
+    gTraceMapping = nullptr;
+    gTraceFile = INVALID_HANDLE_VALUE;
+  }
+  return view;
+}
+
+// Reports the previous run's trace before this run overwrites it. Only the
+// tail matters: the ring is long enough that the interesting part is always at
+// the end.
+void ReportPreviousTrace(const std::wstring& localState) {
+  TraceFile* trace = MapTrace(localState, /*createNew*/ false);
+  if (!trace) return;
+
+  if (trace->magic != kTraceMagic || trace->written == 0) {
+    ::UnmapViewOfFile(trace);
+    return;
+  }
+
+  constexpr unsigned kReport = 40;
+  unsigned total = trace->written;
+  unsigned have = total < kCapacity ? total : kCapacity;
+  unsigned show = have < kReport ? have : kReport;
+
+  Log::WriteNum(L"trace: samples from the previous run", total);
+  for (unsigned i = have - show; i < have; ++i) {
+    unsigned slot = (total - have + i) % kCapacity;
+    const TraceSample& sample = trace->samples[slot];
+
+    std::wstring where;
+    if (sample.module < trace->moduleCount) {
+      const char* name = trace->modules[sample.module].name;
+      int n = ::MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+      std::wstring wide(static_cast<size_t>(n > 1 ? n - 1 : 0), L'\0');
+      if (n > 1) {
+        ::MultiByteToWideChar(CP_UTF8, 0, name, -1, wide.data(), n);
+      }
+      where = wide + L"+" + Hex(sample.offset);
+    } else {
+      where = Hex(sample.offset) + L" (no module)";
+    }
+    Log::Write(L"trace: " + where);
+  }
+
+  ::UnmapViewOfFile(trace);
+  // Reopened for writing by the sampler.
+  if (gTraceMapping) ::CloseHandle(gTraceMapping);
+  if (gTraceFile != INVALID_HANDLE_VALUE) ::CloseHandle(gTraceFile);
+  gTraceMapping = nullptr;
+  gTraceFile = INVALID_HANDLE_VALUE;
+}
+
+// Resolving a module per sample would cost more than the sample; the handles
+// repeat, so a short table answers nearly every lookup.
+unsigned ModuleIndexFor(const void* addr) {
+  HMODULE mod = nullptr;
+  if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(addr), &mod) ||
+      !mod) {
+    return kMaxModules;
+  }
+
+  unsigned base = reinterpret_cast<unsigned>(mod);
+  for (unsigned i = 0; i < gTrace->moduleCount; ++i) {
+    if (gTrace->modules[i].base == base) return i;
+  }
+  if (gTrace->moduleCount >= kMaxModules) return kMaxModules;
+
+  wchar_t path[MAX_PATH] = {};
+  DWORD n = ::GetModuleFileNameW(mod, path, MAX_PATH);
+  std::wstring name(path, n);
+  auto slash = name.find_last_of(L'\\');
+  if (slash != std::wstring::npos) name = name.substr(slash + 1);
+
+  unsigned index = gTrace->moduleCount;
+  TraceModule& entry = gTrace->modules[index];
+  entry.base = base;
+  ::WideCharToMultiByte(CP_UTF8, 0, name.c_str(), -1, entry.name,
+                        sizeof(entry.name) - 1, nullptr, nullptr);
+  gTrace->moduleCount = index + 1;
+  return index;
+}
 
 DWORD WINAPI SamplerThread(LPVOID param) {
   HANDLE target = static_cast<HANDLE>(param);
 
-  if (!ResolveSamplingApis()) {
+  if (!gTrace || !ResolveSamplingApis()) {
     Log::Write(L"sampler: thread inspection unavailable in this container");
     ::CloseHandle(target);
     return 0;
   }
 
-  uintptr_t last = 0;
-  int written = 0;
-  for (int i = 0; i < kMaxSamples; ++i) {
-    if (::WaitForSingleObject(target, 0) == WAIT_OBJECT_0) break;
-
+  unsigned last = 0;
+  while (::WaitForSingleObject(target, 0) != WAIT_OBJECT_0) {
     if (gSuspendThread(target) == static_cast<DWORD>(-1)) break;
 
-    // CONTEXT wants 8-byte alignment on ARM and GetThreadContext will refuse
-    // it otherwise.
+    // CONTEXT wants 8-byte alignment on ARM and GetThreadContext refuses it
+    // otherwise.
     __declspec(align(8)) CONTEXT context{};
     context.ContextFlags = CONTEXT_CONTROL;
     BOOL ok = gGetThreadContext(target, &context);
     gResumeThread(target);
+    if (!ok) break;
 
-    if (!ok) {
-      Log::WriteNum(L"sampler: GetThreadContext failed, err", ::GetLastError());
-      break;
-    }
-
-    uintptr_t pc = static_cast<uintptr_t>(context.Pc);
-    // Consecutive samples inside one tight loop say nothing new; only movement
-    // is worth a line.
+    unsigned pc = static_cast<unsigned>(context.Pc);
+    // Consecutive samples at one address say nothing new; only movement is
+    // worth a slot in the ring.
     if (pc != last) {
       last = pc;
-      Log::Write(L"pc: " + DescribeAddress(reinterpret_cast<void*>(pc)));
-      ++written;
+      unsigned index = ModuleIndexFor(reinterpret_cast<void*>(pc));
+      TraceSample& sample = gTrace->samples[gTrace->written % kCapacity];
+      sample.module = index;
+      sample.offset = index < kMaxModules ? pc - gTrace->modules[index].base : pc;
+      ++gTrace->written;
     }
-    ::Sleep(1);
   }
 
-  Log::WriteNum(L"sampler: finished, samples written", written);
+  Log::WriteNum(L"sampler: finished, samples", gTrace->written);
   ::CloseHandle(target);
   return 0;
 }
@@ -287,7 +418,19 @@ void StartLastLocationSampler(void* thread) {
   ::CloseHandle(sampler);
 }
 
-void InstallCrashProbes() {
+void InstallCrashProbes(const std::wstring& localStatePath) {
+  ReportPreviousTrace(localStatePath);
+
+  gTrace = MapTrace(localStatePath, /*createNew*/ true);
+  if (gTrace) {
+    gTrace->magic = kTraceMagic;
+    gTrace->capacity = kCapacity;
+    gTrace->written = 0;
+    gTrace->moduleCount = 0;
+  } else {
+    Log::WriteNum(L"trace: could not map the trace file, err", ::GetLastError());
+  }
+
   PVOID handler = ::AddVectoredExceptionHandler(1, &OnException);
   Log::Write(L"probe crash: vectored handler",
              handler ? L"installed" : L"REFUSED");
@@ -298,6 +441,16 @@ void InstallCrashProbes() {
     return;
   }
   Log::WriteNum(L"probe crash: exit paths hooked", HookImports(xul));
+
+  // Whether the loader is enforcing Control Flow Guard on the engine decides
+  // whether an indirect call can end the process outright, so it is worth
+  // stating in the log next to the crash it might explain.
+  auto* base = reinterpret_cast<unsigned char*>(xul);
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+  WORD characteristics = nt->OptionalHeader.DllCharacteristics;
+  Log::Write(L"probe crash: xul.dll CFG",
+             (characteristics & 0x4000) ? L"ENFORCED" : L"off");
 }
 
 }  // namespace gecko_w10m::engine

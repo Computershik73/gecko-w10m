@@ -24,7 +24,7 @@
   <Identity
       Name="GeckoW10m.W10M"
       Publisher="CN=GeckoW10m"
-      Version="0.1.1.3"
+      Version="0.1.1.4"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity

@@ -142,7 +142,7 @@ bool StartGeckoRuntime(const std::wstring& localStatePath) {
 
   // Before anything of Gecko's runs: whatever takes the process down, this is
   // the only record that survives it.
-  InstallCrashProbes();
+  InstallCrashProbes(localStatePath);
 
   gecko_w10m_gecko_set_logger(&BridgeLog);
 
