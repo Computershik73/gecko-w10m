@@ -65,6 +65,33 @@ bool ProbeJit(std::string& detail) {
   return true;
 }
 
+// Tries to load the ported engine and resolve its entry point. The engine
+// links against the desktop Win32 surface, which the ARM32 SDK provides and
+// Windows 10 Mobile exports; whether the app container actually lets those
+// calls through at run time is the open question this answers on the device.
+void ProbeXul(std::string& detail) {
+  HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
+  if (!xul) {
+    DWORD err = ::GetLastError();
+    xul = ::LoadLibraryExW(L"xul.dll", nullptr, 0);
+    if (!xul) {
+      detail = "xul.dll did not load (LoadPackagedLibrary err " +
+               std::to_string(err) + ", LoadLibrary err " +
+               std::to_string(::GetLastError()) + ")";
+      return;
+    }
+  }
+
+  // XRE_GetBootstrap is how a Gecko host normally gets hold of the runtime.
+  auto bootstrap = ::GetProcAddress(xul, "XRE_GetBootstrap");
+  if (!bootstrap) {
+    detail = "xul.dll loaded but XRE_GetBootstrap is missing (err " +
+             std::to_string(::GetLastError()) + ")";
+    return;
+  }
+  detail = "xul.dll loaded, XRE_GetBootstrap resolved";
+}
+
 }  // namespace
 
 struct gecko_runtime {
@@ -89,6 +116,9 @@ gecko_runtime* gecko_runtime_create(const gecko_runtime_config* config) {
   rt->jit = config && config->jit_enabled;
   if (rt->jit) {
     ProbeJit(rt->jit_detail);
+    std::string xul_detail;
+    ProbeXul(xul_detail);
+    rt->jit_detail += "  |  " + xul_detail;
   } else {
     rt->jit_detail = "JIT disabled by config";
   }
