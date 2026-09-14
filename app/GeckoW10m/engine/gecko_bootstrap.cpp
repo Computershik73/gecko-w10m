@@ -67,6 +67,31 @@ void RedirectStdErrTo(const std::wstring& path) {
   ::SetStdHandle(STD_OUTPUT_HANDLE, h);
 }
 
+// The engine reads its environment through the C runtime -- PR_GetEnv is
+// getenv, and gfxPlatform::IsHeadless asks it directly -- and ucrtbase copies
+// the Win32 environment block once at process start and never looks again.
+// SetEnvironmentVariableW updates the block, not the copy, so nothing set that
+// way is visible to the engine. GeckoW10m.exe cannot fix that with its own
+// putenv either: it links the static runtime, so its environment is a third
+// one that xul.dll never reads.
+//
+// Setting it where the engine looks means calling ucrtbase's own _wputenv_s.
+// This is why MOZ_HEADLESS was ignored -- the Windows widget backend was being
+// used on a device with no windows -- and why MOZ_LOG_FILE produced nothing.
+void SetEngineEnvironment(const wchar_t* name, const wchar_t* value) {
+  using PutEnvFn = int(__cdecl*)(const wchar_t*, const wchar_t*);
+  static PutEnvFn crtPutEnv = [] {
+    HMODULE ucrt = ::GetModuleHandleW(L"ucrtbase.dll");
+    return ucrt ? reinterpret_cast<PutEnvFn>(::GetProcAddress(ucrt, "_wputenv_s"))
+                : nullptr;
+  }();
+
+  ::SetEnvironmentVariableW(name, value);
+  if (crtPutEnv) {
+    crtPutEnv(name, value);
+  }
+}
+
 using GetBootstrapFn = void(NS_FROZENCALL*)(mozilla::Bootstrap::UniquePtr&);
 
 }  // namespace
@@ -80,8 +105,8 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
 
   // Headless, and single process: an app container cannot spawn the content
   // child, and the build is configured for a single process anyway.
-  ::SetEnvironmentVariableW(L"MOZ_HEADLESS", L"1");
-  ::SetEnvironmentVariableW(L"MOZ_FORCE_DISABLE_E10S", L"1");
+  SetEngineEnvironment(L"MOZ_HEADLESS", L"1");
+  SetEngineEnvironment(L"MOZ_FORCE_DISABLE_E10S", L"1");
 
   // Where libxul writes the delay-load substitutions it had to make. See the
   // failure hook in toolkit/xre/Bootstrap.cpp.
@@ -95,11 +120,11 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // Gecko's own logging, next to ours, so a failure inside the engine says
   // more than a return code.
   const std::wstring geckoLog = profile + L"\\gecko.log";
-  ::SetEnvironmentVariableW(
+  SetEngineEnvironment(
       L"MOZ_LOG",
       L"timestamp,sync,nsAppRunner:5,XRE:5,nsComponentManager:5,"
       L"nsChromeRegistry:5,nsIOService:5,URILoader:5");
-  ::SetEnvironmentVariableW(L"MOZ_LOG_FILE", geckoLog.c_str());
+  SetEngineEnvironment(L"MOZ_LOG_FILE", geckoLog.c_str());
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 
   Log("bootstrap: loading xul.dll");
