@@ -779,6 +779,26 @@ index b159e14d6c..d3703ee280 100644
                                   __uuidof(IDWriteFactory),
                                   reinterpret_cast<IUnknown**>(factory)),
           "Could not create DirectWrite factory.");
+diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
+index f45971a4ec..3f18f8c337 100644
+--- a/gfx/thebes/gfxPlatform.cpp
++++ b/gfx/thebes/gfxPlatform.cpp
+@@ -1344,7 +1344,14 @@ void gfxPlatform::InitLayersIPC() {
+ 
+   if (XRE_IsParentProcess()) {
+ #if defined(XP_WIN)
+-    if (gfxConfig::IsEnabled(gfx::Feature::WINDOW_OCCLUSION)) {
++    // There is nothing to track when there are no windows. Headless has none
++    // by definition, and a packaged app has a CoreWindow rather than the
++    // desktop windows this watches. Either way the tracker's constructor
++    // reaches WinEventWindow::Ensure, which registers a window class and
++    // creates a message-only window -- neither of which exists on a device
++    // without USER32's window functions, and it crashes rather than fail.
++    if (!gfxPlatform::IsHeadless() &&
++        gfxConfig::IsEnabled(gfx::Feature::WINDOW_OCCLUSION)) {
+       widget::WinWindowOcclusionTracker::Ensure();
+     }
+ #endif
 diff --git a/gfx/ycbcr/moz.build b/gfx/ycbcr/moz.build
 index af79c8e59c..44b0bae9bc 100644
 --- a/gfx/ycbcr/moz.build
