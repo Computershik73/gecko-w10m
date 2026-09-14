@@ -19,127 +19,143 @@ its own address instead of a ManifestProcessingContext, read a member 24 bytes
 into its own code, and NS_NewURI dereferenced the result.
 
 The clang bug is in the thunk, not in Control Flow Guard -- but CFG decides
-whether there is room to repair it. With -guard:cf the thunk grows to 34 bytes
-inside a 48-byte slot, because it has to save the target across the guard call:
-
-    push {r4, r5, r11, lr}
-    mov  r4, r0              ; this
-    ldr  r0, [r0]            ; vtable
-    movw r1, #...            ; &__guard_check_icall_fptr   <- r1 dies here
-    movt r1, #...
-    ldr  r1, [r1]
-    ldr  r0, [r0, #N]        ; target
-    mov  r5, r0
-    blx  r1                  ; the guard check
-    mov  r0, r4
-    mov  r1, r5
-    pop  {r4, r5, r11, lr}
-    bx   r1
-
-Fourteen spare bytes, and ten are needed. Without the guard the thunk is six
-bytes with nothing after it, and there is nowhere to put a correct one. So the
-engine is built with -guard:cf for the space and the flag is cleared in the
-image afterwards so the guard is never enforced (its tables are wrong on this
-target too -- see tools/strip-cfg.py), and each thunk is replaced here with
-what MSVC would have emitted:
+whether there is room to repair it. With -guard:cf the thunk has to keep the
+target across the guard call, which grows it to around 34 bytes in a 48-byte
+slot; ten are needed for a correct one. Without the guard it is six bytes with
+nothing after it, and a correct thunk does not fit. So the engine is built with
+-guard:cf for the space, the flag is cleared in the image afterwards so the
+guard is never enforced (its tables are wrong on this target too -- see
+tools/strip-cfg.py), and each thunk is replaced here with what MSVC would have
+emitted:
 
     ldr.w r12, [r0]
     ldr.w r12, [r12, #N]
     bx    r12
 
-N is read out of the thunk being replaced, so nothing needs to be known about
-the class. The rest of the slot is filled with nops; it is unreachable.
+Thunks are found through the linker map rather than by matching their bytes:
+clang allocates registers differently from one to the next, so the prologue
+varies while only the last few instructions are constant. Those constant ones
+are the tail below, and the load right before them carries the vtable offset,
+which is the only thing that has to be recovered.
 
-Usage: python tools/patch-vcall-thunks.py <image.dll> [...]
+Usage: python tools/patch-vcall-thunks.py <image.dll> <image.map>
 """
 
+import re
 import struct
 import sys
 from pathlib import Path
 
-# push {r4,r5,r11,lr} / mov r4,r0 / ldr r0,[r0]
-HEAD = bytes.fromhex("2de93048") + bytes.fromhex("0446") + bytes.fromhex("0068")
-# mov r5,r0 / blx r1 / mov r0,r4 / mov r1,r5 / pop {r4,r5,r11,lr} / bx r1
-TAIL = (bytes.fromhex("0546") + bytes.fromhex("8847") + bytes.fromhex("2046") +
-        bytes.fromhex("2946") + bytes.fromhex("bde83048") + bytes.fromhex("0847"))
-
+# mov rX,r0 / blx r1 / mov r0,r4 / mov r1,r5 / pop {r4,r5,r11,lr} / bx r1
+TAIL = bytes.fromhex("8847204629 46bde830480847".replace(" ", ""))
 NOP = bytes.fromhex("00bf")
 
+MAP_SYMBOL = re.compile(r"^\s+[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})")
+MAP_BASE = re.compile(r"Preferred load address is\s+([0-9a-fA-F]+)")
 
-def vtable_offset(code: bytes):
-    """The offset in `ldr r0, [r0, #N]`, narrow or wide, or None."""
+
+def thunk_rvas(map_path):
+    """Every `??_9` vcall thunk in the map, as image-relative addresses."""
+    base = None
+    out = []
+    with open(map_path, "r", errors="replace") as f:
+        for line in f:
+            if base is None:
+                found = MAP_BASE.search(line)
+                if found:
+                    base = int(found.group(1), 16)
+                continue
+            found = MAP_SYMBOL.match(line)
+            if found and found.group(1).startswith("??_9"):
+                out.append(int(found.group(2), 16) - base)
+    return sorted(set(out))
+
+
+def section_table(data):
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    count = struct.unpack_from("<H", data, pe + 6)[0]
+    opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+    first = pe + 24 + opt_size
+    sections = []
+    for i in range(count):
+        entry = first + i * 40
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from(
+            "<IIII", data, entry + 8
+        )
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_pointer))
+    return sections
+
+
+def to_offset(sections, rva):
+    for virtual_address, size, raw_pointer in sections:
+        if virtual_address <= rva < virtual_address + size:
+            return raw_pointer + (rva - virtual_address)
+    return None
+
+
+def vtable_offset(code):
+    """The offset in the `ldr rT, [rB, #N]` that reads the vtable slot."""
     if len(code) == 2:
         (hw,) = struct.unpack_from("<H", code)
-        # T1: 0110 1 imm5 Rn(3) Rt(3), with Rn = Rt = r0
-        if hw & 0xF83F == 0x6800:
+        # T1: 0110 1 imm5 Rn Rt, low registers only.
+        if hw & 0xF800 == 0x6800:
             return ((hw >> 6) & 0x1F) * 4
-    elif len(code) == 4:
+    else:
         first, second = struct.unpack_from("<HH", code)
-        # T3: F8D0 0imm12
-        if first == 0xF8D0 and second & 0xF000 == 0x0000:
+        # T3: 1111 1000 1101 Rn / Rt imm12
+        if first & 0xFFF0 == 0xF8D0:
             return second & 0x0FFF
     return None
 
 
-def replacement(offset: int) -> bytes:
-    if offset > 0xFFF:
-        return b""
-    return (struct.pack("<HH", 0xF8D0, 0xC000) +          # ldr.w r12, [r0]
-            struct.pack("<HH", 0xF8DC, 0xC000 | offset) +  # ldr.w r12, [r12, #N]
-            struct.pack("<H", 0x4760))                     # bx r12
+def patch(image_path, map_path):
+    data = bytearray(image_path.read_bytes())
+    sections = section_table(data)
 
+    fixed = skipped = 0
+    for rva in thunk_rvas(map_path):
+        start = to_offset(sections, rva)
+        if start is None:
+            skipped += 1
+            continue
 
-def patch(path: Path) -> int:
-    data = bytearray(path.read_bytes())
+        # The tail is the only constant part. Everything before it is prologue
+        # whose shape depends on how clang happened to allocate registers.
+        window = bytes(data[start:start + 48])
+        at = window.find(TAIL)
+        if at < 0:
+            skipped += 1
+            continue
 
-    fixed = 0
-    skipped = 0
-    start = 0
-    while True:
-        head = data.find(HEAD, start)
-        if head < 0:
-            break
-        start = head + len(HEAD)
-
-        # The ldr that reads the vtable slot sits immediately before the tail,
-        # and is two bytes or four depending on how far into the table it is.
-        body = head + len(HEAD)
+        # Immediately before the tail: mov rX,r0 (2 bytes), and before that the
+        # load of the vtable slot, narrow or wide.
+        offset = None
         for width in (2, 4):
-            tail = body + 6 + width  # the movw/movt/ldr pair is 10 bytes
-            if data[tail:tail + len(TAIL)] == TAIL:
-                offset = vtable_offset(bytes(data[tail - width:tail]))
+            offset = vtable_offset(window[at - 2 - width:at - 2])
+            if offset is not None:
                 break
-        else:
-            continue
-
-        if offset is None:
-            skipped += 1
-            continue
-        new = replacement(offset)
-        if not new:
+        if offset is None or offset > 0xFFF:
             skipped += 1
             continue
 
-        end = tail + len(TAIL)
-        data[head:end] = new + NOP * ((end - head - len(new)) // 2)
+        end = start + at + len(TAIL)
+        new = (struct.pack("<HH", 0xF8D0, 0xC000) +           # ldr.w r12, [r0]
+               struct.pack("<HH", 0xF8DC, 0xC000 | offset) +  # ldr.w r12, [r12, #N]
+               struct.pack("<H", 0x4760))                     # bx r12
+        data[start:end] = new + NOP * ((end - start - len(new)) // 2)
         fixed += 1
 
-    if not fixed and not skipped:
-        print(f"{path.name}: no thunks of this shape")
-        return 0
-
-    path.write_bytes(bytes(data))
+    image_path.write_bytes(bytes(data))
     note = f", {skipped} left alone" if skipped else ""
-    print(f"{path.name}: {fixed} vcall thunks rewritten to use r12{note}")
+    print(f"{image_path.name}: {fixed} vcall thunks rewritten to use r12{note}")
     return fixed
 
 
 def main(argv):
-    if len(argv) < 2:
+    if len(argv) != 3:
         print(__doc__)
         return 2
-    for name in argv[1:]:
-        patch(Path(name))
+    patch(Path(argv[1]), Path(argv[2]))
     return 0
 
 
