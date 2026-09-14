@@ -2,21 +2,11 @@
 
 #include <windows.h>
 
-#include <atomic>
 #include <string>
 
 #include "../client/Log.h"
+#include "CrashProbe.h"
 #include "gecko_bootstrap.h"
-
-// The app partition of errhandlingapi.h hides this one, though kernel32 exports
-// it and an app container may call it. Declared here rather than compiling the
-// whole file for the desktop partition, which would drag the A/W macros in
-// ahead of everything else.
-extern "C" {
-using GeckoW10mVectoredHandler = LONG(CALLBACK*)(PEXCEPTION_POINTERS);
-__declspec(dllimport) PVOID WINAPI
-AddVectoredExceptionHandler(ULONG First, GeckoW10mVectoredHandler Handler);
-}
 
 namespace gecko_w10m::engine {
 namespace {
@@ -34,12 +24,6 @@ std::wstring Widen(const char* s) {
 
 void BridgeLog(const char* line) { Log::Write(L"gecko", Widen(line)); }
 
-std::wstring Hex(uintptr_t v) {
-  wchar_t buf[19];
-  ::swprintf_s(buf, L"0x%08llx", static_cast<unsigned long long>(v));
-  return buf;
-}
-
 std::wstring InstallDirectory() {
   wchar_t buf[MAX_PATH] = {};
   DWORD n = ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -49,71 +33,6 @@ std::wstring InstallDirectory() {
   if (slash == std::wstring::npos) return std::wstring();
   path.resize(slash);
   return path;
-}
-
-// An address on its own says nothing across runs -- ASLR moves every module.
-// Named against its module and offset it stays meaningful, and an offset into
-// xul.dll can be looked up against the build that produced it.
-std::wstring DescribeAddress(const void* addr) {
-  HMODULE mod = nullptr;
-  if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            static_cast<LPCWSTR>(addr), &mod) ||
-      !mod) {
-    return Hex(reinterpret_cast<uintptr_t>(addr)) + L" (no module)";
-  }
-
-  wchar_t path[MAX_PATH] = {};
-  DWORD n = ::GetModuleFileNameW(mod, path, MAX_PATH);
-  std::wstring name(path, n);
-  auto slash = name.find_last_of(L'\\');
-  if (slash != std::wstring::npos) name = name.substr(slash + 1);
-
-  uintptr_t rva = reinterpret_cast<uintptr_t>(addr) -
-                  reinterpret_cast<uintptr_t>(mod);
-  return name + L"+" + Hex(rva);
-}
-
-// MOZ_CRASH lands here as a breakpoint, which is why 0x80000003 counts as
-// fatal: it is how Gecko says "this is unrecoverable" on Windows.
-bool IsFatal(DWORD code) {
-  switch (code) {
-    case EXCEPTION_ACCESS_VIOLATION:
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-    case EXCEPTION_IN_PAGE_ERROR:
-    case EXCEPTION_STACK_OVERFLOW:
-    case EXCEPTION_PRIV_INSTRUCTION:
-    case EXCEPTION_DATATYPE_MISALIGNMENT:
-    case EXCEPTION_INT_DIVIDE_BY_ZERO:
-    case EXCEPTION_BREAKPOINT:
-    case STATUS_HEAP_CORRUPTION:
-      return true;
-    default:
-      return false;
-  }
-}
-
-std::atomic<int> gReported{0};
-constexpr int kMaxReports = 4;
-
-LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
-  const DWORD code = info->ExceptionRecord->ExceptionCode;
-  if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
-  if (gReported.fetch_add(1) >= kMaxReports) return EXCEPTION_CONTINUE_SEARCH;
-
-  Log::Write(L"crash: code " + Hex(code) + L" at " +
-             DescribeAddress(info->ExceptionRecord->ExceptionAddress));
-
-  // The frames are the actually useful part: the faulting address alone rarely
-  // names the caller that got there.
-  void* frames[24] = {};
-  USHORT count = ::RtlCaptureStackBackTrace(0, 24, frames, nullptr);
-  for (USHORT i = 0; i < count; ++i) {
-    Log::Write(L"crash:   " + DescribeAddress(frames[i]));
-  }
-
-  // Not ours to handle -- only to record.
-  return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // Bringing an engine up on a phone means the process may well die where it
@@ -221,9 +140,9 @@ bool StartGeckoRuntime(const std::wstring& localStatePath) {
   const std::wstring profileDir = localStatePath + L"\\profile";
   ::CreateDirectoryW(profileDir.c_str(), nullptr);
 
-  // First chance, before anyone else: a crash inside Gecko takes the process
-  // with it, and this is the only record that survives.
-  ::AddVectoredExceptionHandler(1, &OnException);
+  // Before anything of Gecko's runs: whatever takes the process down, this is
+  // the only record that survives it.
+  InstallCrashProbes();
 
   gecko_w10m_gecko_set_logger(&BridgeLog);
 
