@@ -97,7 +97,16 @@ if [ ! -f "$CERT" ]; then
     Write-Output ('    thumbprint ' + \$c.Thumbprint)" | tail -2
 fi
 # /a must not be combined with /f: signtool then rejects the package outright.
-"$BIN/signtool.exe" sign /fd SHA256 /f "$(cygpath -w "$CERT")" /p gecko_w10m "$(cygpath -w "$PKG")"
+# makeappx can still be holding the file when signtool opens it, which shows
+# up as "this file format cannot be signed"; retry a few times.
+for attempt in 1 2 3 4 5; do
+  if "$BIN/signtool.exe" sign /fd SHA256 /f "$(cygpath -w "$CERT")" /p gecko_w10m \n       "$(cygpath -w "$PKG")"; then
+    break
+  fi
+  echo "    sign attempt $attempt failed, retrying"
+  sleep 3
+  [ "$attempt" = 5 ] && exit 1
+done
 
 echo
 echo "PACKAGE: $PKG"
