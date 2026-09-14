@@ -1,0 +1,14 @@
+diff --git a/mozglue/build/moz.build b/mozglue/build/moz.build
+index f8f01e999e..14f7290096 100644
+--- a/mozglue/build/moz.build
++++ b/mozglue/build/moz.build
+@@ -92,3 +92,9 @@ if CONFIG["MOZ_LINKER"] and CONFIG["TARGET_CPU"] == "arm":
+ DIST_INSTALL = True
+ 
+ include("replace_malloc.mozbuild")
++
++# Same reason as toolkit/library/build: this port has no debug symbols, so a
++# crash address inside mozglue resolves to nothing without a linker map. See
++# tools/symbolize.py.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:mozglue.map"]

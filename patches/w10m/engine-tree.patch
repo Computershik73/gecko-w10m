@@ -1757,6 +1757,53 @@ index f924eb3402..110543db8d 100644
      SOURCES += [
          'alpha_processing_neon.c',
          'cost_neon.c',
+diff --git a/memory/mozalloc/mozalloc_abort.cpp b/memory/mozalloc/mozalloc_abort.cpp
+index 23c581f416..f01ed426eb 100644
+--- a/memory/mozalloc/mozalloc_abort.cpp
++++ b/memory/mozalloc/mozalloc_abort.cpp
+@@ -17,7 +17,42 @@
+ #include "mozilla/Assertions.h"
+ #include "mozilla/Sprintf.h"
+ 
++#if defined(GECKO_W10M)
++#  include <windows.h>
++
++// The message carries the size that could not be allocated, and it is built on
++// the stack of the function that is about to crash -- so it is gone by the time
++// anything can be read off the device. stderr does not help either: a packaged
++// app has no console, and ucrtbase bound its streams to handles that go
++// nowhere.
++//
++// This is deliberately a copy of what toolkit/xre/Bootstrap.cpp does rather
++// than a call to it. mozglue sits underneath xul and cannot reach up into it.
++static void GeckoW10mNoteFromMozglue(const char* text) {
++  wchar_t path[MAX_PATH] = {};
++  if (!::GetEnvironmentVariableW(L"GECKO_W10M_NOTE_LOG", path, MAX_PATH)) return;
++
++  CREATEFILE2_EXTENDED_PARAMETERS params{};
++  params.dwSize = sizeof(params);
++  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++  HANDLE file = ::CreateFile2(path, FILE_APPEND_DATA, FILE_SHARE_READ,
++                              OPEN_ALWAYS, &params);
++  if (file == INVALID_HANDLE_VALUE) return;
++
++  ::SetFilePointer(file, 0, nullptr, FILE_END);
++  DWORD written = 0;
++  ::WriteFile(file, "mozalloc: ", 10, &written, nullptr);
++  ::WriteFile(file, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
++  ::WriteFile(file, "\r\n", 2, &written, nullptr);
++  ::FlushFileBuffers(file);
++  ::CloseHandle(file);
++}
++#endif
++
+ void mozalloc_abort(const char* const msg) {
++#if defined(GECKO_W10M)
++  GeckoW10mNoteFromMozglue(msg);
++#endif
+ #ifndef ANDROID
+   fputs(msg, stderr);
+   fputs("\n", stderr);
 diff --git a/mfbt/ResultExtensions.h b/mfbt/ResultExtensions.h
 index c7c2543888..c44afa26c7 100644
 --- a/mfbt/ResultExtensions.h
@@ -1820,6 +1867,20 @@ index bdad42c5bb..ce70d6cea4 100644
          "x86",
          "x86_64",
      ):
+diff --git a/mozglue/build/moz.build b/mozglue/build/moz.build
+index f8f01e999e..14f7290096 100644
+--- a/mozglue/build/moz.build
++++ b/mozglue/build/moz.build
+@@ -92,3 +92,9 @@ if CONFIG["MOZ_LINKER"] and CONFIG["TARGET_CPU"] == "arm":
+ DIST_INSTALL = True
+ 
+ include("replace_malloc.mozbuild")
++
++# Same reason as toolkit/library/build: this port has no debug symbols, so a
++# crash address inside mozglue resolves to nothing without a linker map. See
++# tools/symbolize.py.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:mozglue.map"]
 diff --git a/mozglue/misc/StackWalk.cpp b/mozglue/misc/StackWalk.cpp
 index c04908f945..a0b17add90 100644
 --- a/mozglue/misc/StackWalk.cpp
