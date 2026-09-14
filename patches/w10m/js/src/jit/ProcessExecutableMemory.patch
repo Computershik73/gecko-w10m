@@ -1,5 +1,5 @@
 diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
-index cea7d764ca..e61d700ac5 100644
+index cea7d764ca..4a41f53ba5 100644
 --- a/js/src/jit/ProcessExecutableMemory.cpp
 +++ b/js/src/jit/ProcessExecutableMemory.cpp
 @@ -8,6 +8,7 @@
@@ -48,30 +48,57 @@ index cea7d764ca..e61d700ac5 100644
    static const uintptr_t base = 0x04000000;
    static const uintptr_t mask = 0x3fff0000;
  #  else
-@@ -381,6 +404,22 @@ static DWORD ProtectionSettingToFlags(ProtectionSetting protection) {
-   void* p = VirtualAlloc(addr, bytes, MEM_COMMIT,
-                          ProtectionSettingToFlags(protection));
+@@ -378,12 +401,47 @@ static DWORD ProtectionSettingToFlags(ProtectionSetting protection) {
+ 
+ [[nodiscard]] static bool CommitPages(void* addr, size_t bytes,
+                                       ProtectionSetting protection) {
+-  void* p = VirtualAlloc(addr, bytes, MEM_COMMIT,
+-                         ProtectionSettingToFlags(protection));
++  const DWORD wanted = ProtectionSettingToFlags(protection);
++
++#if defined(GECKO_W10M)
++  // An app container will not hand out an executable page at commit time:
++  // VirtualAllocFromApp answers PAGE_EXECUTE_READ with ERROR_INVALID_PARAMETER
++  // however the capability is declared. What codeGeneration grants is the
++  // transition, not the initial state -- memory is committed writable and then
++  // turned over, which is exactly the sequence the shell's startup probe has
++  // been demonstrating all along.
++  const DWORD committed = (wanted == PAGE_READWRITE) ? wanted : PAGE_READWRITE;
++#else
++  const DWORD committed = wanted;
++#endif
++
++  void* p = VirtualAlloc(addr, bytes, MEM_COMMIT, committed);
    if (!p) {
 +#if defined(GECKO_W10M)
-+    // The reservation succeeds and this does not, which is the whole failure:
-+    // no committed page means no code, and the first thing to compile reports
-+    // out of memory from four frames away. An app container refuses
-+    // PAGE_EXECUTE_READWRITE outright -- that is what the codeGeneration
-+    // capability and the FromApp entry points exist to replace -- so the
-+    // protection being asked for matters as much as the error code.
 +    char note[128];
-+    SprintfLiteral(note,
-+                   "jit: commit of %u bytes at %p failed, protection 0x%x, "
-+                   "err %u, wx %d",
-+                   unsigned(bytes), addr,
-+                   unsigned(ProtectionSettingToFlags(protection)),
-+                   unsigned(GetLastError()), int(JitOptions.writeProtectCode));
++    SprintfLiteral(note, "jit: commit of %u bytes at %p failed, 0x%x, err %u",
++                   unsigned(bytes), addr, unsigned(committed),
++                   unsigned(GetLastError()));
 +    GeckoW10mNote(note);
 +#endif
      return false;
    }
    MOZ_RELEASE_ASSERT(p == addr);
-@@ -718,6 +757,17 @@ class ProcessExecutableMemory {
++
++#if defined(GECKO_W10M)
++  if (committed != wanted) {
++    ULONG previous = 0;
++    if (!VirtualProtect(addr, bytes, wanted, &previous)) {
++      char note[128];
++      SprintfLiteral(note, "jit: protect of %u bytes at %p to 0x%x failed, err %u",
++                     unsigned(bytes), addr, unsigned(wanted),
++                     unsigned(GetLastError()));
++      GeckoW10mNote(note);
++      return false;
++    }
++  }
++#endif
++
+   return true;
+ }
+ 
+@@ -718,6 +776,17 @@ class ProcessExecutableMemory {
      MOZ_RELEASE_ASSERT(gc::SystemPageSize() <= ExecutableCodePageSize);
  
      void* p = ReserveProcessExecutableMemory(MaxCodeBytesPerProcess);
@@ -89,7 +116,7 @@ index cea7d764ca..e61d700ac5 100644
      if (!p) {
        return false;
      }
-@@ -783,6 +833,15 @@ void* ProcessExecutableMemory::allocate(size_t bytes,
+@@ -783,6 +852,15 @@ void* ProcessExecutableMemory::allocate(size_t bytes,
  
      // Check if we have enough pages available.
      if (pagesAllocated_ + numPages >= MaxCodePages) {
