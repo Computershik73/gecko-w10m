@@ -165,7 +165,39 @@ std::wstring FaultDetail(const EXCEPTION_RECORD& record) {
                         : kind == 1 ? L"writing "
                                     : L"executing ";
   return std::wstring(L", ") + verb +
-         Hex(static_cast<uintptr_t>(record.ExceptionInformation[1]));
+         DescribeAddress(
+             reinterpret_cast<const void*>(record.ExceptionInformation[1]));
+}
+
+// Which register held the address that faulted, and what the instruction was.
+// With no symbols and no debugger this is what is left, and between the two it
+// is usually enough to find the faulting line in the source.
+std::wstring Registers(const CONTEXT& context) {
+  const DWORD values[] = {context.R0,  context.R1,  context.R2,  context.R3,
+                          context.R4,  context.R5,  context.R6,  context.R7,
+                          context.R8,  context.R9,  context.R10, context.R11,
+                          context.R12};
+  std::wstring out;
+  for (int i = 0; i < 13; ++i) {
+    out += L" r" + std::to_wstring(i) + L"=" + Hex(values[i]);
+  }
+  return out + L" sp=" + Hex(context.Sp) + L" lr=" + Hex(context.Lr);
+}
+
+// Thumb-2, so an instruction is two bytes or four and there is no telling
+// which without decoding it. Sixteen bytes covers the faulting one and its
+// neighbours, which is what makes it readable.
+std::wstring CodeAt(const void* pc) {
+  // The low bit of a Thumb address is the mode flag, not part of the address.
+  auto* bytes = reinterpret_cast<const unsigned char*>(
+      reinterpret_cast<uintptr_t>(pc) & ~static_cast<uintptr_t>(1));
+  std::wstring out;
+  for (int i = 0; i < 16; ++i) {
+    wchar_t pair[4];
+    ::swprintf_s(pair, L"%02x ", bytes[i]);
+    out += pair;
+  }
+  return out;
 }
 
 std::atomic<int> gReported{0};
@@ -700,6 +732,9 @@ LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
              L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
              FaultDetail(*info->ExceptionRecord));
   LogMemory(L"FATAL:");
+  Log::Write(L"FATAL: code" + Registers(*info->ContextRecord));
+  Log::Write(L"FATAL: at pc " +
+             CodeAt(info->ExceptionRecord->ExceptionAddress));
   LogStack(L"FATAL:", *info->ContextRecord);
   return EXCEPTION_CONTINUE_SEARCH;
 }
