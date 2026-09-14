@@ -1,0 +1,45 @@
+diff --git a/chrome/nsChromeRegistryChrome.cpp b/chrome/nsChromeRegistryChrome.cpp
+index b28f2b7ff8..1713ca59de 100644
+--- a/chrome/nsChromeRegistryChrome.cpp
++++ b/chrome/nsChromeRegistryChrome.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "nsChromeRegistryChrome.h"
+ 
++#include "nsPrintfCString.h"
++
+ #if defined(XP_WIN)
+ #  include <windows.h>
+ #elif defined(XP_MACOSX)
+@@ -414,11 +416,31 @@ void nsChromeRegistryChrome::nsProviderArray::EnumerateToArray(
+   }
+ }
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ nsIURI* nsChromeRegistry::ManifestProcessingContext::GetManifestURI() {
+   if (!mManifestURI) {
+     nsCString uri;
+     mFile.GetURIString(uri);
++#if defined(GECKO_W10M)
++    // ResolveURI's NS_NewURI faults dereferencing what this returns, on a
++    // pointer that is neither null nor inside any module. The call below
++    // ignores its result, which upstream is safe because NS_NewURI does not
++    // write to the out parameter unless it succeeds -- so either that does not
++    // hold here, or what it produced is not an object. Report the string that
++    // went in and what came back.
++    nsresult rv = NS_NewURI(getter_AddRefs(mManifestURI), uri);
++    nsPrintfCString note("manifest uri \"%s\" -> rv=0x%08x ptr=%p", uri.get(),
++                         static_cast<uint32_t>(rv),
++                         static_cast<void*>(mManifestURI.get()));
++    GeckoW10mNote(note.get());
++#else
+     NS_NewURI(getter_AddRefs(mManifestURI), uri);
++#endif
+   }
+   return mManifestURI;
+ }

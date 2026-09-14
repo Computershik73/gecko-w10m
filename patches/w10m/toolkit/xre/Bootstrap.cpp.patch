@@ -1,8 +1,8 @@
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..48fc612c97 100644
+index fe113c825c..3caad7fc35 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -18,6 +18,102 @@ extern "C" int __llvm_profile_dump(void);
+@@ -18,6 +18,115 @@ extern "C" int __llvm_profile_dump(void);
  #  endif
  #endif
  
@@ -36,11 +36,9 @@ index fe113c825c..48fc612c97 100644
 +// caller that expected success will misbehave rather than crash. So every
 +// substitution is written down, and GECKO_W10M_DELAYLOAD_LOG says where.
 +
-+void RecordSubstitution(const char* dll, const char* proc) {
++void AppendLine(const wchar_t* variable, const char* text) {
 +  wchar_t path[MAX_PATH] = {};
-+  if (!::GetEnvironmentVariableW(L"GECKO_W10M_DELAYLOAD_LOG", path, MAX_PATH)) {
-+    return;
-+  }
++  if (!::GetEnvironmentVariableW(variable, path, MAX_PATH)) return;
 +
 +  CREATEFILE2_EXTENDED_PARAMETERS params{};
 +  params.dwSize = sizeof(params);
@@ -49,24 +47,28 @@ index fe113c825c..48fc612c97 100644
 +                              OPEN_ALWAYS, &params);
 +  if (file == INVALID_HANDLE_VALUE) return;
 +
++  ::SetFilePointer(file, 0, nullptr, FILE_END);
++  DWORD written = 0;
++  ::WriteFile(file, text, static_cast<DWORD>(std::strlen(text)), &written,
++              nullptr);
++  ::WriteFile(file, "\r\n", 2, &written, nullptr);
++  ::FlushFileBuffers(file);
++  ::CloseHandle(file);
++}
++
++void RecordSubstitution(const char* dll, const char* proc) {
 +  char line[256];
 +  int length = 0;
 +  auto append = [&](const char* text) {
-+    while (*text && length < static_cast<int>(sizeof(line)) - 2) {
++    while (*text && length < static_cast<int>(sizeof(line)) - 1) {
 +      line[length++] = *text++;
 +    }
 +  };
 +  append(dll ? dll : "?");
 +  append("!");
 +  append(proc ? proc : "(ordinal)");
-+  line[length++] = '\r';
-+  line[length++] = '\n';
-+
-+  ::SetFilePointer(file, 0, nullptr, FILE_END);
-+  DWORD written = 0;
-+  ::WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
-+  ::FlushFileBuffers(file);
-+  ::CloseHandle(file);
++  line[length] = 0;
++  AppendLine(L"GECKO_W10M_DELAYLOAD_LOG", line);
 +}
 +
 +// Zero in r0. Any caller's arguments are its own to clean up, so this is a
@@ -94,6 +96,17 @@ index fe113c825c..48fc612c97 100644
 +}
 +
 +}  // namespace
++
++// Bringing an engine up on a device with no debugger means the engine has to
++// be able to say things. printf_stderr goes nowhere in a packaged app -- the
++// process has no console, and ucrtbase captured the standard handles long
++// before anything could redirect them -- and MOZ_LOG is not up yet during the
++// startup this port keeps dying in. This writes one line to a file the shell
++// names, immediately and flushed, which is enough to instrument a suspect
++// function and read the answer off the device afterwards.
++extern "C" void GeckoW10mNote(const char* text) {
++  AppendLine(L"GECKO_W10M_NOTE_LOG", text);
++}
 +
 +// The hook is const -- it was made so deliberately, a writable global function
 +// pointer being an obvious thing to attack -- so it is defined here rather than

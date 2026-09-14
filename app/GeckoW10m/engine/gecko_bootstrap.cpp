@@ -85,6 +85,10 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
 
   // Where libxul writes the delay-load substitutions it had to make. See the
   // failure hook in toolkit/xre/Bootstrap.cpp.
+  // Ad-hoc notes from inside the engine, for bringing this port up.
+  ::SetEnvironmentVariableW(L"GECKO_W10M_NOTE_LOG",
+                            (profile + L"\gecko-notes.log").c_str());
+
   ::SetEnvironmentVariableW(L"GECKO_W10M_DELAYLOAD_LOG",
                             (profile + L"\\delay-load-used.log").c_str());
 
