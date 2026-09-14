@@ -980,13 +980,27 @@ index 1a5ff25334..1e8fee5a5e 100644
  namespace jit {
  
 diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
-index cea7d764ca..599a7e54e3 100644
+index cea7d764ca..1049ce52f5 100644
 --- a/js/src/jit/ProcessExecutableMemory.cpp
 +++ b/js/src/jit/ProcessExecutableMemory.cpp
-@@ -47,6 +47,19 @@
+@@ -8,6 +8,7 @@
+ #include "mozilla/Atomics.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/Maybe.h"
++#include "mozilla/Sprintf.h"
+ #include "mozilla/PodOperations.h"
+ #include "mozilla/TaggedAnonymousMemory.h"
+ #include "mozilla/XorShift128PlusRNG.h"
+@@ -47,6 +48,25 @@
  using namespace js;
  using namespace js::jit;
  
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
 +#if defined(XP_WIN) && defined(GECKO_W10M)
 +// Inside an app container, VirtualAlloc and VirtualProtect refuse
 +// PAGE_EXECUTE_READ / PAGE_EXECUTE_READWRITE no matter what the package
@@ -1003,7 +1017,7 @@ index cea7d764ca..599a7e54e3 100644
  #ifdef XP_WIN
  #  if defined(HAVE_64BIT_BUILD)
  #    define NEED_JIT_UNWIND_HANDLING
-@@ -67,7 +80,10 @@ static void* ComputeRandomAllocationAddress() {
+@@ -67,7 +87,10 @@ static void* ComputeRandomAllocationAddress() {
  #  ifdef HAVE_64BIT_BUILD
    static const uintptr_t base = 0x0000000080000000;
    static const uintptr_t mask = 0x000003ffffff0000;
@@ -1015,6 +1029,45 @@ index cea7d764ca..599a7e54e3 100644
    static const uintptr_t base = 0x04000000;
    static const uintptr_t mask = 0x3fff0000;
  #  else
+@@ -718,6 +741,17 @@ class ProcessExecutableMemory {
+     MOZ_RELEASE_ASSERT(gc::SystemPageSize() <= ExecutableCodePageSize);
+ 
+     void* p = ReserveProcessExecutableMemory(MaxCodeBytesPerProcess);
++#if defined(GECKO_W10M)
++    {
++      // Whether this succeeded decides whether there is a JIT at all, and a
++      // failure is otherwise only visible as an out-of-memory report from the
++      // first thing that tries to compile.
++      char note[96];
++      SprintfLiteral(note, "jit: reserved %u MB of executable memory at %p",
++                     unsigned(MaxCodeBytesPerProcess / (1024 * 1024)), p);
++      GeckoW10mNote(note);
++    }
++#endif
+     if (!p) {
+       return false;
+     }
+diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
+index 4a08d4a623..43260dd761 100644
+--- a/js/src/jit/ProcessExecutableMemory.h
++++ b/js/src/jit/ProcessExecutableMemory.h
+@@ -16,7 +16,15 @@ namespace jit {
+ 
+ // Limit on the number of bytes of executable memory to prevent JIT spraying
+ // attacks.
+-#if JS_BITS_PER_WORD == 32
++#if defined(GECKO_W10M)
++// This is reserved as one contiguous block at startup, and a phone running a
++// 32-bit process has to fit it alongside a 132 MB engine and everything the
++// app host has already mapped. 140 MB is a reasonable share of a desktop's
++// address space and an unreasonable one here; when the reservation fails the
++// JIT has no memory to allocate from at all, and the first compile reports
++// out of memory on a device using 23 MB of its 2048 MB allowance.
++static const size_t MaxCodeBytesPerProcess = 32 * 1024 * 1024;
++#elif JS_BITS_PER_WORD == 32
+ static const size_t MaxCodeBytesPerProcess = 140 * 1024 * 1024;
+ #else
+ // This is the largest number which satisfies various alignment static
 diff --git a/js/src/jit/arm/Architecture-arm.cpp b/js/src/jit/arm/Architecture-arm.cpp
 index 82c37d2d2a..44bc09786f 100644
 --- a/js/src/jit/arm/Architecture-arm.cpp
