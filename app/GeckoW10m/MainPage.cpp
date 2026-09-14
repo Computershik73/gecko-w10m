@@ -5,6 +5,7 @@
 #include <winrt/Windows.Foundation.Metadata.h>
 
 #include "client/Log.h"
+#include "engine/GeckoRuntimeHost.h"
 #include "client/SearchEngines.h"
 
 using namespace winrt;
@@ -73,6 +74,12 @@ MainPage::MainPage() {
   // shell sat on a static placeholder and never told us whether the runtime,
   // the JIT probe or xul.dll had worked.
   Navigate(L"about:home");
+
+  // Last, so the window is up and the log is readable before Gecko gets its
+  // chance to take the process down with it. Navigation still goes through the
+  // stub -- this brings the runtime up and reports how far it gets, nothing
+  // more.
+  engine::StartGeckoRuntime(std::wstring(localState));
 }
 
 void MainPage::ApplyVisibleBounds() {

@@ -41,7 +41,7 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/GeckoEngine.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
@@ -52,6 +52,26 @@ for s in $SRCS; do
         "/I$(cygpath -w "$APP")" "/I$(cygpath -w "$SDK/Include/$SDKV/cppwinrt")"
   OBJS="$OBJS $OBJDIR_W\\$name"
 done
+
+echo "=== compile the Gecko bootstrap (clang-cl, ARM) ==="
+# This one translation unit includes Gecko headers, and that decides its
+# compiler. mfbt uses clang builtins cl.exe does not have (__builtin_unreachable
+# among them), so it must be clang-cl -- and clang emits no C++ exception
+# handling at all on 32-bit ARM Windows, so exceptions must be off. Gecko is
+# built without them anyway. The rest of the shell is the mirror image: cl.exe
+# with exceptions on, because C++/WinRT requires both. The two halves meet at a
+# plain C boundary in gecko_bootstrap.h.
+#
+# gecko_w10m_arm_intrin.h fills in the MSVC ARM intrinsics the STL calls and clang
+# does not provide; the engine build force-includes it for the same reason.
+"$LLVM/clang-cl.exe" --target=thumbv7-windows-msvc /nologo /c \
+  "$(cygpath -w "$APP/engine/gecko_bootstrap.cpp")" \
+  "/Fo:$OBJDIR_W\\engine_gecko_bootstrap.obj" \
+  /std:c++20 /EHs-c- /GR- /O2 /utf-8 -FIgecko_w10m_arm_intrin.h \
+  /DWIN32 /D_WIN32 /DNOMINMAX /DUNICODE /D_UNICODE \
+  /DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP /DXP_WIN /DGECKO_W10M=1 \
+  "/I$(cygpath -w "$DIST/../include")"
+OBJS="$OBJS $OBJDIR_W\\engine_gecko_bootstrap.obj"
 
 echo "=== compat stubs ==="
 # Windows 10 Mobile does not carry every desktop module xul.dll imports, and a
@@ -72,8 +92,12 @@ for stub in ktmw32; do
 done
 
 echo "=== link GeckoW10m.exe ==="
+# mozglue.lib supplies moz_xmalloc and the rest of Gecko's allocator, which the
+# bootstrap unit reaches through the mfbt headers. mozglue.dll already ships in
+# the package, so this adds an import and no new payload.
 "$LLVM/lld-link.exe" $OBJS "/OUT:$STAGE_W\\GeckoW10m.exe" /APPCONTAINER \
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
+  "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
   WindowsApp.lib
 echo "    $(stat -c%s "$STAGE/GeckoW10m.exe") bytes"
 
