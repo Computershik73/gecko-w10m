@@ -1,0 +1,32 @@
+diff --git a/ipc/mscom/ProcessRuntime.cpp b/ipc/mscom/ProcessRuntime.cpp
+index 5faafce15f..537ddba7e1 100644
+--- a/ipc/mscom/ProcessRuntime.cpp
++++ b/ipc/mscom/ProcessRuntime.cpp
+@@ -255,6 +255,27 @@ void ProcessRuntime::InitInsideApartment() {
+     return;
+   }
+ 
++#if defined(GECKO_W10M)
++  // Gecko is a guest in this process. A packaged app is already running XAML
++  // by the time the runtime starts, and its dispatcher and cross-apartment
++  // marshalling stand on the COM configuration the app host installed before
++  // any of this existed.
++  //
++  // Everything below is process-wide, not ours to change. CoInitializeSecurity
++  // takes effect once for the whole process; COMGLB_EXCEPTION_DONOT_HANDLE_ANY
++  // changes how every COM call in the process treats an exception, so a fault
++  // the host used to absorb becomes fatal; SetOaNoCache turns the BSTR cache
++  // off for everyone. Reconfiguring COM underneath the host is how the UI
++  // thread ended up faulting inside CoreUIComponents with not one Gecko frame
++  // on its stack.
++  //
++  // The apartment this thread joined is still real, so COM works for Gecko --
++  // it simply stops rewriting the host's settings.
++  mInitResult = S_OK;
++  lock.SetInitState(ProcessInitState::FullyInitialized);
++  return;
++#endif
++
+   if (prevInitState < ProcessInitState::PartialSecurityInitialized) {
+     // We are required to initialize security prior to configuring global
+     // options.
