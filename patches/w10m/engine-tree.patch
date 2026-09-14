@@ -980,7 +980,7 @@ index 1a5ff25334..1e8fee5a5e 100644
  namespace jit {
  
 diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
-index cea7d764ca..4a41f53ba5 100644
+index cea7d764ca..a1df907396 100644
 --- a/js/src/jit/ProcessExecutableMemory.cpp
 +++ b/js/src/jit/ProcessExecutableMemory.cpp
 @@ -8,6 +8,7 @@
@@ -1113,6 +1113,35 @@ index cea7d764ca..4a41f53ba5 100644
        return nullptr;
      }
  
+@@ -975,11 +1053,28 @@ bool js::jit::ReprotectRegion(void* start, size_t size,
+ 
+ #  ifdef XP_WIN
+   DWORD flags = ProtectionSettingToFlags(protection);
++#    if defined(GECKO_W10M)
++  // Not the re-commit trick here. An app container will not hand out an
++  // executable page through VirtualAllocFromApp at all -- it answers
++  // PAGE_EXECUTE_READ with ERROR_INVALID_PARAMETER, whatever the package
++  // declares. Changing the protection of a page the process already owns is a
++  // different question, and the one codeGeneration actually answers yes to.
++  ULONG previous = 0;
++  if (!VirtualProtect(pageStart, size, flags, &previous)) {
++    char note[128];
++    SprintfLiteral(note, "jit: reprotect of %u bytes at %p to 0x%x failed, err %u",
++                   unsigned(size), pageStart, unsigned(flags),
++                   unsigned(GetLastError()));
++    GeckoW10mNote(note);
++    return false;
++  }
++#    else
+   // This is a essentially a VirtualProtect, but with lighter impact on
+   // antivirus analysis. See bug 1823634.
+   if (!VirtualAlloc(pageStart, size, MEM_COMMIT, flags)) {
+     return false;
+   }
++#    endif
+ #  else
+   unsigned flags = ProtectionSettingToFlags(protection);
+   if (mprotect(pageStart, size, flags)) {
 diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
 index 4a08d4a623..43260dd761 100644
 --- a/js/src/jit/ProcessExecutableMemory.h
