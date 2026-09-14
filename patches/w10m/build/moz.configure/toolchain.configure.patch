@@ -1,8 +1,28 @@
 diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
-index eb1251f51f..adb978283c 100644
+index eb1251f51f..6d0c5b6812 100644
 --- a/build/moz.configure/toolchain.configure
 +++ b/build/moz.configure/toolchain.configure
-@@ -3163,6 +3163,12 @@ def as_info(target, c_compiler):
+@@ -2913,9 +2913,19 @@ def security_hardening_cflags(
+             ldflags.append("-Wl,--dynamicbase")
+ 
+         # Control Flow Guard (CFG) ----------------------------
++        # Not on 32-bit ARM. Two separate things go wrong there. The guard
++        # metadata lld-link produces is wrong, so the loader kills the process
++        # at the first virtual call once it enforces the flag. And asking for
++        # the guard changes how clang emits virtual-call thunks: the thunk
++        # tail-jumps through r1, which is the first argument register, so every
++        # pointer-to-member call on a virtual function arrives with its first
++        # argument overwritten by the callee's own address. r12 is the scratch
++        # register that exists for this. Both are compiler bugs rather than
++        # anything about CFG, and both go away when it is not asked for.
+         if (
+             c_compiler.type == "clang-cl"
+             and c_compiler.version >= "8"
++            and target.cpu != "arm"
+             and (target.cpu != "aarch64" or c_compiler.version >= "8.0.1")
+         ):
+             if target.cpu == "aarch64" and c_compiler.version >= "10.0.0":
+@@ -3163,6 +3173,12 @@ def as_info(target, c_compiler):
      if c_compiler.type == "clang-cl":
          if target.cpu == "aarch64":
              return namespace(type="armasm", names=("armasm64.exe",))

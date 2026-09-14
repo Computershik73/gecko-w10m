@@ -150,6 +150,12 @@ if [ -d "$DIST" ]; then
   # the exact death this port sees inside XRE_main. Clearing the flag on the
   # packaged copy tells the loader not to enforce it. See tools/strip-cfg.py.
   python "$(cygpath -w "$ROOT/tools/strip-cfg.py")" "$(cygpath -w "$STAGE/xul.dll")"     | sed 's/^/    /'
+  # clang's 32-bit ARM virtual-call thunks tail-jump through r1, the first
+  # argument register, so every pointer-to-member call on a virtual function
+  # arrives with its first argument destroyed. See
+  # tools/patch-vcall-thunks.py. The real fix is to build without -guard:cf,
+  # which stops the thunks being emitted in this shape at all.
+  python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")" "$(cygpath -w "$STAGE/xul.dll")" "$(cygpath -w "$STAGE/mozglue.dll")" | sed 's/^/    /'
 else
   echo "    WARNING: $DIST not found, packaging the shell alone" >&2
 fi
