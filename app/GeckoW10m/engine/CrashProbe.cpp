@@ -200,7 +200,92 @@ int HookImports(HMODULE module) {
   return hooked;
 }
 
+// ------------------------------------------------------------- pc sampling
+
+// SuspendThread and GetThreadContext are outside the app partition of the
+// headers, and unlike AddVectoredExceptionHandler they may genuinely be
+// refused, so they are resolved at run time and their absence is reported
+// rather than failing the link.
+using SuspendThreadFn = DWORD(WINAPI*)(HANDLE);
+using ResumeThreadFn = DWORD(WINAPI*)(HANDLE);
+using GetThreadContextFn = BOOL(WINAPI*)(HANDLE, PCONTEXT);
+
+SuspendThreadFn gSuspendThread = nullptr;
+ResumeThreadFn gResumeThread = nullptr;
+GetThreadContextFn gGetThreadContext = nullptr;
+
+bool ResolveSamplingApis() {
+  HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+  if (!k32) return false;
+  gSuspendThread =
+      reinterpret_cast<SuspendThreadFn>(::GetProcAddress(k32, "SuspendThread"));
+  gResumeThread =
+      reinterpret_cast<ResumeThreadFn>(::GetProcAddress(k32, "ResumeThread"));
+  gGetThreadContext = reinterpret_cast<GetThreadContextFn>(
+      ::GetProcAddress(k32, "GetThreadContext"));
+  return gSuspendThread && gResumeThread && gGetThreadContext;
+}
+
+// Long enough to cover a startup that has been dying in tens of milliseconds,
+// short enough that a runtime which survives stops paying for it.
+constexpr int kMaxSamples = 1200;
+
+DWORD WINAPI SamplerThread(LPVOID param) {
+  HANDLE target = static_cast<HANDLE>(param);
+
+  if (!ResolveSamplingApis()) {
+    Log::Write(L"sampler: thread inspection unavailable in this container");
+    ::CloseHandle(target);
+    return 0;
+  }
+
+  uintptr_t last = 0;
+  int written = 0;
+  for (int i = 0; i < kMaxSamples; ++i) {
+    if (::WaitForSingleObject(target, 0) == WAIT_OBJECT_0) break;
+
+    if (gSuspendThread(target) == static_cast<DWORD>(-1)) break;
+
+    // CONTEXT wants 8-byte alignment on ARM and GetThreadContext will refuse
+    // it otherwise.
+    __declspec(align(8)) CONTEXT context{};
+    context.ContextFlags = CONTEXT_CONTROL;
+    BOOL ok = gGetThreadContext(target, &context);
+    gResumeThread(target);
+
+    if (!ok) {
+      Log::WriteNum(L"sampler: GetThreadContext failed, err", ::GetLastError());
+      break;
+    }
+
+    uintptr_t pc = static_cast<uintptr_t>(context.Pc);
+    // Consecutive samples inside one tight loop say nothing new; only movement
+    // is worth a line.
+    if (pc != last) {
+      last = pc;
+      Log::Write(L"pc: " + DescribeAddress(reinterpret_cast<void*>(pc)));
+      ++written;
+    }
+    ::Sleep(1);
+  }
+
+  Log::WriteNum(L"sampler: finished, samples written", written);
+  ::CloseHandle(target);
+  return 0;
+}
+
 }  // namespace
+
+void StartLastLocationSampler(void* thread) {
+  HANDLE sampler =
+      ::CreateThread(nullptr, 0, &SamplerThread, thread, 0, nullptr);
+  if (!sampler) {
+    Log::WriteNum(L"sampler: CreateThread failed, err", ::GetLastError());
+    ::CloseHandle(static_cast<HANDLE>(thread));
+    return;
+  }
+  ::CloseHandle(sampler);
+}
 
 void InstallCrashProbes() {
   PVOID handler = ::AddVectoredExceptionHandler(1, &OnException);

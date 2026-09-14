@@ -156,7 +156,9 @@ bool StartGeckoRuntime(const std::wstring& localStatePath) {
     delete args;
     return false;
   }
-  ::CloseHandle(thread);
+  // The sampler takes the handle: it is the only thing that will know where
+  // the thread was if the process goes without a word.
+  StartLastLocationSampler(thread);
   return true;
 }
 
