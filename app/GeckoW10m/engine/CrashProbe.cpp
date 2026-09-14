@@ -161,38 +161,111 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
 
 // -------------------------------------------------------------- import hooks
 //
-// A process that ends through abort, _exit or TerminateProcess raises no
-// exception, so no handler of any kind sees it go. Gecko reaches all three:
-// a failed MOZ_RELEASE_ASSERT or an OOM abort is a deliberate, silent kill.
-// Redirecting xul.dll's own import slots catches the call while its stack is
-// still standing, which is the only moment the caller can still be named.
+// Two jobs, one mechanism. A process ended through abort, _exit,
+// TerminateProcess or ExitProcess raises nothing, so no handler of any kind
+// sees it go -- those get hooked so the caller can be named while its stack is
+// still standing. And with the control run showing that the XAML fault only
+// happens when the engine runs, the rest are here to say what the engine was
+// asking the system for on its way there: which libraries it pulled in, and
+// what it was raising, since every trace so far has ended inside
+// RaiseException.
+//
+// Every hook records and calls straight through. None of them change what
+// happens.
 
 using AbortFn = void(__cdecl*)();
 using ExitFn = void(__cdecl*)(int);
 using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
+using ExitProcessFn = void(WINAPI*)(UINT);
+using RaiseExceptionFn = void(WINAPI*)(DWORD, DWORD, DWORD, const ULONG_PTR*);
+using LoadLibraryExWFn = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+using LoadPackagedLibraryFn = HMODULE(WINAPI*)(LPCWSTR, DWORD);
 
 AbortFn gRealAbort = nullptr;
 ExitFn gRealExit = nullptr;
 TerminateProcessFn gRealTerminateProcess = nullptr;
+ExitProcessFn gRealExitProcess = nullptr;
+RaiseExceptionFn gRealRaiseException = nullptr;
+LoadLibraryExWFn gRealLoadLibraryExW = nullptr;
+LoadPackagedLibraryFn gRealLoadPackagedLibrary = nullptr;
 
 void __cdecl HookAbort() {
-  Log::Write(L"kill: xul.dll called abort()");
+  Log::Write(L"kill: the engine called abort()");
   LogBacktrace(L"kill:");
   if (gRealAbort) gRealAbort();
   ::TerminateProcess(::GetCurrentProcess(), 3);
 }
 
 void __cdecl HookExit(int code) {
-  Log::WriteNum(L"kill: xul.dll called _exit", code);
+  Log::WriteNum(L"kill: the engine called _exit", code);
   LogBacktrace(L"kill:");
   if (gRealExit) gRealExit(code);
 }
 
 BOOL WINAPI HookTerminateProcess(HANDLE process, UINT code) {
-  Log::WriteNum(L"kill: xul.dll called TerminateProcess, code", code);
+  Log::WriteNum(L"kill: the engine called TerminateProcess, code", code);
   LogBacktrace(L"kill:");
   return gRealTerminateProcess ? gRealTerminateProcess(process, code) : FALSE;
 }
+
+void WINAPI HookExitProcess(UINT code) {
+  Log::WriteNum(L"kill: the engine called ExitProcess, code", code);
+  LogBacktrace(L"kill:");
+  if (gRealExitProcess) gRealExitProcess(code);
+}
+
+// Naming a thread is done by raising an exception a debugger is meant to
+// swallow, and Gecko names a lot of threads. Reporting those would bury
+// everything else.
+constexpr DWORD kThreadNameException = 0x406D1388;
+
+std::atomic<int> gRaiseReports{0};
+
+void WINAPI HookRaiseException(DWORD code, DWORD flags, DWORD count,
+                               const ULONG_PTR* args) {
+  if (code != kThreadNameException && gRaiseReports.fetch_add(1) < 12) {
+    Log::Write(L"raise: the engine raised " + Hex(code));
+    LogBacktrace(L"raise:");
+  }
+  if (gRealRaiseException) gRealRaiseException(code, flags, count, args);
+}
+
+HMODULE WINAPI HookLoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
+  HMODULE module = gRealLoadLibraryExW(name, file, flags);
+  Log::Write(L"load: " + std::wstring(name ? name : L"(null)") +
+             (module ? L"" : L"  FAILED"));
+  return module;
+}
+
+HMODULE WINAPI HookLoadPackagedLibrary(LPCWSTR name, DWORD reserved) {
+  HMODULE module = gRealLoadPackagedLibrary(name, reserved);
+  Log::Write(L"load: " + std::wstring(name ? name : L"(null)") +
+             (module ? L" (packaged)" : L" (packaged)  FAILED"));
+  return module;
+}
+
+struct Hook {
+  const char* name;
+  void* replacement;
+  void** original;
+};
+
+const Hook kHooks[] = {
+    {"abort", reinterpret_cast<void*>(&HookAbort),
+     reinterpret_cast<void**>(&gRealAbort)},
+    {"_exit", reinterpret_cast<void*>(&HookExit),
+     reinterpret_cast<void**>(&gRealExit)},
+    {"TerminateProcess", reinterpret_cast<void*>(&HookTerminateProcess),
+     reinterpret_cast<void**>(&gRealTerminateProcess)},
+    {"ExitProcess", reinterpret_cast<void*>(&HookExitProcess),
+     reinterpret_cast<void**>(&gRealExitProcess)},
+    {"RaiseException", reinterpret_cast<void*>(&HookRaiseException),
+     reinterpret_cast<void**>(&gRealRaiseException)},
+    {"LoadLibraryExW", reinterpret_cast<void*>(&HookLoadLibraryExW),
+     reinterpret_cast<void**>(&gRealLoadLibraryExW)},
+    {"LoadPackagedLibrary", reinterpret_cast<void*>(&HookLoadPackagedLibrary),
+     reinterpret_cast<void**>(&gRealLoadPackagedLibrary)},
+};
 
 // Writes one import slot, saving what was there. The import table sits in
 // read-only memory, and VirtualProtectFromApp is the only way an app container
@@ -202,7 +275,7 @@ bool ReplaceSlot(void** slot, void* replacement, void** original) {
   if (!::VirtualProtectFromApp(slot, sizeof(void*), PAGE_READWRITE, &previous)) {
     return false;
   }
-  *original = *slot;
+  if (!*original) *original = *slot;
   *slot = replacement;
   ULONG ignored = 0;
   ::VirtualProtectFromApp(slot, sizeof(void*), previous, &ignored);
@@ -237,25 +310,15 @@ int HookImports(HMODULE module) {
 
       auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
           base + names->u1.AddressOfData);
-      const char* name = byName->Name;
 
-      void** slot = reinterpret_cast<void**>(&addresses->u1.Function);
-      if (std::strcmp(name, "abort") == 0 && !gRealAbort) {
-        if (ReplaceSlot(slot, reinterpret_cast<void*>(&HookAbort),
-                        reinterpret_cast<void**>(&gRealAbort))) {
-          ++hooked;
-        }
-      } else if (std::strcmp(name, "_exit") == 0 && !gRealExit) {
-        if (ReplaceSlot(slot, reinterpret_cast<void*>(&HookExit),
-                        reinterpret_cast<void**>(&gRealExit))) {
-          ++hooked;
-        }
-      } else if (std::strcmp(name, "TerminateProcess") == 0 &&
-                 !gRealTerminateProcess) {
-        if (ReplaceSlot(slot, reinterpret_cast<void*>(&HookTerminateProcess),
-                        reinterpret_cast<void**>(&gRealTerminateProcess))) {
-          ++hooked;
-        }
+      for (const Hook& hook : kHooks) {
+        if (std::strcmp(byName->Name, hook.name) != 0) continue;
+        void** slot = reinterpret_cast<void**>(&addresses->u1.Function);
+        // A slot already pointing at the replacement belongs to a module that
+        // has been through here.
+        if (*slot == hook.replacement) break;
+        if (ReplaceSlot(slot, hook.replacement, hook.original)) ++hooked;
+        break;
       }
     }
   }
@@ -554,12 +617,21 @@ void InstallProcessProbes(const std::wstring& localStatePath) {
 }
 
 void InstallEngineProbes() {
-  HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
-  if (!xul) {
-    Log::WriteNum(L"probe crash: xul.dll not loaded, err", ::GetLastError());
-    return;
+  // mozglue and nss3 reach the same exits and load the same way, and a call
+  // through either of them would otherwise pass unseen.
+  int hooked = 0;
+  for (const wchar_t* name : {L"xul.dll", L"mozglue.dll", L"nss3.dll"}) {
+    HMODULE module = ::LoadPackagedLibrary(name, 0);
+    if (!module) {
+      Log::Write(std::wstring(L"probe crash: ") + name + L" not loaded");
+      continue;
+    }
+    hooked += HookImports(module);
   }
-  Log::WriteNum(L"probe crash: exit paths hooked", HookImports(xul));
+  Log::WriteNum(L"probe crash: imports hooked", hooked);
+
+  HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
+  if (!xul) return;
 
   // Whether the loader is enforcing Control Flow Guard on the engine decides
   // whether an indirect call can end the process outright, so it is worth
