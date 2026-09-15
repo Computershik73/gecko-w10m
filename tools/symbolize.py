@@ -90,7 +90,22 @@ def resolve(rvas, names, objects, rva):
     i = bisect.bisect_right(rvas, rva) - 1
     if i < 0:
         return None
-    return names[i], objects[i], rva - rvas[i]
+    return names[i], objects[i], rva - rvas[i], i
+
+
+def previous(rvas, names, objects, i):
+    """The symbol before index i, for addresses that land on a function entry.
+
+    Thumb code carries the low bit set, so a return address from a call that is
+    the last instruction of a function is (end of that function) | 1 -- which is
+    the entry of whatever the linker put next. Reading that as "the next
+    function, offset 1" is wrong and convincing: it happened here with
+    mozalloc_handle_oom, whose trailing call to mozalloc_abort made every OOM
+    look like it came from moz_xcalloc.
+    """
+    if i <= 0:
+        return None
+    return names[i - 1], objects[i - 1], rvas[i] - rvas[i - 1]
 
 
 def main(argv):
@@ -133,9 +148,21 @@ def main(argv):
         if not hit:
             print(f"{module}+0x{rva:08x}  (below the first symbol)")
             continue
-        name, obj, delta = hit
+        name, obj, delta, i = hit
         where = f" [{obj}]" if obj else ""
         print(f"{module}+0x{rva:08x}  {name}+0x{delta:x}{where}")
+
+        # An offset of 0 or 1 is a function entry, which a return address never
+        # is -- so say what else it could be.
+        if delta <= 1:
+            other = previous(rvas, names, objects, i)
+            if other:
+                prev_name, prev_obj, prev_delta = other
+                prev_where = f" [{prev_obj}]" if prev_obj else ""
+                print(
+                    f"{' ' * (len(module) + 12)}  or the end of "
+                    f"{prev_name}+0x{prev_delta:x}{prev_where}"
+                )
 
     return 0
 

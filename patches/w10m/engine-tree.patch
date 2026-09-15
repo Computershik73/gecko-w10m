@@ -1819,6 +1819,36 @@ index 23c581f416..78efce446f 100644
  #ifndef ANDROID
    fputs(msg, stderr);
    fputs("\n", stderr);
+diff --git a/memory/mozalloc/mozalloc_oom.cpp b/memory/mozalloc/mozalloc_oom.cpp
+index 83e0da5764..6b3f923709 100644
+--- a/memory/mozalloc/mozalloc_oom.cpp
++++ b/memory/mozalloc/mozalloc_oom.cpp
+@@ -5,6 +5,8 @@
+ #include "mozilla/mozalloc_abort.h"
+ #include "mozilla/mozalloc_oom.h"
+ 
++#include "GeckoW10mNote.h"
++
+ #define OOM_MSG_LEADER "out of memory: 0x"
+ #define OOM_MSG_DIGITS "0000000000000000"  // large enough for 2^64
+ #define OOM_MSG_TRAILER " bytes requested"
+@@ -20,6 +22,16 @@ void mozalloc_handle_oom(size_t size) {
+   char oomMsg[] = OOM_MSG_LEADER OOM_MSG_DIGITS OOM_MSG_TRAILER;
+   size_t i;
+ 
++#if defined(GECKO_W10M)
++  // Every infallible allocation funnels through here, from mozglue and from
++  // xul alike, and the backtrace does not survive the crash: the last
++  // instruction of this function is the call to mozalloc_abort, so its return
++  // address lands one byte past the end of this symbol and a linker map
++  // attributes it to whatever function comes next.  Ask the compiler instead.
++  gecko_w10m::NoteFailedAllocation("handle_oom", size, 0,
++                                __builtin_return_address(0));
++#endif
++
+   // NB: this is handle_oom() stage 1, which simply aborts on OOM.
+   // we might proceed to a stage 2 in which an attempt is made to
+   // reclaim memory
 diff --git a/mfbt/ResultExtensions.h b/mfbt/ResultExtensions.h
 index c7c2543888..c44afa26c7 100644
 --- a/mfbt/ResultExtensions.h
