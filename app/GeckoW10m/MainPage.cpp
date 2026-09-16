@@ -217,11 +217,19 @@ void MainPage::BuildUi() {
   // tap landed on a text control and Windows raised the keyboard for each one,
   // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
-  // The panel is under the picture. When the engine draws on the GPU it
-  // presents here and the picture above stays empty; when it falls back to
-  // software the picture is what has content and the panel is invisible
-  // beneath it. Nothing has to choose.
-  contentStack.Children().Append(engineView_->Panel());
+  // The panel is deliberately NOT in the tree for this build.
+  //
+  // The crash is in the XAML compositor and nothing of ours is in its stack;
+  // the log now shows the EGL compositor coming up and then nothing -- no EGL
+  // surface asked for, ANGLE never called -- so it happens before the panel is
+  // used for anything. The panel sat here harmlessly while D3D11 was off and
+  // the process started dying the moment D3D11 came on, so the two are worth
+  // separating, and this separates them: it is the only thing I put in the
+  // visual tree.
+  //
+  // Still in the log either way, so the difference is measured rather than
+  // assumed.
+  Log::Write(L"view: the panel is out of the tree for this build");
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing
