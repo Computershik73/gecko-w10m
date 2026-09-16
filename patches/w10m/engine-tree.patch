@@ -835,7 +835,7 @@ index b159e14d6c..d3703ee280 100644
                                   reinterpret_cast<IUnknown**>(factory)),
           "Could not create DirectWrite factory.");
 diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
-index f45971a4ec..0968763683 100644
+index f45971a4ec..cea8861b57 100644
 --- a/gfx/thebes/gfxPlatform.cpp
 +++ b/gfx/thebes/gfxPlatform.cpp
 @@ -4,6 +4,11 @@
@@ -866,7 +866,31 @@ index f45971a4ec..0968763683 100644
        widget::WinWindowOcclusionTracker::Ensure();
      }
  #endif
-@@ -2648,6 +2660,27 @@ void gfxPlatform::InitWebRenderConfig() {
+@@ -2552,11 +2564,23 @@ void gfxPlatform::InitCompositorAccelerationPrefs() {
+                          "Acceleration blocked by safe-mode",
+                          "FEATURE_FAILURE_COMP_SAFEMODE"_ns);
+   }
++#if defined(GECKO_W10M)
++  // Not here. Headless blocks acceleration because a headless window has
++  // nothing to present to -- which was true of this one until it was given a
++  // XAML SwapChainPanel. It is headless because an app container is handed no
++  // HWND, not because there is no screen; the screen is the phone's.
++  //
++  // This is the single line that was keeping the frame in software. It turned
++  // off hardware compositing, which turned off D3D11 compositing, which turned
++  // off WebRender -- the log named all three and only the last two gave a
++  // reason, because the reason was this one.
++#else
+   if (IsHeadless()) {
+     feature.ForceDisable(FeatureStatus::Blocked,
+                          "Acceleration blocked by headless mode",
+                          "FEATURE_FAILURE_COMP_HEADLESSMODE"_ns);
+   }
++#endif
+ }
+ 
+ /*static*/
+@@ -2648,6 +2672,29 @@ void gfxPlatform::InitWebRenderConfig() {
  
    gfxVars::SetUseSoftwareWebRender(!hasHardware);
  
@@ -884,7 +908,9 @@ index f45971a4ec..0968763683 100644
 +                     (why && *why) ? " -- " : "", (why && *why) ? why : "");
 +      GeckoW10mNote(note);
 +    };
++    say("hardware compositing", Feature::HW_COMPOSITING);
 +    say("webrender", Feature::WEBRENDER);
++    say("d3d11 hardware angle", Feature::D3D11_HW_ANGLE);
 +    say("webrender angle", Feature::WEBRENDER_ANGLE);
 +    say("d3d11 compositing", Feature::D3D11_COMPOSITING);
 +    say("hardware video decoding", Feature::HARDWARE_VIDEO_DECODING);
