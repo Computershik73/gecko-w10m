@@ -1,6 +1,7 @@
 #include "CrashProbe.h"
 
 #include <windows.h>
+#include <d3d11.h>
 #include <winrt/Windows.System.h>
 
 #include <delayimp.h>
@@ -275,19 +276,27 @@ void LogInstruction(const wchar_t* tag, void* address) {
 std::atomic<unsigned> gUiFrames{0};
 std::atomic<DWORD> gUiThread{0};
 std::atomic<HANDLE> gUiThreadHandle{nullptr};
+std::atomic<ULONGLONG> gLastFrameAt{0};
 
 DWORD WINAPI HeartbeatThread(LPVOID) {
   unsigned last = 0;
   unsigned beat = 0;
   while (true) {
-    ::Sleep(500);
+    // Quarter-second, and carrying how long ago the last frame was. At half a
+    // second with only a count, a beat that lands sixteen milliseconds after a
+    // fault reports the same thirty frames whether the thread died at the
+    // fault or drew straight through it -- which is exactly the reading I got
+    // wrong.
+    ::Sleep(250);
     const unsigned frames = gUiFrames.load();
+    const ULONGLONG age = ::GetTickCount64() - gLastFrameAt.load();
     // The fault-safe path: the ordinary one ends by posting to the UI thread,
     // and a pulse that adds work to the thread it is watching measures itself.
     Log::WriteFromFault(L"alive: beat " + std::to_wstring(++beat) +
                L", ui frames " +
                std::to_wstring(frames) + L" (+" +
-               std::to_wstring(frames - last) + L")");
+               std::to_wstring(frames - last) + L"), last one " +
+               std::to_wstring(age) + L" ms ago");
     last = frames;
   }
 }
@@ -894,6 +903,7 @@ LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
 
 void NoteUiFrame() {
   gUiFrames.fetch_add(1, std::memory_order_relaxed);
+  gLastFrameAt.store(::GetTickCount64(), std::memory_order_relaxed);
   if (gUiThread.load() != 0) return;
   // The first frame is also the moment the UI thread identifies itself, and
   // the only moment a handle to it can be had: an app container will not open
@@ -905,6 +915,65 @@ void NoteUiFrame() {
                     DUPLICATE_SAME_ACCESS);
   gUiThreadHandle.store(real);
   gUiThread.store(::GetCurrentThreadId());
+}
+
+void MakeSecondD3DDevice() {
+  HMODULE d3d11 = ::LoadLibraryExW(L"d3d11.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!d3d11) {
+    Log::WriteNum(L"second device: d3d11.dll would not load, err",
+                  ::GetLastError());
+    return;
+  }
+  using CreateFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE,
+                                    UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                    ID3D11Device**, D3D_FEATURE_LEVEL*,
+                                    ID3D11DeviceContext**);
+  auto create =
+      reinterpret_cast<CreateFn>(::GetProcAddress(d3d11, "D3D11CreateDevice"));
+  if (!create) {
+    Log::Write(L"second device: d3d11.dll has no D3D11CreateDevice");
+    return;
+  }
+
+  // The same shape the engine asks for, so the answer is about the same thing.
+  const D3D_FEATURE_LEVEL levels[] = {
+      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+      D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
+  ID3D11Device* device = nullptr;
+  ID3D11DeviceContext* context = nullptr;
+  D3D_FEATURE_LEVEL got = static_cast<D3D_FEATURE_LEVEL>(0);
+  Log::Write(L"second device: asking for one");
+  HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                      D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                      ARRAYSIZE(levels), D3D11_SDK_VERSION, &device, &got,
+                      &context);
+  if (FAILED(hr)) {
+    Log::Write(L"second device: refused, " + Hex(static_cast<uintptr_t>(hr)));
+    return;
+  }
+  Log::Write(L"second device: made, feature level " +
+             Hex(static_cast<uintptr_t>(got)) +
+             L" -- if the process dies in the next second or two, one D3D11 "
+             L"device beside XAML's is all it takes");
+
+  // And a texture, because a device that is never used may never reach the
+  // driver at all.
+  D3D11_TEXTURE2D_DESC desc{};
+  desc.Width = 256;
+  desc.Height = 256;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  ID3D11Texture2D* texture = nullptr;
+  hr = device->CreateTexture2D(&desc, nullptr, &texture);
+  Log::Write(SUCCEEDED(hr) ? L"second device: it drew a texture"
+                           : L"second device: it would not make a texture");
+  // Deliberately kept, not released: the question is whether the process
+  // survives a second device existing alongside XAML's for the whole run.
 }
 
 void StartHeartbeat() {

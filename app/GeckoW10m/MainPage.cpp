@@ -62,6 +62,7 @@ MainPage::MainPage() {
   // something this device does on every launch.
   engine::InstallProcessProbes(std::wstring(localState));
   engine::StartHeartbeat();
+  engine::MakeSecondD3DDevice();
 
   // The compositor telling us it has lost its surfaces is the one warning a
   // GPU reset gives an application. If the phone's driver is being knocked
@@ -226,31 +227,11 @@ void MainPage::BuildUi() {
   // tap landed on a text control and Windows raised the keyboard for each one,
   // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
-  // Out of the tree for this build, and the log says so, because this is an
-  // experiment rather than a decision.
-  //
-  // The panel still exists, the engine is still given it, ANGLE still makes
-  // the swap chain and still hands it over -- everything up to the moment the
-  // compositor would have to show it. The one thing that does not happen is
-  // the showing. It was taken out once before and called innocent, but that
-  // was measured when ANGLE never reached the panel at all: no EGL surface, no
-  // swap chain, nothing to composite. There was nothing for the answer to mean.
-  // Now there is.
-  //
-  // Nothing of ours appears in the fault, and the fault turns out to be
-  // survived; the process is ended half a second later without raising
-  // anything. So the question is no longer "what faults" but "what does the
-  // compositor do with the swap chain we gave it", and this is the way to ask
-  // it without an engine build.
-  constexpr bool kPanelInTree = false;
-  if (kPanelInTree) {
-    contentStack.Children().Append(engineView_->Panel());
-  }
-  client::Log::Write(kPanelInTree
-                         ? L"experiment: the panel is in the visual tree"
-                         : L"experiment: the panel is NOT in the visual tree -- "
-                           L"the swap chain is made and handed over, but never "
-                           L"composited");
+  // Back in the tree. Out of it the browser died on time, twice, with the
+  // swap chain made and handed over and never composited -- so what the
+  // compositor does with our swap chain is not what kills this process, and
+  // there is no reason left to keep the picture off the screen.
+  contentStack.Children().Append(engineView_->Panel());
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing

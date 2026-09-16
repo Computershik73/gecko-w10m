@@ -63,4 +63,16 @@ void StartHeartbeat();
 // Called from XAML's render callback. Costs one increment.
 void NoteUiFrame();
 
+// Makes a second D3D11 device -- the shell's own, used for nothing -- and
+// keeps it.
+//
+// Across every run since 0.1.9.5 the one thing that separates a launch that
+// dies from a launch that does not is whether d3d11.dll was loaded; two runs
+// of the identical 0.1.9.9 build split exactly that way. The engine's use of
+// the device has been the suspect, but the plainer question was never asked:
+// whether this device tolerates a second D3D11 device in a process that
+// already has one, which every XAML app does. This asks it, seventeen seconds
+// before the engine would.
+void MakeSecondD3DDevice();
+
 }  // namespace gecko_w10m::engine
