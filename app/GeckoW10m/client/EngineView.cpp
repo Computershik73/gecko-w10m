@@ -254,6 +254,22 @@ void EngineView::Tick() {
       auto handler = std::move(firstFrame_);
       firstFrame_ = nullptr;
       handler();
+
+      // Whatever the window decided it was, it is the size of the screen from
+      // here on. It came out wider than the phone -- 1765 against 1440 -- and
+      // every one of those extra columns is rasterised by the software
+      // compositor and then copied across, for pixels the screen cannot show.
+      // This is the same call the keyboard uses to make room for itself, so it
+      // is known to work; why the window needed telling at all is a separate
+      // question the engine now writes down.
+      if (resize_ && fullWidth_ > 0 && fullHeight_ > 0 &&
+          (width_ != fullWidth_ || height_ != fullHeight_)) {
+        Log::Write(L"view: window is " + std::to_wstring(width_) + L"x" +
+                   std::to_wstring(height_) + L", asking for " +
+                   std::to_wstring(fullWidth_) + L"x" +
+                   std::to_wstring(fullHeight_));
+        resize_(fullWidth_, fullHeight_);
+      }
     }
     return;
   }
