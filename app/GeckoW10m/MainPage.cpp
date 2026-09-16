@@ -105,7 +105,8 @@ MainPage::MainPage() {
 
   // Last, so the window is up and the log is readable before Gecko gets its
   // chance to take the process down with it.
-  engine::StartGeckoRuntime(std::wstring(localState), pixelWidth, pixelHeight);
+  engine::StartGeckoRuntime(std::wstring(localState), pixelWidth, pixelHeight,
+                            raw);
 }
 
 void MainPage::ApplyVisibleBounds() {

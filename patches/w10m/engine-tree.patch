@@ -15893,10 +15893,10 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..79ca565f1c 100644
+index 8484851f67..6ae6e004f2 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,37 @@
+@@ -7,6 +7,39 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
@@ -15909,6 +15909,8 @@ index 8484851f67..79ca565f1c 100644
 +#  include "mozilla/UniquePtr.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
++#  include "nsIWidget.h"
++#  include "nsThreadUtils.h"
 +
 +extern "C" void GeckoW10mNote(const char* text);
 +
@@ -15934,7 +15936,7 @@ index 8484851f67..79ca565f1c 100644
  namespace mozilla {
  namespace widget {
  
-@@ -42,5 +73,92 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +75,138 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -16001,6 +16003,52 @@ index 8484851f67..79ca565f1c 100644
 +  return sSerial;
 +}
 +
++// Input goes the other way, and takes the same route a synthesized event takes
++// in a test: HeadlessWidget builds a real WidgetMouseEvent or WidgetWheelEvent
++// and puts it through DispatchInputEvent. The shell calls from its UI thread,
++// so each one is handed to the main thread rather than dispatched in place.
++//
++// Message: 0 move, 1 button down, 2 button up. Coordinates are in the pixels of
++// the frame the shell last drew, which is what the window is.
++extern "C" __declspec(dllexport) void gecko_w10m_input_mouse(int32_t aMessage,
++                                                          int32_t aX,
++                                                          int32_t aY) {
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "gecko_w10m_input_mouse", [aMessage, aX, aY]() {
++        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        if (!widget) {
++          return;
++        }
++        using NativeMouseMessage = nsIWidget::NativeMouseMessage;
++        NativeMouseMessage message = NativeMouseMessage::Move;
++        if (aMessage == 1) {
++          message = NativeMouseMessage::ButtonDown;
++        } else if (aMessage == 2) {
++          message = NativeMouseMessage::ButtonUp;
++        }
++        widget->SynthesizeNativeMouseEvent(
++            mozilla::LayoutDeviceIntPoint(aX, aY), message,
++            aMessage == 0 ? mozilla::MouseButton::eNotPressed
++                          : mozilla::MouseButton::ePrimary,
++            nsIWidget::NativeModifiers::NO_MODIFIERS, nullptr);
++      }));
++}
++
++extern "C" __declspec(dllexport) void gecko_w10m_input_wheel(int32_t aX, int32_t aY,
++                                                          double aDeltaX,
++                                                          double aDeltaY) {
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "gecko_w10m_input_wheel", [aX, aY, aDeltaX, aDeltaY]() {
++        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        if (!widget) {
++          return;
++        }
++        widget->SynthesizeNativeMouseScrollEvent(
++            mozilla::LayoutDeviceIntPoint(aX, aY), 0, aDeltaX, aDeltaY, 0,
++            nsIWidget::NativeModifiers::NO_MODIFIERS, 0, nullptr);
++      }));
++}
++
 +extern "C" __declspec(dllexport) int32_t gecko_w10m_frame_copy(
 +    void* aDest, int32_t aCapacity, int32_t* aWidth, int32_t* aHeight,
 +    uint64_t* aSerial) {
@@ -16052,6 +16100,69 @@ index f9454a79f3..44bcecfad4 100644
   private:
    HeadlessWidget* mWidget;
  
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index 0c28540ee6..274643edd9 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -91,7 +91,25 @@ HeadlessWidget::~HeadlessWidget() {
+   Destroy();
+ }
+ 
++#if defined(GECKO_W10M)
++namespace {
++// Raw, and main thread only. A strong reference here would keep a window
++// alive past its own teardown, which is worse than the discipline.
++HeadlessWidget* sShownWidget = nullptr;
++}  // namespace
++
++HeadlessWidget* HeadlessWidget::ShownWidget() {
++  MOZ_ASSERT(NS_IsMainThread());
++  return sShownWidget;
++}
++#endif
++
+ void HeadlessWidget::Destroy() {
++#if defined(GECKO_W10M)
++  if (sShownWidget == this) {
++    sShownWidget = nullptr;
++  }
++#endif
+   if (mDestroyed) {
+     return;
+   }
+@@ -162,6 +180,13 @@ void HeadlessWidget::RaiseWindow() {
+ }
+ 
+ void HeadlessWidget::Show(bool aState) {
++#if defined(GECKO_W10M)
++  if (aState) {
++    // Last one shown wins, which after startup is the browser window: the
++    // graphics sanity test shows and hides one of its own before it.
++    sShownWidget = this;
++  }
++#endif
+   mVisible = aState;
+ 
+   LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+index 05ae8d02e8..5fec749609 100644
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -49,6 +49,14 @@ class HeadlessWidget final : public nsIWidget {
+     return nullptr;
+   }
+ 
++#if defined(GECKO_W10M)
++  // The window the shell is showing, and so the one a tap on the phone
++  // belongs to. Main thread only: set when a window is shown, cleared when
++  // it is destroyed, read by the input entry points in
++  // HeadlessCompositorWidget.cpp.
++  static HeadlessWidget* ShownWidget();
++#endif
++
+   nsresult Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
+                   const widget::InitData&) override;
+   using nsIWidget::Create;  // for Create signature not overridden here
 diff --git a/widget/windows/nsWindow.cpp b/widget/windows/nsWindow.cpp
 index c6572ecf58..00d62e04a1 100644
 --- a/widget/windows/nsWindow.cpp

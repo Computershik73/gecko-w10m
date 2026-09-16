@@ -14,6 +14,6 @@ namespace gecko_w10m::engine {
 // Gecko is headless here, so this is the only thing that decides how big the
 // window it opens will be. Zero leaves Gecko's own default alone.
 bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
-                       int height);
+                       int height, double scale);
 
 }  // namespace gecko_w10m::engine

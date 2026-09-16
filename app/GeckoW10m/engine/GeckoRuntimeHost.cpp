@@ -144,6 +144,7 @@ struct ThreadArgs {
   std::wstring localState;
   int width;
   int height;
+  double scale;
 };
 
 DWORD WINAPI GeckoThread(LPVOID param) {
@@ -151,7 +152,7 @@ DWORD WINAPI GeckoThread(LPVOID param) {
 
   int rc = gecko_w10m_gecko_run(args->installDir.c_str(),
                              args->profileDir.c_str(), args->width,
-                             args->height);
+                             args->height, args->scale);
   Log::WriteNum(L"gecko: runtime exited with", rc);
 
   // Reaching this line at all means the process stayed alive, so the next
@@ -165,7 +166,7 @@ DWORD WINAPI GeckoThread(LPVOID param) {
 }  // namespace
 
 bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
-                       int height) {
+                       int height, double scale) {
   const std::wstring installDir = InstallDirectory();
   if (installDir.empty()) {
     Log::Write(L"gecko: could not determine the install directory");
@@ -197,7 +198,7 @@ bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
   gecko_w10m_gecko_set_logger(&BridgeLog);
 
   auto* args = new ThreadArgs{installDir, profileDir, localStatePath, width,
-                              height};
+                              height,    scale};
   // 8 MB, reserved rather than committed. Gecko's main thread does deep work
   // and the executable's default of 1 MB is not what it expects.
   HANDLE thread = ::CreateThread(nullptr, 8 * 1024 * 1024, &GeckoThread, args,

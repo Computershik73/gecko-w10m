@@ -34,10 +34,28 @@ class EngineView {
   bool Resolve();
   void EnsureBitmap(int32_t width, int32_t height);
 
+  // A drag scrolls and a tap clicks, which is what a phone means by touch. The
+  // engine is told in the pixels of the frame it drew, so every point has to
+  // come back through the letterbox the image is shown in.
+  void OnPressed(winrt::Windows::Foundation::Point const& point);
+  void OnMoved(winrt::Windows::Foundation::Point const& point);
+  void OnReleased(winrt::Windows::Foundation::Point const& point);
+  bool ToFrame(winrt::Windows::Foundation::Point const& point, int32_t* x,
+               int32_t* y) const;
+
   using CopyFn = int32_t (*)(void* dest, int32_t capacity, int32_t* width,
                              int32_t* height, uint64_t* serial);
+  using MouseFn = void (*)(int32_t message, int32_t x, int32_t y);
+  using WheelFn = void (*)(int32_t x, int32_t y, double dx, double dy);
 
   CopyFn copy_ = nullptr;
+  MouseFn mouse_ = nullptr;
+  WheelFn wheel_ = nullptr;
+
+  bool pressed_ = false;
+  double lastX_ = 0;
+  double lastY_ = 0;
+  double travelled_ = 0;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
   winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap bitmap_{nullptr};

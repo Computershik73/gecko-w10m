@@ -103,6 +103,60 @@ void SetEngineEnvironment(const wchar_t* name, const wchar_t* value) {
   }
 }
 
+
+// Two files the profile has to carry before Gecko reads it.
+//
+// Gecko opens its window at Firefox's desktop default -- 1280 by 1040 -- on a
+// screen it was told is the whole phone, and leaves the rest blank. sizemode
+// is how a window is asked to fill its screen, and xulstore.json is where that
+// is remembered; writing it every start is right here because a phone window
+// is never any other size.
+//
+// devPixelsPerPx is the other half. Left alone, Gecko draws one CSS pixel per
+// device pixel, which on a 1440-wide phone is a browser rendered for ants. The
+// shell already knows the number Windows uses for exactly this, so it passes
+// it down and a CSS pixel becomes what Windows means by a pixel.
+void WriteProfileFile(const std::wstring& path, const std::string& body) {
+  CREATEFILE2_EXTENDED_PARAMETERS params{};
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+  HANDLE file = ::CreateFile2(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              CREATE_ALWAYS, &params);
+  if (file == INVALID_HANDLE_VALUE) {
+    Log("bootstrap: could not write " + Narrow(path));
+    return;
+  }
+  DWORD written = 0;
+  ::WriteFile(file, body.data(), static_cast<DWORD>(body.size()), &written,
+              nullptr);
+  ::CloseHandle(file);
+}
+
+void PrepareProfile(const std::wstring& profile, int width, int height,
+                    double scale) {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  const int cssWidth = static_cast<int>(width / (scale > 0 ? scale : 1.0));
+  const int cssHeight = static_cast<int>(height / (scale > 0 ? scale : 1.0));
+
+  std::string store =
+      "{\"chrome://browser/content/browser.xhtml\":{\"main-window\":{"
+      "\"screenX\":\"0\",\"screenY\":\"0\","
+      "\"width\":\"" + std::to_string(cssWidth) + "\","
+      "\"height\":\"" + std::to_string(cssHeight) + "\","
+      "\"sizemode\":\"maximized\"}}}\n";
+  WriteProfileFile(profile + L"\\xulstore.json", store);
+
+  std::string scaleText = std::to_string(scale);
+  std::string prefs =
+      "// Written by the shell every start; see gecko_bootstrap.cpp.\n"
+      "user_pref(\"layout.css.devPixelsPerPx\", \"" + scaleText + "\");\n";
+  WriteProfileFile(profile + L"\\user.js", prefs);
+  Log("bootstrap: profile window " + std::to_string(cssWidth) + "x" +
+      std::to_string(cssHeight) + " at " + scaleText + " device pixels per CSS pixel");
+}
+
 using GetBootstrapFn = void(NS_FROZENCALL*)(mozilla::Bootstrap::UniquePtr&);
 
 }  // namespace
@@ -111,7 +165,7 @@ extern "C" void gecko_w10m_gecko_set_logger(gecko_w10m_gecko_log_fn fn) { gLog =
 
 extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
                                  const wchar_t* profileDir, int width,
-                                 int height) {
+                                 int height, double scale) {
   const std::wstring install(installDir ? installDir : L"");
   const std::wstring profile(profileDir ? profileDir : L"");
 
@@ -162,6 +216,8 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // init() would have assigned stayed undefined: no arrowScrollbox, no
   // pinnedTabsContainer, no selectedTab, no tabs.
   const mozilla::TimeStamp startedAt = mozilla::TimeStamp::Now();
+
+  PrepareProfile(profile, width, height, scale);
 
   Log("bootstrap: loading xul.dll");
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
