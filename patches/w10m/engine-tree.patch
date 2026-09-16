@@ -706,7 +706,7 @@ index 7834485f3e..94b9595a06 100644
  		    reinterpret_cast<IUnknown**>(&mFactoryInstance));
  		assert(SUCCEEDED(hr));
 diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
-index 728fa98356..838cd462f7 100644
+index 728fa98356..f2266f531e 100644
 --- a/gfx/gl/GLContextProviderEGL.cpp
 +++ b/gfx/gl/GLContextProviderEGL.cpp
 @@ -12,6 +12,26 @@
@@ -736,7 +736,35 @@ index 728fa98356..838cd462f7 100644
  #elif defined(XP_WIN)
  #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
-@@ -336,12 +356,26 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+@@ -194,6 +214,27 @@ static EGLSurface CreateSurfaceFromNativeWindow(
+   if (!newSurface) {
+     const auto err = egl.mLib->fGetError();
+     gfxCriticalNote << "Failed to create EGLSurface!: " << gfx::hexa(err);
++#if defined(GECKO_W10M)
++    // Here, not at the call site: fGetError clears the error, so the note
++    // above was eating it and my own read a moment later got EGL_SUCCESS.
++    //
++    // 0x3009 EGL_BAD_MATCH means the config has no window bit -- the context
++    // was made for offscreen use and its config cannot carry a window.
++    // 0x300b EGL_BAD_NATIVE_WINDOW means ANGLE looked at the panel and said no,
++    // which is the case that reaches IsValidNativeWindow.
++    char note[128];
++    SprintfLiteral(note, "gfx: eglCreateWindowSurface refused it, egl 0x%04x",
++                   unsigned(err));
++    GeckoW10mNote(note);
++    EGLint surfaceType = 0;
++    if (egl.fGetConfigAttrib(config, LOCAL_EGL_SURFACE_TYPE, &surfaceType)) {
++      SprintfLiteral(note,
++                     "gfx: the config's surface type is 0x%04x, window bit %s",
++                     unsigned(surfaceType),
++                     (surfaceType & LOCAL_EGL_WINDOW_BIT) ? "set" : "MISSING");
++      GeckoW10mNote(note);
++    }
++#endif
+   }
+   return newSurface;
+ }
+@@ -336,6 +377,10 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
    MOZ_ASSERT(aCompositorWidget);
    EGLNativeWindowType window =
        GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aCompositorWidget);
@@ -747,23 +775,6 @@ index 728fa98356..838cd462f7 100644
    if (!window) {
      gfxCriticalNote << "window is null";
      return EGL_NO_SURFACE;
-   }
- 
--  return mozilla::gl::CreateSurfaceFromNativeWindow(*egl, window, aConfig);
-+  const auto surface =
-+      mozilla::gl::CreateSurfaceFromNativeWindow(*egl, window, aConfig);
-+#if defined(GECKO_W10M)
-+  if (surface == EGL_NO_SURFACE) {
-+    char note[128];
-+    SprintfLiteral(note, "gfx: eglCreateWindowSurface refused it, egl error 0x%04x",
-+                   unsigned(egl->mLib->fGetError()));
-+    GeckoW10mNote(note);
-+  }
-+#endif
-+  return surface;
- }
- 
- GLContextEGL::GLContextEGL(const std::shared_ptr<EglDisplay> egl,
 diff --git a/gfx/graphite2/src/inc/Machine.h b/gfx/graphite2/src/inc/Machine.h
 index 5ceedc296d..67b20e2a1d 100644
 --- a/gfx/graphite2/src/inc/Machine.h
