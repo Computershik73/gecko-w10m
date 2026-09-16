@@ -175,8 +175,22 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   mozilla::BootstrapConfig config{};
   config.appData = nullptr;
   // With appData null this is the path of an application.ini to read, and the
-  // packaged one sits next to the executable.
-  const std::string appIni = Narrow(install + L"\\application.ini");
+  // directory that holds it becomes the application directory -- what
+  // resource:/// and chrome://browser/ resolve against.
+  //
+  // That has to be browser/, not the root. The root application.ini says so
+  // in its first line, and reading it instead left every resource:///module
+  // unreachable: no command line handler could be created, so nothing opened
+  // a window and nsAppStartup was handed eConsiderQuit. firefox.exe arranges
+  // the same thing differently, by passing static app data with "browser" as
+  // the relative directory; we have no such symbol, so we point at the copy
+  // that tools/build-appx.sh stages there.
+  std::wstring appIniPath = install + L"\\browser\\application.ini";
+  if (::GetFileAttributesW(appIniPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    Log("bootstrap: no browser\\application.ini, falling back to the root one");
+    appIniPath = install + L"\\application.ini";
+  }
+  const std::string appIni = Narrow(appIniPath);
   config.appDataPath = appIni.c_str();
 
   Log("bootstrap: XRE_main with " + appIni);

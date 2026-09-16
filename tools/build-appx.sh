@@ -145,6 +145,15 @@ fi
 if [ -d "$DIST" ]; then
   cp -r "$DIST/." "$STAGE/"
   echo "    engine payload from $DIST"
+  # resource:/// and chrome://browser/ resolve against the directory holding
+  # the application.ini that XRE_main is given, and for a browser build that
+  # directory is browser/. The packaged tree has no application.ini there --
+  # firefox.exe never needs one, it passes static app data instead -- so put
+  # the root copy in place for the shell to point at.
+  if [ -f "$STAGE/application.ini" ] && [ -d "$STAGE/browser" ]; then
+    cp "$STAGE/application.ini" "$STAGE/browser/application.ini"
+    echo "    application.ini staged into browser/ as the app directory"
+  fi
   # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
   # guard dispatcher reaches its target with bx, and an entry recorded without
   # the Thumb bit lands there in ARM state, where the first honest Thumb
