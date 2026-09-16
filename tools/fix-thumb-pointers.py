@@ -21,17 +21,26 @@ to a pointer it synthesises in .rdata aimed at the local definition. On 32-bit
 ARM lld-link synthesises it without the Thumb bit. There are 69 of them in
 nss3.dll and none anywhere else in the build.
 
-Finding them needs no guesswork and no symbol names. A slot qualifies only if
-all three hold:
+Finding them needs no guesswork and no symbol names. A slot qualifies when all
+three hold:
 
   * it has a base relocation of type HIGHLOW, so it is a pointer the loader
     rewrites rather than an integer that happens to look like one;
-  * its value minus the image base is even; and
-  * that RVA is the start of a function, as listed in .pdata.
+  * its value is even; and
+  * that value, minus the image base, lands in a section marked executable.
 
-The third is what makes it safe. xul.dll has 456964 relocations and 218023
-functions and this test fires on none of them, so it is not the kind of filter
-that finds what it is looking for whether or not it is there.
+An even pointer into code is a contradiction on this architecture: every
+address that can be branched to carries the Thumb bit. So the rule is not a
+heuristic about what the value probably is -- it is the invariant itself.
+
+Measured across the whole build: 89 in nss3.dll, and zero in every other
+module, xul.dll included, which alone has 456964 relocations. A filter that
+finds what it is looking for whether or not it is there would not do that.
+
+An earlier version of this required the target to be a function start listed
+in .pdata. That missed 20 of the 89: the linker-generated import thunks have
+no unwind data, and neither do leaf functions that never touch the stack. The
+crash simply moved from PR_CallOnce to one of the thunks.
 
 Usage: python tools/fix-thumb-pointers.py <image.dll> [...]
 """
@@ -42,6 +51,7 @@ from pathlib import Path
 
 IMAGE_FILE_MACHINE_ARMNT = 0x01C4
 REL_HIGHLOW = 3
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 
 def fix(path: Path) -> int:
@@ -76,19 +86,18 @@ def fix(path: Path) -> int:
                 return raw + (rva - va)
         return None
 
-    pdata_rva, pdata_size = struct.unpack_from("<II", data, pe + 24 + 96 + 8 * 3)
     reloc_rva, reloc_size = struct.unpack_from("<II", data, pe + 24 + 96 + 8 * 5)
-    if not pdata_size or not reloc_size:
+    if not reloc_size:
         return 0
 
-    # Every function that has unwind data, which is every function the linker
-    # laid out. The low bit of BeginAddress is not the Thumb bit here.
-    base = offset(pdata_rva)
-    starts = set()
-    for i in range(pdata_size // 8):
-        begin = struct.unpack_from("<I", data, base + 8 * i)[0]
-        if begin:
-            starts.add(begin & ~1)
+    executable = []
+    for i in range(nsec):
+        o = pe + 24 + optsize + 40 * i
+        characteristics = struct.unpack_from("<I", data, o + 36)[0]
+        if characteristics & IMAGE_SCN_MEM_EXECUTE:
+            va = struct.unpack_from("<I", data, o + 12)[0]
+            vsize = struct.unpack_from("<I", data, o + 8)[0]
+            executable.append((va, va + max(vsize, 1)))
 
     fixed = 0
     p = offset(reloc_rva)
@@ -107,7 +116,8 @@ def fix(path: Path) -> int:
             value = struct.unpack_from("<I", data, slot)[0]
             if value & 1:
                 continue
-            if value - image_base not in starts:
+            target = value - image_base
+            if not any(lo <= target < hi for lo, hi in executable):
                 continue
             struct.pack_into("<I", data, slot, value | 1)
             fixed += 1
