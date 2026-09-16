@@ -71,12 +71,12 @@ void EngineView::WireKeyboard() {
   sink_.Opacity(0);
   sink_.HorizontalAlignment(HorizontalAlignment::Stretch);
   sink_.VerticalAlignment(VerticalAlignment::Stretch);
-  // It must never be touched. It is the size of the content so that Windows
-  // treats it as a real place to type, and it sits underneath the picture, but
-  // the picture is letterboxed and a tap in the bands beside it would reach
-  // this and raise the keyboard for no reason. Focus arrives here only when
-  // Gecko asks for it.
-  sink_.IsHitTestVisible(false);
+  // Nothing else is done to it. It was made non-hit-testable to stop taps in
+  // the letterbox bands reaching it, but there are no bands any more -- the
+  // window is the size of the room -- and the picture above it takes every
+  // tap. That left an edit control the system had been told not to accept
+  // input on, which is a candidate for why nothing typed arrives, so it is an
+  // ordinary text box again.
   sink_.AcceptsReturn(false);
   sink_.IsSpellCheckEnabled(false);
   sink_.IsTextPredictionEnabled(false);
@@ -96,6 +96,9 @@ void EngineView::WireKeyboard() {
       return;
     }
     auto typed = sink_.Text();
+    Log::Write(L"view: the sink changed, " + std::to_wstring(typed.size()) +
+               L" characters, engine " +
+               std::wstring(text_ && typing_ ? L"told" : L"not told"));
     if (typed.empty()) {
       return;
     }
@@ -177,29 +180,36 @@ void EngineView::WireKeyboard() {
   // The keyboard takes the bottom of the screen away. Telling the engine makes
   // it lay the window out in what is left, so the field being typed into is
   // not underneath it.
+  // The keyboard takes the bottom of the screen, so the room loses its bottom:
+  // the container is made shorter and everything else follows from that. The
+  // window was being resized directly before, which left the container at full
+  // height with a shorter frame centred inside it -- a band of empty across
+  // the top about a fifth of the screen deep, which is the other half of the
+  // 878 pixels the keyboard took.
+  //
+  // A margin is in view pixels and so is the occluded rectangle, so no scale
+  // comes into this at all.
   auto pane = InputPane::GetForCurrentView();
   pane.Showing([this](InputPane const&,
                       winrt::Windows::UI::ViewManagement::
                           InputPaneVisibilityEventArgs const& args) {
-    if (!resize_ || fullHeight_ <= 0) {
+    if (!host_) {
       return;
     }
-    const int32_t covered =
-        static_cast<int32_t>(args.OccludedRect().Height * rawPerView_ + 0.5);
-    const int32_t height = (std::max)(fullHeight_ - covered, 240);
-    Log::Write(L"view: keyboard covers " + std::to_wstring(covered) +
-               L" px, window height " + std::to_wstring(height));
-    resize_(fullWidth_, height);
+    const double covered = args.OccludedRect().Height;
+    Log::Write(L"view: keyboard covers " +
+               std::to_wstring(static_cast<int>(covered)) +
+               L" view px, taking it off the bottom of the room");
+    host_.Margin(Thickness{0, 0, 0, covered});
   });
   pane.Hiding([this](InputPane const&,
                      winrt::Windows::UI::ViewManagement::
                          InputPaneVisibilityEventArgs const&) {
-    if (!resize_ || fullHeight_ <= 0) {
+    if (!host_) {
       return;
     }
-    Log::Write(L"view: keyboard gone, window height " +
-               std::to_wstring(fullHeight_));
-    resize_(fullWidth_, fullHeight_);
+    Log::Write(L"view: keyboard gone, the room is whole again");
+    host_.Margin(Thickness{0, 0, 0, 0});
   });
 }
 

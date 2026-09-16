@@ -1,8 +1,8 @@
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..f9c3244380 100644
+index 8484851f67..dfdd88f59f 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,44 @@
+@@ -7,6 +7,45 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
@@ -15,6 +15,7 @@ index 8484851f67..f9c3244380 100644
 +#  include "mozilla/StaticMutex.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
++#  include "mozilla/Sprintf.h"
 +#  include "mozilla/TextEventDispatcher.h"
 +#  include "mozilla/TextEvents.h"
 +#  include "nsIWidget.h"
@@ -47,7 +48,7 @@ index 8484851f67..f9c3244380 100644
  namespace mozilla {
  namespace widget {
  
-@@ -16,7 +54,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
+@@ -16,7 +55,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
      : CompositorWidget(aOptions),
        mWidget(aWindow),
        mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
@@ -83,7 +84,7 @@ index 8484851f67..f9c3244380 100644
  
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
    if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +98,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+@@ -33,6 +99,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
    *size = aClientSize;
  }
  
@@ -102,7 +103,7 @@ index 8484851f67..f9c3244380 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +119,381 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +120,420 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -119,14 +120,28 @@ index 8484851f67..f9c3244380 100644
 +  const size_t bytes = stride * size_t(size.height);
 +
 +  if (mCapacity < bytes) {
++    // Zeroed, so that a buffer which is never painted is transparent rather
++    // than whatever the allocator happened to hand over.
 +    mPixels = MakeUnique<uint8_t[]>(bytes);
 +    mCapacity = mPixels ? bytes : 0;
 +    if (!mPixels) {
 +      return nullptr;
 +    }
++    memset(mPixels.get(), 0, bytes);
 +  }
-+  mWidth = size.width;
-+  mHeight = size.height;
++
++  // The size becomes visible to the compositing loop here, before a single
++  // pixel of it has been drawn -- so the loop is told to leave this window
++  // alone until a paint at this size has finished. Without that, a menu caught
++  // between starting and finishing was composited from a buffer still holding
++  // the last paint, at the last paint's row length, and came out as a black
++  // rectangle over the page. It only happened when the timing fell that way,
++  // which is why it happened every other time.
++  {
++    StaticMutexAutoLock lock(sFrameLock);
++    mWidth = size.width;
++    mHeight = size.height;
++  }
 +
 +  static bool sSaidSo = false;
 +  if (!sSaidSo) {
@@ -148,6 +163,10 @@ index 8484851f67..f9c3244380 100644
 +  }
 +
 +  StaticMutexAutoLock lock(sFrameLock);
++
++  // This window now holds a complete picture of itself at its current size.
++  mPaintedWidth = mWidth;
++  mPaintedHeight = mHeight;
 +
 +  if (!mIsOverlay) {
 +    sMain = this;
@@ -182,6 +201,12 @@ index 8484851f67..f9c3244380 100644
 +  for (auto* window : sWindows) {
 +    if (window == sMain || !window->mIsOverlay || !window->mVisible ||
 +        window->mWidth <= 0 || !window->mPixels) {
++      continue;
++    }
++    // Resized but not yet redrawn: what is in the buffer belongs to the old
++    // size and would be read with the wrong row length.
++    if (window->mPaintedWidth != window->mWidth ||
++        window->mPaintedHeight != window->mHeight) {
 +      continue;
 +    }
 +
@@ -374,18 +399,33 @@ index 8484851f67..f9c3244380 100644
 +  nsString text(reinterpret_cast<const char16_t*>(aText), aLength);
 +  NS_DispatchToMainThread(NS_NewRunnableFunction(
 +      "gecko_w10m_input_text", [text = std::move(text)]() mutable {
++        // Three ways for this to come to nothing, and none of them said so.
++        // Typing has now failed twice for reasons that were in different
++        // halves of the path, so each step reports itself and the next log
++        // names the one that is silent.
 +        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
 +        if (!widget) {
++          GeckoW10mNote("text: arrived, but there is no shown widget");
 +          return;
 +        }
 +        mozilla::widget::TextEventDispatcher* dispatcher =
 +            widget->GetTextEventDispatcher();
-+        if (!dispatcher ||
-+            NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++        if (!dispatcher) {
++          GeckoW10mNote("text: arrived, but the widget has no dispatcher");
++          return;
++        }
++        if (NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++          GeckoW10mNote("text: arrived, but the transaction was refused");
 +          return;
 +        }
 +        nsEventStatus status = nsEventStatus_eIgnore;
 +        dispatcher->CommitComposition(status, &text);
++        {
++          char note[96];
++          SprintfLiteral(note, "text: committed %d characters, status %d",
++                         int(text.Length()), int(status));
++          GeckoW10mNote(note);
++        }
 +      }));
 +}
 +
@@ -485,7 +525,7 @@ index 8484851f67..f9c3244380 100644
 +}
 +#endif
 diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
-index f9454a79f3..685e824450 100644
+index f9454a79f3..680d9ffd8a 100644
 --- a/widget/headless/HeadlessCompositorWidget.h
 +++ b/widget/headless/HeadlessCompositorWidget.h
 @@ -8,6 +8,11 @@
@@ -522,7 +562,7 @@ index f9454a79f3..685e824450 100644
  
    // CompositorWidget Overrides
  
-@@ -39,11 +57,44 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -39,11 +57,49 @@ class HeadlessCompositorWidget final : public CompositorWidget,
      return this;
    }
  
@@ -561,6 +601,11 @@ index f9454a79f3..685e824450 100644
 +  // of it. About Nightly is a dialog, and treating it as a window of its
 +  // own is what put it and the browser in a fight over the same frame.
 +  bool mIsOverlay = false;
++  // The size this window's buffer was last fully painted at. Until it matches
++  // the current size, the buffer holds the previous picture at the previous
++  // row length and must not be composited.
++  int32_t mPaintedWidth = 0;
++  int32_t mPaintedHeight = 0;
 +  mozilla::Atomic<bool> mVisible{true};
 +  DataMutex<LayoutDeviceIntPoint> mOrigin;
 +#endif
