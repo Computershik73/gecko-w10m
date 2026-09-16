@@ -2503,10 +2503,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..81ef59bf52
+index 0000000000..1dc11b4b84
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,272 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2525,7 +2525,11 @@ index 0000000000..81ef59bf52
 +#include <atomic>
 +#include <cstdint>
 +
++#include <windows.ui.core.h>
++#include <windows.ui.xaml.h>
 +#include <windows.ui.xaml.media.dxinterop.h>
++#include <wrl.h>
++#include <wrl/wrappers/corewrappers.h>
 +
 +namespace
 +{
@@ -2535,6 +2539,60 @@ index 0000000000..81ef59bf52
 +// number arriving by a shorter road. Written rarely, read every resize.
 +std::atomic<LONG> sPanelWidth{0};
 +std::atomic<LONG> sPanelHeight{0};
++
++// A SwapChainPanel may only be touched from the thread that owns it. Calling
++// SetSwapChain from the render thread does not fail -- it corrupts the system
++// compositor, and the process dies a moment later writing to address zero
++// inside CoreUIComponents, several frames below dcomp. So the call is handed
++// to the panel's own dispatcher and waited on.
++HRESULT RunOnUIThread(std::function<HRESULT()> &&work,
++                      ABI::Windows::UI::Core::ICoreDispatcher *dispatcher)
++{
++    if (!dispatcher)
++    {
++        return E_INVALIDARG;
++    }
++
++    boolean hasAccess = FALSE;
++    HRESULT result    = dispatcher->get_HasThreadAccess(&hasAccess);
++    if (FAILED(result))
++    {
++        return result;
++    }
++    if (hasAccess)
++    {
++        return work();
++    }
++
++    Microsoft::WRL::Wrappers::Event done(
++        CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS));
++    if (!done.IsValid())
++    {
++        return E_FAIL;
++    }
++
++    HRESULT inner = E_FAIL;
++    Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IAsyncAction> action;
++    result = dispatcher->RunAsync(
++        ABI::Windows::UI::Core::CoreDispatcherPriority_Normal,
++        Microsoft::WRL::Callback<Microsoft::WRL::Implements<
++            Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
++            ABI::Windows::UI::Core::IDispatchedHandler, Microsoft::WRL::FtmBase>>(
++            [&work, &inner, &done]() -> HRESULT {
++                inner = work();
++                SetEvent(done.Get());
++                return S_OK;
++            })
++            .Get(),
++        &action);
++    if (FAILED(result))
++    {
++        return result;
++    }
++
++    WaitForSingleObjectEx(done.Get(), INFINITE, FALSE);
++    return inner;
++}
 +}  // namespace
 +
 +// Called by the shell, which owns the panel and is the only thing that knows
@@ -2552,12 +2610,18 @@ index 0000000000..81ef59bf52
 +{
 +
 +NativeWindow11WinRT::NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha)
-+    : NativeWindow11(window), mPanel(nullptr), mHasAlpha(hasAlpha), mWidth(0), mHeight(0)
++    : NativeWindow11(window),
++      mPanel(nullptr),
++      mDispatcher(nullptr),
++      mHasAlpha(hasAlpha),
++      mWidth(0),
++      mHeight(0)
 +{}
 +
 +NativeWindow11WinRT::~NativeWindow11WinRT()
 +{
 +    SafeRelease(mPanel);
++    SafeRelease(mDispatcher);
 +}
 +
 +bool NativeWindow11WinRT::initialize()
@@ -2574,8 +2638,28 @@ index 0000000000..81ef59bf52
 +    // A SwapChainPanel presents through this one interface and nothing else;
 +    // if the object handed over does not have it, it is not a panel and there
 +    // is nothing this class can do with it.
-+    return SUCCEEDED(window->QueryInterface(__uuidof(ISwapChainPanelNative),
-+                                            reinterpret_cast<void **>(&mPanel)));
++    if (FAILED(window->QueryInterface(__uuidof(ISwapChainPanelNative),
++                                      reinterpret_cast<void **>(&mPanel))))
++    {
++        return false;
++    }
++
++    // Every XAML object knows the thread it belongs to, and that is the only
++    // thread allowed to give it a swap chain.
++    Microsoft::WRL::ComPtr<ABI::Windows::UI::Xaml::IDependencyObject> dependency;
++    if (FAILED(window->QueryInterface(
++            __uuidof(ABI::Windows::UI::Xaml::IDependencyObject),
++            reinterpret_cast<void **>(dependency.GetAddressOf()))))
++    {
++        SafeRelease(mPanel);
++        return false;
++    }
++    if (FAILED(dependency->get_Dispatcher(&mDispatcher)) || !mDispatcher)
++    {
++        SafeRelease(mPanel);
++        return false;
++    }
++    return true;
 +}
 +
 +bool NativeWindow11WinRT::getClientRect(LPRECT rect) const
@@ -2658,7 +2742,10 @@ index 0000000000..81ef59bf52
 +        return result;
 +    }
 +
-+    result = mPanel->SetSwapChain(swapChain1);
++    ISwapChainPanelNative *panel = mPanel;
++    result                       = RunOnUIThread(
++        [panel, swapChain1]() -> HRESULT { return panel->SetSwapChain(swapChain1); },
++        mDispatcher);
 +    if (FAILED(result))
 +    {
 +        SafeRelease(swapChain1);
@@ -2694,10 +2781,10 @@ index 0000000000..81ef59bf52
 +}  // namespace rx
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
 new file mode 100644
-index 0000000000..a69143a2b1
+index 0000000000..f01cb80cde
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,82 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2724,6 +2811,20 @@ index 0000000000..a69143a2b1
 +
 +struct ISwapChainPanelNative;
 +struct IInspectable;
++
++namespace ABI
++{
++namespace Windows
++{
++namespace UI
++{
++namespace Core
++{
++struct ICoreDispatcher;
++}
++}  // namespace UI
++}  // namespace Windows
++}  // namespace ABI
 +
 +namespace rx
 +{
@@ -2755,6 +2856,9 @@ index 0000000000..a69143a2b1
 +    // remembered rather than asked for because it belongs to the UI thread and
 +    // this is called from the renderer's.
 +    ISwapChainPanelNative *mPanel;
++  // The thread the panel belongs to. Giving it a swap chain from any other
++  // thread takes the system compositor down with it.
++  ABI::Windows::UI::Core::ICoreDispatcher *mDispatcher;
 +    bool mHasAlpha;
 +    LONG mWidth;
 +    LONG mHeight;
