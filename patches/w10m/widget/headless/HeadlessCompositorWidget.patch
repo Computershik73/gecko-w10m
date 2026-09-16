@@ -553,13 +553,15 @@ index 02bd76ba38..bab37e25c5 100644
        rect, rect, 24, 24, 0, DesktopToLayoutDeviceScale(),
        CSSToLayoutDeviceScale(), 96.0f, Screen::IsPseudoDisplay::No,
 diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
-index 0c28540ee6..c5df32033c 100644
+index 0c28540ee6..6835745603 100644
 --- a/widget/headless/HeadlessWidget.cpp
 +++ b/widget/headless/HeadlessWidget.cpp
-@@ -3,6 +3,12 @@
+@@ -3,6 +3,14 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  #include "HeadlessWidget.h"
  
++#include <algorithm>
++
 +#if defined(GECKO_W10M)
 +#  include "mozilla/Atomics.h"
 +#  include "mozilla/Sprintf.h"
@@ -569,7 +571,7 @@ index 0c28540ee6..c5df32033c 100644
  #include "BasicEvents.h"
  #include "ErrorList.h"
  #include "HeadlessCompositorWidget.h"
-@@ -91,7 +97,43 @@ HeadlessWidget::~HeadlessWidget() {
+@@ -91,7 +99,43 @@ HeadlessWidget::~HeadlessWidget() {
    Destroy();
  }
  
@@ -613,7 +615,7 @@ index 0c28540ee6..c5df32033c 100644
    if (mDestroyed) {
      return;
    }
-@@ -162,6 +204,16 @@ void HeadlessWidget::RaiseWindow() {
+@@ -162,6 +206,16 @@ void HeadlessWidget::RaiseWindow() {
  }
  
  void HeadlessWidget::Show(bool aState) {
@@ -630,11 +632,27 @@ index 0c28540ee6..c5df32033c 100644
    mVisible = aState;
  
    LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
-@@ -223,6 +275,13 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
+@@ -223,6 +277,29 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
    }
  
    mBounds.MoveTo(aX, aY);
 +#if defined(GECKO_W10M)
++  // And having been made to fit, it has to be put somewhere it fits. A window
++  // placed for a screen it is no longer the size of would hang off an edge,
++  // and the part that hangs off is simply not drawn.
++  if (mWindowType != WindowType::TopLevel) {
++    if (nsCOMPtr<nsIScreen> screen = GetWidgetScreen()) {
++      int32_t left, top, screenWidth, screenHeight;
++      if (NS_SUCCEEDED(screen->GetRectDisplayPix(&left, &top, &screenWidth,
++                                                 &screenHeight))) {
++        const int32_t x = std::clamp(
++            mBounds.X(), left, std::max(left, left + screenWidth - mBounds.Width()));
++        const int32_t y = std::clamp(
++            mBounds.Y(), top, std::max(top, top + screenHeight - mBounds.Height()));
++        mBounds.MoveTo(x, y);
++      }
++    }
++  }
 +  // A popup is a window of its own and the shell has to be told where to put
 +  // it over the one underneath.
 +  if (mCompositorWidget) {
@@ -644,19 +662,40 @@ index 0c28540ee6..c5df32033c 100644
    NotifyWindowMoved(mBounds.TopLeft());
  }
  
-@@ -257,8 +316,26 @@ void HeadlessWidget::Resize(const DesktopSize& aSize, bool aRepaint) {
+@@ -257,8 +334,47 @@ void HeadlessWidget::Resize(const DesktopSize& aSize, bool aRepaint) {
  
  void HeadlessWidget::ResizeInternal(int32_t aWidth, int32_t aHeight,
                                      bool aRepaint) {
 +#if defined(GECKO_W10M)
-+  // The window came out wider than the screen and nothing in the path says
-+  // why, so the path says it now: what was asked for, what the constraints
-+  // allowed, and what kind of window it was. ConstrainSize is the only thing
-+  // between the two numbers.
++  // What was asked for, what the constraints allowed, and what kind of window
++  // it was. This found the window that came out wider than the screen, and it
++  // stays because it is the only place the two numbers can be compared.
 +  const int32_t asked = aWidth;
 +  const int32_t askedHeight = aHeight;
 +#endif
    ConstrainSize(&aWidth, &aHeight);
++#if defined(GECKO_W10M)
++  // ConstrainSize knows only the minimum and maximum the front end asked for;
++  // nothing in the path brings a window down to the size of the display. On a
++  // desktop a dialog wider than the screen is merely a window wider than the
++  // screen. Here there is nowhere for it to hang off to, so the About dialog
++  // arrived 1991 device pixels wide on a screen of 1440 and lost its right
++  // hand side. The screen wins, and layout is told the real size so the
++  // contents reflow into it rather than being cut.
++  //
++  // Only for windows that sit over the browser. The browser window itself is
++  // sized by the shell and has a minimum of its own that must not be fought.
++  if (mWindowType != WindowType::TopLevel) {
++    if (nsCOMPtr<nsIScreen> screen = GetWidgetScreen()) {
++      int32_t left, top, screenWidth, screenHeight;
++      if (NS_SUCCEEDED(screen->GetRectDisplayPix(&left, &top, &screenWidth,
++                                                 &screenHeight))) {
++        aWidth = std::min(aWidth, screenWidth);
++        aHeight = std::min(aHeight, screenHeight);
++      }
++    }
++  }
++#endif
    mBounds.SizeTo(LayoutDeviceIntSize(aWidth, aHeight));
 +#if defined(GECKO_W10M)
 +  {
