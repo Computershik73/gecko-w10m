@@ -89,6 +89,34 @@ void Log::Write(std::wstring_view line) {
   if (handler) handler(stamped);
 }
 
+void Log::WriteFromFault(std::wstring_view line) {
+  std::wstring stamped = Timestamp() + L"  " + std::wstring(line);
+
+  // try_lock, not lock: if the fault happened while this thread already held
+  // the mutex, taking it again is undefined and waiting on it is a deadlock.
+  // A missing line is better than a hung phone.
+  if (g_mutex.try_lock()) {
+    if (g_file != INVALID_HANDLE_VALUE) {
+      std::string utf8 = ToUtf8(stamped) + "\r\n";
+      DWORD written = 0;
+      ::WriteFile(g_file, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+      // No FlushFileBuffers here. The report is flushed once at its end.
+    }
+    g_mutex.unlock();
+  }
+  ::OutputDebugStringW((stamped + L"\r\n").c_str());
+  // And no handler. That is the whole point of this function.
+}
+
+void Log::FlushFromFault() {
+  if (g_mutex.try_lock()) {
+    if (g_file != INVALID_HANDLE_VALUE) {
+      ::FlushFileBuffers(g_file);
+    }
+    g_mutex.unlock();
+  }
+}
+
 void Log::Write(std::wstring_view label, std::wstring_view value) {
   Write(std::wstring(label) + L": " + std::wstring(value));
 }

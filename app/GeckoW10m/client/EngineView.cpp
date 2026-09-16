@@ -224,6 +224,16 @@ bool EngineView::Resolve() {
   // The engine starts on its own thread and may not be up yet, so this is
   // retried rather than done once. LoadPackagedLibrary on an already-loaded
   // module just returns it; it is also the only load an app container allows.
+  // Once a second at most. This is called from the render callback, so at
+  // display rate it was asking the loader for a module sixty times a second
+  // for the whole of startup -- while the engine thread was inside the loader
+  // lock bringing xul.dll up.
+  const ULONGLONG now = ::GetTickCount64();
+  if (lastResolveAttempt_ && now - lastResolveAttempt_ < 1000) {
+    return false;
+  }
+  lastResolveAttempt_ = now;
+
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
   if (!xul) {
     return false;
@@ -389,7 +399,24 @@ void EngineView::Tick() {
   if (!Resolve()) {
     return;
   }
-  FollowTextInput();
+  // Taking focus and raising the keyboard are not things to do from in here.
+  // This runs inside CompositionTarget::Rendering -- XAML's own render pass --
+  // and Focus() and InputPane::TryShow() re-enter focus, layout and the input
+  // host while the frame is still in flight. The crash lands about a second
+  // after the keyboard appears, which is the wrong place to be clever.
+  //
+  // So the render pass only notices; the work is posted and happens on a
+  // later turn of the message loop, when XAML is between frames.
+  if (wanted_ && (wanted_() == 1) != typing_ && !textInputPending_) {
+    textInputPending_ = true;
+    auto dispatcher =
+        winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Dispatcher();
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [this]() {
+                          textInputPending_ = false;
+                          FollowTextInput();
+                        });
+  }
 
   // Ask with the serial we last drew. An unchanged engine answers zero without
   // copying anything, so an idle page costs a lock and a comparison.

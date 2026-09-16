@@ -89,13 +89,13 @@ void ResolveUnwindApis() {
 // belongs to the exception record.
 void LogStack(const wchar_t* tag, CONTEXT context) {
   if (!gLookupFunctionEntry || !gVirtualUnwind) {
-    Log::Write(std::wstring(tag) + L"   (no unwind support)");
+    Log::WriteFromFault(std::wstring(tag) + L"   (no unwind support)");
     return;
   }
 
   for (int depth = 0; depth < 32; ++depth) {
     if (!context.Pc) return;
-    Log::Write(std::wstring(tag) + L"   " +
+    Log::WriteFromFault(std::wstring(tag) + L"   " +
                DescribeAddress(reinterpret_cast<void*>(context.Pc)));
 
     DWORD imageBase = 0;
@@ -128,7 +128,7 @@ void LogStackScan(const wchar_t* tag, DWORD sp) {
   const uintptr_t* limit = reinterpret_cast<const uintptr_t*>(
       reinterpret_cast<const char*>(region.BaseAddress) + region.RegionSize);
 
-  Log::Write(std::wstring(tag) + L"   -- stack scan (candidates) --");
+  Log::WriteFromFault(std::wstring(tag) + L"   -- stack scan (candidates) --");
   int printed = 0;
   for (const uintptr_t* word = start; word < limit && printed < 24; ++word) {
     const uintptr_t value = *word;
@@ -137,7 +137,7 @@ void LogStackScan(const wchar_t* tag, DWORD sp) {
     if (!gLookupFunctionEntry(static_cast<DWORD>(value), &imageBase, nullptr)) {
       continue;
     }
-    Log::Write(std::wstring(tag) + L"   ?? " +
+    Log::WriteFromFault(std::wstring(tag) + L"   ?? " +
                DescribeAddress(reinterpret_cast<void*>(value)));
     ++printed;
   }
@@ -150,7 +150,7 @@ void LogStackScan(const wchar_t* tag, DWORD sp) {
 void LogMemory(const wchar_t* tag) {
   auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
   auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-  Log::Write(std::wstring(tag) + L" memory " +
+  Log::WriteFromFault(std::wstring(tag) + L" memory " +
              std::to_wstring(used / (1024 * 1024)) + L" MB of " +
              std::to_wstring(limit / (1024 * 1024)) + L" MB");
 }
@@ -234,20 +234,64 @@ std::wstring CodeAt(const void* pc) {
 std::atomic<int> gReported{0};
 constexpr int kMaxReports = 4;
 
+// The bytes at the faulting instruction. Every report so far has said where
+// the fault was and what the registers held, and none has said what the
+// instruction actually does -- which is the one thing that would name the
+// register that was null instead of leaving it to be guessed at.
+void LogInstruction(const wchar_t* tag, void* address) {
+  if (!address) {
+    return;
+  }
+  const uint8_t* at = reinterpret_cast<const uint8_t*>(
+      reinterpret_cast<uintptr_t>(address) & ~uintptr_t(1));
+  // Thumb-2 is two or four bytes; eight covers the faulting one and its
+  // neighbour, which is usually enough to read the addressing mode.
+  // Check the page is really there first. There is no IsBadReadPtr in an app
+  // container, and faulting inside the fault handler would be the end of it.
+  MEMORY_BASIC_INFORMATION info = {};
+  if (!::VirtualQuery(at, &info, sizeof(info)) ||
+      info.State != MEM_COMMIT ||
+      (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+    return;
+  }
+  const uintptr_t end =
+      reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+  wchar_t bytes[64] = {};
+  wchar_t* out = bytes;
+  for (int i = 0; i < 8; ++i) {
+    if (reinterpret_cast<uintptr_t>(at + i) >= end) {
+      break;
+    }
+    out += swprintf(out, 4, L"%02x ", at[i]);
+  }
+  Log::WriteFromFault(std::wstring(tag) + L"   instruction at " +
+                      (reinterpret_cast<uintptr_t>(address) & 1 ? L"thumb "
+                                                                : L"arm ") +
+                      bytes);
+}
+
 LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
-  if (gReported.fetch_add(1) >= kMaxReports) return EXCEPTION_CONTINUE_SEARCH;
+  const int nth = gReported.fetch_add(1);
+  if (nth == kMaxReports) {
+    Log::WriteFromFault(
+        L"first-chance: further reports suppressed -- the cap is reached, so "
+        L"do not read later silence as no further faults");
+  }
+  if (nth >= kMaxReports) return EXCEPTION_CONTINUE_SEARCH;
 
   // First chance means exactly that: the process may well have a handler for
   // this and carry on. Said plainly so it is not read as a cause of death.
-  Log::Write(L"first-chance: code " + Hex(code) + L" at " +
+  Log::WriteFromFault(L"first-chance: code " + Hex(code) + L" at " +
              DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
              FaultDetail(*info->ExceptionRecord));
   LogMemory(L"first-chance:");
-  Log::Write(L"first-chance: code" + Registers(*info->ContextRecord));
+  Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
+  LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
   LogStack(L"first-chance:", *info->ContextRecord);
   LogStackScan(L"first-chance:", info->ContextRecord->Sp);
+  Log::FlushFromFault();
 
   // Not ours to handle -- only to record.
   return EXCEPTION_CONTINUE_SEARCH;
@@ -284,7 +328,7 @@ LoadLibraryExWFn gRealLoadLibraryExW = nullptr;
 LoadPackagedLibraryFn gRealLoadPackagedLibrary = nullptr;
 
 void __cdecl HookAbort() {
-  Log::Write(L"kill: the engine called abort()");
+  Log::WriteFromFault(L"kill: the engine called abort()");
   LogBacktrace(L"kill:");
   if (gRealAbort) gRealAbort();
   ::TerminateProcess(::GetCurrentProcess(), 3);
@@ -333,7 +377,7 @@ void LogDelayLoadFailure(DWORD code, DWORD count, const ULONG_PTR* args) {
           : (info->dlp.fImportByName
                  ? L"!" + Widen(info->dlp.szProcName) + L" not found"
                  : L" ordinal not found");
-  Log::Write(L"delay-load: " + dll + what + L", err " +
+  Log::WriteFromFault(L"delay-load: " + dll + what + L", err " +
              std::to_wstring(info->dwLastError));
 }
 
@@ -342,7 +386,7 @@ void WINAPI HookRaiseException(DWORD code, DWORD flags, DWORD count,
   if (code == kDelayLoadModuleMissing || code == kDelayLoadProcMissing) {
     LogDelayLoadFailure(code, count, args);
   } else if (code != kThreadNameException && gRaiseReports.fetch_add(1) < 12) {
-    Log::Write(L"raise: the engine raised " + Hex(code));
+    Log::WriteFromFault(L"raise: the engine raised " + Hex(code));
     LogBacktrace(L"raise:");
   }
   if (gRealRaiseException) gRealRaiseException(code, flags, count, args);
@@ -350,14 +394,14 @@ void WINAPI HookRaiseException(DWORD code, DWORD flags, DWORD count,
 
 HMODULE WINAPI HookLoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
   HMODULE module = gRealLoadLibraryExW(name, file, flags);
-  Log::Write(L"load: " + std::wstring(name ? name : L"(null)") +
+  Log::WriteFromFault(L"load: " + std::wstring(name ? name : L"(null)") +
              (module ? L"" : L"  FAILED"));
   return module;
 }
 
 HMODULE WINAPI HookLoadPackagedLibrary(LPCWSTR name, DWORD reserved) {
   HMODULE module = gRealLoadPackagedLibrary(name, reserved);
-  Log::Write(L"load: " + std::wstring(name ? name : L"(null)") +
+  Log::WriteFromFault(L"load: " + std::wstring(name ? name : L"(null)") +
              (module ? L" (packaged)" : L" (packaged)  FAILED"));
   return module;
 }
@@ -477,7 +521,7 @@ void ProbeDelayLoads(HMODULE module) {
                   .DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
                   .VirtualAddress;
   if (!rva) {
-    Log::Write(L"delay-probe: no delay-load directory");
+    Log::WriteFromFault(L"delay-probe: no delay-load directory");
     return;
   }
 
@@ -501,7 +545,7 @@ void ProbeDelayLoads(HMODULE module) {
                                           LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!target) {
       ++missing;
-      Log::Write(L"delay-probe: " + Widen(moduleName) + L" absent entirely");
+      Log::WriteFromFault(L"delay-probe: " + Widen(moduleName) + L" absent entirely");
       continue;
     }
 
@@ -535,14 +579,14 @@ void ProbeDelayLoads(HMODULE module) {
     // shape of it, and the shape is what matters -- whole subsystems this
     // device does not have.
     if (moduleMissing) {
-      Log::Write(L"delay-probe: " + Widen(moduleName) + L" missing " +
+      Log::WriteFromFault(L"delay-probe: " + Widen(moduleName) + L" missing " +
                  std::to_wstring(moduleMissing) + L" of " +
                  std::to_wstring(moduleImports));
     }
     ::FreeLibrary(target);
   }
 
-  Log::Write(L"delay-probe: " + std::to_wstring(modules) + L" modules, " +
+  Log::WriteFromFault(L"delay-probe: " + std::to_wstring(modules) + L" modules, " +
              std::to_wstring(imports) + L" delayed imports, " +
              std::to_wstring(missing) + L" unavailable");
 }
@@ -670,7 +714,7 @@ void ReportPreviousTrace(const std::wstring& localState) {
     } else {
       where = Hex(sample.offset) + L" (no module)";
     }
-    Log::Write(L"trace: " + where);
+    Log::WriteFromFault(L"trace: " + where);
   }
 
   ::UnmapViewOfFile(trace);
@@ -717,7 +761,7 @@ DWORD WINAPI SamplerThread(LPVOID param) {
   HANDLE target = static_cast<HANDLE>(param);
 
   if (!gTrace || !ResolveSamplingApis()) {
-    Log::Write(L"sampler: thread inspection unavailable in this container");
+    Log::WriteFromFault(L"sampler: thread inspection unavailable in this container");
     ::CloseHandle(target);
     return 0;
   }
@@ -761,12 +805,12 @@ DWORD WINAPI SamplerThread(LPVOID param) {
 // Reached only when nothing in the process handled the exception, which makes
 // this the one report that names a cause rather than an event.
 LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
-  Log::Write(L"FATAL: unhandled " + Hex(info->ExceptionRecord->ExceptionCode) +
+  Log::WriteFromFault(L"FATAL: unhandled " + Hex(info->ExceptionRecord->ExceptionCode) +
              L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
              FaultDetail(*info->ExceptionRecord));
   LogMemory(L"FATAL:");
-  Log::Write(L"FATAL: code" + Registers(*info->ContextRecord));
-  Log::Write(L"FATAL: at pc " +
+  Log::WriteFromFault(L"FATAL: code" + Registers(*info->ContextRecord));
+  Log::WriteFromFault(L"FATAL: at pc " +
              CodeAt(info->ExceptionRecord->ExceptionAddress));
   LogStack(L"FATAL:", *info->ContextRecord);
   return EXCEPTION_CONTINUE_SEARCH;
@@ -815,7 +859,7 @@ void LogKnownOffsets() {
       uintptr_t offset = reinterpret_cast<uintptr_t>(proc) -
                          reinterpret_cast<uintptr_t>(module);
       std::wstring wide(*name, *name + std::strlen(*name));
-      Log::Write(std::wstring(L"known: ") + entry.module + L"+" + Hex(offset) +
+      Log::WriteFromFault(std::wstring(L"known: ") + entry.module + L"+" + Hex(offset) +
                  L" " + wide);
     }
   }
@@ -849,7 +893,7 @@ void InstallEngineProbes() {
   for (const wchar_t* name : {L"xul.dll", L"mozglue.dll", L"nss3.dll"}) {
     HMODULE module = ::LoadPackagedLibrary(name, 0);
     if (!module) {
-      Log::Write(std::wstring(L"probe crash: ") + name + L" not loaded");
+      Log::WriteFromFault(std::wstring(L"probe crash: ") + name + L" not loaded");
       continue;
     }
     hooked += HookImports(module);
@@ -866,7 +910,7 @@ void InstallEngineProbes() {
   // at, which ASLR changes every run.
   for (const wchar_t* name : {L"xul.dll", L"mozglue.dll", L"nss3.dll"}) {
     if (HMODULE module = ::GetModuleHandleW(name)) {
-      Log::Write(std::wstring(L"base: ") + name + L" at " +
+      Log::WriteFromFault(std::wstring(L"base: ") + name + L" at " +
                  Hex(reinterpret_cast<uintptr_t>(module)));
     }
   }

@@ -23,6 +23,19 @@ class Log {
 
   static void Write(std::wstring_view line);
 
+  // For use from inside an exception handler, and nowhere else.
+  //
+  // The ordinary Write ends by calling whatever handler the page installed,
+  // and that handler posts to the XAML dispatcher. Doing that from a vectored
+  // handler re-enters the message pump on a thread already nineteen frames
+  // deep inside it -- about sixty times per crash report. It also takes a
+  // non-recursive mutex and waits for the disk, either of which can finish the
+  // process off by itself. This path notifies nobody, waits for nothing, and
+  // gives up rather than block.
+  static void WriteFromFault(std::wstring_view line);
+  // Called once, at the end of a report.
+  static void FlushFromFault();
+
   // printf-free formatting helpers for the common cases.
   static void Write(std::wstring_view label, std::wstring_view value);
   static void WriteNum(std::wstring_view label, long long value);

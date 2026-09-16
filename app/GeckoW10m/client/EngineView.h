@@ -116,6 +116,8 @@ class EngineView {
   int32_t height_ = 0;
   bool reported_ = false;
   bool panelGiven_ = false;
+  bool textInputPending_ = false;
+  unsigned long long lastResolveAttempt_ = 0;
   std::function<void()> firstFrame_;
 
   bool pressed_ = false;
