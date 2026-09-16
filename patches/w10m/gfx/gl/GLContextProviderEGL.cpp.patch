@@ -1,8 +1,8 @@
 diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
-index 728fa98356..31bbe6d859 100644
+index 728fa98356..19d77ff31f 100644
 --- a/gfx/gl/GLContextProviderEGL.cpp
 +++ b/gfx/gl/GLContextProviderEGL.cpp
-@@ -12,6 +12,24 @@
+@@ -12,6 +12,25 @@
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_JAVA_SURFACE))
  #  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
      (aWidget->AsAndroid()->GetEGLNativeWindow())
@@ -20,6 +20,7 @@ index 728fa98356..31bbe6d859 100644
 +// Declared rather than included -- the panel belongs to the headless widget,
 +// and gfx has no business including widget headers.
 +extern "C" void* gecko_w10m_egl_native_window();
++extern "C" void GeckoW10mNote(const char* text);
 +#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
 +    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
 +#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
@@ -27,3 +28,14 @@ index 728fa98356..31bbe6d859 100644
  #elif defined(XP_WIN)
  #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
+@@ -336,6 +355,10 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+   MOZ_ASSERT(aCompositorWidget);
+   EGLNativeWindowType window =
+       GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aCompositorWidget);
++#if defined(GECKO_W10M)
++  GeckoW10mNote(window ? "gfx: making an EGL surface for the panel"
++                     : "gfx: asked for an EGL surface but there is no panel");
++#endif
+   if (!window) {
+     gfxCriticalNote << "window is null";
+     return EGL_NO_SURFACE;

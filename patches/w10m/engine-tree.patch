@@ -706,10 +706,10 @@ index 7834485f3e..94b9595a06 100644
  		    reinterpret_cast<IUnknown**>(&mFactoryInstance));
  		assert(SUCCEEDED(hr));
 diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
-index 728fa98356..31bbe6d859 100644
+index 728fa98356..19d77ff31f 100644
 --- a/gfx/gl/GLContextProviderEGL.cpp
 +++ b/gfx/gl/GLContextProviderEGL.cpp
-@@ -12,6 +12,24 @@
+@@ -12,6 +12,25 @@
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_JAVA_SURFACE))
  #  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
      (aWidget->AsAndroid()->GetEGLNativeWindow())
@@ -727,6 +727,7 @@ index 728fa98356..31bbe6d859 100644
 +// Declared rather than included -- the panel belongs to the headless widget,
 +// and gfx has no business including widget headers.
 +extern "C" void* gecko_w10m_egl_native_window();
++extern "C" void GeckoW10mNote(const char* text);
 +#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
 +    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
 +#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
@@ -734,6 +735,17 @@ index 728fa98356..31bbe6d859 100644
  #elif defined(XP_WIN)
  #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
+@@ -336,6 +355,10 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+   MOZ_ASSERT(aCompositorWidget);
+   EGLNativeWindowType window =
+       GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aCompositorWidget);
++#if defined(GECKO_W10M)
++  GeckoW10mNote(window ? "gfx: making an EGL surface for the panel"
++                     : "gfx: asked for an EGL surface but there is no panel");
++#endif
+   if (!window) {
+     gfxCriticalNote << "window is null";
+     return EGL_NO_SURFACE;
 diff --git a/gfx/graphite2/src/inc/Machine.h b/gfx/graphite2/src/inc/Machine.h
 index 5ceedc296d..67b20e2a1d 100644
 --- a/gfx/graphite2/src/inc/Machine.h
@@ -921,10 +933,21 @@ index f45971a4ec..cea8861b57 100644
                                               "gfx.swap-interval");
  
 diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
-index 06ed553c01..ec245236a6 100644
+index 06ed553c01..ba41fac850 100644
 --- a/gfx/webrender_bindings/RenderCompositor.cpp
 +++ b/gfx/webrender_bindings/RenderCompositor.cpp
-@@ -22,7 +22,7 @@
+@@ -17,12 +17,18 @@
+ #include "mozilla/webrender/RenderCompositorSWGL.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++#  include "nsString.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #ifdef XP_WIN
+ #  include "mozilla/webrender/RenderCompositorANGLE.h"
  #  include "mozilla/widget/WinCompositorWidget.h"
  #endif
  
@@ -933,7 +956,7 @@ index 06ed553c01..ec245236a6 100644
  #  include "mozilla/webrender/RenderCompositorEGL.h"
  #endif
  
-@@ -229,7 +229,20 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
+@@ -229,7 +235,30 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
      return RenderCompositorSWGL::Create(aWidget, aError);
    }
  
@@ -950,7 +973,17 @@ index 06ed553c01..ec245236a6 100644
 +  // makes a composition swap chain for it -- so the frame is handed to the
 +  // system compositor as a texture instead of being copied out through main
 +  // memory.
-+  return RenderCompositorEGL::Create(aWidget, aError);
++  GeckoW10mNote("gfx: making the EGL compositor");
++  auto compositor = RenderCompositorEGL::Create(aWidget, aError);
++  if (compositor) {
++    GeckoW10mNote("gfx: the EGL compositor is up");
++  } else {
++    char note[192];
++    SprintfLiteral(note, "gfx: the EGL compositor failed -- %s",
++                   nsPromiseFlatCString(aError).get());
++    GeckoW10mNote(note);
++  }
++  return compositor;
 +#elif defined(XP_WIN)
    if (gfx::gfxVars::UseWebRenderANGLE()) {
      return RenderCompositorANGLE::Create(aWidget, aError);
