@@ -63,6 +63,8 @@ class EngineView {
                int32_t* y) const;
 
   void FollowTextInput();
+  // Tells the engine how much room the picture has, whenever that changes.
+  void PushSize();
   void WireKeyboard();
 
   using CopyFn = int32_t (*)(void* dest, int32_t capacity, int32_t* width,
@@ -70,6 +72,7 @@ class EngineView {
   using MouseFn = void (*)(int32_t message, int32_t x, int32_t y);
   using WheelFn = void (*)(int32_t x, int32_t y, double dx, double dy);
   using WantedFn = int32_t (*)();
+  using OverlayFn = int32_t (*)();
   using TextFn = void (*)(const uint16_t* text, int32_t length);
   using KeyFn = void (*)(int32_t keyCode);
   using ResizeFn = void (*)(int32_t width, int32_t height);
@@ -78,6 +81,7 @@ class EngineView {
   MouseFn mouse_ = nullptr;
   WheelFn wheel_ = nullptr;
   WantedFn wanted_ = nullptr;
+  OverlayFn overlay_ = nullptr;
   TextFn text_ = nullptr;
   KeyFn key_ = nullptr;
   ResizeFn resize_ = nullptr;

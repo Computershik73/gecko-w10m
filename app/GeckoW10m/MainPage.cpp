@@ -100,14 +100,22 @@ MainPage::MainPage() {
   // So the scale is whatever Windows says, or whatever makes the screen wide
   // enough, whichever is smaller. 540 rather than 504 leaves room for rounding
   // and for a locale whose toolbar needs a little more.
+  //
+  // This is a second scale, not a correction to the first. `raw` says how many
+  // physical pixels Windows puts in a view pixel and is what turns a XAML size
+  // or a keyboard height into frame pixels; `cssScale` says how big Gecko
+  // should draw. Writing the second over the first, which the last build did,
+  // makes the shell measure the keyboard in the wrong unit: it reported 669
+  // physical pixels covered where the keyboard really takes 878, and the
+  // window moved up by too little.
   constexpr double kNarrowestChromeCss = 540.0;
-  if (pixelWidth > 0 && raw > pixelWidth / kNarrowestChromeCss) {
-    const double fitted = pixelWidth / kNarrowestChromeCss;
+  double cssScale = raw;
+  if (pixelWidth > 0 && cssScale > pixelWidth / kNarrowestChromeCss) {
+    cssScale = pixelWidth / kNarrowestChromeCss;
     Log::Write(L"view: scale " + std::to_wstring(raw) + L" would leave " +
                std::to_wstring(static_cast<int>(pixelWidth / raw)) +
-               L" CSS pixels, too narrow for the chrome; using " +
-               std::to_wstring(fitted));
-    raw = fitted;
+               L" CSS pixels, too narrow for the chrome; drawing at " +
+               std::to_wstring(cssScale));
   }
   Log::WriteNum(L"cpu: cores visible to the process",
                 static_cast<int>(std::thread::hardware_concurrency()));
@@ -142,7 +150,7 @@ MainPage::MainPage() {
   // Last, so the window is up and the log is readable before Gecko gets its
   // chance to take the process down with it.
   engine::StartGeckoRuntime(std::wstring(localState), pixelWidth, pixelHeight,
-                            raw);
+                            cssScale);
 }
 
 void MainPage::ApplyVisibleBounds() {

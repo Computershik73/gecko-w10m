@@ -53,6 +53,14 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
       [this](winrt::Windows::Foundation::IInspectable const&,
              Input::PointerRoutedEventArgs const&) { pressed_ = false; });
 
+  // The window is whatever room the picture actually has, measured whenever
+  // that changes rather than once at startup. The status bar and the
+  // navigation bar come and go, and the screen turns; a size taken at startup
+  // is right for none of that, and the frame was being letterboxed into the
+  // difference instead of filling it.
+  image_.SizeChanged([this](winrt::Windows::Foundation::IInspectable const&,
+                            SizeChangedEventArgs const&) { PushSize(); });
+
   WireKeyboard();
 }
 
@@ -80,11 +88,35 @@ void EngineView::WireKeyboard() {
   sink_.IsSpellCheckEnabled(false);
   sink_.IsTextPredictionEnabled(false);
 
-  // The characters are taken from the window rather than from the sink.
-  // CharacterReceived fires for whatever the keyboard produced, whichever
-  // control happens to hold focus, so it does not depend on the sink having
-  // won it -- and that dependency is the only thing the last build could have
-  // got wrong, since everything else about the path was already in place.
+  // This is how the typing actually arrives. The on-screen keyboard of a phone
+  // does not send characters to the window the way a physical one does: it
+  // edits the focused text control directly, through the text services, and
+  // the only sign of it is that the control's text changed. Listening for
+  // characters on the window was the mistake -- the keyboard appeared, the
+  // sink held focus, and nothing was ever delivered to listen for.
+  //
+  // So whatever lands here is passed on and the sink is emptied again, which
+  // keeps it from growing and keeps the next change a pure delta.
+  sink_.TextChanged([this](winrt::Windows::Foundation::IInspectable const&,
+                           Controls::TextChangedEventArgs const&) {
+    if (clearing_) {
+      return;
+    }
+    auto typed = sink_.Text();
+    if (typed.empty()) {
+      return;
+    }
+    if (text_ && typing_) {
+      text_(reinterpret_cast<const uint16_t*>(typed.c_str()),
+            static_cast<int32_t>(typed.size()));
+    }
+    clearing_ = true;
+    sink_.Text(L"");
+    clearing_ = false;
+  });
+
+  // A hardware keyboard, if one is ever attached, still sends characters this
+  // way, and it costs nothing to keep.
   auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
   window.CharacterReceived(
       [this](winrt::Windows::UI::Core::CoreWindow const&,
@@ -128,6 +160,26 @@ void EngineView::WireKeyboard() {
         break;
     }
   });
+
+  // A dialog or a menu here has no title bar -- a headless window has no frame
+  // for the system to draw one in -- so there is nothing on it to press to
+  // close it. The About window could be opened and then never dismissed. The
+  // phone's back button does it instead, as Escape, which is what closes a
+  // dialog or a menu in Firefox.
+  //
+  // Only while something is actually open. Swallowing back the rest of the
+  // time would take away the way out of the app.
+  auto navigation =
+      winrt::Windows::UI::Core::SystemNavigationManager::GetForCurrentView();
+  navigation.BackRequested(
+      [this](winrt::Windows::Foundation::IInspectable const&,
+             winrt::Windows::UI::Core::BackRequestedEventArgs const& args) {
+        if (!key_ || !overlay_ || overlay_() != 1) {
+          return;
+        }
+        key_(27);  // Escape
+        args.Handled(true);
+      });
 
   // The keyboard takes the bottom of the screen away. Telling the engine makes
   // it lay the window out in what is left, so the field being typed into is
@@ -176,6 +228,8 @@ bool EngineView::Resolve() {
       reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
   wanted_ = reinterpret_cast<WantedFn>(
       ::GetProcAddress(xul, "gecko_w10m_text_input_wanted"));
+  overlay_ = reinterpret_cast<OverlayFn>(
+      ::GetProcAddress(xul, "gecko_w10m_overlay_open"));
   text_ = reinterpret_cast<TextFn>(::GetProcAddress(xul, "gecko_w10m_input_text"));
   key_ = reinterpret_cast<KeyFn>(::GetProcAddress(xul, "gecko_w10m_input_key"));
   resize_ =
@@ -197,6 +251,27 @@ void EngineView::EnsureBitmap(int32_t width, int32_t height) {
   image_.Source(bitmap_);
   Log::Write(L"view: frame size " + std::to_wstring(width) + L"x" +
              std::to_wstring(height));
+}
+
+void EngineView::PushSize() {
+  if (!resize_) {
+    return;
+  }
+  const int32_t width =
+      static_cast<int32_t>(image_.ActualWidth() * rawPerView_ + 0.5);
+  const int32_t height =
+      static_cast<int32_t>(image_.ActualHeight() * rawPerView_ + 0.5);
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  if (width == fullWidth_ && height == fullHeight_) {
+    return;
+  }
+  fullWidth_ = width;
+  fullHeight_ = height;
+  Log::Write(L"view: room is now " + std::to_wstring(width) + L"x" +
+             std::to_wstring(height) + L", telling the engine");
+  resize_(width, height);
 }
 
 void EngineView::FollowTextInput() {
@@ -261,21 +336,9 @@ void EngineView::Tick() {
       firstFrame_ = nullptr;
       handler();
 
-      // Whatever the window decided it was, it is the size of the screen from
-      // here on. It came out wider than the phone -- 1765 against 1440 -- and
-      // every one of those extra columns is rasterised by the software
-      // compositor and then copied across, for pixels the screen cannot show.
-      // This is the same call the keyboard uses to make room for itself, so it
-      // is known to work; why the window needed telling at all is a separate
-      // question the engine now writes down.
-      if (resize_ && fullWidth_ > 0 && fullHeight_ > 0 &&
-          (width_ != fullWidth_ || height_ != fullHeight_)) {
-        Log::Write(L"view: window is " + std::to_wstring(width_) + L"x" +
-                   std::to_wstring(height_) + L", asking for " +
-                   std::to_wstring(fullWidth_) + L"x" +
-                   std::to_wstring(fullHeight_));
-        resize_(fullWidth_, fullHeight_);
-      }
+      // The engine could not be told a size before it existed, so the first
+      // frame is when the room it actually has is handed over.
+      PushSize();
     }
     return;
   }

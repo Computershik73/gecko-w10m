@@ -15893,7 +15893,7 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..e444f105db 100644
+index 8484851f67..f9be4b52b6 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
 @@ -7,6 +7,44 @@
@@ -15996,7 +15996,7 @@ index 8484851f67..e444f105db 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +119,334 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +119,371 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -16088,6 +16088,15 @@ index 8484851f67..e444f105db 100644
 +    const int32_t dy = at.y - base.y;
 +    const size_t sourceStride = size_t(window->mWidth) * 4;
 +
++    // Blended, not copied. An overlay's buffer is only as painted as its
++    // window is: a menu paints its panel and leaves the rest of the buffer
++    // alone, and those bytes are zeros. Copied straight down, a zero pixel is
++    // opaque black, which is what the address bar's drop-down turned into --
++    // a black rectangle over the page. Composited over, a zero pixel is
++    // nothing at all and the window beneath shows through.
++    //
++    // WebRender hands these over premultiplied, so this is the plain
++    // source-over: dest = src + dest * (1 - alpha).
 +    for (int32_t row = 0; row < window->mHeight; ++row) {
 +      const int32_t y = dy + row;
 +      if (y < 0 || y >= sFrontHeight) {
@@ -16099,10 +16108,23 @@ index 8484851f67..e444f105db 100644
 +      if (count <= 0) {
 +        continue;
 +      }
-+      memcpy(sFront.get() + size_t(y) * stride + size_t(dx + from) * 4,
-+             window->mPixels.get() + size_t(row) * sourceStride +
-+                 size_t(from) * 4,
-+             size_t(count) * 4);
++      uint8_t* dest = sFront.get() + size_t(y) * stride + size_t(dx + from) * 4;
++      const uint8_t* src = window->mPixels.get() + size_t(row) * sourceStride +
++                           size_t(from) * 4;
++      for (int32_t i = 0; i < count; ++i, dest += 4, src += 4) {
++        const uint32_t alpha = src[3];
++        if (alpha == 255) {
++          memcpy(dest, src, 4);
++          continue;
++        }
++        if (alpha == 0) {
++          continue;
++        }
++        const uint32_t inverse = 255 - alpha;
++        for (int c = 0; c < 4; ++c) {
++          dest[c] = uint8_t(src[c] + ((dest[c] * inverse + 127) / 255));
++        }
++      }
 +    }
 +  }
 +
@@ -16208,6 +16230,21 @@ index 8484851f67..e444f105db 100644
 +// That is what an on-screen keyboard is -- it produces text, not scancodes --
 +// and it is the path TextEventDispatcher exists to serve. Keys that are not
 +// text, like Backspace and Enter, still have to be keys.
++
++// Whether anything is open over the browser window: a dialog, a menu, a popup.
++// These have no title bar here, because a headless window has no frame for the
++// system to draw one in, so there is nothing on them to press to make them go
++// away. The shell gives them the phone's back button instead, and asks this
++// first so that back still means back when nothing is open.
++extern "C" __declspec(dllexport) int32_t gecko_w10m_overlay_open() {
++  mozilla::StaticMutexAutoLock lock(sFrameLock);
++  for (auto* window : sWindows) {
++    if (window->IsOverlayShowing()) {
++      return 1;
++    }
++  }
++  return 0;
++}
 +
 +extern "C" __declspec(dllexport) int32_t gecko_w10m_text_input_wanted() {
 +  return mozilla::widget::HeadlessWidget::TextInputWanted() ? 1 : 0;
@@ -16332,7 +16369,7 @@ index 8484851f67..e444f105db 100644
 +}
 +#endif
 diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
-index f9454a79f3..2c62736d11 100644
+index f9454a79f3..685e824450 100644
 --- a/widget/headless/HeadlessCompositorWidget.h
 +++ b/widget/headless/HeadlessCompositorWidget.h
 @@ -8,6 +8,11 @@
@@ -16347,7 +16384,7 @@ index f9454a79f3..2c62736d11 100644
  namespace mozilla {
  namespace widget {
  
-@@ -19,8 +24,19 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -19,8 +24,21 @@ class HeadlessCompositorWidget final : public CompositorWidget,
    HeadlessCompositorWidget(const HeadlessCompositorWidgetInitData& aInitData,
                             const layers::CompositorOptions& aOptions,
                             HeadlessWidget* aWindow);
@@ -16363,11 +16400,13 @@ index f9454a79f3..2c62736d11 100644
 +  // A menu that has been dismissed still has its last frame; without this it
 +  // would keep being drawn over the window it was dismissed from.
 +  void NotifyVisibilityChanged(bool aVisible);
++  // Something is standing over the browser window right now.
++  bool IsOverlayShowing() const { return mIsOverlay && mVisible; }
 +#endif
  
    // CompositorWidget Overrides
  
-@@ -39,11 +55,44 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -39,11 +57,44 @@ class HeadlessCompositorWidget final : public CompositorWidget,
      return this;
    }
  
