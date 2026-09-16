@@ -274,6 +274,7 @@ void LogInstruction(const wchar_t* tag, void* address) {
 // whether it happened where the frames are drawn.
 std::atomic<unsigned> gUiFrames{0};
 std::atomic<DWORD> gUiThread{0};
+std::atomic<HANDLE> gUiThreadHandle{nullptr};
 
 DWORD WINAPI HeartbeatThread(LPVOID) {
   unsigned last = 0;
@@ -708,10 +709,23 @@ TraceFile* MapTrace(const std::wstring& localState, bool createNew) {
 // tail matters: the ring is long enough that the interesting part is always at
 // the end.
 void ReportPreviousTrace(const std::wstring& localState) {
+  // Silence here has been read twice as "the previous run left nothing", and
+  // there are three quite different reasons for it. It says which now, because
+  // this is about to be the only account of how the process died.
   TraceFile* trace = MapTrace(localState, /*createNew*/ false);
-  if (!trace) return;
+  if (!trace) {
+    Log::WriteNum(L"trace: no trace file from the previous run, err",
+                  ::GetLastError());
+    return;
+  }
 
-  if (trace->magic != kTraceMagic || trace->written == 0) {
+  if (trace->magic != kTraceMagic) {
+    Log::Write(L"trace: the previous run's trace file is not one");
+    ::UnmapViewOfFile(trace);
+    return;
+  }
+  if (trace->written == 0) {
+    Log::Write(L"trace: the previous run wrote no samples");
     ::UnmapViewOfFile(trace);
     return;
   }
@@ -821,8 +835,44 @@ DWORD WINAPI SamplerThread(LPVOID param) {
     }
   }
 
-  Log::WriteNum(L"sampler: finished, samples", gTrace->written);
+  Log::WriteNum(L"sampler: the engine start-up thread ended, samples",
+                gTrace->written);
   ::CloseHandle(target);
+
+  // And now the one that matters. The process is being ended without raising
+  // anything at all -- no unhandled exception, no exit hook, no error reaching
+  // the framework -- which is what a __fastfail looks like from inside, and
+  // there is no way to catch one. The only way left to find out where it
+  // happens is to have been watching the thread it happens on, and the fault
+  // we do see says which thread that is: the UI thread.
+  //
+  // Slower than the first phase on purpose. Phase one watched a thread doing
+  // nothing but starting the engine; this one suspends the thread that draws
+  // the screen, and doing that in a tight loop would measure the measurement.
+  HANDLE ui = gUiThreadHandle.load();
+  if (!ui) {
+    Log::WriteFromFault(L"sampler: no handle to the UI thread, not following it");
+    return 0;
+  }
+  Log::WriteFromFault(L"sampler: now following the UI thread");
+  unsigned lastPc = 0;
+  while (::WaitForSingleObject(ui, 0) != WAIT_OBJECT_0) {
+    ::Sleep(1);
+    if (gSuspendThread(ui) == static_cast<DWORD>(-1)) break;
+    __declspec(align(8)) CONTEXT context{};
+    context.ContextFlags = CONTEXT_CONTROL;
+    BOOL ok = gGetThreadContext(ui, &context);
+    gResumeThread(ui);
+    if (!ok) break;
+    unsigned pc = static_cast<unsigned>(context.Pc);
+    if (pc == lastPc) continue;
+    lastPc = pc;
+    unsigned index = ModuleIndexFor(reinterpret_cast<void*>(pc));
+    TraceSample& sample = gTrace->samples[gTrace->written % kCapacity];
+    sample.module = index;
+    sample.offset = index < kMaxModules ? pc - gTrace->modules[index].base : pc;
+    ++gTrace->written;
+  }
   return 0;
 }
 
@@ -844,9 +894,17 @@ LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
 
 void NoteUiFrame() {
   gUiFrames.fetch_add(1, std::memory_order_relaxed);
-  // The first frame is also the moment the UI thread identifies itself; there
-  // is nowhere earlier that runs on it and is guaranteed to run at all.
-  if (gUiThread.load() == 0) gUiThread.store(::GetCurrentThreadId());
+  if (gUiThread.load() != 0) return;
+  // The first frame is also the moment the UI thread identifies itself, and
+  // the only moment a handle to it can be had: an app container will not open
+  // a thread by id, but a thread may always duplicate its own pseudo-handle
+  // into a real one. The sampler needs that handle to follow it.
+  HANDLE real = nullptr;
+  ::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(),
+                    ::GetCurrentProcess(), &real, 0, FALSE,
+                    DUPLICATE_SAME_ACCESS);
+  gUiThreadHandle.store(real);
+  gUiThread.store(::GetCurrentThreadId());
 }
 
 void StartHeartbeat() {

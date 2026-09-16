@@ -226,20 +226,31 @@ void MainPage::BuildUi() {
   // tap landed on a text control and Windows raised the keyboard for each one,
   // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
-  // The panel is back in the tree: taking it out proved it innocent -- the
-  // crash came back byte for byte without it.
+  // Out of the tree for this build, and the log says so, because this is an
+  // experiment rather than a decision.
   //
-  // The crash is in the XAML compositor and nothing of ours is in its stack;
-  // the log now shows the EGL compositor coming up and then nothing -- no EGL
-  // surface asked for, ANGLE never called -- so it happens before the panel is
-  // used for anything. The panel sat here harmlessly while D3D11 was off and
-  // the process started dying the moment D3D11 came on, so the two are worth
-  // separating, and this separates them: it is the only thing I put in the
-  // visual tree.
+  // The panel still exists, the engine is still given it, ANGLE still makes
+  // the swap chain and still hands it over -- everything up to the moment the
+  // compositor would have to show it. The one thing that does not happen is
+  // the showing. It was taken out once before and called innocent, but that
+  // was measured when ANGLE never reached the panel at all: no EGL surface, no
+  // swap chain, nothing to composite. There was nothing for the answer to mean.
+  // Now there is.
   //
-  // Still in the log either way, so the difference is measured rather than
-  // assumed.
-  contentStack.Children().Append(engineView_->Panel());
+  // Nothing of ours appears in the fault, and the fault turns out to be
+  // survived; the process is ended half a second later without raising
+  // anything. So the question is no longer "what faults" but "what does the
+  // compositor do with the swap chain we gave it", and this is the way to ask
+  // it without an engine build.
+  constexpr bool kPanelInTree = false;
+  if (kPanelInTree) {
+    contentStack.Children().Append(engineView_->Panel());
+  }
+  client::Log::Write(kPanelInTree
+                         ? L"experiment: the panel is in the visual tree"
+                         : L"experiment: the panel is NOT in the visual tree -- "
+                           L"the swap chain is made and handed over, but never "
+                           L"composited");
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing
