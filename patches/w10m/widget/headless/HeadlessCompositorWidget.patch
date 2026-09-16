@@ -1,5 +1,5 @@
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..030635afe6 100644
+index 8484851f67..e444f105db 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
 @@ -7,6 +7,44 @@
@@ -60,7 +60,7 @@ index 8484851f67..030635afe6 100644
 +#endif
 +{
 +#if defined(GECKO_W10M)
-+  mIsOverlay = aWindow->GetWindowType() == WindowType::Popup;
++  mIsOverlay = aWindow->GetWindowType() != WindowType::TopLevel;
 +  StaticMutexAutoLock lock(sFrameLock);
 +  sWindows.push_back(this);
 +#endif
@@ -83,7 +83,7 @@ index 8484851f67..030635afe6 100644
  
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
    if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +98,14 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+@@ -33,6 +98,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
    *size = aClientSize;
  }
  
@@ -93,12 +93,16 @@ index 8484851f67..030635afe6 100644
 +  auto origin = mOrigin.Lock();
 +  *origin = aOrigin;
 +}
++
++void HeadlessCompositorWidget::NotifyVisibilityChanged(bool aVisible) {
++  mVisible = aVisible;
++}
 +#endif
 +
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +115,334 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +119,334 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -176,8 +180,8 @@ index 8484851f67..030635afe6 100644
 +  }
 +
 +  for (auto* window : sWindows) {
-+    if (window == sMain || !window->mIsOverlay || window->mWidth <= 0 ||
-+        !window->mPixels) {
++    if (window == sMain || !window->mIsOverlay || !window->mVisible ||
++        window->mWidth <= 0 || !window->mPixels) {
 +      continue;
 +    }
 +
@@ -434,21 +438,22 @@ index 8484851f67..030635afe6 100644
 +}
 +#endif
 diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
-index f9454a79f3..41f2abbb04 100644
+index f9454a79f3..2c62736d11 100644
 --- a/widget/headless/HeadlessCompositorWidget.h
 +++ b/widget/headless/HeadlessCompositorWidget.h
-@@ -8,6 +8,10 @@
+@@ -8,6 +8,11 @@
  #include "HeadlessWidget.h"
  #include "mozilla/widget/CompositorWidget.h"
  
 +#if defined(GECKO_W10M)
++#  include "mozilla/Atomics.h"
 +#  include "mozilla/UniquePtr.h"
 +#endif
 +
  namespace mozilla {
  namespace widget {
  
-@@ -19,8 +23,16 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -19,8 +24,19 @@ class HeadlessCompositorWidget final : public CompositorWidget,
    HeadlessCompositorWidget(const HeadlessCompositorWidgetInitData& aInitData,
                             const layers::CompositorOptions& aOptions,
                             HeadlessWidget* aWindow);
@@ -461,11 +466,14 @@ index f9454a79f3..41f2abbb04 100644
 +  // Where this window sits on the headless screen. A menu is a window of its
 +  // own and knows only its own corner, so this is what says where to put it.
 +  void NotifyOriginChanged(const LayoutDeviceIntPoint& aOrigin);
++  // A menu that has been dismissed still has its last frame; without this it
++  // would keep being drawn over the window it was dismissed from.
++  void NotifyVisibilityChanged(bool aVisible);
 +#endif
  
    // CompositorWidget Overrides
  
-@@ -39,11 +51,39 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -39,11 +55,44 @@ class HeadlessCompositorWidget final : public CompositorWidget,
      return this;
    }
  
@@ -499,14 +507,19 @@ index f9454a79f3..41f2abbb04 100644
 +  int32_t mHeight = 0;
 +
 +  // Popups are drawn over the window rather than instead of it.
++  // Anything that is not the browser window itself -- menus, dialogs, the
++  // graphics sanity test's window -- is drawn over it rather than instead
++  // of it. About Nightly is a dialog, and treating it as a window of its
++  // own is what put it and the browser in a fight over the same frame.
 +  bool mIsOverlay = false;
++  mozilla::Atomic<bool> mVisible{true};
 +  DataMutex<LayoutDeviceIntPoint> mOrigin;
 +#endif
  };
  
  }  // namespace widget
 diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
-index 0c28540ee6..9afa7e4377 100644
+index 0c28540ee6..78612fdb40 100644
 --- a/widget/headless/HeadlessWidget.cpp
 +++ b/widget/headless/HeadlessWidget.cpp
 @@ -3,6 +3,10 @@
@@ -564,12 +577,15 @@ index 0c28540ee6..9afa7e4377 100644
    if (mDestroyed) {
      return;
    }
-@@ -162,6 +202,13 @@ void HeadlessWidget::RaiseWindow() {
+@@ -162,6 +202,16 @@ void HeadlessWidget::RaiseWindow() {
  }
  
  void HeadlessWidget::Show(bool aState) {
 +#if defined(GECKO_W10M)
-+  if (aState) {
++  if (mCompositorWidget) {
++    mCompositorWidget->NotifyVisibilityChanged(aState);
++  }
++  if (aState && mWindowType == WindowType::TopLevel) {
 +    // Last one shown wins, which after startup is the browser window: the
 +    // graphics sanity test shows and hides one of its own before it.
 +    sShownWidget = this;
@@ -578,7 +594,7 @@ index 0c28540ee6..9afa7e4377 100644
    mVisible = aState;
  
    LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
-@@ -223,6 +270,13 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
+@@ -223,6 +273,13 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
    }
  
    mBounds.MoveTo(aX, aY);

@@ -61,43 +61,46 @@ void EngineView::WireKeyboard() {
   // because that is the only thing Windows will raise a keyboard for, and it
   // is invisible because the field the user is actually looking at is drawn by
   // Gecko, inside the picture.
+  // Windows raises its keyboard for a focused text control and nothing else,
+  // so there is one. It does no other work: it is the size of the content it
+  // sits behind, because a control one pixel across is not something the
+  // system treats as a place to type, and it is invisible because the field
+  // the user is looking at is drawn by Gecko inside the picture.
   sink_ = TextBox();
   sink_.Opacity(0);
-  sink_.Width(1);
-  sink_.Height(1);
-  sink_.HorizontalAlignment(HorizontalAlignment::Left);
-  sink_.VerticalAlignment(VerticalAlignment::Top);
+  sink_.HorizontalAlignment(HorizontalAlignment::Stretch);
+  sink_.VerticalAlignment(VerticalAlignment::Stretch);
   sink_.AcceptsReturn(false);
   sink_.IsSpellCheckEnabled(false);
   sink_.IsTextPredictionEnabled(false);
 
-  // Whatever arrives is handed straight to the engine and the sink is emptied
-  // again, so it never holds state of its own and Backspace always reaches
-  // Gecko rather than deleting a character the page never saw.
-  sink_.TextChanged([this](winrt::Windows::Foundation::IInspectable const&,
-                           Controls::TextChangedEventArgs const&) {
-    if (clearing_ || !text_) {
-      return;
-    }
-    auto value = sink_.Text();
-    if (value.empty()) {
-      return;
-    }
-    text_(reinterpret_cast<const uint16_t*>(value.c_str()),
-          static_cast<int32_t>(value.size()));
-    clearing_ = true;
-    sink_.Text(L"");
-    clearing_ = false;
-  });
+  // The characters are taken from the window rather than from the sink.
+  // CharacterReceived fires for whatever the keyboard produced, whichever
+  // control happens to hold focus, so it does not depend on the sink having
+  // won it -- and that dependency is the only thing the last build could have
+  // got wrong, since everything else about the path was already in place.
+  auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+  window.CharacterReceived(
+      [this](winrt::Windows::UI::Core::CoreWindow const&,
+             winrt::Windows::UI::Core::CharacterReceivedEventArgs const& args) {
+        const uint32_t code = args.KeyCode();
+        // Anything below space arrives as a key instead; sending it as text
+        // would insert a control character into the page.
+        if (!text_ || !typing_ || code < 32 || code == 127) {
+          return;
+        }
+        const uint16_t one = static_cast<uint16_t>(code);
+        text_(&one, 1);
+      });
 
-  sink_.KeyDown([this](winrt::Windows::Foundation::IInspectable const&,
-                       Input::KeyRoutedEventArgs const& args) {
-    if (!key_) {
+  window.KeyDown([this](winrt::Windows::UI::Core::CoreWindow const&,
+                        winrt::Windows::UI::Core::KeyEventArgs const& args) {
+    if (!key_ || !typing_) {
       return;
     }
     // Windows virtual key codes are what the engine side expects; the ones
-    // that produce text come through TextChanged instead and are ignored here.
-    const int32_t code = static_cast<int32_t>(args.Key());
+    // that produce text come through CharacterReceived instead.
+    const int32_t code = static_cast<int32_t>(args.VirtualKey());
     switch (code) {
       case 8:   // Back
       case 9:   // Tab
@@ -202,11 +205,13 @@ void EngineView::FollowTextInput() {
 
   auto pane = InputPane::GetForCurrentView();
   if (wants) {
-    Log::Write(L"view: engine asked for text input");
-    sink_.Focus(FocusState::Programmatic);
+    const bool focused = sink_.Focus(FocusState::Programmatic);
     // Focus alone raises the keyboard only when the focus came from a touch,
     // and this one came from Gecko, so ask outright as well.
-    pane.TryShow();
+    const bool shown = pane.TryShow();
+    Log::Write(L"view: engine asked for text input, sink focus " +
+               std::wstring(focused ? L"taken" : L"refused") + L", pane " +
+               std::wstring(shown ? L"shown" : L"refused"));
   } else {
     Log::Write(L"view: engine no longer wants text input");
     pane.TryHide();
