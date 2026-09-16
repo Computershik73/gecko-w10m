@@ -1,0 +1,35 @@
+diff --git a/xpcom/base/nsConsoleService.cpp b/xpcom/base/nsConsoleService.cpp
+index e049d1e623..0c0110e9ca 100644
+--- a/xpcom/base/nsConsoleService.cpp
++++ b/xpcom/base/nsConsoleService.cpp
+@@ -29,6 +29,13 @@
+ #include "nsProxyRelease.h"
+ #include "nsThreadUtils.h"
+ 
++#if defined(GECKO_W10M)
++// Gecko puts console messages on stderr, and a packaged app has no stderr
++// worth the name -- so a JS exception during startup leaves no trace at all.
++// This is the only way to read them off the device.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #if defined(ANDROID)
+ #  include <android/log.h>
+ 
+@@ -277,6 +284,16 @@ nsresult nsConsoleService::LogMessageWithMode(
+     return NS_OK;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    nsCString text;
++    aMessage->ToString(text);
++    nsCString note("console: ");
++    note.Append(text);
++    GeckoW10mNote(note.get());
++  }
++#endif
++
+   if (NS_IsMainThread() && mDeliveringMessage) {
+     nsCString msg;
+     aMessage->ToString(msg);

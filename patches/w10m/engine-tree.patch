@@ -15339,6 +15339,40 @@ index d70e85a620..7c8dfd5d5b 100644
    } __except (exception_filter_helper.FilterPageError(
        GetExceptionInformation()->ExceptionRecord)) {
      LOG(ERROR) << "EXCEPTION_IN_PAGE_ERROR while "
+diff --git a/toolkit/components/startup/nsAppStartup.cpp b/toolkit/components/startup/nsAppStartup.cpp
+index b0f1e285ad..e43d5d4816 100644
+--- a/toolkit/components/startup/nsAppStartup.cpp
++++ b/toolkit/components/startup/nsAppStartup.cpp
+@@ -4,6 +4,11 @@
+ 
+ #include "nsAppStartup.h"
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #include "nsComponentManagerUtils.h"
+ #include "nsIAppShellService.h"
+ #include "nsPIDOMWindow.h"
+@@ -324,6 +329,17 @@ nsAppStartup::Run(void) {
+ 
+ NS_IMETHODIMP
+ nsAppStartup::Quit(uint32_t aMode, int aExitCode, bool* aUserAllowedQuit) {
++#if defined(GECKO_W10M)
++  // Startup reaches final-ui-startup and then quits without ever opening a
++  // window. Whoever calls this is the reason, and the return address names
++  // them -- the caller is JS more often than not, in which case the console
++  // notes above say which script.
++  {
++    nsPrintfCString note("quit: mode=0x%x exit=%d from %p", aMode, aExitCode,
++                         __builtin_return_address(0));
++    GeckoW10mNote(note.get());
++  }
++#endif
+   if ((aMode & eSilently) != 0 && (aMode & eRestart) == 0) {
+     // eSilently is only valid when combined with eRestart.
+     return NS_ERROR_INVALID_ARG;
 diff --git a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h b/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
 index 78afb068c4..5ad6bf23a5 100644
 --- a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
@@ -15877,6 +15911,41 @@ index c6572ecf58..00d62e04a1 100644
  
    // Notify visibility change when window is activated.
    if (!(wp->flags & SWP_NOACTIVATE) && NeedsToTrackWindowOcclusionState()) {
+diff --git a/xpcom/base/nsConsoleService.cpp b/xpcom/base/nsConsoleService.cpp
+index e049d1e623..0c0110e9ca 100644
+--- a/xpcom/base/nsConsoleService.cpp
++++ b/xpcom/base/nsConsoleService.cpp
+@@ -29,6 +29,13 @@
+ #include "nsProxyRelease.h"
+ #include "nsThreadUtils.h"
+ 
++#if defined(GECKO_W10M)
++// Gecko puts console messages on stderr, and a packaged app has no stderr
++// worth the name -- so a JS exception during startup leaves no trace at all.
++// This is the only way to read them off the device.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #if defined(ANDROID)
+ #  include <android/log.h>
+ 
+@@ -277,6 +284,16 @@ nsresult nsConsoleService::LogMessageWithMode(
+     return NS_OK;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    nsCString text;
++    aMessage->ToString(text);
++    nsCString note("console: ");
++    note.Append(text);
++    GeckoW10mNote(note.get());
++  }
++#endif
++
+   if (NS_IsMainThread() && mDeliveringMessage) {
+     nsCString msg;
+     aMessage->ToString(msg);
 diff --git a/xpcom/base/nscore.h b/xpcom/base/nscore.h
 index 48cdfdf774..2fdf14dfd0 100644
 --- a/xpcom/base/nscore.h
