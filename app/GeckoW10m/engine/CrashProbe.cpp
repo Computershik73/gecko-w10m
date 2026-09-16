@@ -112,6 +112,37 @@ void LogStack(const wchar_t* tag, CONTEXT context) {
   }
 }
 
+// When the walk above stops at once -- a fault mid-prologue leaves the unwinder
+// with nothing but lr, and lr is not always a return address -- this is what is
+// left: read the raw stack and keep the words that RtlLookupFunctionEntry
+// recognizes as belonging to a function. That filter is what makes it worth
+// reading; a plausible-looking integer is not a return address unless something
+// claims to be able to unwind it. Stale frames survive on a stack, so these are
+// candidates, not a call chain.
+void LogStackScan(const wchar_t* tag, DWORD sp) {
+  if (!gLookupFunctionEntry) return;
+
+  MEMORY_BASIC_INFORMATION region{};
+  const uintptr_t* start = reinterpret_cast<const uintptr_t*>(sp);
+  if (!::VirtualQuery(start, &region, sizeof(region))) return;
+  const uintptr_t* limit = reinterpret_cast<const uintptr_t*>(
+      reinterpret_cast<const char*>(region.BaseAddress) + region.RegionSize);
+
+  Log::Write(std::wstring(tag) + L"   -- stack scan (candidates) --");
+  int printed = 0;
+  for (const uintptr_t* word = start; word < limit && printed < 24; ++word) {
+    const uintptr_t value = *word;
+    if (value < 0x10000) continue;
+    DWORD imageBase = 0;
+    if (!gLookupFunctionEntry(static_cast<DWORD>(value), &imageBase, nullptr)) {
+      continue;
+    }
+    Log::Write(std::wstring(tag) + L"   ?? " +
+               DescribeAddress(reinterpret_cast<void*>(value)));
+    ++printed;
+  }
+}
+
 // For the hooks, which have no exception context of their own.
 // A phone gives an app a hard memory ceiling, and 132 MB of engine plus
 // everything Gecko allocates on startup is a real candidate for reaching it.
@@ -214,7 +245,9 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
              DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
              FaultDetail(*info->ExceptionRecord));
   LogMemory(L"first-chance:");
+  Log::Write(L"first-chance: code" + Registers(*info->ContextRecord));
   LogStack(L"first-chance:", *info->ContextRecord);
+  LogStackScan(L"first-chance:", info->ContextRecord->Sp);
 
   // Not ours to handle -- only to record.
   return EXCEPTION_CONTINUE_SEARCH;
