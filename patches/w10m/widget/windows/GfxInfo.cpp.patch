@@ -1,0 +1,30 @@
+diff --git a/widget/windows/GfxInfo.cpp b/widget/windows/GfxInfo.cpp
+index 25b8066054..34bccf45af 100644
+--- a/widget/windows/GfxInfo.cpp
++++ b/widget/windows/GfxInfo.cpp
+@@ -1916,12 +1916,25 @@ nsresult GfxInfo::GetFeatureStatusImpl(
+     }
+ 
+     if (adapterDriverVersionString.Length() == 0) {
++#if defined(GECKO_W10M)
++      // The driver version is read out of HKLM, which an app container is not
++      // allowed to open -- so it is empty here whatever the driver is, and
++      // treating that as an unknown configuration blocks every accelerated
++      // feature on every device. It blocked D3D11 compositing on this one,
++      // which blocked WebRender, and the adapter itself was never at issue:
++      // the vendor was recognised, so DXGI had enumerated the device fine.
++      //
++      // An unreadable registry is not evidence about the driver. Let it
++      // through and let the real thing fail if it is going to.
++      *aStatus = FEATURE_STATUS_OK;
++#else
+       if (OnlyAllowFeatureOnKnownConfig(aFeature)) {
+         aFailureId = "FEATURE_FAILURE_EMPTY_DRIVER_VERSION";
+         *aStatus = FEATURE_BLOCKED_DRIVER_VERSION;
+       } else {
+         *aStatus = FEATURE_STATUS_OK;
+       }
++#endif
+       return NS_OK;
+     }
+ 
