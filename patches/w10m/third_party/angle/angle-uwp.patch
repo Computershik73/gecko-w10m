@@ -1,0 +1,521 @@
+diff --git a/third_party/angle/angle_d3d_format_tables_gn/moz.build b/third_party/angle/angle_d3d_format_tables_gn/moz.build
+index 7b5ea2627f..dcc6994ccd 100644
+--- a/third_party/angle/angle_d3d_format_tables_gn/moz.build
++++ b/third_party/angle/angle_d3d_format_tables_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -85,3 +85,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d_format_tables_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/angle_gpu_info_util_gn/moz.build b/third_party/angle/angle_gpu_info_util_gn/moz.build
+index 280ffaf09f..e24725d6db 100644
+--- a/third_party/angle/angle_gpu_info_util_gn/moz.build
++++ b/third_party/angle/angle_gpu_info_util_gn/moz.build
+@@ -74,7 +74,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+     DEFINES["NOMINMAX"] = True
+@@ -123,3 +123,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("angle_gpu_info_util_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libANGLE_gn/moz.build b/third_party/angle/libANGLE_gn/moz.build
+index f2404f0df1..4fda6d54cd 100644
+--- a/third_party/angle/libANGLE_gn/moz.build
++++ b/third_party/angle/libANGLE_gn/moz.build
+@@ -72,7 +72,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -100,7 +100,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["__STD_C"] = True
+ 
+     OS_LIBS += [
+-        "d3d9",
+         "delayimp",
+         "dxgi",
+         "dxguid",
+@@ -123,3 +122,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("ANGLE_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libANGLE_no_vulkan_gn/moz.build b/third_party/angle/libANGLE_no_vulkan_gn/moz.build
+index 9c9b022535..37822a1da1 100644
+--- a/third_party/angle/libANGLE_no_vulkan_gn/moz.build
++++ b/third_party/angle/libANGLE_no_vulkan_gn/moz.build
+@@ -182,7 +182,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -210,7 +210,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["__STD_C"] = True
+ 
+     OS_LIBS += [
+-        "d3d9",
+         "delayimp",
+         "dxgi",
+         "dxguid",
+@@ -222,7 +221,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     USE_LIBS += [
+         "angle_d3d11_backend_gn",
+-        "angle_d3d9_backend_gn"
+     ]
+ 
+ if CONFIG["TARGET_CPU"] == "aarch64":
+@@ -238,3 +236,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("ANGLE_no_vulkan_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libGLESv2_gn/moz.build b/third_party/angle/libGLESv2_gn/moz.build
+index 74622ae58e..a8f7dceb56 100644
+--- a/third_party/angle/libGLESv2_gn/moz.build
++++ b/third_party/angle/libGLESv2_gn/moz.build
+@@ -97,7 +97,7 @@ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -129,7 +129,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     OS_LIBS += [
+         "advapi32",
+         "comdlg32",
+-        "d3d9",
+         "dbghelp",
+         "delayimp",
+         "dnsapi",
+@@ -179,3 +178,19 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ GeckoSharedLibrary("GLESv2_gn")
++
++# GeckoW10m: with the UWP paths on, ANGLE calls D3D11CreateDevice and the shader
++# compiler directly rather than reaching for them with LoadLibrary, so the
++# import libraries have to be named. Both exist on the phone -- the whole system
++# UI is D3D11, and d3dcompiler_47.dll is already loaded at runtime today.
++OS_LIBS += [
++    "d3d11",
++    "d3dcompiler"
++]
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/moz.build b/third_party/angle/moz.build
+index d2c7208f4d..ea6b05a901 100644
+--- a/third_party/angle/moz.build
++++ b/third_party/angle/moz.build
+@@ -54,7 +54,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+         "/third_party/angle/libEGL_gn",
+         "/third_party/angle/libGLESv2_gn",
+         "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn",
+-        "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn",
+         "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn",
+         "/third_party/angle/third_party/zlib/google/compression_utils_portable_gn",
+         "/third_party/angle/third_party/zlib/zlib_gn"
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
+index 6b3ee46089..d51666ffaf 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -63,7 +63,7 @@ OS_LIBS += [
+ ]
+ 
+ SOURCES += [
+-    "/third_party/angle/src/libANGLE/renderer/d3d/d3d11/win32/NativeWindow11Win32.cpp"
++    "/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp"
+ ]
+ 
+ UNIFIED_SOURCES += [
+@@ -124,3 +124,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d11_backend_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
+index 10ed39bf55..4047a52195 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -56,7 +56,6 @@ LOCAL_INCLUDES += [
+ ]
+ 
+ OS_LIBS += [
+-    "d3d9",
+     "delayimp",
+     "dxgi",
+     "setupapi",
+@@ -108,3 +107,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d9_backend_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
+index fbce4d57e4..7fe2f88a7a 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -113,3 +113,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d_shared_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+new file mode 100644
+index 0000000000..be5b8bff5e
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+@@ -0,0 +1,182 @@
++//
++// Copyright 2016 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++
++// NativeWindow11WinRT.cpp: Implementation of NativeWindow11 for a XAML
++// SwapChainPanel.
++
++#include "libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h"
++
++#include "libANGLE/renderer/d3d/d3d11/renderer11_utils.h"
++
++#include "common/debug.h"
++
++#include <atomic>
++#include <cstdint>
++
++#include <windows.ui.xaml.media.dxinterop.h>
++
++namespace
++{
++// The size of the panel, which belongs to the UI thread while everything here
++// runs on the renderer's. So it is handed over rather than asked for: the shell
++// already measures the room it has and tells the engine, and this is the same
++// number arriving by a shorter road. Written rarely, read every resize.
++std::atomic<LONG> sPanelWidth{0};
++std::atomic<LONG> sPanelHeight{0};
++}  // namespace
++
++// Called by the compositor widget when the window is resized, which is also
++// when the shell has just resized the panel.
++extern "C" void angle_uwp_set_panel_size(int32_t width, int32_t height)
++{
++    sPanelWidth  = width;
++    sPanelHeight = height;
++}
++
++namespace rx
++{
++
++NativeWindow11WinRT::NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha)
++    : NativeWindow11(window), mPanel(nullptr), mHasAlpha(hasAlpha), mWidth(0), mHeight(0)
++{}
++
++NativeWindow11WinRT::~NativeWindow11WinRT()
++{
++    SafeRelease(mPanel);
++}
++
++bool NativeWindow11WinRT::initialize()
++{
++    if (mPanel)
++    {
++        return true;
++    }
++    IInspectable *window = reinterpret_cast<IInspectable *>(getNativeWindow());
++    if (!window)
++    {
++        return false;
++    }
++    // A SwapChainPanel presents through this one interface and nothing else;
++    // if the object handed over does not have it, it is not a panel and there
++    // is nothing this class can do with it.
++    return SUCCEEDED(window->QueryInterface(__uuidof(ISwapChainPanelNative),
++                                            reinterpret_cast<void **>(&mPanel)));
++}
++
++bool NativeWindow11WinRT::getClientRect(LPRECT rect) const
++{
++    if (!rect)
++    {
++        return false;
++    }
++    const LONG width  = sPanelWidth.load();
++    const LONG height = sPanelHeight.load();
++    if (width <= 0 || height <= 0)
++    {
++        return false;
++    }
++    rect->left   = 0;
++    rect->top    = 0;
++    rect->right  = width;
++    rect->bottom = height;
++    return true;
++}
++
++bool NativeWindow11WinRT::isIconic() const
++{
++    // A phone has no minimised window. It has a suspended app, which stops
++    // drawing altogether rather than drawing into a hidden surface.
++    return false;
++}
++
++HRESULT NativeWindow11WinRT::createSwapChain(ID3D11Device *device,
++                                             IDXGIFactory *factory,
++                                             DXGI_FORMAT format,
++                                             UINT width,
++                                             UINT height,
++                                             UINT samples,
++                                             IDXGISwapChain **swapChain)
++{
++    if (device == nullptr || factory == nullptr || swapChain == nullptr || width == 0 ||
++        height == 0)
++    {
++        return E_INVALIDARG;
++    }
++    if (!mPanel && !initialize())
++    {
++        return E_INVALIDARG;
++    }
++
++    // There is no window to present to, so the chain is made for composition
++    // and then given to the panel, which is what puts it on the screen. This is
++    // the whole point of the exercise: the frame stops being copied through
++    // main memory and is handed to the compositor as a texture.
++    IDXGIFactory2 *factory2 = d3d11::DynamicCastComObject<IDXGIFactory2>(factory);
++    if (factory2 == nullptr)
++    {
++        return E_INVALIDARG;
++    }
++
++    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
++    swapChainDesc.Width                 = width;
++    swapChainDesc.Height                = height;
++    swapChainDesc.Format                = format;
++    swapChainDesc.Stereo                = FALSE;
++    // Composition swap chains take no multisampling; the renderer resolves
++    // before presenting.
++    swapChainDesc.SampleDesc.Count   = 1;
++    swapChainDesc.SampleDesc.Quality = 0;
++    swapChainDesc.BufferUsage =
++        DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHADER_INPUT;
++    swapChainDesc.BufferCount = 2;
++    swapChainDesc.Scaling     = DXGI_SCALING_STRETCH;
++    swapChainDesc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++    swapChainDesc.AlphaMode = mHasAlpha ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE;
++    swapChainDesc.Flags     = 0;
++
++    IDXGISwapChain1 *swapChain1 = nullptr;
++    HRESULT result =
++        factory2->CreateSwapChainForComposition(device, &swapChainDesc, nullptr, &swapChain1);
++    SafeRelease(factory2);
++    if (FAILED(result))
++    {
++        return result;
++    }
++
++    result = mPanel->SetSwapChain(swapChain1);
++    if (FAILED(result))
++    {
++        SafeRelease(swapChain1);
++        return result;
++    }
++
++    mWidth     = static_cast<LONG>(width);
++    mHeight    = static_cast<LONG>(height);
++    *swapChain = static_cast<IDXGISwapChain *>(swapChain1);
++    return S_OK;
++}
++
++void NativeWindow11WinRT::commitChange() {}
++
++// static
++bool NativeWindow11WinRT::IsValidNativeWindow(EGLNativeWindowType window)
++{
++    IInspectable *inspectable = reinterpret_cast<IInspectable *>(window);
++    if (!inspectable)
++    {
++        return false;
++    }
++    ISwapChainPanelNative *panel = nullptr;
++    if (FAILED(inspectable->QueryInterface(__uuidof(ISwapChainPanelNative),
++                                           reinterpret_cast<void **>(&panel))))
++    {
++        return false;
++    }
++    SafeRelease(panel);
++    return true;
++}
++
++}  // namespace rx
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+new file mode 100644
+index 0000000000..a69143a2b1
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+@@ -0,0 +1,65 @@
++//
++// Copyright 2016 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++
++// NativeWindow11WinRT.h: Implementation of NativeWindow11 for a XAML
++// SwapChainPanel.
++//
++// Renderer11 already asks for this class when ANGLE_ENABLE_WINDOWS_UWP is set;
++// only the files were missing, because the vendored copy of ANGLE carries just
++// the win32 window -- Firefox is not shipped as a store app. This is the other
++// half, cut down to the one case that exists on a phone.
++//
++// Upstream's version also handles an ICoreWindow and picks between the two at
++// runtime. There is no CoreWindow to draw into here: an app container hands out
++// no HWND, the browser has always been drawn into a XAML element, and that
++// element is what this presents to.
++
++#ifndef LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_
++#define LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_
++
++#include "libANGLE/renderer/d3d/d3d11/NativeWindow11.h"
++
++struct ISwapChainPanelNative;
++struct IInspectable;
++
++namespace rx
++{
++
++class NativeWindow11WinRT : public NativeWindow11
++{
++  public:
++    NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha);
++    ~NativeWindow11WinRT() override;
++
++    bool initialize() override;
++    bool getClientRect(LPRECT rect) const override;
++    bool isIconic() const override;
++
++    HRESULT createSwapChain(ID3D11Device *device,
++                            IDXGIFactory *factory,
++                            DXGI_FORMAT format,
++                            UINT width,
++                            UINT height,
++                            UINT samples,
++                            IDXGISwapChain **swapChain) override;
++
++    void commitChange() override;
++
++    static bool IsValidNativeWindow(EGLNativeWindowType window);
++
++  private:
++    // The panel this presents to, and the size it was last given. The size is
++    // remembered rather than asked for because it belongs to the UI thread and
++    // this is called from the renderer's.
++    ISwapChainPanelNative *mPanel;
++    bool mHasAlpha;
++    LONG mWidth;
++    LONG mHeight;
++};
++
++}  // namespace rx
++
++#endif  // LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_
