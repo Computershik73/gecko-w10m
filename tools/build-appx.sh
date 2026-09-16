@@ -157,6 +157,11 @@ if [ -d "$DIST" ]; then
     cfg_targets+=("$(cygpath -w "$STAGE/$rel")")
   done < <(cd "$DIST" && find . \( -name '*.dll' -o -name '*.exe' \) -printf '%P\n')
   python "$(cygpath -w "$ROOT/tools/strip-cfg.py")" "${cfg_targets[@]}"     | sed 's/^/    /'
+  # lld-link synthesises the __imp_ pointer for a dllimport-declared symbol that
+  # turns out to live in the same image, and on 32-bit ARM it synthesises it
+  # without the Thumb bit -- so the indirect call through it lands in ARM state.
+  # nss3.dll died at PR_CallOnce that way. See tools/fix-thumb-pointers.py.
+  python "$(cygpath -w "$ROOT/tools/fix-thumb-pointers.py")" "${cfg_targets[@]}"     | sed 's/^/    /'
   # clang's 32-bit ARM virtual-call thunks tail-jump through r1, the first
   # argument register, so every pointer-to-member call on a virtual function
   # arrives with its first argument destroyed. The linker map is what finds
