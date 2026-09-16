@@ -91,6 +91,7 @@ class EngineView {
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
+  using AngleLogFn = void (*)(void (*)(const char*));
 
   CopyFn copy_ = nullptr;
   MouseFn mouse_ = nullptr;

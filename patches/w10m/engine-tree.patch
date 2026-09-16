@@ -2503,10 +2503,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..1dc11b4b84
+index 0000000000..e75fdf40df
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,313 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2523,6 +2523,7 @@ index 0000000000..1dc11b4b84
 +#include "common/debug.h"
 +
 +#include <atomic>
++#include <cstdio>
 +#include <cstdint>
 +
 +#include <windows.ui.core.h>
@@ -2539,6 +2540,21 @@ index 0000000000..1dc11b4b84
 +// number arriving by a shorter road. Written rarely, read every resize.
 +std::atomic<LONG> sPanelWidth{0};
 +std::atomic<LONG> sPanelHeight{0};
++
++// Where this says what it did. The notes Gecko writes live in xul, which this
++// library is not linked against, so the shell hands over somewhere to write --
++// its own log, which is also where the crash trace goes, so the two can be
++// read against each other.
++std::atomic<void (*)(const char *)> sLogger{nullptr};
++
++void Note(const char *text)
++{
++    auto logger = sLogger.load();
++    if (logger)
++    {
++        logger(text);
++    }
++}
 +
 +// A SwapChainPanel may only be touched from the thread that owns it. Calling
 +// SetSwapChain from the render thread does not fail -- it corrupts the system
@@ -2606,6 +2622,11 @@ index 0000000000..1dc11b4b84
 +    sPanelHeight = height;
 +}
 +
++extern "C" __declspec(dllexport) void angle_uwp_set_logger(void (*logger)(const char *))
++{
++    sLogger = logger;
++}
++
 +namespace rx
 +{
 +
@@ -2641,6 +2662,7 @@ index 0000000000..1dc11b4b84
 +    if (FAILED(window->QueryInterface(__uuidof(ISwapChainPanelNative),
 +                                      reinterpret_cast<void **>(&mPanel))))
 +    {
++        Note("angle: what was handed over is not a SwapChainPanel");
 +        return false;
 +    }
 +
@@ -2656,9 +2678,11 @@ index 0000000000..1dc11b4b84
 +    }
 +    if (FAILED(dependency->get_Dispatcher(&mDispatcher)) || !mDispatcher)
 +    {
++        Note("angle: the panel would not say which thread it belongs to");
 +        SafeRelease(mPanel);
 +        return false;
 +    }
++    Note("angle: the panel is ready");
 +    return true;
 +}
 +
@@ -2733,14 +2757,26 @@ index 0000000000..1dc11b4b84
 +    swapChainDesc.AlphaMode = mHasAlpha ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE;
 +    swapChainDesc.Flags     = 0;
 +
++    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: making a %ux%u swap chain for the panel", width,
++                 height);
++        Note(note);
++    }
++
 +    IDXGISwapChain1 *swapChain1 = nullptr;
 +    HRESULT result =
 +        factory2->CreateSwapChainForComposition(device, &swapChainDesc, nullptr, &swapChain1);
 +    SafeRelease(factory2);
 +    if (FAILED(result))
 +    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: the swap chain was refused, 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
 +        return result;
 +    }
++    Note("angle: the swap chain exists, giving it to the panel");
 +
 +    ISwapChainPanelNative *panel = mPanel;
 +    result                       = RunOnUIThread(
@@ -2748,9 +2784,14 @@ index 0000000000..1dc11b4b84
 +        mDispatcher);
 +    if (FAILED(result))
 +    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: the panel would not take it, 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
 +        SafeRelease(swapChain1);
 +        return result;
 +    }
++    Note("angle: the panel took the swap chain");
 +
 +    mWidth     = static_cast<LONG>(width);
 +    mHeight    = static_cast<LONG>(height);

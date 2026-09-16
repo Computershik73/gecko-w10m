@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <string>
 
 #include "client/Log.h"
 #include "winrt/Windows.UI.Core.h"
@@ -249,6 +251,24 @@ bool EngineView::Resolve() {
     if (HMODULE gles = ::LoadPackagedLibrary(L"libGLESv2.dll", 0)) {
       panel_size_fn_ = reinterpret_cast<PanelSizeFn>(
           ::GetProcAddress(gles, "angle_uwp_set_panel_size"));
+      // And somewhere for it to say what it did. Its notes cannot go where
+      // Gecko's do -- those live in xul, which ANGLE is not linked against --
+      // so they come here, which is also where the crash trace lands, so the
+      // two can be read against each other.
+      if (auto install = reinterpret_cast<AngleLogFn>(
+              ::GetProcAddress(gles, "angle_uwp_set_logger"))) {
+        install([](const char* text) {
+          if (!text) {
+            return;
+          }
+          std::wstring wide;
+          wide.reserve(strlen(text));
+          for (const char* p = text; *p; ++p) {
+            wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+          }
+          Log::Write(wide);
+        });
+      }
     }
   }
   if (copy_ && !reported_) {
