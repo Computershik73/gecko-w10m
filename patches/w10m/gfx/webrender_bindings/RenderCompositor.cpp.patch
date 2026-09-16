@@ -54,3 +54,40 @@ index 06ed553c01..ba41fac850 100644
    if (gfx::gfxVars::UseWebRenderANGLE()) {
      return RenderCompositorANGLE::Create(aWidget, aError);
    }
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index 0a9e5b4a85..2e6d8353ca 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -29,6 +29,10 @@
+ #  include "mozilla/widget/AndroidCompositorWidget.h"
+ #endif
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ namespace mozilla::wr {
+ 
+ extern LazyLogModule gRenderThreadLog;
+@@ -71,6 +75,21 @@ RenderCompositorEGL::RenderCompositorEGL(
+     : RenderCompositor(aWidget), mGL(aGL), mEGLSurface(EGL_NO_SURFACE) {
+   MOZ_ASSERT(mGL);
+   LOG("RenderCompositorEGL::RenderCompositorEGL()");
++#if defined(GECKO_W10M)
++  // Nobody was making the surface. Wayland makes it here, Android makes it in
++  // Resume, and this target is neither -- so mEGLSurface stayed EGL_NO_SURFACE
++  // for the whole of a run. WebRender then drew into a 1x1 pbuffer and
++  // SwapBuffers returned false every frame, which is why ANGLE's window code
++  // was never reached and nothing ever appeared. The panel is the surface, and
++  // it is made the same way Wayland makes its own.
++  mEGLSurface = CreateEGLSurface();
++  if (mEGLSurface == EGL_NO_SURFACE) {
++    GeckoW10mNote("gfx: the panel would not give an EGL surface");
++  } else {
++    gl::GLContextEGL::Cast(gl())->SetEGLSurfaceOverride(mEGLSurface);
++    GeckoW10mNote("gfx: the panel has an EGL surface, frames go to the GPU");
++  }
++#endif
+ #ifdef MOZ_WAYLAND
+   if (widget::GdkIsWaylandDisplay()) {
+     mEGLSurface = CreateEGLSurface();
