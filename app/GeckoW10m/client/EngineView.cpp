@@ -265,8 +265,12 @@ bool EngineView::Resolve() {
       // Gecko's do -- those live in xul, which ANGLE is not linked against --
       // so they come here, which is also where the crash trace lands, so the
       // two can be read against each other.
-      if (auto install = reinterpret_cast<AngleLogFn>(
-              ::GetProcAddress(gles, "angle_uwp_set_logger"))) {
+      auto install = reinterpret_cast<AngleLogFn>(
+          ::GetProcAddress(gles, "angle_uwp_set_logger"));
+      Log::Write(std::wstring(L"view: ANGLE size entry point ") +
+                 (panel_size_fn_ ? L"found" : L"MISSING") +
+                 L", logging entry point " + (install ? L"found" : L"MISSING"));
+      if (install) {
         install([](const char* text) {
           if (!text) {
             return;

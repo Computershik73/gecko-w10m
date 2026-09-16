@@ -262,10 +262,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..65157160ca
+index 0000000000..fd5acbe604
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,331 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -384,6 +384,10 @@ index 0000000000..65157160ca
 +extern "C" __declspec(dllexport) void angle_uwp_set_logger(void (*logger)(const char *))
 +{
 +    sLogger = logger;
++    // Proof the channel works. Everything else this file says has failed to
++    // appear, and there are two reasons that could be: the code did not run,
++    // or it cannot be heard. This line separates them.
++    Note("angle: logging is on");
 +}
 +
 +namespace rx
