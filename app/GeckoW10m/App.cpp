@@ -49,6 +49,16 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     Suspending([](auto const&, auto const&) {
       client::Log::Write(L"app: suspending");
     });
+
+    // Gecko runs a dozen threads of its own and shuts itself down by calling
+    // TerminateProcess; there is no orderly way to park that and pick it up
+    // again. When the system says the app is going, the process goes with it
+    // rather than lingering with the engine still painting into a window
+    // nobody will ever see.
+    CoreApplication::Exiting([](auto const&, auto const&) {
+      client::Log::Write(L"app: exiting");
+      ::TerminateProcess(::GetCurrentProcess(), 0);
+    });
     Resuming([](auto const&, auto const&) {
       client::Log::Write(L"app: resuming");
     });

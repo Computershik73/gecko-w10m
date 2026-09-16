@@ -12,6 +12,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 #include "winrt/Windows.UI.Xaml.Controls.h"
 #include "winrt/Windows.UI.Xaml.Media.Imaging.h"
@@ -38,6 +40,13 @@ class EngineView {
   // comparison per display refresh, no copy.
   void Start();
   void Stop();
+
+  // Called once, when the engine has drawn something. It is the only
+  // evidence that a start succeeded, so it is what takes the splash down
+  // and what clears the failed-attempt count.
+  void OnFirstFrame(std::function<void()> handler) {
+    firstFrame_ = std::move(handler);
+  }
 
  private:
   void Tick();
@@ -82,6 +91,7 @@ class EngineView {
   int32_t width_ = 0;
   int32_t height_ = 0;
   bool reported_ = false;
+  std::function<void()> firstFrame_;
 
   bool pressed_ = false;
   double lastX_ = 0;

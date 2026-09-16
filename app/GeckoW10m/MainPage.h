@@ -47,6 +47,10 @@ class MainPage {
   winrt::Windows::UI::Xaml::Controls::Button logButton_{nullptr};
   winrt::Windows::UI::Xaml::Controls::ProgressBar progress_{nullptr};
   winrt::Windows::UI::Xaml::Controls::Border contentHost_{nullptr};
+  // Shown until the engine has drawn something. Starting Gecko takes the
+  // better part of half a minute on this hardware, and a blank rectangle
+  // for that long is indistinguishable from a browser that did not start.
+  winrt::Windows::UI::Xaml::Controls::Grid splash_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBlock statusText_{nullptr};
   winrt::Windows::UI::Xaml::Controls::StackPanel tabStrip_{nullptr};
 

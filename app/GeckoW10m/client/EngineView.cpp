@@ -245,6 +245,11 @@ void EngineView::Tick() {
   if (copy_(pixels, capacity, &width, &height, &serial) == 1) {
     seen_ = serial;
     bitmap_.Invalidate();
+    if (firstFrame_) {
+      auto handler = std::move(firstFrame_);
+      firstFrame_ = nullptr;
+      handler();
+    }
     return;
   }
 

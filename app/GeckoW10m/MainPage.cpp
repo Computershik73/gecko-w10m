@@ -107,6 +107,14 @@ MainPage::MainPage() {
   // the JIT probe or xul.dll had worked.
   Navigate(L"about:home");
 
+  engineView_->OnFirstFrame([this, state = std::wstring(localState)]() {
+    if (splash_) {
+      splash_.Visibility(Visibility::Collapsed);
+    }
+    // Drawing is the only proof the engine started; anything short of it could
+    // be a launch that is about to die.
+    engine::MarkGeckoHealthy(state);
+  });
   engineView_->Start();
 
   // Last, so the window is up and the log is readable before Gecko gets its
@@ -177,6 +185,22 @@ void MainPage::BuildUi() {
   contentStack.Children().Append(statusText_);
   contentStack.Children().Append(engineView_->Surface());
   contentStack.Children().Append(engineView_->TextSink());
+
+  // The browser's own logo, out of the browser's own package. It is the thing
+  // the user is waiting for, so it is the right thing to wait in front of.
+  splash_ = Grid();
+  splash_.Background(Brush(ContentBg()));
+  {
+    Image logo;
+    logo.Width(128);
+    logo.Height(128);
+    logo.HorizontalAlignment(HorizontalAlignment::Center);
+    logo.VerticalAlignment(VerticalAlignment::Center);
+    logo.Source(Media::Imaging::BitmapImage(Uri(
+        L"ms-appx:///browser/chrome/browser/content/branding/about-logo@2x.png")));
+    splash_.Children().Append(logo);
+  }
+  contentStack.Children().Append(splash_);
   contentHost_.Child(contentStack);
 
   // --- Diagnostics overlay, hidden until asked for ---

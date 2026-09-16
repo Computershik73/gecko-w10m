@@ -52,41 +52,15 @@ std::wstring AttemptsPath(const std::wstring& localState) {
 // Every other launch leaves the engine alone.
 //
 // The device has been faulting inside XAML's own dispatcher shortly after
-// Gecko starts, at the same address every run. Whether Gecko has anything to
-// do with that cannot be told from a log in which Gecko always starts -- and
-// until now it always did, so there was no control to compare against.
-// Alternating gives both cases in one log file, from one device, minutes
-// apart.
-bool IsControlLaunch(const std::wstring& localState) {
-  const std::wstring path = localState + L"\\gecko-control.txt";
-
-  CREATEFILE2_EXTENDED_PARAMETERS params{};
-  params.dwSize = sizeof(params);
-  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-
-  char previous = '0';
-  HANDLE h = ::CreateFile2(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           OPEN_EXISTING, &params);
-  if (h != INVALID_HANDLE_VALUE) {
-    DWORD read = 0;
-    ::ReadFile(h, &previous, 1, &read, nullptr);
-    ::CloseHandle(h);
-    if (!read) previous = '0';
-  }
-
-  const bool control = previous == '1';
-  const char next = control ? '0' : '1';
-
-  h = ::CreateFile2(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS,
-                    &params);
-  if (h != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    ::WriteFile(h, &next, 1, &written, nullptr);
-    ::FlushFileBuffers(h);
-    ::CloseHandle(h);
-  }
-  return control;
-}
+// The counter exists so a build that dies on startup cannot lock the phone out
+// of its own browser: three tries and it stops trying. What it measured until
+// now was launches, not failures -- it was cleared only when XRE_main returned,
+// and XRE_main does not return any more. Gecko shuts down through
+// AppShutdown::MaybeFastShutdown, which calls TerminateProcess, so every launch
+// counted as a failure and after three the engine refused to start. Now it is
+// cleared when the engine has drawn something, which is the only definition of
+// a successful start that is worth anything.
+std::wstring gInstallDir;
 
 int ReadAttempts(const std::wstring& localState, const std::wstring& installDir) {
   CREATEFILE2_EXTENDED_PARAMETERS params{};
@@ -165,6 +139,15 @@ DWORD WINAPI GeckoThread(LPVOID param) {
 
 }  // namespace
 
+void MarkGeckoHealthy(const std::wstring& localStatePath) {
+  if (gInstallDir.empty()) {
+    return;
+  }
+  WriteAttempts(localStatePath, gInstallDir, 0);
+  Log::Write(L"gecko: the engine drew a frame, attempt count cleared");
+  gInstallDir.clear();
+}
+
 bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
                        int height, double scale) {
   const std::wstring installDir = InstallDirectory();
@@ -173,11 +156,7 @@ bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
     return false;
   }
 
-  if (IsControlLaunch(localStatePath)) {
-    Log::Write(L"control run: leaving the engine alone this launch");
-    Log::Write(L"control run: anything that faults now is not Gecko's doing");
-    return false;
-  }
+  gInstallDir = installDir;
 
   int attempts = ReadAttempts(localStatePath, installDir);
   if (attempts >= kMaxAttempts) {
