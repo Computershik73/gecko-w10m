@@ -217,7 +217,8 @@ void MainPage::BuildUi() {
   // tap landed on a text control and Windows raised the keyboard for each one,
   // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
-  // The panel is deliberately NOT in the tree for this build.
+  // The panel is back in the tree: taking it out proved it innocent -- the
+  // crash came back byte for byte without it.
   //
   // The crash is in the XAML compositor and nothing of ours is in its stack;
   // the log now shows the EGL compositor coming up and then nothing -- no EGL
@@ -229,7 +230,7 @@ void MainPage::BuildUi() {
   //
   // Still in the log either way, so the difference is measured rather than
   // assumed.
-  Log::Write(L"view: the panel is out of the tree for this build");
+  contentStack.Children().Append(engineView_->Panel());
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing

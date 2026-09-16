@@ -164,6 +164,20 @@ if [ -d "$DIST" ]; then
     cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
 // GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
 pref("gfx.webrender.software", false);
+
+// The XAML compositor dies about two and a half seconds after these load, and
+// the last thing in the log before it is always the same run: mozavcodec,
+// mfplat, mf, dxva2, evr -- the media stack with hardware decoding, and the gfx
+// sanity test trying to decode a video. The same libraries loaded in every
+// software build and nothing happened; the difference now is that D3D11 is on,
+// so DXVA takes a device.
+//
+// So this build does not ask. Hardware video decoding was already reported off
+// as a feature, which did not stop the probe from happening.
+pref("media.hardware-video-decoding.enabled", false);
+pref("media.wmf.dxva.enabled", false);
+pref("media.wmf.dxva.d3d11.enabled", false);
+pref("media.sanity-test.disabled", true);
 PREFS
     echo "    app default preferences staged"
   fi
