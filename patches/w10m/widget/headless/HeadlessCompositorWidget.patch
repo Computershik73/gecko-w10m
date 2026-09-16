@@ -1,8 +1,8 @@
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..cf63d0e519 100644
+index 8484851f67..9c2571bbe4 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,101 @@
+@@ -7,6 +7,102 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
@@ -12,6 +12,7 @@ index 8484851f67..cf63d0e519 100644
 +#  include <algorithm>
 +#  include <vector>
 +
++#  include "mozilla/Atomics.h"
 +#  include "mozilla/StaticMutex.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
@@ -104,7 +105,7 @@ index 8484851f67..cf63d0e519 100644
  namespace mozilla {
  namespace widget {
  
-@@ -16,7 +111,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
+@@ -16,7 +112,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
      : CompositorWidget(aOptions),
        mWidget(aWindow),
        mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
@@ -140,7 +141,7 @@ index 8484851f67..cf63d0e519 100644
  
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
    if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +155,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+@@ -33,6 +156,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
    *size = aClientSize;
  }
  
@@ -159,7 +160,7 @@ index 8484851f67..cf63d0e519 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +176,423 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +177,450 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -433,6 +434,33 @@ index 8484851f67..cf63d0e519 100644
 +// system to draw one in, so there is nothing on them to press to make them go
 +// away. The shell gives them the phone's back button instead, and asks this
 +// first so that back still means back when nothing is open.
++// ---------------------------------------------------------------- the panel
++//
++// The one XAML SwapChainPanel the shell is showing. EGL asks for it by name
++// when it makes a surface, and ANGLE turns it into a composition swap chain;
++// from then on the frame is handed to the system compositor as a texture
++// rather than copied out through this buffer.
++//
++// One panel per process, so a static is the honest shape. Written once by the
++// shell before the engine starts, read by the render thread afterwards.
++namespace {
++mozilla::Atomic<void*> sPanel{nullptr};
++}
++
++// Called by the shell. Only the panel: its size goes straight to ANGLE, which
++// the shell can reach and this cannot -- xul does not link against ANGLE at
++// all, because EGL loads it at run time.
++extern "C" __declspec(dllexport) void gecko_w10m_set_panel(void* aPanel) {
++  const bool first = !sPanel && aPanel;
++  sPanel = aPanel;
++  if (first) {
++    GeckoW10mNote("panel: the engine has somewhere to present");
++  }
++}
++
++// Read by GLContextProviderEGL, which declares it rather than including this.
++extern "C" void* gecko_w10m_egl_native_window() { return sPanel; }
++
 +extern "C" __declspec(dllexport) int32_t gecko_w10m_overlay_open() {
 +  mozilla::StaticMutexAutoLock lock(sFrameLock);
 +  for (auto* window : sWindows) {

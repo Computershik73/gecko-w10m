@@ -163,7 +163,7 @@ if [ -d "$DIST" ]; then
   if [ -d "$STAGE/browser/defaults/preferences" ]; then
     cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
 // GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
-pref("gfx.webrender.software", true);
+pref("gfx.webrender.software", false);
 PREFS
     echo "    app default preferences staged"
   fi

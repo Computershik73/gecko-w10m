@@ -1,0 +1,35 @@
+diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
+index 06ed553c01..ec245236a6 100644
+--- a/gfx/webrender_bindings/RenderCompositor.cpp
++++ b/gfx/webrender_bindings/RenderCompositor.cpp
+@@ -22,7 +22,7 @@
+ #  include "mozilla/widget/WinCompositorWidget.h"
+ #endif
+ 
+-#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
++#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK) ||     defined(GECKO_W10M)
+ #  include "mozilla/webrender/RenderCompositorEGL.h"
+ #endif
+ 
+@@ -229,7 +229,20 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
+     return RenderCompositorSWGL::Create(aWidget, aError);
+   }
+ 
+-#ifdef XP_WIN
++#if defined(GECKO_W10M)
++  // RenderCompositorANGLE is written around mWidget->AsWindows() -- GetHwnd,
++  // GetCompositorHwnd, MakeWindowAssociation, DestroyCompositorWindow. An app
++  // container is given no HWND and this widget is headless, so there is
++  // nothing for it to hold on to.
++  //
++  // RenderCompositorEGL is the one that asks the widget for a native window
++  // and leaves the rest to EGL, which is how Android and Wayland present. Here
++  // EGL is ANGLE, the native window is the XAML SwapChainPanel, and ANGLE
++  // makes a composition swap chain for it -- so the frame is handed to the
++  // system compositor as a texture instead of being copied out through main
++  // memory.
++  return RenderCompositorEGL::Create(aWidget, aError);
++#elif defined(XP_WIN)
+   if (gfx::gfxVars::UseWebRenderANGLE()) {
+     return RenderCompositorANGLE::Create(aWidget, aError);
+   }

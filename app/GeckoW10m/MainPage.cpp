@@ -217,6 +217,11 @@ void MainPage::BuildUi() {
   // tap landed on a text control and Windows raised the keyboard for each one,
   // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
+  // The panel is under the picture. When the engine draws on the GPU it
+  // presents here and the picture above stays empty; when it falls back to
+  // software the picture is what has content and the panel is invisible
+  // beneath it. Nothing has to choose.
+  contentStack.Children().Append(engineView_->Panel());
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing

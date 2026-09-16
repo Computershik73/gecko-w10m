@@ -29,6 +29,15 @@ class EngineView {
   EngineView(int32_t pixelWidth, int32_t pixelHeight, double rawPerView);
 
   winrt::Windows::UI::Xaml::Controls::Image Surface() const { return image_; }
+  // What the engine presents to when it is drawing on the GPU. It sits under
+  // the picture and stays empty while the software path is in use, so whichever
+  // of the two produces a frame is the one that shows.
+  winrt::Windows::UI::Xaml::Controls::SwapChainPanel Panel() const {
+    return panel_;
+  }
+  // Hands the panel to the engine. Must happen before the engine starts, since
+  // EGL asks for it as soon as it makes a surface.
+  void GivePanelToEngine();
   // Invisible, and focused only when Gecko says something takes text. It is
   // what the on-screen keyboard types into and the only way its keys can be
   // caught at all.
@@ -80,6 +89,8 @@ class EngineView {
   using TextFn = void (*)(const uint16_t* text, int32_t length);
   using KeyFn = void (*)(int32_t keyCode);
   using ResizeFn = void (*)(int32_t width, int32_t height);
+  using PanelFn = void (*)(void* panel);
+  using PanelSizeFn = void (*)(int32_t width, int32_t height);
 
   CopyFn copy_ = nullptr;
   MouseFn mouse_ = nullptr;
@@ -89,8 +100,11 @@ class EngineView {
   TextFn text_ = nullptr;
   KeyFn key_ = nullptr;
   ResizeFn resize_ = nullptr;
+  PanelFn panel_fn_ = nullptr;
+  PanelSizeFn panel_size_fn_ = nullptr;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel_{nullptr};
   winrt::Windows::UI::Xaml::FrameworkElement host_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBox sink_{nullptr};
   winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap bitmap_{nullptr};
@@ -100,6 +114,7 @@ class EngineView {
   int32_t width_ = 0;
   int32_t height_ = 0;
   bool reported_ = false;
+  bool panelGiven_ = false;
   std::function<void()> firstFrame_;
 
   bool pressed_ = false;

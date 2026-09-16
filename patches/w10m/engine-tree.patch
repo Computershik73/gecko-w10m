@@ -705,6 +705,35 @@ index 7834485f3e..94b9595a06 100644
  		    __uuidof(IDWriteFactory),
  		    reinterpret_cast<IUnknown**>(&mFactoryInstance));
  		assert(SUCCEEDED(hr));
+diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
+index 728fa98356..31bbe6d859 100644
+--- a/gfx/gl/GLContextProviderEGL.cpp
++++ b/gfx/gl/GLContextProviderEGL.cpp
+@@ -12,6 +12,24 @@
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_JAVA_SURFACE))
+ #  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
+     (aWidget->AsAndroid()->GetEGLNativeWindow())
++#elif defined(GECKO_W10M)
++// There is no HWND to give: an app container is handed none, and this widget
++// is headless. What EGL gets instead is the XAML SwapChainPanel the shell is
++// showing, which ANGLE knows how to make a composition swap chain for -- so
++// the frame is handed to the system compositor as a texture rather than
++// copied out through main memory.
++//
++// It travels as an EGLNativeWindowType because that is what EGL takes. The
++// typedef stays HWND-shaped here: this build claims the desktop API family on
++// purpose, so that the rest of Gecko keeps its Win32 APIs.
++//
++// Declared rather than included -- the panel belongs to the headless widget,
++// and gfx has no business including widget headers.
++extern "C" void* gecko_w10m_egl_native_window();
++#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
++#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
+ #elif defined(XP_WIN)
+ #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
 diff --git a/gfx/graphite2/src/inc/Machine.h b/gfx/graphite2/src/inc/Machine.h
 index 5ceedc296d..67b20e2a1d 100644
 --- a/gfx/graphite2/src/inc/Machine.h
@@ -825,6 +854,41 @@ index f45971a4ec..3f18f8c337 100644
        widget::WinWindowOcclusionTracker::Ensure();
      }
  #endif
+diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
+index 06ed553c01..ec245236a6 100644
+--- a/gfx/webrender_bindings/RenderCompositor.cpp
++++ b/gfx/webrender_bindings/RenderCompositor.cpp
+@@ -22,7 +22,7 @@
+ #  include "mozilla/widget/WinCompositorWidget.h"
+ #endif
+ 
+-#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
++#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK) ||     defined(GECKO_W10M)
+ #  include "mozilla/webrender/RenderCompositorEGL.h"
+ #endif
+ 
+@@ -229,7 +229,20 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
+     return RenderCompositorSWGL::Create(aWidget, aError);
+   }
+ 
+-#ifdef XP_WIN
++#if defined(GECKO_W10M)
++  // RenderCompositorANGLE is written around mWidget->AsWindows() -- GetHwnd,
++  // GetCompositorHwnd, MakeWindowAssociation, DestroyCompositorWindow. An app
++  // container is given no HWND and this widget is headless, so there is
++  // nothing for it to hold on to.
++  //
++  // RenderCompositorEGL is the one that asks the widget for a native window
++  // and leaves the rest to EGL, which is how Android and Wayland present. Here
++  // EGL is ANGLE, the native window is the XAML SwapChainPanel, and ANGLE
++  // makes a composition swap chain for it -- so the frame is handed to the
++  // system compositor as a texture instead of being copied out through main
++  // memory.
++  return RenderCompositorEGL::Create(aWidget, aError);
++#elif defined(XP_WIN)
+   if (gfx::gfxVars::UseWebRenderANGLE()) {
+     return RenderCompositorANGLE::Create(aWidget, aError);
+   }
 diff --git a/gfx/ycbcr/moz.build b/gfx/ycbcr/moz.build
 index af79c8e59c..44b0bae9bc 100644
 --- a/gfx/ycbcr/moz.build
@@ -2373,10 +2437,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..be5b8bff5e
+index 0000000000..81ef59bf52
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,185 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2407,9 +2471,12 @@ index 0000000000..be5b8bff5e
 +std::atomic<LONG> sPanelHeight{0};
 +}  // namespace
 +
-+// Called by the compositor widget when the window is resized, which is also
-+// when the shell has just resized the panel.
-+extern "C" void angle_uwp_set_panel_size(int32_t width, int32_t height)
++// Called by the shell, which owns the panel and is the only thing that knows
++// how big it is. Exported because it is called from outside this library --
++// xul cannot forward it, since xul does not link against ANGLE at all: EGL
++// loads it at run time.
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_size(int32_t width,
++                                                               int32_t height)
 +{
 +    sPanelWidth  = width;
 +    sPanelHeight = height;
@@ -16414,10 +16481,10 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..cf63d0e519 100644
+index 8484851f67..9c2571bbe4 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,101 @@
+@@ -7,6 +7,102 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
@@ -16427,6 +16494,7 @@ index 8484851f67..cf63d0e519 100644
 +#  include <algorithm>
 +#  include <vector>
 +
++#  include "mozilla/Atomics.h"
 +#  include "mozilla/StaticMutex.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
@@ -16519,7 +16587,7 @@ index 8484851f67..cf63d0e519 100644
  namespace mozilla {
  namespace widget {
  
-@@ -16,7 +111,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
+@@ -16,7 +112,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
      : CompositorWidget(aOptions),
        mWidget(aWindow),
        mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
@@ -16555,7 +16623,7 @@ index 8484851f67..cf63d0e519 100644
  
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
    if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +155,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+@@ -33,6 +156,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
    *size = aClientSize;
  }
  
@@ -16574,7 +16642,7 @@ index 8484851f67..cf63d0e519 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +176,423 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +177,450 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -16848,6 +16916,33 @@ index 8484851f67..cf63d0e519 100644
 +// system to draw one in, so there is nothing on them to press to make them go
 +// away. The shell gives them the phone's back button instead, and asks this
 +// first so that back still means back when nothing is open.
++// ---------------------------------------------------------------- the panel
++//
++// The one XAML SwapChainPanel the shell is showing. EGL asks for it by name
++// when it makes a surface, and ANGLE turns it into a composition swap chain;
++// from then on the frame is handed to the system compositor as a texture
++// rather than copied out through this buffer.
++//
++// One panel per process, so a static is the honest shape. Written once by the
++// shell before the engine starts, read by the render thread afterwards.
++namespace {
++mozilla::Atomic<void*> sPanel{nullptr};
++}
++
++// Called by the shell. Only the panel: its size goes straight to ANGLE, which
++// the shell can reach and this cannot -- xul does not link against ANGLE at
++// all, because EGL loads it at run time.
++extern "C" __declspec(dllexport) void gecko_w10m_set_panel(void* aPanel) {
++  const bool first = !sPanel && aPanel;
++  sPanel = aPanel;
++  if (first) {
++    GeckoW10mNote("panel: the engine has somewhere to present");
++  }
++}
++
++// Read by GLContextProviderEGL, which declares it rather than including this.
++extern "C" void* gecko_w10m_egl_native_window() { return sPanel; }
++
 +extern "C" __declspec(dllexport) int32_t gecko_w10m_overlay_open() {
 +  mozilla::StaticMutexAutoLock lock(sFrameLock);
 +  for (auto* window : sWindows) {

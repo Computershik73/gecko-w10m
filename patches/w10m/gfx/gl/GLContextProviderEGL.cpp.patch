@@ -1,0 +1,29 @@
+diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
+index 728fa98356..31bbe6d859 100644
+--- a/gfx/gl/GLContextProviderEGL.cpp
++++ b/gfx/gl/GLContextProviderEGL.cpp
+@@ -12,6 +12,24 @@
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_JAVA_SURFACE))
+ #  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
+     (aWidget->AsAndroid()->GetEGLNativeWindow())
++#elif defined(GECKO_W10M)
++// There is no HWND to give: an app container is handed none, and this widget
++// is headless. What EGL gets instead is the XAML SwapChainPanel the shell is
++// showing, which ANGLE knows how to make a composition swap chain for -- so
++// the frame is handed to the system compositor as a texture rather than
++// copied out through main memory.
++//
++// It travels as an EGLNativeWindowType because that is what EGL takes. The
++// typedef stays HWND-shaped here: this build claims the desktop API family on
++// purpose, so that the rest of Gecko keeps its Win32 APIs.
++//
++// Declared rather than included -- the panel belongs to the headless widget,
++// and gfx has no business including widget headers.
++extern "C" void* gecko_w10m_egl_native_window();
++#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
++#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
+ #elif defined(XP_WIN)
+ #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))

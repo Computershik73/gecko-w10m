@@ -27,6 +27,14 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     : fullWidth_(pixelWidth),
       fullHeight_(pixelHeight),
       rawPerView_(rawPerView > 0 ? rawPerView : 1.0) {
+  // What the engine presents to when it draws on the GPU. It is created
+  // whether or not that succeeds: it stays empty and invisible under the
+  // picture if the engine falls back to drawing in software, so there is no
+  // mode to switch and no way for the two to disagree.
+  panel_ = SwapChainPanel();
+  panel_.HorizontalAlignment(HorizontalAlignment::Stretch);
+  panel_.VerticalAlignment(VerticalAlignment::Stretch);
+
   image_ = Image();
   // The engine paints a whole window; show all of it, keeping its shape. The
   // headless screen it was given has the window's aspect, so this costs at
@@ -231,6 +239,18 @@ bool EngineView::Resolve() {
   key_ = reinterpret_cast<KeyFn>(::GetProcAddress(xul, "gecko_w10m_input_key"));
   resize_ =
       reinterpret_cast<ResizeFn>(::GetProcAddress(xul, "gecko_w10m_resize"));
+  panel_fn_ =
+      reinterpret_cast<PanelFn>(::GetProcAddress(xul, "gecko_w10m_set_panel"));
+  // The size goes to ANGLE rather than to the engine: ANGLE needs it on its
+  // render thread, where XAML cannot be asked for anything, and xul cannot
+  // pass it on because xul does not link against ANGLE -- EGL loads it at run
+  // time. It may not be loaded yet, so this is retried like the rest.
+  if (!panel_size_fn_) {
+    if (HMODULE gles = ::LoadPackagedLibrary(L"libGLESv2.dll", 0)) {
+      panel_size_fn_ = reinterpret_cast<PanelSizeFn>(
+          ::GetProcAddress(gles, "angle_uwp_set_panel_size"));
+    }
+  }
   if (copy_ && !reported_) {
     reported_ = true;
     Log::Write(L"view: engine frame buffer found");
@@ -265,8 +285,32 @@ void EngineView::WatchRoom(
   PushSize();
 }
 
+void EngineView::GivePanelToEngine() {
+  Resolve();
+  if (!panel_ || fullWidth_ <= 0) {
+    return;
+  }
+  if (panel_size_fn_) {
+    panel_size_fn_(fullWidth_, fullHeight_);
+  }
+  if (!panel_fn_) {
+    return;
+  }
+  // The engine takes the panel as a bare COM pointer -- it is the shell that
+  // knows it is XAML, and the engine only passes it on to ANGLE.
+  auto inspectable = panel_.as<winrt::Windows::Foundation::IInspectable>();
+  panel_fn_(winrt::get_abi(inspectable));
+  if (!panelGiven_) {
+    panelGiven_ = true;
+    Log::Write(L"view: the engine has the panel, " +
+               std::to_wstring(fullWidth_) + L"x" +
+               std::to_wstring(fullHeight_) + L", size entry point " +
+               std::wstring(panel_size_fn_ ? L"found" : L"missing"));
+  }
+}
+
 void EngineView::PushSize() {
-  if (!resize_ || !host_) {
+  if (!host_) {
     return;
   }
   const int32_t width =
@@ -281,6 +325,16 @@ void EngineView::PushSize() {
   }
   fullWidth_ = width;
   fullHeight_ = height;
+
+  // The panel goes first and goes every time. ANGLE needs its size on the
+  // render thread, where XAML cannot be asked for anything, and it needs the
+  // panel itself before EGL makes a surface -- which is early, so this cannot
+  // wait for a resize that may never come.
+  GivePanelToEngine();
+
+  if (!resize_) {
+    return;
+  }
   Log::Write(L"view: room is now " + std::to_wstring(width) + L"x" +
              std::to_wstring(height) + L", telling the engine");
   resize_(width, height);

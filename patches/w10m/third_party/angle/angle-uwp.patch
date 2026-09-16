@@ -262,10 +262,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..be5b8bff5e
+index 0000000000..81ef59bf52
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,185 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -296,9 +296,12 @@ index 0000000000..be5b8bff5e
 +std::atomic<LONG> sPanelHeight{0};
 +}  // namespace
 +
-+// Called by the compositor widget when the window is resized, which is also
-+// when the shell has just resized the panel.
-+extern "C" void angle_uwp_set_panel_size(int32_t width, int32_t height)
++// Called by the shell, which owns the panel and is the only thing that knows
++// how big it is. Exported because it is called from outside this library --
++// xul cannot forward it, since xul does not link against ANGLE at all: EGL
++// loads it at run time.
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_size(int32_t width,
++                                                               int32_t height)
 +{
 +    sPanelWidth  = width;
 +    sPanelHeight = height;
