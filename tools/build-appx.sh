@@ -70,7 +70,8 @@ echo "=== compile the Gecko bootstrap (clang-cl, ARM) ==="
   /std:c++20 /EHs-c- /GR- /O2 /utf-8 -FIgecko_w10m_arm_intrin.h \
   /DWIN32 /D_WIN32 /DNOMINMAX /DUNICODE /D_UNICODE \
   /DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP /DXP_WIN /DGECKO_W10M=1 \
-  "/I$(cygpath -w "$DIST/../include")"
+  "/I$(cygpath -w "$DIST/../include")" \
+  "/I$(cygpath -w "$ROOT/engine/firefox/toolkit/components/startup")"
 OBJS="$OBJS $OBJDIR_W\\engine_gecko_bootstrap.obj"
 
 echo "=== compat stubs ==="

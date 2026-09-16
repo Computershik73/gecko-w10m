@@ -22,6 +22,17 @@
 #include <vector>
 
 #include "mozilla/Bootstrap.h"
+#include "mozilla/TimeStamp.h"
+
+// The startup timeline event ids, taken from the same header firefox.exe uses,
+// in the list form it offers for exactly this. Reading them from the source
+// rather than writing 1 keeps them from drifting away from the enum
+// XRE_StartupTimelineRecord expects.
+enum GeckoW10mStartupEvent {
+#define mozilla_StartupTimeline_Event(ev, name) ev,
+#include "StartupTimeline.h"
+#undef mozilla_StartupTimeline_Event
+};
 
 namespace {
 
@@ -127,6 +138,18 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   SetEngineEnvironment(L"MOZ_LOG_FILE", geckoLog.c_str());
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 
+  // firefox.exe takes this at the top of main and hands it to Gecko as
+  // StartupTimeline::START. We are not firefox.exe, so nobody did -- and
+  // Services.startup.getStartupInfo() only defines a property for an event
+  // that was recorded. The browser window's tab strip begins its init() with
+  //
+  //     Services.startup.getStartupInfo().start.getTime()
+  //
+  // so with start missing it threw on its first statement, and every element
+  // init() would have assigned stayed undefined: no arrowScrollbox, no
+  // pinnedTabsContainer, no selectedTab, no tabs.
+  const mozilla::TimeStamp startedAt = mozilla::TimeStamp::Now();
+
   Log("bootstrap: loading xul.dll");
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
   if (!xul) {
@@ -157,6 +180,9 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // makes it a useful canary before XRE_main.
   bootstrap->NS_LogInit();
   Log("bootstrap: NS_LogInit returned");
+
+  bootstrap->XRE_StartupTimelineRecord(START, startedAt);
+  Log("bootstrap: recorded StartupTimeline::START");
 
   // argv[0] must be the executable; XRE_main derives the install directory
   // from it. -profile keeps the profile inside LocalState, the only place a
