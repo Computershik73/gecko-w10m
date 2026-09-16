@@ -5,6 +5,7 @@
 
 #include <memory>
 #include "client/BrowserPreferences.h"
+#include "client/EngineView.h"
 #include "client/TabManager.h"
 #include "engine/GeckoEngine.h"
 
@@ -34,6 +35,7 @@ class MainPage {
   // Engine
   std::shared_ptr<engine::Runtime> runtime_;
   std::unique_ptr<client::TabManager> tabManager_;
+  std::unique_ptr<client::EngineView> engineView_;
 
   // Views
   winrt::Windows::UI::Xaml::Controls::Grid root_{nullptr};

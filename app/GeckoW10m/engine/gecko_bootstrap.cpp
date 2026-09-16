@@ -110,7 +110,8 @@ using GetBootstrapFn = void(NS_FROZENCALL*)(mozilla::Bootstrap::UniquePtr&);
 extern "C" void gecko_w10m_gecko_set_logger(gecko_w10m_gecko_log_fn fn) { gLog = fn; }
 
 extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
-                                 const wchar_t* profileDir) {
+                                 const wchar_t* profileDir, int width,
+                                 int height) {
   const std::wstring install(installDir ? installDir : L"");
   const std::wstring profile(profileDir ? profileDir : L"");
 
@@ -118,6 +119,18 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // child, and the build is configured for a single process anyway.
   SetEngineEnvironment(L"MOZ_HEADLESS", L"1");
   SetEngineEnvironment(L"MOZ_FORCE_DISABLE_E10S", L"1");
+
+  // The headless screen is 1366x768 unless told otherwise, and every window
+  // Gecko opens is sized from it. Since the shell shows those pixels at 1:1,
+  // a wrong size here is a wrong size on the phone.
+  if (width > 0 && height > 0) {
+    SetEngineEnvironment(L"MOZ_HEADLESS_WIDTH",
+                         std::to_wstring(width).c_str());
+    SetEngineEnvironment(L"MOZ_HEADLESS_HEIGHT",
+                         std::to_wstring(height).c_str());
+    Log("bootstrap: headless screen " + std::to_string(width) + "x" +
+        std::to_string(height));
+  }
 
   // Where libxul writes the delay-load substitutions it had to make. See the
   // failure hook in toolkit/xre/Bootstrap.cpp.

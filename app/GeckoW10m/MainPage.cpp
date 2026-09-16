@@ -3,6 +3,7 @@
 #include "MainPage.h"
 
 #include <winrt/Windows.Foundation.Metadata.h>
+#include <winrt/Windows.Graphics.Display.h>
 
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
@@ -66,6 +67,7 @@ MainPage::MainPage() {
   Log::Write(L"runtime", runtime_ ? L"created" : L"FAILED to create");
 
   tabManager_ = std::make_unique<client::TabManager>(runtime_);
+  engineView_ = std::make_unique<client::EngineView>();
 
   BuildUi();
   WireEngine();
@@ -81,11 +83,29 @@ MainPage::MainPage() {
   // the JIT probe or xul.dll had worked.
   Navigate(L"about:home");
 
+  engineView_->Start();
+
+  // Gecko is headless and has no idea how large the phone is, so it has to be
+  // told: the size of the window in physical pixels, which is what the buffer
+  // the shell reads back will be. XAML measures in view pixels, and on a phone
+  // those are nothing like the same thing.
+  double raw = 1.0;
+  if (ApiInformation::IsPropertyPresent(
+          L"Windows.Graphics.Display.DisplayInformation",
+          L"RawPixelsPerViewPixel")) {
+    raw = winrt::Windows::Graphics::Display::DisplayInformation::
+        GetForCurrentView()
+            .RawPixelsPerViewPixel();
+  }
+  auto bounds = Window::Current().Bounds();
+  const int pixelWidth = static_cast<int>(bounds.Width * raw + 0.5);
+  const int pixelHeight = static_cast<int>(bounds.Height * raw + 0.5);
+  Log::Write(L"view: asking the engine for " + std::to_wstring(pixelWidth) +
+             L"x" + std::to_wstring(pixelHeight) + L" physical pixels");
+
   // Last, so the window is up and the log is readable before Gecko gets its
-  // chance to take the process down with it. Navigation still goes through the
-  // stub -- this brings the runtime up and reports how far it gets, nothing
-  // more.
-  engine::StartGeckoRuntime(std::wstring(localState));
+  // chance to take the process down with it.
+  engine::StartGeckoRuntime(std::wstring(localState), pixelWidth, pixelHeight);
 }
 
 void MainPage::ApplyVisibleBounds() {
@@ -144,7 +164,12 @@ void MainPage::BuildUi() {
   statusText_.TextAlignment(TextAlignment::Center);
   statusText_.Margin(ThicknessHelper::FromUniformLength(16));
   statusText_.Foreground(Brush(ContentFg()));
-  contentHost_.Child(statusText_);
+  // The engine's frames go on top of the placeholder, so the text below shows
+  // until there is something better to show and never afterwards.
+  auto contentStack = Grid();
+  contentStack.Children().Append(statusText_);
+  contentStack.Children().Append(engineView_->Surface());
+  contentHost_.Child(contentStack);
 
   // --- Diagnostics overlay, hidden until asked for ---
   logPanel_ = Border();

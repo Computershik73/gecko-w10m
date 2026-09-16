@@ -41,7 +41,7 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/EngineView.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
@@ -154,6 +154,18 @@ if [ -d "$DIST" ]; then
   if [ -f "$STAGE/application.ini" ] && [ -d "$STAGE/browser" ]; then
     cp "$STAGE/application.ini" "$STAGE/browser/application.ini"
     echo "    application.ini staged into browser/ as the app directory"
+  fi
+  # Application default preferences for this port. The only one that matters
+  # so far decides whether anything can be seen at all: the hardware
+  # compositors present to a surface, and a headless widget has none, so the
+  # software one -- which paints into a buffer the shell reads back -- is the
+  # only one that reaches the screen here.
+  if [ -d "$STAGE/browser/defaults/preferences" ]; then
+    cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
+// GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
+pref("gfx.webrender.software", true);
+PREFS
+    echo "    app default preferences staged"
   fi
   # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
   # guard dispatcher reaches its target with bx, and an entry recorded without

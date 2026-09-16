@@ -15892,6 +15892,166 @@ index 2e0f09cbfd..f6217dfe47 100644
  #  include "mozilla/ProfilerState.h"
  
  #  include <windows.h>
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 8484851f67..79ca565f1c 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -7,6 +7,37 @@
+ #include "VsyncDispatcher.h"
+ #include "mozilla/widget/PlatformWidgetTypes.h"
+ 
++#if defined(GECKO_W10M)
++#  include <string.h>
++
++#  include <utility>
++
++#  include "mozilla/StaticMutex.h"
++#  include "mozilla/UniquePtr.h"
++#  include "mozilla/gfx/2D.h"
++#  include "mozilla/gfx/Types.h"
++
++extern "C" void GeckoW10mNote(const char* text);
++
++namespace {
++
++// Two buffers: the compositor paints into the back one and the swap happens
++// under the lock, so the shell never reads a half-drawn frame and the lock is
++// never held for the length of a paint.
++mozilla::StaticMutex sFrameLock MOZ_UNANNOTATED;
++mozilla::UniquePtr<uint8_t[]> sFront;
++mozilla::UniquePtr<uint8_t[]> sBack;
++size_t sFrontCapacity = 0;
++size_t sBackCapacity = 0;
++int32_t sFrontWidth = 0;
++int32_t sFrontHeight = 0;
++int32_t sBackWidth = 0;
++int32_t sBackHeight = 0;
++uint64_t sSerial = 0;
++
++}  // namespace
++#endif
++
+ namespace mozilla {
+ namespace widget {
+ 
+@@ -42,5 +73,92 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+   return reinterpret_cast<uintptr_t>(mWidget);
+ }
+ 
++#if defined(GECKO_W10M)
++already_AddRefed<gfx::DrawTarget>
++HeadlessCompositorWidget::StartRemoteDrawingInRegion(
++    const LayoutDeviceIntRegion& aInvalidRegion) {
++  const LayoutDeviceIntSize size = GetClientSize();
++  if (size.width <= 0 || size.height <= 0) {
++    return nullptr;
++  }
++
++  const size_t stride = size_t(size.width) * 4;
++  const size_t bytes = stride * size_t(size.height);
++
++  if (sBackCapacity < bytes) {
++    sBack = MakeUnique<uint8_t[]>(bytes);
++    sBackCapacity = sBack ? bytes : 0;
++    if (!sBack) {
++      return nullptr;
++    }
++  }
++  sBackWidth = size.width;
++  sBackHeight = size.height;
++
++  static bool sSaidSo = false;
++  if (!sSaidSo) {
++    sSaidSo = true;
++    GeckoW10mNote("frames: the compositor is drawing into the shell's buffer");
++  }
++
++  RefPtr<gfx::DrawTarget> dt = gfx::Factory::CreateDrawTargetForData(
++      gfx::BackendType::SKIA, sBack.get(),
++      gfx::IntSize(size.width, size.height), int32_t(stride),
++      gfx::SurfaceFormat::B8G8R8A8);
++  return dt.forget();
++}
++
++void HeadlessCompositorWidget::EndRemoteDrawingInRegion(
++    gfx::DrawTarget* aDrawTarget, const LayoutDeviceIntRegion& aInvalidRegion) {
++  if (aDrawTarget) {
++    aDrawTarget->Flush();
++  }
++
++  StaticMutexAutoLock lock(sFrameLock);
++  sFront.swap(sBack);
++  std::swap(sFrontCapacity, sBackCapacity);
++  sFrontWidth = sBackWidth;
++  sFrontHeight = sBackHeight;
++  ++sSerial;
++}
++#endif
++
+ }  // namespace widget
+ }  // namespace mozilla
++
++#if defined(GECKO_W10M)
++// Read by the shell, which has no other way to see what Gecko drew. Frames are
++// BGRA, top row first, tightly packed. A caller that already holds the serial
++// it last saw gets nothing copied and a zero back, so an idle engine costs the
++// UI thread a lock and a comparison.
++extern "C" __declspec(dllexport) uint64_t gecko_w10m_frame_serial() {
++  mozilla::StaticMutexAutoLock lock(sFrameLock);
++  return sSerial;
++}
++
++extern "C" __declspec(dllexport) int32_t gecko_w10m_frame_copy(
++    void* aDest, int32_t aCapacity, int32_t* aWidth, int32_t* aHeight,
++    uint64_t* aSerial) {
++  mozilla::StaticMutexAutoLock lock(sFrameLock);
++  if (!sFront || sFrontWidth <= 0 || sFrontHeight <= 0) {
++    return 0;
++  }
++  if (aSerial && *aSerial == sSerial) {
++    return 0;
++  }
++
++  const size_t bytes = size_t(sFrontWidth) * size_t(sFrontHeight) * 4;
++  if (!aDest || size_t(aCapacity) < bytes) {
++    // Still report the size, so the caller can size its bitmap and come back.
++    if (aWidth) *aWidth = sFrontWidth;
++    if (aHeight) *aHeight = sFrontHeight;
++    return 0;
++  }
++
++  memcpy(aDest, sFront.get(), bytes);
++  if (aWidth) *aWidth = sFrontWidth;
++  if (aHeight) *aHeight = sFrontHeight;
++  if (aSerial) *aSerial = sSerial;
++  return 1;
++}
++#endif
+diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
+index f9454a79f3..44bcecfad4 100644
+--- a/widget/headless/HeadlessCompositorWidget.h
++++ b/widget/headless/HeadlessCompositorWidget.h
+@@ -39,6 +39,20 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+     return this;
+   }
+ 
++#if defined(GECKO_W10M)
++  // A headless compositor widget hands the software WebRender compositor no
++  // surface at all, so everything it paints goes nowhere. On Windows 10 Mobile
++  // there is no HWND for app content and headless is the only widget this port
++  // can create, which makes these two methods the whole of the path from Gecko
++  // to the screen: they paint into a plain BGRA buffer that the shell copies
++  // into a XAML bitmap.
++  already_AddRefed<gfx::DrawTarget> StartRemoteDrawingInRegion(
++      const LayoutDeviceIntRegion& aInvalidRegion) override;
++  void EndRemoteDrawingInRegion(
++      gfx::DrawTarget* aDrawTarget,
++      const LayoutDeviceIntRegion& aInvalidRegion) override;
++#endif
++
+  private:
+   HeadlessWidget* mWidget;
+ 
 diff --git a/widget/windows/nsWindow.cpp b/widget/windows/nsWindow.cpp
 index c6572ecf58..00d62e04a1 100644
 --- a/widget/windows/nsWindow.cpp

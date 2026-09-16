@@ -27,7 +27,11 @@ void gecko_w10m_gecko_set_logger(gecko_w10m_gecko_log_fn fn);
 //
 // Returns the XRE_main exit code, or a negative value if the runtime never got
 // that far.
-int gecko_w10m_gecko_run(const wchar_t* installDir, const wchar_t* profileDir);
+/* width/height are the size in physical pixels of the area the shell can
+ * show. Gecko has no window of its own here, so this is what its headless
+ * screen is told it has; pass 0 to leave Gecko's own default alone. */
+int gecko_w10m_gecko_run(const wchar_t* installDir, const wchar_t* profileDir,
+                      int width, int height);
 
 #ifdef __cplusplus
 }
