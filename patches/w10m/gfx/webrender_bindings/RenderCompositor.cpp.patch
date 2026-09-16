@@ -55,21 +55,55 @@ index 06ed553c01..ba41fac850 100644
      return RenderCompositorANGLE::Create(aWidget, aError);
    }
 diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
-index 0a9e5b4a85..2e6d8353ca 100644
+index 0a9e5b4a85..274943dd74 100644
 --- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
 +++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
-@@ -29,6 +29,10 @@
+@@ -29,6 +29,11 @@
  #  include "mozilla/widget/AndroidCompositorWidget.h"
  #endif
  
 +#if defined(GECKO_W10M)
 +extern "C" void GeckoW10mNote(const char* text);
++extern "C" void* gecko_w10m_egl_native_window();
 +#endif
 +
  namespace mozilla::wr {
  
  extern LazyLogModule gRenderThreadLog;
-@@ -71,6 +75,21 @@ RenderCompositorEGL::RenderCompositorEGL(
+@@ -54,6 +59,32 @@ UniquePtr<RenderCompositor> RenderCompositorEGL::Create(
+ 
+ EGLSurface RenderCompositorEGL::CreateEGLSurface() {
+   EGLSurface surface = EGL_NO_SURFACE;
++#if defined(GECKO_W10M)
++  // The surface has to be made on the context's own display, not on the
++  // default one. CreateEGLSurfaceForCompositorWidget fetches DefaultEglDisplay
++  // and is handed the context's config -- fine on Android and Wayland, where
++  // those are the same display, and wrong here: RenderThread::SingletonGL
++  // builds its context on a display made from Gecko's D3D11 device, so the
++  // config belongs to that one. EGL refused with 0x3005, EGL_BAD_CONFIG,
++  // before it ever looked at the window, which is why nothing in ANGLE's
++  // SwapChainPanel code ever ran.
++  //
++  // CreateCompatibleSurface takes both the display and the config from the
++  // context, which is the pairing EGL requires.
++  {
++    const auto& gle = gl::GLContextEGL::Cast(gl());
++    void* const window = gecko_w10m_egl_native_window();
++    if (!window) {
++      GeckoW10mNote("gfx: no panel to make a surface for");
++      return EGL_NO_SURFACE;
++    }
++    surface = gle->CreateCompatibleSurface(window);
++    GeckoW10mNote(surface == EGL_NO_SURFACE
++                    ? "gfx: the context's own display refused the panel too"
++                    : "gfx: the panel has a surface on the context's display");
++    return surface;
++  }
++#endif
+   surface = gl::GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+       mWidget, gl::GLContextEGL::Cast(gl())->mSurfaceConfig);
+   if (surface == EGL_NO_SURFACE) {
+@@ -71,6 +102,21 @@ RenderCompositorEGL::RenderCompositorEGL(
      : RenderCompositor(aWidget), mGL(aGL), mEGLSurface(EGL_NO_SURFACE) {
    MOZ_ASSERT(mGL);
    LOG("RenderCompositorEGL::RenderCompositorEGL()");
