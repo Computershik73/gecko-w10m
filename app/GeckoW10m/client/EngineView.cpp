@@ -111,29 +111,23 @@ void EngineView::WireKeyboard() {
     clearing_ = false;
   });
 
-  // A hardware keyboard, if one is ever attached, still sends characters this
-  // way, and it costs nothing to keep.
+  // There is no second way in. Characters were also being taken from the
+  // window, kept on the grounds that a hardware keyboard would need it and
+  // that it cost nothing -- both wrong. It cost every letter twice, because
+  // the on-screen keyboard raises CharacterReceived as well as editing the
+  // control, and a hardware keyboard needs nothing special either: it types
+  // into whatever holds focus, which is this same sink, and arrives as the
+  // same change.
   auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
-  window.CharacterReceived(
-      [this](winrt::Windows::UI::Core::CoreWindow const&,
-             winrt::Windows::UI::Core::CharacterReceivedEventArgs const& args) {
-        const uint32_t code = args.KeyCode();
-        // Anything below space arrives as a key instead; sending it as text
-        // would insert a control character into the page.
-        if (!text_ || !typing_ || code < 32 || code == 127) {
-          return;
-        }
-        const uint16_t one = static_cast<uint16_t>(code);
-        text_(&one, 1);
-      });
 
   window.KeyDown([this](winrt::Windows::UI::Core::CoreWindow const&,
                         winrt::Windows::UI::Core::KeyEventArgs const& args) {
     if (!key_ || !typing_) {
       return;
     }
-    // Windows virtual key codes are what the engine side expects; the ones
-    // that produce text come through CharacterReceived instead.
+    // Only the keys that produce no text, so there is nothing here that the
+    // sink's own change also reports. Backspace on an empty sink changes
+    // nothing, and Enter cannot, so neither is delivered twice.
     const int32_t code = static_cast<int32_t>(args.VirtualKey());
     switch (code) {
       case 8:   // Back
