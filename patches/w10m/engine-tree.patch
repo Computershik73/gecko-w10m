@@ -15893,10 +15893,10 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..dfdd88f59f 100644
+index 8484851f67..cf63d0e519 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,45 @@
+@@ -7,6 +7,101 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
@@ -15909,7 +15909,10 @@ index 8484851f67..dfdd88f59f 100644
 +#  include "mozilla/StaticMutex.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
++#  include "mozilla/ClearOnShutdown.h"
 +#  include "mozilla/Sprintf.h"
++#  include "mozilla/StaticPtr.h"
++#  include "mozilla/TextEventDispatcherListener.h"
 +#  include "mozilla/TextEventDispatcher.h"
 +#  include "mozilla/TextEvents.h"
 +#  include "nsIWidget.h"
@@ -15919,6 +15922,59 @@ index 8484851f67..dfdd88f59f 100644
 +extern "C" void GeckoW10mNote(const char* text);
 +
 +namespace {
++
++// The reason typed characters never arrived. A transaction has to be opened on
++// the dispatcher before anything can be sent through it, and the native kind
++// asks the widget for a listener -- which every real platform provides and a
++// headless window does not, so BeginNativeInputTransaction refused every time
++// and the text was dropped in silence.
++//
++// This is that listener, modelled on the Windows one, which is also a
++// singleton because there is one input context in the process. There is no
++// native input method here to be told anything, so the notifications are
++// accepted and dropped; what it exists for is to let a transaction begin.
++//
++// The dispatcher holds it weakly, so something else has to hold it strongly,
++// which is what the static reference is for.
++class GeckoW10mTextListener final
++    : public mozilla::widget::TextEventDispatcherListener {
++ public:
++  NS_DECL_ISUPPORTS
++
++  NS_IMETHOD NotifyIME(mozilla::widget::TextEventDispatcher*,
++                       const mozilla::widget::IMENotification&) override {
++    return NS_OK;
++  }
++  NS_IMETHOD_(mozilla::widget::IMENotificationRequests)
++  GetIMENotificationRequests() override {
++    return mozilla::widget::IMENotificationRequests();
++  }
++  NS_IMETHOD_(void)
++  OnRemovedFrom(mozilla::widget::TextEventDispatcher*) override {}
++  NS_IMETHOD_(void)
++  WillDispatchKeyboardEvent(mozilla::widget::TextEventDispatcher*,
++                            mozilla::WidgetKeyboardEvent&, uint32_t,
++                            void*) override {}
++
++ private:
++  ~GeckoW10mTextListener() = default;
++};
++
++NS_IMPL_ISUPPORTS(GeckoW10mTextListener,
++                  mozilla::widget::TextEventDispatcherListener,
++                  nsISupportsWeakReference)
++
++mozilla::StaticRefPtr<GeckoW10mTextListener> sTextListener;
++
++GeckoW10mTextListener* TextListener() {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!sTextListener) {
++    sTextListener = new GeckoW10mTextListener();
++    mozilla::ClearOnShutdown(&sTextListener);
++  }
++  return sTextListener.get();
++}
++
 +
 +// What the shell reads. The windows paint into their own buffers and the
 +// finished picture is assembled here, so the shell never sees a half-drawn
@@ -15942,7 +15998,7 @@ index 8484851f67..dfdd88f59f 100644
  namespace mozilla {
  namespace widget {
  
-@@ -16,7 +55,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
+@@ -16,7 +111,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
      : CompositorWidget(aOptions),
        mWidget(aWindow),
        mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
@@ -15978,7 +16034,7 @@ index 8484851f67..dfdd88f59f 100644
  
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
    if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +99,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+@@ -33,6 +155,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
    *size = aClientSize;
  }
  
@@ -15997,7 +16053,7 @@ index 8484851f67..dfdd88f59f 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +120,420 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +176,423 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -16308,7 +16364,7 @@ index 8484851f67..dfdd88f59f 100644
 +          GeckoW10mNote("text: arrived, but the widget has no dispatcher");
 +          return;
 +        }
-+        if (NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++        if (NS_FAILED(dispatcher->BeginInputTransaction(TextListener()))) {
 +          GeckoW10mNote("text: arrived, but the transaction was refused");
 +          return;
 +        }
@@ -16332,8 +16388,11 @@ index 8484851f67..dfdd88f59f 100644
 +        }
 +        mozilla::widget::TextEventDispatcher* dispatcher =
 +            widget->GetTextEventDispatcher();
++        // Same refusal as the text path, and so the same cause: Backspace,
++        // Enter and the arrows never worked either.
 +        if (!dispatcher ||
-+            NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++            NS_FAILED(dispatcher->BeginInputTransaction(TextListener()))) {
++          GeckoW10mNote("key: arrived, but the transaction was refused");
 +          return;
 +        }
 +
