@@ -10,14 +10,21 @@ exactly the death this port has been seeing inside XRE_main.
 Whether the check is enforced is the loader's decision, taken from this flag in
 the image header. With it clear, the loader leaves __guard_check_icall_fptr
 pointing at a no-op instead of the validator, and the guarded call sites become
-ordinary indirect calls. Nothing else about the image changes, so this is a
-two-byte experiment rather than a rebuild: if the crash moves, CFG was the
-cause; if it does not, CFG is ruled out and the flag can go back.
+ordinary indirect calls. Nothing else about the image changes, so this is two
+bytes rather than a rebuild.
 
-The suspicion is not that CFG is wrong in principle but that its metadata is
-wrong here. Firefox ships with it on x86, x64 and ARM64; 32-bit ARM with
-lld-link is a combination almost nobody builds, and the guard function table
-has to account for the Thumb bit on every entry.
+CFG is not wrong in principle; its metadata is wrong here. Firefox ships with
+it on x86, x64 and ARM64, but 32-bit ARM with lld-link is a combination almost
+nobody builds, and the guard function table has to account for the Thumb bit on
+every entry. It does not: the dispatcher reaches its target with bx, and an
+entry recorded without that bit arrives in ARM state, where the first honest
+Thumb instruction of the callee decodes as an illegal one. That is how
+nss3.dll died -- 0xc000001d on the push at the entry of PR_CallOnce, which is
+as legal an instruction as exists.
+
+So every module this port links needs the flag cleared, not just the one that
+showed the symptom first. The CRT staged from VCLibs is Microsoft's own build
+and keeps its own, correct, metadata.
 
 Usage: python tools/strip-cfg.py <image.dll> [...]
 """

@@ -145,11 +145,18 @@ fi
 if [ -d "$DIST" ]; then
   cp -r "$DIST/." "$STAGE/"
   echo "    engine payload from $DIST"
-  # Diagnostic: Control Flow Guard turns a failed indirect call into a
-  # __fastfail, which ends the process with nothing written down anywhere --
-  # the exact death this port sees inside XRE_main. Clearing the flag on the
-  # packaged copy tells the loader not to enforce it. See tools/strip-cfg.py.
-  python "$(cygpath -w "$ROOT/tools/strip-cfg.py")" "$(cygpath -w "$STAGE/xul.dll")"     | sed 's/^/    /'
+  # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
+  # guard dispatcher reaches its target with bx, and an entry recorded without
+  # the Thumb bit lands there in ARM state, where the first honest Thumb
+  # instruction is an illegal one. Every module we link needs the flag cleared,
+  # not just xul.dll -- nss3.dll died this way at the entry of PR_CallOnce.
+  # The CRT staged from VCLibs is Microsoft's own build and is left alone.
+  # See tools/strip-cfg.py.
+  cfg_targets=()
+  while IFS= read -r rel; do
+    cfg_targets+=("$(cygpath -w "$STAGE/$rel")")
+  done < <(cd "$DIST" && find . \( -name '*.dll' -o -name '*.exe' \) -printf '%P\n')
+  python "$(cygpath -w "$ROOT/tools/strip-cfg.py")" "${cfg_targets[@]}"     | sed 's/^/    /'
   # clang's 32-bit ARM virtual-call thunks tail-jump through r1, the first
   # argument register, so every pointer-to-member call on a virtual function
   # arrives with its first argument destroyed. The linker map is what finds
