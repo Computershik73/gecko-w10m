@@ -121,6 +121,7 @@ class EngineView {
   bool panelGiven_ = false;
   bool textInputPending_ = false;
   bool touched_ = false;
+  bool declinedUntilTouch_ = false;
   bool saidWaiting_ = false;
   unsigned long long lastResolveAttempt_ = 0;
   std::function<void()> firstFrame_;

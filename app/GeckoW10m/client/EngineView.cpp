@@ -5,11 +5,13 @@
 #include <robuffer.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
 
 #include "client/Log.h"
+#include "engine/CrashProbe.h"
 #include "winrt/Windows.UI.Core.h"
 #include "winrt/Windows.UI.Input.h"
 #include "winrt/Windows.UI.Xaml.Input.h"
@@ -23,6 +25,12 @@ using namespace winrt::Windows::UI::Xaml::Media::Imaging;
 using winrt::Windows::UI::ViewManagement::InputPane;
 
 namespace gecko_w10m::client {
+namespace {
+// Set by ANGLE's logger, which is a plain function pointer and can carry no
+// state of its own.
+std::atomic<bool> g_panelPresenting{false};
+}  // namespace
+
 
 EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
                        double rawPerView)
@@ -281,6 +289,15 @@ bool EngineView::Resolve() {
           if (!text) {
             return;
           }
+          // ANGLE announcing that the panel has the swap chain is the only
+          // notice the shell gets that frames have stopped coming through
+          // memory. Nothing else changes: gecko_w10m_frame_copy simply stops
+          // answering, which is indistinguishable from an engine that has not
+          // drawn yet -- and the splash waits for a copied frame, so it would
+          // have covered a working GPU path for ever.
+          if (strstr(text, "took the swap chain")) {
+            g_panelPresenting.store(true);
+          }
           std::wstring wide;
           wide.reserve(strlen(text));
           for (const char* p = text; *p; ++p) {
@@ -408,6 +425,7 @@ void EngineView::FollowTextInput() {
     // will at last see whether the GPU path draws anything.
     if (!touched_) {
       typing_ = false;  // ask again once there has been a touch
+      declinedUntilTouch_ = true;
       if (!saidWaiting_) {
         saidWaiting_ = true;
         Log::Write(L"view: the engine wants text, but nothing has been touched "
@@ -429,6 +447,21 @@ void EngineView::FollowTextInput() {
 }
 
 void EngineView::Tick() {
+  // Counted before anything can return early: this is the proof that the UI
+  // thread is still drawing, and the heartbeat reports it from a thread of its
+  // own. A count that stops while the pulse goes on says the UI thread died
+  // without the process.
+  engine::NoteUiFrame();
+
+  // The hardware path presents on its own and never fills the buffer the
+  // splash is waiting for, so the splash has to be told separately.
+  if (g_panelPresenting.load() && firstFrame_) {
+    auto handler = std::move(firstFrame_);
+    firstFrame_ = nullptr;
+    Log::Write(L"view: the GPU is presenting through the panel, splash down");
+    handler();
+  }
+
   if (!Resolve()) {
     return;
   }
@@ -440,7 +473,12 @@ void EngineView::Tick() {
   //
   // So the render pass only notices; the work is posted and happens on a
   // later turn of the message loop, when XAML is between frames.
-  if (wanted_ && (wanted_() == 1) != typing_ && !textInputPending_) {
+  // declinedUntilTouch_ closes a hole this check had: when the keyboard is
+  // held back, typing_ stays false while the engine goes on wanting text, so
+  // the condition below stayed true and posted to the dispatcher on every
+  // single frame -- sixty queued turns a second, for ever.
+  if (wanted_ && (wanted_() == 1) != typing_ && !textInputPending_ &&
+      !(declinedUntilTouch_ && !touched_)) {
     textInputPending_ = true;
     PostToUi([this]() {
       textInputPending_ = false;

@@ -61,6 +61,15 @@ MainPage::MainPage() {
   // running looks like Gecko's fault, and there was no way to tell that from
   // something this device does on every launch.
   engine::InstallProcessProbes(std::wstring(localState));
+  engine::StartHeartbeat();
+
+  // The compositor telling us it has lost its surfaces is the one warning a
+  // GPU reset gives an application. If the phone's driver is being knocked
+  // over by the engine using D3D11 alongside XAML, this is where it would say
+  // so, and it has never been asked.
+  Media::CompositionTarget::SurfaceContentsLost([](auto&&, auto&&) {
+    client::Log::Write(L"FATAL: the compositor lost its surfaces");
+  });
 
   bool jit = BrowserPreferences::Shared().IsJitEnabled();
   Log::Write(L"jit preference", jit ? L"enabled" : L"disabled");

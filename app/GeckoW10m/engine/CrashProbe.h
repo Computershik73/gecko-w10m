@@ -47,4 +47,20 @@ void InstallEngineProbes();
 // Takes ownership of the handle.
 void StartLastLocationSampler(void* thread);
 
+// A pulse from a thread of its own, twice a second, carrying the number of
+// frames the UI thread has rendered since the last one.
+//
+// Every report this project has of the process dying ends at the same fault in
+// the XAML compositor, and the log simply stops there -- which was read as the
+// fault killing the process. It is not evidence of that. The log stops at the
+// last thing written, and nothing writes unless something happens. A pulse
+// makes silence mean something: if it goes on past the fault, the fault was
+// survived and the death is elsewhere; if the frame count freezes while the
+// pulse continues, the UI thread died and the system took the process after;
+// if both stop together, the fault is the death.
+void StartHeartbeat();
+
+// Called from XAML's render callback. Costs one increment.
+void NoteUiFrame();
+
 }  // namespace gecko_w10m::engine

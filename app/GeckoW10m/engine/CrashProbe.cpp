@@ -270,6 +270,27 @@ void LogInstruction(const wchar_t* tag, void* address) {
                       bytes);
 }
 
+// The UI thread's frame count, and the thread itself, so a fault can say
+// whether it happened where the frames are drawn.
+std::atomic<unsigned> gUiFrames{0};
+std::atomic<DWORD> gUiThread{0};
+
+DWORD WINAPI HeartbeatThread(LPVOID) {
+  unsigned last = 0;
+  unsigned beat = 0;
+  while (true) {
+    ::Sleep(500);
+    const unsigned frames = gUiFrames.load();
+    // The fault-safe path: the ordinary one ends by posting to the UI thread,
+    // and a pulse that adds work to the thread it is watching measures itself.
+    Log::WriteFromFault(L"alive: beat " + std::to_wstring(++beat) +
+               L", ui frames " +
+               std::to_wstring(frames) + L" (+" +
+               std::to_wstring(frames - last) + L")");
+    last = frames;
+  }
+}
+
 LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
@@ -285,7 +306,10 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   // this and carry on. Said plainly so it is not read as a cause of death.
   Log::WriteFromFault(L"first-chance: code " + Hex(code) + L" at " +
              DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
-             FaultDetail(*info->ExceptionRecord));
+             FaultDetail(*info->ExceptionRecord) + L", thread " +
+             std::to_wstring(::GetCurrentThreadId()) +
+             (::GetCurrentThreadId() == gUiThread.load() ? L" (the UI thread)"
+                                                         : L""));
   LogMemory(L"first-chance:");
   Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
@@ -817,6 +841,22 @@ LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
 }
 
 }  // namespace
+
+void NoteUiFrame() {
+  gUiFrames.fetch_add(1, std::memory_order_relaxed);
+  // The first frame is also the moment the UI thread identifies itself; there
+  // is nowhere earlier that runs on it and is guaranteed to run at all.
+  if (gUiThread.load() == 0) gUiThread.store(::GetCurrentThreadId());
+}
+
+void StartHeartbeat() {
+  HANDLE beat = ::CreateThread(nullptr, 0, &HeartbeatThread, nullptr, 0, nullptr);
+  if (!beat) {
+    Log::WriteNum(L"alive: no heartbeat thread, err", ::GetLastError());
+    return;
+  }
+  ::CloseHandle(beat);
+}
 
 void StartLastLocationSampler(void* thread) {
   HANDLE sampler =
