@@ -917,6 +917,61 @@ void NoteUiFrame() {
   gUiThread.store(::GetCurrentThreadId());
 }
 
+std::atomic<int> gProbeWidth{1440};
+std::atomic<int> gProbeHeight{2560};
+ID3D11Device* gProbeDevice = nullptr;
+
+// Runs on its own thread, a few seconds in, so that XAML is up and compositing
+// normally while the ground is taken out from under it.
+DWORD WINAPI CeilingThread(LPVOID) {
+  ::Sleep(3000);
+  const UINT width = static_cast<UINT>(gProbeWidth.load());
+  const UINT height = static_cast<UINT>(gProbeHeight.load());
+  const double each = double(width) * height * 4.0 / (1024.0 * 1024.0);
+
+  D3D11_TEXTURE2D_DESC desc{};
+  desc.Width = width;
+  desc.Height = height;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+  constexpr int kMost = 48;
+  ID3D11Texture2D* held[kMost] = {};
+  int taken = 0;
+  for (; taken < kMost; ++taken) {
+    HRESULT hr = gProbeDevice->CreateTexture2D(&desc, nullptr, &held[taken]);
+    if (FAILED(hr)) {
+      wchar_t line[192];
+      ::swprintf_s(line,
+                   L"ceiling: refused at %d surfaces, %.0f MB, hr 0x%08lx -- "
+                   L"this is the wall",
+                   taken + 1, (taken + 1) * each,
+                   static_cast<unsigned long>(hr));
+      Log::WriteFromFault(line);
+      break;
+    }
+    wchar_t line[128];
+    ::swprintf_s(line, L"ceiling: %d surfaces of %ux%u, %.0f MB taken", taken + 1,
+                 width, height, (taken + 1) * each);
+    Log::WriteFromFault(line);
+    // Slowly, so the compositor has whole frames to fail in and the heartbeat
+    // says which surface it died on.
+    ::Sleep(150);
+  }
+  if (taken == kMost) {
+    Log::WriteFromFault(L"ceiling: no wall found -- allocation is innocent too");
+  }
+  for (int i = 0; i < taken; ++i) {
+    if (held[i]) held[i]->Release();
+  }
+  Log::WriteFromFault(L"ceiling: given back");
+  return 0;
+}
+
 void MakeSecondD3DDevice() {
   HMODULE d3d11 = ::LoadLibraryExW(L"d3d11.dll", nullptr,
                                    LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -936,44 +991,58 @@ void MakeSecondD3DDevice() {
     return;
   }
 
-  // The same shape the engine asks for, so the answer is about the same thing.
   const D3D_FEATURE_LEVEL levels[] = {
       D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
       D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
-  ID3D11Device* device = nullptr;
   ID3D11DeviceContext* context = nullptr;
   D3D_FEATURE_LEVEL got = static_cast<D3D_FEATURE_LEVEL>(0);
-  Log::Write(L"second device: asking for one");
   HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                       D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                      ARRAYSIZE(levels), D3D11_SDK_VERSION, &device, &got,
+                      ARRAYSIZE(levels), D3D11_SDK_VERSION, &gProbeDevice, &got,
                       &context);
   if (FAILED(hr)) {
     Log::Write(L"second device: refused, " + Hex(static_cast<uintptr_t>(hr)));
     return;
   }
   Log::Write(L"second device: made, feature level " +
-             Hex(static_cast<uintptr_t>(got)) +
-             L" -- if the process dies in the next second or two, one D3D11 "
-             L"device beside XAML's is all it takes");
+             Hex(static_cast<uintptr_t>(got)));
 
-  // And a texture, because a device that is never used may never reach the
-  // driver at all.
-  D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = 256;
-  desc.Height = 256;
-  desc.MipLevels = 1;
-  desc.ArraySize = 1;
-  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  desc.Usage = D3D11_USAGE_DEFAULT;
-  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-  ID3D11Texture2D* texture = nullptr;
-  hr = device->CreateTexture2D(&desc, nullptr, &texture);
-  Log::Write(SUCCEEDED(hr) ? L"second device: it drew a texture"
-                           : L"second device: it would not make a texture");
-  // Deliberately kept, not released: the question is whether the process
-  // survives a second device existing alongside XAML's for the whole run.
+  // What the adapter says it has, which is the only figure available before
+  // asking for memory and finding out.
+  IDXGIDevice* dxgi = nullptr;
+  if (SUCCEEDED(gProbeDevice->QueryInterface(__uuidof(IDXGIDevice),
+                                             reinterpret_cast<void**>(&dxgi)))) {
+    IDXGIAdapter* adapter = nullptr;
+    if (SUCCEEDED(dxgi->GetAdapter(&adapter)) && adapter) {
+      DXGI_ADAPTER_DESC ad{};
+      if (SUCCEEDED(adapter->GetDesc(&ad))) {
+        wchar_t line[256];
+        ::swprintf_s(line,
+                     L"second device: adapter %s, dedicated %.0f MB, shared "
+                     L"%.0f MB",
+                     ad.Description,
+                     double(ad.DedicatedVideoMemory) / (1024.0 * 1024.0),
+                     double(ad.SharedSystemMemory) / (1024.0 * 1024.0));
+        Log::Write(line);
+      }
+      adapter->Release();
+    }
+    dxgi->Release();
+  }
+
+  HANDLE ceiling = ::CreateThread(nullptr, 0, &CeilingThread, nullptr, 0, nullptr);
+  if (ceiling) {
+    ::CloseHandle(ceiling);
+  } else {
+    Log::WriteNum(L"ceiling: no thread, err", ::GetLastError());
+  }
+}
+
+void SetProbeSurfaceSize(int width, int height) {
+  if (width > 0 && height > 0) {
+    gProbeWidth.store(width);
+    gProbeHeight.store(height);
+  }
 }
 
 void StartHeartbeat() {

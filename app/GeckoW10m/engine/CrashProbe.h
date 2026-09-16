@@ -63,16 +63,27 @@ void StartHeartbeat();
 // Called from XAML's render callback. Costs one increment.
 void NoteUiFrame();
 
-// Makes a second D3D11 device -- the shell's own, used for nothing -- and
-// keeps it.
+// Makes a second D3D11 device -- the shell's own -- and then finds out how
+// much this phone will actually give it.
 //
-// Across every run since 0.1.9.5 the one thing that separates a launch that
-// dies from a launch that does not is whether d3d11.dll was loaded; two runs
-// of the identical 0.1.9.9 build split exactly that way. The engine's use of
-// the device has been the suspect, but the plainer question was never asked:
-// whether this device tolerates a second D3D11 device in a process that
-// already has one, which every XAML app does. This asks it, seventeen seconds
-// before the engine would.
+// A second device beside XAML's turned out to be harmless: one was made at
+// startup, used, and kept for a whole run, and the browser died exactly where
+// it always does, fifteen seconds later. So it is not the device. What is left
+// is what the engine asks of it, and the first thing WebRender does is
+// allocate: render targets the size of the screen, texture cache pages, a
+// staging pool. If this device has a ceiling an app container may not cross,
+// the compositor would be the first thing to fail an allocation on the other
+// side of it -- and failing an allocation and then writing through the null it
+// returned is exactly the instruction the UI thread dies on.
+//
+// So this allocates screen-sized render targets, one at a time, saying how
+// much it has taken each time. Either it stops at a number, which is the
+// number we have to keep the engine under, or it does not, and allocation is
+// innocent too.
 void MakeSecondD3DDevice();
+
+// How large a screen-sized render target is, for the ceiling probe. Set from
+// the shell, which is the only thing that knows the screen.
+void SetProbeSurfaceSize(int width, int height);
 
 }  // namespace gecko_w10m::engine

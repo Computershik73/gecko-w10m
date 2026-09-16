@@ -97,6 +97,9 @@ MainPage::MainPage() {
   const int pixelHeight = static_cast<int>(bounds.Height * raw + 0.5);
   Log::Write(L"view: asking the engine for " + std::to_wstring(pixelWidth) +
              L"x" + std::to_wstring(pixelHeight) + L" physical pixels");
+  // The ceiling probe asks for surfaces the size of the screen, because that
+  // is the size of the ones WebRender asks for.
+  engine::SetProbeSurfaceSize(pixelWidth, pixelHeight);
 
   // The desktop Firefox chrome has a narrowest width it will accept, and it
   // wins: ask for anything narrower and the window comes back at the minimum.
