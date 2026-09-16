@@ -26,13 +26,25 @@ ac_add_options --enable-uwp
 # allocators make executable memory legal in the container; ACG stays off.
 ac_add_options --enable-jit
 
-# ---- Rust (tier-3 UWP target, built from source) ----------------------------
-# thumbv7a-uwp-windows-msvc is a tier-3 Rust target: no prebuilt std ships, so
-# std/core/alloc are compiled from source with -Z build-std. Requires a nightly
+# ---- Rust (custom UWP target, std built from source) ------------------------
+# The target is ours, not the built-in thumbv7a-uwp-windows-msvc, and it differs
+# from it in exactly one field: llvm-target ends in "hf".
+#
+# That field decides whether rustc passes homogeneous float aggregates in the
+# VFP registers, which is what the ARM32 Windows ABI requires and what clang-cl
+# does. rustc gates it on `llvm_target.ends_with("hf")` -- a test written for
+# gnueabihf triples, which no MSVC triple can ever pass. On the stock target a
+# struct of four floats (LayoutRect, ColorF, ...) therefore goes in r1-r3 plus
+# a stack word while the C++ caller put it in s0-s3, and every argument after it
+# is read from the wrong place. That is four words of shift across 78 by-value
+# parameters in the WebRender bindings alone.
+#
+# std still ships for neither target, so it is compiled from source and
+# installed into the sysroot by tools/uwp-install-std.sh. Requires a nightly
 # toolchain with the rust-src component (rustup component add rust-src).
-export RUST_TARGET="thumbv7a-uwp-windows-msvc"
+export RUST_TARGET="thumbv7a-uwp-windows-msvchf"
 export CARGO_BUILD_FLAGS="-Z build-std=std,panic_abort"
-export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort"
+export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort -Zunstable-options"
 ac_add_options --disable-rust-simd
 
 # ---- Single-process (no e10s) ----------------------------------------------

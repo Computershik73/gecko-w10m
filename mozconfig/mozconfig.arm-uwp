@@ -26,9 +26,9 @@ ac_add_options --enable-jit
 # thumbv7a-uwp-windows-msvc is a tier-3 Rust target: no prebuilt std ships, so
 # std/core/alloc are compiled from source with -Z build-std. Requires a nightly
 # toolchain with the rust-src component (rustup component add rust-src).
-export RUST_TARGET="thumbv7a-uwp-windows-msvc"
+export RUST_TARGET="thumbv7a-uwp-windows-msvchf"
 export CARGO_BUILD_FLAGS="-Z build-std=std,panic_abort"
-export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort"
+export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort -Zunstable-options"
 ac_add_options --disable-rust-simd
 
 # ---- Single-process (no e10s) ----------------------------------------------
