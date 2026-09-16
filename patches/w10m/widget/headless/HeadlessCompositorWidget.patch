@@ -1,40 +1,45 @@
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..6ae6e004f2 100644
+index 8484851f67..030635afe6 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,39 @@
+@@ -7,6 +7,44 @@
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
  
 +#if defined(GECKO_W10M)
 +#  include <string.h>
 +
-+#  include <utility>
++#  include <algorithm>
++#  include <vector>
 +
 +#  include "mozilla/StaticMutex.h"
-+#  include "mozilla/UniquePtr.h"
 +#  include "mozilla/gfx/2D.h"
 +#  include "mozilla/gfx/Types.h"
++#  include "mozilla/TextEventDispatcher.h"
++#  include "mozilla/TextEvents.h"
 +#  include "nsIWidget.h"
++#  include "nsString.h"
 +#  include "nsThreadUtils.h"
 +
 +extern "C" void GeckoW10mNote(const char* text);
 +
 +namespace {
 +
-+// Two buffers: the compositor paints into the back one and the swap happens
-+// under the lock, so the shell never reads a half-drawn frame and the lock is
-+// never held for the length of a paint.
++// What the shell reads. The windows paint into their own buffers and the
++// finished picture is assembled here, so the shell never sees a half-drawn
++// frame and the lock is never held for the length of a paint.
 +mozilla::StaticMutex sFrameLock MOZ_UNANNOTATED;
 +mozilla::UniquePtr<uint8_t[]> sFront;
-+mozilla::UniquePtr<uint8_t[]> sBack;
 +size_t sFrontCapacity = 0;
-+size_t sBackCapacity = 0;
 +int32_t sFrontWidth = 0;
 +int32_t sFrontHeight = 0;
-+int32_t sBackWidth = 0;
-+int32_t sBackHeight = 0;
 +uint64_t sSerial = 0;
++
++// Every live window, and which of them is the one being shown. Guarded by the
++// same lock; the compositor is a single thread, so this is only ever contended
++// with the shell reading a frame.
++std::vector<mozilla::widget::HeadlessCompositorWidget*> sWindows;
++mozilla::widget::HeadlessCompositorWidget* sMain = nullptr;
 +
 +}  // namespace
 +#endif
@@ -42,7 +47,58 @@ index 8484851f67..6ae6e004f2 100644
  namespace mozilla {
  namespace widget {
  
-@@ -42,5 +75,138 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -16,7 +54,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
+     : CompositorWidget(aOptions),
+       mWidget(aWindow),
+       mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
+-                  "HeadlessCompositorWidget::mClientSize") {}
++                  "HeadlessCompositorWidget::mClientSize")
++#if defined(GECKO_W10M)
++      ,
++      mOrigin(aWindow->GetBounds().TopLeft(),
++              "HeadlessCompositorWidget::mOrigin")
++#endif
++{
++#if defined(GECKO_W10M)
++  mIsOverlay = aWindow->GetWindowType() == WindowType::Popup;
++  StaticMutexAutoLock lock(sFrameLock);
++  sWindows.push_back(this);
++#endif
++}
++
++#if defined(GECKO_W10M)
++HeadlessCompositorWidget::~HeadlessCompositorWidget() {
++  StaticMutexAutoLock lock(sFrameLock);
++  for (auto it = sWindows.begin(); it != sWindows.end(); ++it) {
++    if (*it == this) {
++      sWindows.erase(it);
++      break;
++    }
++  }
++  if (sMain == this) {
++    sMain = nullptr;
++  }
++}
++#endif
+ 
+ void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
+   if (RefPtr<CompositorVsyncDispatcher> cvd =
+@@ -33,6 +98,14 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+   *size = aClientSize;
+ }
+ 
++#if defined(GECKO_W10M)
++void HeadlessCompositorWidget::NotifyOriginChanged(
++    const LayoutDeviceIntPoint& aOrigin) {
++  auto origin = mOrigin.Lock();
++  *origin = aOrigin;
++}
++#endif
++
+ LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
+   auto size = mClientSize.Lock();
+   return *size;
+@@ -42,5 +115,334 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -58,24 +114,24 @@ index 8484851f67..6ae6e004f2 100644
 +  const size_t stride = size_t(size.width) * 4;
 +  const size_t bytes = stride * size_t(size.height);
 +
-+  if (sBackCapacity < bytes) {
-+    sBack = MakeUnique<uint8_t[]>(bytes);
-+    sBackCapacity = sBack ? bytes : 0;
-+    if (!sBack) {
++  if (mCapacity < bytes) {
++    mPixels = MakeUnique<uint8_t[]>(bytes);
++    mCapacity = mPixels ? bytes : 0;
++    if (!mPixels) {
 +      return nullptr;
 +    }
 +  }
-+  sBackWidth = size.width;
-+  sBackHeight = size.height;
++  mWidth = size.width;
++  mHeight = size.height;
 +
 +  static bool sSaidSo = false;
 +  if (!sSaidSo) {
 +    sSaidSo = true;
-+    GeckoW10mNote("frames: the compositor is drawing into the shell's buffer");
++    GeckoW10mNote("frames: the compositor is drawing into the shell buffer");
 +  }
 +
 +  RefPtr<gfx::DrawTarget> dt = gfx::Factory::CreateDrawTargetForData(
-+      gfx::BackendType::SKIA, sBack.get(),
++      gfx::BackendType::SKIA, mPixels.get(),
 +      gfx::IntSize(size.width, size.height), int32_t(stride),
 +      gfx::SurfaceFormat::B8G8R8A8);
 +  return dt.forget();
@@ -88,10 +144,70 @@ index 8484851f67..6ae6e004f2 100644
 +  }
 +
 +  StaticMutexAutoLock lock(sFrameLock);
-+  sFront.swap(sBack);
-+  std::swap(sFrontCapacity, sBackCapacity);
-+  sFrontWidth = sBackWidth;
-+  sFrontHeight = sBackHeight;
++
++  if (!mIsOverlay) {
++    sMain = this;
++  }
++  if (!sMain || sMain->mWidth <= 0 || sMain->mHeight <= 0 || !sMain->mPixels) {
++    return;
++  }
++
++  // Assemble the whole picture every time, whichever window painted. A menu
++  // that painted on its own would otherwise be erased the next time the window
++  // beneath it painted, and a window that painted on its own would leave the
++  // menu behind as a stale patch.
++  const size_t stride = size_t(sMain->mWidth) * 4;
++  const size_t bytes = stride * size_t(sMain->mHeight);
++  if (sFrontCapacity < bytes) {
++    sFront = MakeUnique<uint8_t[]>(bytes);
++    sFrontCapacity = sFront ? bytes : 0;
++    if (!sFront) {
++      return;
++    }
++  }
++  sFrontWidth = sMain->mWidth;
++  sFrontHeight = sMain->mHeight;
++  memcpy(sFront.get(), sMain->mPixels.get(), bytes);
++
++  LayoutDeviceIntPoint base;
++  {
++    auto origin = sMain->mOrigin.Lock();
++    base = *origin;
++  }
++
++  for (auto* window : sWindows) {
++    if (window == sMain || !window->mIsOverlay || window->mWidth <= 0 ||
++        !window->mPixels) {
++      continue;
++    }
++
++    LayoutDeviceIntPoint at;
++    {
++      auto origin = window->mOrigin.Lock();
++      at = *origin;
++    }
++    const int32_t dx = at.x - base.x;
++    const int32_t dy = at.y - base.y;
++    const size_t sourceStride = size_t(window->mWidth) * 4;
++
++    for (int32_t row = 0; row < window->mHeight; ++row) {
++      const int32_t y = dy + row;
++      if (y < 0 || y >= sFrontHeight) {
++        continue;
++      }
++      const int32_t from = dx < 0 ? -dx : 0;
++      const int32_t count =
++          std::min(window->mWidth - from, sFrontWidth - (dx + from));
++      if (count <= 0) {
++        continue;
++      }
++      memcpy(sFront.get() + size_t(y) * stride + size_t(dx + from) * 4,
++             window->mPixels.get() + size_t(row) * sourceStride +
++                 size_t(from) * 4,
++             size_t(count) * 4);
++    }
++  }
++
 +  ++sSerial;
 +}
 +#endif
@@ -115,12 +231,12 @@ index 8484851f67..6ae6e004f2 100644
 +// so each one is handed to the main thread rather than dispatched in place.
 +//
 +// Message: 0 move, 1 button down, 2 button up. Coordinates are in the pixels of
-+// the frame the shell last drew, which is what the window is.
++// the frame the shell last drew, which is the window.
 +extern "C" __declspec(dllexport) void gecko_w10m_input_mouse(int32_t aMessage,
 +                                                          int32_t aX,
 +                                                          int32_t aY) {
-+  NS_DispatchToMainThread(NS_NewRunnableFunction(
-+      "gecko_w10m_input_mouse", [aMessage, aX, aY]() {
++  NS_DispatchToMainThread(
++      NS_NewRunnableFunction("gecko_w10m_input_mouse", [aMessage, aX, aY]() {
 +        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
 +        if (!widget) {
 +          return;
@@ -143,8 +259,8 @@ index 8484851f67..6ae6e004f2 100644
 +extern "C" __declspec(dllexport) void gecko_w10m_input_wheel(int32_t aX, int32_t aY,
 +                                                          double aDeltaX,
 +                                                          double aDeltaY) {
-+  NS_DispatchToMainThread(NS_NewRunnableFunction(
-+      "gecko_w10m_input_wheel", [aX, aY, aDeltaX, aDeltaY]() {
++  NS_DispatchToMainThread(
++      NS_NewRunnableFunction("gecko_w10m_input_wheel", [aX, aY, aDeltaX, aDeltaY]() {
 +        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
 +        if (!widget) {
 +          return;
@@ -181,11 +297,175 @@ index 8484851f67..6ae6e004f2 100644
 +  return 1;
 +}
 +#endif
++
++#if defined(GECKO_W10M)
++// ---------------------------------------------------------------- text input
++//
++// A phone has no keyboard until something asks for one, and the only thing
++// that knows to ask is Gecko: SetInputContext is called when focus moves onto
++// or off an editable field. The shell reads that and raises the on-screen
++// keyboard, which is the only reason any of the rest of this is reachable.
++//
++// Characters are committed as a composition rather than sent as keystrokes.
++// That is what an on-screen keyboard is -- it produces text, not scancodes --
++// and it is the path TextEventDispatcher exists to serve. Keys that are not
++// text, like Backspace and Enter, still have to be keys.
++
++extern "C" __declspec(dllexport) int32_t gecko_w10m_text_input_wanted() {
++  return mozilla::widget::HeadlessWidget::TextInputWanted() ? 1 : 0;
++}
++
++extern "C" __declspec(dllexport) void gecko_w10m_input_text(
++    const uint16_t* aText, int32_t aLength) {
++  if (!aText || aLength <= 0) {
++    return;
++  }
++  nsString text(reinterpret_cast<const char16_t*>(aText), aLength);
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "gecko_w10m_input_text", [text = std::move(text)]() mutable {
++        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        if (!widget) {
++          return;
++        }
++        mozilla::widget::TextEventDispatcher* dispatcher =
++            widget->GetTextEventDispatcher();
++        if (!dispatcher ||
++            NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++          return;
++        }
++        nsEventStatus status = nsEventStatus_eIgnore;
++        dispatcher->CommitComposition(status, &text);
++      }));
++}
++
++extern "C" __declspec(dllexport) void gecko_w10m_input_key(int32_t aKeyCode) {
++  NS_DispatchToMainThread(
++      NS_NewRunnableFunction("gecko_w10m_input_key", [aKeyCode]() {
++        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        if (!widget) {
++          return;
++        }
++        mozilla::widget::TextEventDispatcher* dispatcher =
++            widget->GetTextEventDispatcher();
++        if (!dispatcher ||
++            NS_FAILED(dispatcher->BeginNativeInputTransaction())) {
++          return;
++        }
++
++        // The shell sends Windows virtual key codes, which is also what
++        // NS_VK_* are, so the code needs no translation -- only the name,
++        // which is what the DOM actually reports as KeyboardEvent.key.
++        mozilla::KeyNameIndex name = mozilla::KEY_NAME_INDEX_Unidentified;
++        switch (aKeyCode) {
++          case 8:
++            name = mozilla::KEY_NAME_INDEX_Backspace;
++            break;
++          case 9:
++            name = mozilla::KEY_NAME_INDEX_Tab;
++            break;
++          case 13:
++            name = mozilla::KEY_NAME_INDEX_Enter;
++            break;
++          case 27:
++            name = mozilla::KEY_NAME_INDEX_Escape;
++            break;
++          case 33:
++            name = mozilla::KEY_NAME_INDEX_PageUp;
++            break;
++          case 34:
++            name = mozilla::KEY_NAME_INDEX_PageDown;
++            break;
++          case 35:
++            name = mozilla::KEY_NAME_INDEX_End;
++            break;
++          case 36:
++            name = mozilla::KEY_NAME_INDEX_Home;
++            break;
++          case 37:
++            name = mozilla::KEY_NAME_INDEX_ArrowLeft;
++            break;
++          case 38:
++            name = mozilla::KEY_NAME_INDEX_ArrowUp;
++            break;
++          case 39:
++            name = mozilla::KEY_NAME_INDEX_ArrowRight;
++            break;
++          case 40:
++            name = mozilla::KEY_NAME_INDEX_ArrowDown;
++            break;
++          case 46:
++            name = mozilla::KEY_NAME_INDEX_Delete;
++            break;
++          default:
++            return;
++        }
++
++        mozilla::WidgetKeyboardEvent event(true, mozilla::eKeyDown, widget);
++        event.mKeyCode = uint32_t(aKeyCode);
++        event.mKeyNameIndex = name;
++        event.mCodeNameIndex = mozilla::CODE_NAME_INDEX_UNKNOWN;
++        event.mIsRepeat = false;
++
++        nsEventStatus status = nsEventStatus_eIgnore;
++        if (dispatcher->DispatchKeyboardEvent(mozilla::eKeyDown, event,
++                                              status)) {
++          dispatcher->MaybeDispatchKeypressEvents(event, status);
++        }
++        status = nsEventStatus_eIgnore;
++        dispatcher->DispatchKeyboardEvent(mozilla::eKeyUp, event, status);
++      }));
++}
++
++// The on-screen keyboard covers the bottom of the screen, and a window that
++// does not know that puts the field being typed into underneath it.
++extern "C" __declspec(dllexport) void gecko_w10m_resize(int32_t aWidth,
++                                                     int32_t aHeight) {
++  if (aWidth <= 0 || aHeight <= 0) {
++    return;
++  }
++  NS_DispatchToMainThread(
++      NS_NewRunnableFunction("gecko_w10m_resize", [aWidth, aHeight]() {
++        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        if (!widget) {
++          return;
++        }
++        widget->Resize(mozilla::DesktopSize(aWidth, aHeight), true);
++      }));
++}
++#endif
 diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
-index f9454a79f3..44bcecfad4 100644
+index f9454a79f3..41f2abbb04 100644
 --- a/widget/headless/HeadlessCompositorWidget.h
 +++ b/widget/headless/HeadlessCompositorWidget.h
-@@ -39,6 +39,20 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+@@ -8,6 +8,10 @@
+ #include "HeadlessWidget.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/UniquePtr.h"
++#endif
++
+ namespace mozilla {
+ namespace widget {
+ 
+@@ -19,8 +23,16 @@ class HeadlessCompositorWidget final : public CompositorWidget,
+   HeadlessCompositorWidget(const HeadlessCompositorWidgetInitData& aInitData,
+                            const layers::CompositorOptions& aOptions,
+                            HeadlessWidget* aWindow);
++#if defined(GECKO_W10M)
++  ~HeadlessCompositorWidget();
++#endif
+ 
+   void NotifyClientSizeChanged(const LayoutDeviceIntSize& aClientSize);
++#if defined(GECKO_W10M)
++  // Where this window sits on the headless screen. A menu is a window of its
++  // own and knows only its own corner, so this is what says where to put it.
++  void NotifyOriginChanged(const LayoutDeviceIntPoint& aOrigin);
++#endif
+ 
+   // CompositorWidget Overrides
+ 
+@@ -39,11 +51,39 @@ class HeadlessCompositorWidget final : public CompositorWidget,
      return this;
    }
  
@@ -194,8 +474,7 @@ index f9454a79f3..44bcecfad4 100644
 +  // surface at all, so everything it paints goes nowhere. On Windows 10 Mobile
 +  // there is no HWND for app content and headless is the only widget this port
 +  // can create, which makes these two methods the whole of the path from Gecko
-+  // to the screen: they paint into a plain BGRA buffer that the shell copies
-+  // into a XAML bitmap.
++  // to the screen.
 +  already_AddRefed<gfx::DrawTarget> StartRemoteDrawingInRegion(
 +      const LayoutDeviceIntRegion& aInvalidRegion) override;
 +  void EndRemoteDrawingInRegion(
@@ -206,11 +485,42 @@ index f9454a79f3..44bcecfad4 100644
   private:
    HeadlessWidget* mWidget;
  
+   // See GtkCompositorWidget for the justification for this mutex.
+   DataMutex<LayoutDeviceIntSize> mClientSize;
++
++#if defined(GECKO_W10M)
++  // Every window paints into its own buffer. With one buffer between them, a
++  // menu and the window underneath it took turns writing the same pixels and
++  // the shell showed whatever was there when it looked -- which is what the
++  // streaks across the screen were.
++  UniquePtr<uint8_t[]> mPixels;
++  size_t mCapacity = 0;
++  int32_t mWidth = 0;
++  int32_t mHeight = 0;
++
++  // Popups are drawn over the window rather than instead of it.
++  bool mIsOverlay = false;
++  DataMutex<LayoutDeviceIntPoint> mOrigin;
++#endif
+ };
+ 
+ }  // namespace widget
 diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
-index 0c28540ee6..274643edd9 100644
+index 0c28540ee6..9afa7e4377 100644
 --- a/widget/headless/HeadlessWidget.cpp
 +++ b/widget/headless/HeadlessWidget.cpp
-@@ -91,7 +91,25 @@ HeadlessWidget::~HeadlessWidget() {
+@@ -3,6 +3,10 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #include "HeadlessWidget.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Atomics.h"
++#endif
++
+ #include "BasicEvents.h"
+ #include "ErrorList.h"
+ #include "HeadlessCompositorWidget.h"
+@@ -91,7 +95,43 @@ HeadlessWidget::~HeadlessWidget() {
    Destroy();
  }
  
@@ -225,6 +535,24 @@ index 0c28540ee6..274643edd9 100644
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return sShownWidget;
 +}
++
++namespace {
++// Written on the main thread when focus moves, read by the shell from its own.
++// A bool either side of a torn read is still a bool.
++mozilla::Atomic<bool> sTextInputWanted{false};
++}  // namespace
++
++bool HeadlessWidget::TextInputWanted() { return sTextInputWanted; }
++
++void HeadlessWidget::SetInputContext(const InputContext& aContext,
++                                     const InputContextAction& aAction) {
++  mInputContext = aContext;
++  // Gecko says this whenever focus moves onto or off an editable field, which
++  // is exactly when a phone should raise or drop its keyboard.
++  sTextInputWanted =
++      aContext.mIMEState.mEnabled == IMEEnabled::Enabled ||
++      aContext.mIMEState.mEnabled == IMEEnabled::Password;
++}
 +#endif
 +
  void HeadlessWidget::Destroy() {
@@ -236,7 +564,7 @@ index 0c28540ee6..274643edd9 100644
    if (mDestroyed) {
      return;
    }
-@@ -162,6 +180,13 @@ void HeadlessWidget::RaiseWindow() {
+@@ -162,6 +202,13 @@ void HeadlessWidget::RaiseWindow() {
  }
  
  void HeadlessWidget::Show(bool aState) {
@@ -250,11 +578,25 @@ index 0c28540ee6..274643edd9 100644
    mVisible = aState;
  
    LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
+@@ -223,6 +270,13 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
+   }
+ 
+   mBounds.MoveTo(aX, aY);
++#if defined(GECKO_W10M)
++  // A popup is a window of its own and the shell has to be told where to put
++  // it over the one underneath.
++  if (mCompositorWidget) {
++    mCompositorWidget->NotifyOriginChanged(mBounds.TopLeft());
++  }
++#endif
+   NotifyWindowMoved(mBounds.TopLeft());
+ }
+ 
 diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
-index 05ae8d02e8..5fec749609 100644
+index 05ae8d02e8..4356920778 100644
 --- a/widget/headless/HeadlessWidget.h
 +++ b/widget/headless/HeadlessWidget.h
-@@ -49,6 +49,14 @@ class HeadlessWidget final : public nsIWidget {
+@@ -49,6 +49,17 @@ class HeadlessWidget final : public nsIWidget {
      return nullptr;
    }
  
@@ -264,8 +606,22 @@ index 05ae8d02e8..5fec749609 100644
 +  // it is destroyed, read by the input entry points in
 +  // HeadlessCompositorWidget.cpp.
 +  static HeadlessWidget* ShownWidget();
++  // True while focus is on something that takes text. It is the only
++  // signal a phone has that it should raise its keyboard.
++  static bool TextInputWanted();
 +#endif
 +
    nsresult Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
                    const widget::InitData&) override;
    using nsIWidget::Create;  // for Create signature not overridden here
+@@ -78,9 +89,7 @@ class HeadlessWidget final : public nsIWidget {
+   }
+   LayoutDeviceIntPoint WidgetToScreenOffset() override;
+   void SetInputContext(const InputContext& aContext,
+-                       const InputContextAction& aAction) override {
+-    mInputContext = aContext;
+-  }
++                       const InputContextAction& aAction) override;
+   InputContext GetInputContext() override { return mInputContext; }
+ 
+   WindowRenderer* GetWindowRenderer() override;

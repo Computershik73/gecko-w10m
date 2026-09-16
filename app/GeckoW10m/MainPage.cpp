@@ -5,6 +5,8 @@
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Display.h>
 
+#include <thread>
+
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
 #include "engine/GeckoRuntimeHost.h"
@@ -67,23 +69,6 @@ MainPage::MainPage() {
   Log::Write(L"runtime", runtime_ ? L"created" : L"FAILED to create");
 
   tabManager_ = std::make_unique<client::TabManager>(runtime_);
-  engineView_ = std::make_unique<client::EngineView>();
-
-  BuildUi();
-  WireEngine();
-  WireLog();
-
-  tabManager_->AddTab(/*isPrivate*/ false, L"about:home");
-  Log::WriteNum(L"tabs after first AddTab", tabManager_->Count());
-  RebuildTabStrip();
-  RefreshChrome();
-
-  // The engine only reports anything in response to a load. Without this the
-  // shell sat on a static placeholder and never told us whether the runtime,
-  // the JIT probe or xul.dll had worked.
-  Navigate(L"about:home");
-
-  engineView_->Start();
 
   // Gecko is headless and has no idea how large the phone is, so it has to be
   // told: the size of the window in physical pixels, which is what the buffer
@@ -102,6 +87,27 @@ MainPage::MainPage() {
   const int pixelHeight = static_cast<int>(bounds.Height * raw + 0.5);
   Log::Write(L"view: asking the engine for " + std::to_wstring(pixelWidth) +
              L"x" + std::to_wstring(pixelHeight) + L" physical pixels");
+  Log::WriteNum(L"cpu: cores visible to the process",
+                static_cast<int>(std::thread::hardware_concurrency()));
+
+  engineView_ = std::make_unique<client::EngineView>(pixelWidth, pixelHeight,
+                                                     raw);
+
+  BuildUi();
+  WireEngine();
+  WireLog();
+
+  tabManager_->AddTab(/*isPrivate*/ false, L"about:home");
+  Log::WriteNum(L"tabs after first AddTab", tabManager_->Count());
+  RebuildTabStrip();
+  RefreshChrome();
+
+  // The engine only reports anything in response to a load. Without this the
+  // shell sat on a static placeholder and never told us whether the runtime,
+  // the JIT probe or xul.dll had worked.
+  Navigate(L"about:home");
+
+  engineView_->Start();
 
   // Last, so the window is up and the log is readable before Gecko gets its
   // chance to take the process down with it.
@@ -170,6 +176,7 @@ void MainPage::BuildUi() {
   auto contentStack = Grid();
   contentStack.Children().Append(statusText_);
   contentStack.Children().Append(engineView_->Surface());
+  contentStack.Children().Append(engineView_->TextSink());
   contentHost_.Child(contentStack);
 
   // --- Diagnostics overlay, hidden until asked for ---
@@ -255,15 +262,17 @@ void MainPage::BuildUi() {
   bool barOnTop =
       BrowserPreferences::Shared().AddressBarPosition() == ChromePosition::Top;
 
-  Grid::SetRow(chrome, barOnTop ? 0 : 2);
-  Grid::SetRow(tabScroller, barOnTop ? 2 : 0);
+  // Only the engine's own picture goes on screen. Firefox has a tab strip, an
+  // address bar and a menu of its own, and now that they are visible and can be
+  // touched, a second set underneath them is not a second opinion -- it is two
+  // address bars, one of which does nothing. The controls above are still built
+  // because the engine facade reports through them; they are simply not shown.
+  //
+  // The log panel goes with them. It was the only way to read anything off the
+  // device before the engine could draw, and that has not been true for a while
+  // -- the log is a file, and that is how it has actually been read all along.
   Grid::SetRow(contentHost_, 1);
-  Grid::SetRow(logPanel_, 1);
-
-  root_.Children().Append(tabScroller);
   root_.Children().Append(contentHost_);
-  root_.Children().Append(logPanel_);
-  root_.Children().Append(chrome);
 
   // The status bar exists only on mobile; tint it to match so the chrome does
   // not look like it is floating under a foreign strip.

@@ -7,10 +7,10 @@
 #include <algorithm>
 #include <cmath>
 
+#include "client/Log.h"
+#include "winrt/Windows.UI.Core.h"
 #include "winrt/Windows.UI.Input.h"
 #include "winrt/Windows.UI.Xaml.Input.h"
-
-#include "client/Log.h"
 #include "winrt/Windows.UI.Xaml.Media.h"
 
 using namespace winrt::Windows::UI::Xaml;
@@ -18,10 +18,15 @@ using namespace winrt::Windows::UI::Xaml::Controls;
 namespace Input = winrt::Windows::UI::Xaml::Input;
 using namespace winrt::Windows::UI::Xaml::Media;
 using namespace winrt::Windows::UI::Xaml::Media::Imaging;
+using winrt::Windows::UI::ViewManagement::InputPane;
 
 namespace gecko_w10m::client {
 
-EngineView::EngineView() {
+EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
+                       double rawPerView)
+    : fullWidth_(pixelWidth),
+      fullHeight_(pixelHeight),
+      rawPerView_(rawPerView > 0 ? rawPerView : 1.0) {
   image_ = Image();
   // The engine paints a whole window; show all of it, keeping its shape. The
   // headless screen it was given has the window's aspect, so this costs at
@@ -47,6 +52,206 @@ EngineView::EngineView() {
   image_.PointerCaptureLost(
       [this](winrt::Windows::Foundation::IInspectable const&,
              Input::PointerRoutedEventArgs const&) { pressed_ = false; });
+
+  WireKeyboard();
+}
+
+void EngineView::WireKeyboard() {
+  // The keyboard types into this and nothing else. It is a real text control
+  // because that is the only thing Windows will raise a keyboard for, and it
+  // is invisible because the field the user is actually looking at is drawn by
+  // Gecko, inside the picture.
+  sink_ = TextBox();
+  sink_.Opacity(0);
+  sink_.Width(1);
+  sink_.Height(1);
+  sink_.HorizontalAlignment(HorizontalAlignment::Left);
+  sink_.VerticalAlignment(VerticalAlignment::Top);
+  sink_.AcceptsReturn(false);
+  sink_.IsSpellCheckEnabled(false);
+  sink_.IsTextPredictionEnabled(false);
+
+  // Whatever arrives is handed straight to the engine and the sink is emptied
+  // again, so it never holds state of its own and Backspace always reaches
+  // Gecko rather than deleting a character the page never saw.
+  sink_.TextChanged([this](winrt::Windows::Foundation::IInspectable const&,
+                           Controls::TextChangedEventArgs const&) {
+    if (clearing_ || !text_) {
+      return;
+    }
+    auto value = sink_.Text();
+    if (value.empty()) {
+      return;
+    }
+    text_(reinterpret_cast<const uint16_t*>(value.c_str()),
+          static_cast<int32_t>(value.size()));
+    clearing_ = true;
+    sink_.Text(L"");
+    clearing_ = false;
+  });
+
+  sink_.KeyDown([this](winrt::Windows::Foundation::IInspectable const&,
+                       Input::KeyRoutedEventArgs const& args) {
+    if (!key_) {
+      return;
+    }
+    // Windows virtual key codes are what the engine side expects; the ones
+    // that produce text come through TextChanged instead and are ignored here.
+    const int32_t code = static_cast<int32_t>(args.Key());
+    switch (code) {
+      case 8:   // Back
+      case 9:   // Tab
+      case 13:  // Enter
+      case 27:  // Escape
+      case 33:  // PageUp
+      case 34:  // PageDown
+      case 35:  // End
+      case 36:  // Home
+      case 37:  // Left
+      case 38:  // Up
+      case 39:  // Right
+      case 40:  // Down
+      case 46:  // Delete
+        key_(code);
+        args.Handled(true);
+        break;
+      default:
+        break;
+    }
+  });
+
+  // The keyboard takes the bottom of the screen away. Telling the engine makes
+  // it lay the window out in what is left, so the field being typed into is
+  // not underneath it.
+  auto pane = InputPane::GetForCurrentView();
+  pane.Showing([this](InputPane const&,
+                      winrt::Windows::UI::ViewManagement::
+                          InputPaneVisibilityEventArgs const& args) {
+    if (!resize_ || fullHeight_ <= 0) {
+      return;
+    }
+    const int32_t covered =
+        static_cast<int32_t>(args.OccludedRect().Height * rawPerView_ + 0.5);
+    const int32_t height = (std::max)(fullHeight_ - covered, 240);
+    Log::Write(L"view: keyboard covers " + std::to_wstring(covered) +
+               L" px, window height " + std::to_wstring(height));
+    resize_(fullWidth_, height);
+  });
+  pane.Hiding([this](InputPane const&,
+                     winrt::Windows::UI::ViewManagement::
+                         InputPaneVisibilityEventArgs const&) {
+    if (!resize_ || fullHeight_ <= 0) {
+      return;
+    }
+    Log::Write(L"view: keyboard gone, window height " +
+               std::to_wstring(fullHeight_));
+    resize_(fullWidth_, fullHeight_);
+  });
+}
+
+bool EngineView::Resolve() {
+  if (copy_) {
+    return true;
+  }
+  // The engine starts on its own thread and may not be up yet, so this is
+  // retried rather than done once. LoadPackagedLibrary on an already-loaded
+  // module just returns it; it is also the only load an app container allows.
+  HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
+  if (!xul) {
+    return false;
+  }
+  copy_ = reinterpret_cast<CopyFn>(::GetProcAddress(xul, "gecko_w10m_frame_copy"));
+  mouse_ =
+      reinterpret_cast<MouseFn>(::GetProcAddress(xul, "gecko_w10m_input_mouse"));
+  wheel_ =
+      reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
+  wanted_ = reinterpret_cast<WantedFn>(
+      ::GetProcAddress(xul, "gecko_w10m_text_input_wanted"));
+  text_ = reinterpret_cast<TextFn>(::GetProcAddress(xul, "gecko_w10m_input_text"));
+  key_ = reinterpret_cast<KeyFn>(::GetProcAddress(xul, "gecko_w10m_input_key"));
+  resize_ =
+      reinterpret_cast<ResizeFn>(::GetProcAddress(xul, "gecko_w10m_resize"));
+  if (copy_ && !reported_) {
+    reported_ = true;
+    Log::Write(L"view: engine frame buffer found");
+  }
+  return copy_ != nullptr;
+}
+
+void EngineView::EnsureBitmap(int32_t width, int32_t height) {
+  if (bitmap_ && width_ == width && height_ == height) {
+    return;
+  }
+  width_ = width;
+  height_ = height;
+  bitmap_ = WriteableBitmap(width, height);
+  image_.Source(bitmap_);
+  Log::Write(L"view: frame size " + std::to_wstring(width) + L"x" +
+             std::to_wstring(height));
+}
+
+void EngineView::FollowTextInput() {
+  if (!wanted_) {
+    return;
+  }
+  const bool wants = wanted_() == 1;
+  if (wants == typing_) {
+    return;
+  }
+  typing_ = wants;
+
+  auto pane = InputPane::GetForCurrentView();
+  if (wants) {
+    Log::Write(L"view: engine asked for text input");
+    sink_.Focus(FocusState::Programmatic);
+    // Focus alone raises the keyboard only when the focus came from a touch,
+    // and this one came from Gecko, so ask outright as well.
+    pane.TryShow();
+  } else {
+    Log::Write(L"view: engine no longer wants text input");
+    pane.TryHide();
+  }
+}
+
+void EngineView::Tick() {
+  if (!Resolve()) {
+    return;
+  }
+  FollowTextInput();
+
+  // Ask with the serial we last drew. An unchanged engine answers zero without
+  // copying anything, so an idle page costs a lock and a comparison.
+  int32_t width = 0;
+  int32_t height = 0;
+  uint64_t serial = seen_;
+
+  if (!bitmap_) {
+    // Nothing to copy into yet; the call still reports the size to build one.
+    copy_(nullptr, 0, &width, &height, nullptr);
+    if (width > 0 && height > 0) {
+      EnsureBitmap(width, height);
+    }
+    return;
+  }
+
+  uint8_t* pixels = nullptr;
+  auto access = bitmap_.PixelBuffer()
+                    .as<::Windows::Storage::Streams::IBufferByteAccess>();
+  if (FAILED(access->Buffer(&pixels)) || !pixels) {
+    return;
+  }
+
+  const int32_t capacity = width_ * height_ * 4;
+  if (copy_(pixels, capacity, &width, &height, &serial) == 1) {
+    seen_ = serial;
+    bitmap_.Invalidate();
+    return;
+  }
+
+  // Zero with a size that is not ours means the engine resized its window.
+  if (width > 0 && height > 0 && (width != width_ || height != height_)) {
+    EnsureBitmap(width, height);
+  }
 }
 
 bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
@@ -62,8 +267,7 @@ bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
   // Uniform means the frame is centred in whatever space it was given, so the
   // bands on either side of it are not part of the window and a point in them
   // belongs to nothing.
-  const double scale =
-      (std::min)(actualW / width_, actualH / height_);
+  const double scale = (std::min)(actualW / width_, actualH / height_);
   if (scale <= 0) {
     return false;
   }
@@ -130,81 +334,6 @@ void EngineView::OnReleased(winrt::Windows::Foundation::Point const& point) {
   mouse_(0, x, y);
   mouse_(1, x, y);
   mouse_(2, x, y);
-}
-
-bool EngineView::Resolve() {
-  if (copy_) {
-    return true;
-  }
-  // The engine starts on its own thread and may not be up yet, so this is
-  // retried rather than done once. LoadPackagedLibrary on an already-loaded
-  // module just returns it; it is also the only load an app container allows.
-  HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
-  if (!xul) {
-    return false;
-  }
-  copy_ = reinterpret_cast<CopyFn>(::GetProcAddress(xul, "gecko_w10m_frame_copy"));
-  mouse_ =
-      reinterpret_cast<MouseFn>(::GetProcAddress(xul, "gecko_w10m_input_mouse"));
-  wheel_ =
-      reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
-  if (copy_ && !reported_) {
-    reported_ = true;
-    Log::Write(L"view: engine frame buffer found");
-  }
-  return copy_ != nullptr;
-}
-
-void EngineView::EnsureBitmap(int32_t width, int32_t height) {
-  if (bitmap_ && width_ == width && height_ == height) {
-    return;
-  }
-  width_ = width;
-  height_ = height;
-  bitmap_ = WriteableBitmap(width, height);
-  image_.Source(bitmap_);
-  Log::Write(L"view: frame size " + std::to_wstring(width) + L"x" +
-             std::to_wstring(height));
-}
-
-void EngineView::Tick() {
-  if (!Resolve()) {
-    return;
-  }
-
-  // Ask with the serial we last drew. An unchanged engine answers zero without
-  // copying anything, so an idle page costs a lock and a comparison.
-  int32_t width = 0;
-  int32_t height = 0;
-  uint64_t serial = seen_;
-
-  if (!bitmap_) {
-    // Nothing to copy into yet; the call still reports the size to build one.
-    copy_(nullptr, 0, &width, &height, nullptr);
-    if (width > 0 && height > 0) {
-      EnsureBitmap(width, height);
-    }
-    return;
-  }
-
-  uint8_t* pixels = nullptr;
-  auto access = bitmap_.PixelBuffer()
-                    .as<::Windows::Storage::Streams::IBufferByteAccess>();
-  if (FAILED(access->Buffer(&pixels)) || !pixels) {
-    return;
-  }
-
-  const int32_t capacity = width_ * height_ * 4;
-  if (copy_(pixels, capacity, &width, &height, &serial) == 1) {
-    seen_ = serial;
-    bitmap_.Invalidate();
-    return;
-  }
-
-  // Zero with a size that is not ours means the engine resized its window.
-  if (width > 0 && height > 0 && (width != width_ || height != height_)) {
-    EnsureBitmap(width, height);
-  }
 }
 
 void EngineView::Start() {
