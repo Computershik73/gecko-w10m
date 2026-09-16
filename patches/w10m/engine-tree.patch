@@ -835,10 +835,22 @@ index b159e14d6c..d3703ee280 100644
                                   reinterpret_cast<IUnknown**>(factory)),
           "Could not create DirectWrite factory.");
 diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
-index f45971a4ec..3f18f8c337 100644
+index f45971a4ec..0968763683 100644
 --- a/gfx/thebes/gfxPlatform.cpp
 +++ b/gfx/thebes/gfxPlatform.cpp
-@@ -1344,7 +1344,14 @@ void gfxPlatform::InitLayersIPC() {
+@@ -4,6 +4,11 @@
+ 
+ #include "gfxPlatform.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #include "GfxDriverInfo.h"
+ #include "VRProcessManager.h"
+ #include "VRThread.h"
+@@ -1344,7 +1349,14 @@ void gfxPlatform::InitLayersIPC() {
  
    if (XRE_IsParentProcess()) {
  #if defined(XP_WIN)
@@ -854,6 +866,34 @@ index f45971a4ec..3f18f8c337 100644
        widget::WinWindowOcclusionTracker::Ensure();
      }
  #endif
+@@ -2648,6 +2660,27 @@ void gfxPlatform::InitWebRenderConfig() {
+ 
+   gfxVars::SetUseSoftwareWebRender(!hasHardware);
+ 
++#if defined(GECKO_W10M)
++  {
++    // Which of these is off, and the reason it gives, is the whole answer to
++    // why the frame is still being rasterised in software -- and the decision
++    // is made here, long before anything reaches RenderCompositor.
++    auto say = [](const char* name, gfx::Feature aFeature) {
++      auto& feature = gfxConfig::GetFeature(aFeature);
++      const char* why = feature.GetFailureMessage();
++      char note[256];
++      SprintfLiteral(note, "gfx: %s is %s%s%s", name,
++                     feature.IsEnabled() ? "on" : "off",
++                     (why && *why) ? " -- " : "", (why && *why) ? why : "");
++      GeckoW10mNote(note);
++    };
++    say("webrender", Feature::WEBRENDER);
++    say("webrender angle", Feature::WEBRENDER_ANGLE);
++    say("d3d11 compositing", Feature::D3D11_COMPOSITING);
++    say("hardware video decoding", Feature::HARDWARE_VIDEO_DECODING);
++  }
++#endif
++
+   Preferences::RegisterPrefixCallbackAndCall(SwapIntervalPrefChangeCallback,
+                                              "gfx.swap-interval");
+ 
 diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
 index 06ed553c01..ec245236a6 100644
 --- a/gfx/webrender_bindings/RenderCompositor.cpp
