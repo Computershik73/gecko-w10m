@@ -78,6 +78,9 @@ class EngineView {
   void FollowTextInput();
   // Tells the engine how much room the picture has, whenever that changes.
   void PushSize();
+  // Runs work on a later turn of the UI loop, never inside the handler that
+  // asked for it.
+  static void PostToUi(std::function<void()> work);
   void WireKeyboard();
 
   using CopyFn = int32_t (*)(void* dest, int32_t capacity, int32_t* width,

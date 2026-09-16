@@ -204,7 +204,12 @@ void EngineView::WireKeyboard() {
     Log::Write(L"view: keyboard covers " +
                std::to_wstring(static_cast<int>(covered)) +
                L" view px, taking it off the bottom of the room");
-    host_.Margin(Thickness{0, 0, 0, covered});
+    // Not from in here. This is the input pane's own Showing handler, and
+    // changing a margin inside it makes XAML lay the tree out again while the
+    // pane is still animating itself into place. It is the last thing we do
+    // from inside a system event handler, and it is the last thing in the log
+    // before every one of these crashes. The work is posted instead.
+    PostToUi([this, covered]() { host_.Margin(Thickness{0, 0, 0, covered}); });
   });
   pane.Hiding([this](InputPane const&,
                      winrt::Windows::UI::ViewManagement::
@@ -213,7 +218,7 @@ void EngineView::WireKeyboard() {
       return;
     }
     Log::Write(L"view: keyboard gone, the room is whole again");
-    host_.Margin(Thickness{0, 0, 0, 0});
+    PostToUi([this]() { host_.Margin(Thickness{0, 0, 0, 0}); });
   });
 }
 
@@ -319,6 +324,13 @@ void EngineView::WatchRoom(
   PushSize();
 }
 
+void EngineView::PostToUi(std::function<void()> work) {
+  auto dispatcher =
+      winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Dispatcher();
+  dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                      [work = std::move(work)]() { work(); });
+}
+
 void EngineView::GivePanelToEngine() {
   Resolve();
   if (!panel_ || fullWidth_ <= 0) {
@@ -413,13 +425,10 @@ void EngineView::Tick() {
   // later turn of the message loop, when XAML is between frames.
   if (wanted_ && (wanted_() == 1) != typing_ && !textInputPending_) {
     textInputPending_ = true;
-    auto dispatcher =
-        winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Dispatcher();
-    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-                        [this]() {
-                          textInputPending_ = false;
-                          FollowTextInput();
-                        });
+    PostToUi([this]() {
+      textInputPending_ = false;
+      FollowTextInput();
+    });
   }
 
   // Ask with the serial we last drew. An unchanged engine answers zero without
