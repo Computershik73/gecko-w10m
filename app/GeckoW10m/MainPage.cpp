@@ -331,6 +331,11 @@ void MainPage::BuildUi() {
   Grid::SetRow(contentHost_, 1);
   root_.Children().Append(contentHost_);
 
+  // The engine's window is the size of this, measured whenever it changes.
+  // Not the size of the picture inside it: a stretched Image reports what it
+  // drew, which is the frame, which would make the frame decide its own size.
+  engineView_->WatchRoom(contentHost_);
+
   // The status bar exists only on mobile; tint it to match so the chrome does
   // not look like it is floating under a foreign strip.
   if (ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar")) {

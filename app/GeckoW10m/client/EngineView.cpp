@@ -53,13 +53,6 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
       [this](winrt::Windows::Foundation::IInspectable const&,
              Input::PointerRoutedEventArgs const&) { pressed_ = false; });
 
-  // The window is whatever room the picture actually has, measured whenever
-  // that changes rather than once at startup. The status bar and the
-  // navigation bar come and go, and the screen turns; a size taken at startup
-  // is right for none of that, and the frame was being letterboxed into the
-  // difference instead of filling it.
-  image_.SizeChanged([this](winrt::Windows::Foundation::IInspectable const&,
-                            SizeChangedEventArgs const&) { PushSize(); });
 
   WireKeyboard();
 }
@@ -253,14 +246,29 @@ void EngineView::EnsureBitmap(int32_t width, int32_t height) {
              std::to_wstring(height));
 }
 
+void EngineView::WatchRoom(
+    winrt::Windows::UI::Xaml::FrameworkElement const& host) {
+  // The room has to be measured on whatever holds the picture, never on the
+  // picture. A stretched Image reports the size of what it drew, not of the
+  // space it was given, so measuring it fed the frame's own size back to the
+  // engine: the engine resized, the picture resized to match, and the two
+  // chased each other down -- 1440, 1393, 1298, 810 -- with the log saying
+  // "room is now" each time. The container's size is a fact about the screen
+  // and does not move when the frame does.
+  host_ = host;
+  host_.SizeChanged([this](winrt::Windows::Foundation::IInspectable const&,
+                           SizeChangedEventArgs const&) { PushSize(); });
+  PushSize();
+}
+
 void EngineView::PushSize() {
-  if (!resize_) {
+  if (!resize_ || !host_) {
     return;
   }
   const int32_t width =
-      static_cast<int32_t>(image_.ActualWidth() * rawPerView_ + 0.5);
+      static_cast<int32_t>(host_.ActualWidth() * rawPerView_ + 0.5);
   const int32_t height =
-      static_cast<int32_t>(image_.ActualHeight() * rawPerView_ + 0.5);
+      static_cast<int32_t>(host_.ActualHeight() * rawPerView_ + 0.5);
   if (width <= 0 || height <= 0) {
     return;
   }
@@ -307,12 +315,16 @@ void EngineView::Tick() {
 
   // Ask with the serial we last drew. An unchanged engine answers zero without
   // copying anything, so an idle page costs a lock and a comparison.
-  int32_t width = 0;
-  int32_t height = 0;
+  // The engine is told the shape of the bitmap and answers with the shape of
+  // the frame; it copies only when the two agree.
+  int32_t width = width_;
+  int32_t height = height_;
   uint64_t serial = seen_;
 
   if (!bitmap_) {
     // Nothing to copy into yet; the call still reports the size to build one.
+    width = 0;
+    height = 0;
     copy_(nullptr, 0, &width, &height, nullptr);
     if (width > 0 && height > 0) {
       EnsureBitmap(width, height);

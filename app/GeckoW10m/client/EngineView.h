@@ -38,6 +38,10 @@ class EngineView {
 
   // Begins watching for frames. Cheap when the engine is idle: one lock and a
   // comparison per display refresh, no copy.
+  // The element that holds the picture. Its size is the room the window has,
+  // and it is watched for as long as the view lives.
+  void WatchRoom(winrt::Windows::UI::Xaml::FrameworkElement const& host);
+
   void Start();
   void Stop();
 
@@ -87,6 +91,7 @@ class EngineView {
   ResizeFn resize_ = nullptr;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
+  winrt::Windows::UI::Xaml::FrameworkElement host_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBox sink_{nullptr};
   winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap bitmap_{nullptr};
   winrt::event_token tick_{};

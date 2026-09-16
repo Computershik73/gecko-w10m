@@ -15893,7 +15893,7 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..f9be4b52b6 100644
+index 8484851f67..f9c3244380 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
 @@ -7,6 +7,44 @@
@@ -15996,7 +15996,7 @@ index 8484851f67..f9be4b52b6 100644
  LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
    auto size = mClientSize.Lock();
    return *size;
-@@ -42,5 +119,371 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+@@ -42,5 +119,381 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
    return reinterpret_cast<uintptr_t>(mWidget);
  }
  
@@ -16202,9 +16202,19 @@ index 8484851f67..f9be4b52b6 100644
 +    return 0;
 +  }
 +
++  // aWidth and aHeight come in holding the size of the caller's bitmap and go
++  // out holding the size of the frame. The shape has to match exactly, not
++  // merely fit: a 1440-wide bitmap has room for a 1298x2308 frame, but the
++  // rows are 1298 pixels long and the bitmap's are 1440, so each row lands a
++  // little further along than the last and the picture shears into diagonal
++  // stripes. Nor is an equal pixel count enough -- 1440x2560 and 2560x1440 are
++  // the same number of pixels and nothing alike -- so both are compared.
 +  const size_t bytes = size_t(sFrontWidth) * size_t(sFrontHeight) * 4;
-+  if (!aDest || size_t(aCapacity) < bytes) {
-+    // Still report the size, so the caller can size its bitmap and come back.
++  const bool fits = aDest && size_t(aCapacity) >= bytes && aWidth && aHeight &&
++                    *aWidth == sFrontWidth && *aHeight == sFrontHeight;
++  if (!fits) {
++    // Report the size anyway, so the caller can build the right bitmap and
++    // come back for the frame.
 +    if (aWidth) *aWidth = sFrontWidth;
 +    if (aHeight) *aHeight = sFrontHeight;
 +    return 0;
