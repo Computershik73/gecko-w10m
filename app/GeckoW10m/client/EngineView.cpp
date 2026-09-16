@@ -47,6 +47,7 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
 
   image_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                Input::PointerRoutedEventArgs const& args) {
+    touched_ = true;
     OnPressed(args.GetCurrentPoint(image_).Position());
     image_.CapturePointer(args.Pointer());
   });
@@ -398,6 +399,22 @@ void EngineView::FollowTextInput() {
 
   auto pane = InputPane::GetForCurrentView();
   if (wants) {
+    // Not before the screen has been touched. Firefox puts the caret in the
+    // address bar as it starts, so the keyboard came up on its own every
+    // launch -- which no phone browser should do, and which is also the one
+    // event present in every crash there has been. Waiting for a real touch
+    // makes the launch behave and makes the experiment: if the browser lives
+    // when the keyboard never appears, the keyboard is the trigger, and we
+    // will at last see whether the GPU path draws anything.
+    if (!touched_) {
+      typing_ = false;  // ask again once there has been a touch
+      if (!saidWaiting_) {
+        saidWaiting_ = true;
+        Log::Write(L"view: the engine wants text, but nothing has been touched "
+                   L"yet -- not raising the keyboard");
+      }
+      return;
+    }
     const bool focused = sink_.Focus(FocusState::Programmatic);
     // Focus alone raises the keyboard only when the focus came from a touch,
     // and this one came from Gecko, so ask outright as well.
