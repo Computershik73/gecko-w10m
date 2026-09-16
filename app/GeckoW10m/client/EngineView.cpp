@@ -70,6 +70,12 @@ void EngineView::WireKeyboard() {
   sink_.Opacity(0);
   sink_.HorizontalAlignment(HorizontalAlignment::Stretch);
   sink_.VerticalAlignment(VerticalAlignment::Stretch);
+  // It must never be touched. It is the size of the content so that Windows
+  // treats it as a real place to type, and it sits underneath the picture, but
+  // the picture is letterboxed and a tap in the bands beside it would reach
+  // this and raise the keyboard for no reason. Focus arrives here only when
+  // Gecko asks for it.
+  sink_.IsHitTestVisible(false);
   sink_.AcceptsReturn(false);
   sink_.IsSpellCheckEnabled(false);
   sink_.IsTextPredictionEnabled(false);

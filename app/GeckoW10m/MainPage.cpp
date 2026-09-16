@@ -87,6 +87,28 @@ MainPage::MainPage() {
   const int pixelHeight = static_cast<int>(bounds.Height * raw + 0.5);
   Log::Write(L"view: asking the engine for " + std::to_wstring(pixelWidth) +
              L"x" + std::to_wstring(pixelHeight) + L" physical pixels");
+
+  // The desktop Firefox chrome has a narrowest width it will accept, and it
+  // wins: ask for anything narrower and the window comes back at the minimum.
+  // Measured at 504 CSS pixels on this build -- the engine was asked for 1440
+  // device pixels and returned 1765, which is 504 at 3.5 device pixels per CSS
+  // pixel. At the scale Windows reports, a 1440-pixel screen is 411 CSS pixels
+  // wide, so the window could not be as narrow as the phone and every frame
+  // carried a quarter more columns than the screen can show, rasterised in
+  // software and then copied.
+  //
+  // So the scale is whatever Windows says, or whatever makes the screen wide
+  // enough, whichever is smaller. 540 rather than 504 leaves room for rounding
+  // and for a locale whose toolbar needs a little more.
+  constexpr double kNarrowestChromeCss = 540.0;
+  if (pixelWidth > 0 && raw > pixelWidth / kNarrowestChromeCss) {
+    const double fitted = pixelWidth / kNarrowestChromeCss;
+    Log::Write(L"view: scale " + std::to_wstring(raw) + L" would leave " +
+               std::to_wstring(static_cast<int>(pixelWidth / raw)) +
+               L" CSS pixels, too narrow for the chrome; using " +
+               std::to_wstring(fitted));
+    raw = fitted;
+  }
   Log::WriteNum(L"cpu: cores visible to the process",
                 static_cast<int>(std::thread::hardware_concurrency()));
 
@@ -183,8 +205,11 @@ void MainPage::BuildUi() {
   // until there is something better to show and never afterwards.
   auto contentStack = Grid();
   contentStack.Children().Append(statusText_);
-  contentStack.Children().Append(engineView_->Surface());
+  // Order matters: the text sink goes underneath the picture. Above it, every
+  // tap landed on a text control and Windows raised the keyboard for each one,
+  // and nothing reached the engine at all.
   contentStack.Children().Append(engineView_->TextSink());
+  contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing
   // the user is waiting for, so it is the right thing to wait in front of.
