@@ -1,5 +1,5 @@
 diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
-index 728fa98356..ecbb275a14 100644
+index 728fa98356..838cd462f7 100644
 --- a/gfx/gl/GLContextProviderEGL.cpp
 +++ b/gfx/gl/GLContextProviderEGL.cpp
 @@ -12,6 +12,26 @@
@@ -21,7 +21,7 @@ index 728fa98356..ecbb275a14 100644
 +// and gfx has no business including widget headers.
 +extern "C" void* gecko_w10m_egl_native_window();
 +extern "C" void GeckoW10mNote(const char* text);
-+#  include "mozilla/gfx/DeviceManagerDx.h"
++#  include "mozilla/Sprintf.h"
 +#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
 +    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
 +#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
@@ -29,48 +29,7 @@ index 728fa98356..ecbb275a14 100644
  #elif defined(XP_WIN)
  #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
      ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
-@@ -324,6 +344,40 @@ already_AddRefed<GLContext> GLContextEGLFactory::Create(
- }
- 
- /* static */
-+#if defined(GECKO_W10M)
-+// Share the device Gecko already made, rather than letting ANGLE make another.
-+// There are three D3D11 devices in this process otherwise -- the XAML
-+// compositor's, Gecko's, and ANGLE's own -- on a phone whose driver has to keep
-+// all of them alive at once, and it is the XAML one that dies.
-+//
-+// This is what RenderCompositorANGLE does on the desktop for reasons of its
-+// own. It simply never runs here, because that compositor wants an HWND, so
-+// nothing was doing it. Three becomes two.
-+static std::shared_ptr<EglDisplay> GeckoW10mEglDisplay(
-+    nsACString* const out_failureId) {
-+  static bool said = false;
-+  if (const auto lib = GLLibraryEGL::Get(out_failureId)) {
-+    if (auto* manager = gfx::DeviceManagerDx::Get()) {
-+      if (const RefPtr<ID3D11Device> device = manager->GetCompositorDevice()) {
-+        if (const auto shared = lib->CreateDisplay(device.get())) {
-+          if (!said) {
-+            said = true;
-+            GeckoW10mNote("gfx: EGL is sharing the engine's D3D11 device");
-+          }
-+          return shared;
-+        }
-+      }
-+    }
-+  }
-+  if (!said) {
-+    said = true;
-+    GeckoW10mNote("gfx: EGL could not share a device, ANGLE will make its own");
-+  }
-+  return DefaultEglDisplay(out_failureId);
-+}
-+#  define DefaultEglDisplay GeckoW10mEglDisplay
-+#endif
-+
- EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
-     widget::CompositorWidget* aCompositorWidget, const EGLConfig aConfig) {
-   nsCString discardFailureId;
-@@ -336,6 +390,10 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+@@ -336,12 +356,26 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
    MOZ_ASSERT(aCompositorWidget);
    EGLNativeWindowType window =
        GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aCompositorWidget);
@@ -81,3 +40,20 @@ index 728fa98356..ecbb275a14 100644
    if (!window) {
      gfxCriticalNote << "window is null";
      return EGL_NO_SURFACE;
+   }
+ 
+-  return mozilla::gl::CreateSurfaceFromNativeWindow(*egl, window, aConfig);
++  const auto surface =
++      mozilla::gl::CreateSurfaceFromNativeWindow(*egl, window, aConfig);
++#if defined(GECKO_W10M)
++  if (surface == EGL_NO_SURFACE) {
++    char note[128];
++    SprintfLiteral(note, "gfx: eglCreateWindowSurface refused it, egl error 0x%04x",
++                   unsigned(egl->mLib->fGetError()));
++    GeckoW10mNote(note);
++  }
++#endif
++  return surface;
+ }
+ 
+ GLContextEGL::GLContextEGL(const std::shared_ptr<EglDisplay> egl,

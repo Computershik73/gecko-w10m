@@ -262,10 +262,10 @@ index fbce4d57e4..7fe2f88a7a 100644
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..e75fdf40df
+index 0000000000..65157160ca
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,327 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -563,18 +563,32 @@ index 0000000000..e75fdf40df
 +// static
 +bool NativeWindow11WinRT::IsValidNativeWindow(EGLNativeWindowType window)
 +{
++    // This is where the refusal happens, and until now it happened in silence:
++    // eglCreateWindowSurface asks this first, and if it says no the surface is
++    // never attempted and nothing else in this file runs. It says why now.
 +    IInspectable *inspectable = reinterpret_cast<IInspectable *>(window);
 +    if (!inspectable)
 +    {
++        Note("angle: there is no panel to make a surface for");
 +        return false;
 +    }
 +    ISwapChainPanelNative *panel = nullptr;
-+    if (FAILED(inspectable->QueryInterface(__uuidof(ISwapChainPanelNative),
-+                                           reinterpret_cast<void **>(&panel))))
++    const HRESULT result = inspectable->QueryInterface(
++        __uuidof(ISwapChainPanelNative), reinterpret_cast<void **>(&panel));
++    if (FAILED(result))
 +    {
++        // RPC_E_WRONG_THREAD (0x8001010e) here would mean the panel is bound
++        // to the UI thread's apartment and this is not that thread -- which is
++        // a marshalling problem, not a bad pointer.
++        char note[128];
++        snprintf(note, sizeof(note),
++                 "angle: the panel refused ISwapChainPanelNative, hr 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
 +        return false;
 +    }
 +    SafeRelease(panel);
++    Note("angle: the panel is a real SwapChainPanel");
 +    return true;
 +}
 +
