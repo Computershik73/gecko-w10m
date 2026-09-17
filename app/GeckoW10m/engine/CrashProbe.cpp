@@ -1560,6 +1560,18 @@ using eglGetErrorFn = EGLintT (*)();
 using glClearColorFn = void (*)(float, float, float, float);
 using glClearFn = void (*)(unsigned);
 using glFinishFn = void (*)();
+using glCreateShaderFn = unsigned (*)(unsigned);
+using glShaderSourceFn = void (*)(unsigned, int, const char* const*, const int*);
+using glCompileShaderFn = void (*)(unsigned);
+using glCreateProgramFn = unsigned (*)();
+using glAttachShaderFn = void (*)(unsigned, unsigned);
+using glLinkProgramFn = void (*)(unsigned);
+using glUseProgramFn = void (*)(unsigned);
+using glGetProgramivFn = void (*)(unsigned, unsigned, int*);
+using glVertexAttribPointerFn = void (*)(unsigned, int, unsigned, unsigned char, int, const void*);
+using glEnableVertexAttribArrayFn = void (*)(unsigned);
+using glDrawArraysFn = void (*)(unsigned, int, int);
+using glGetErrorFn = unsigned (*)();
 
 DWORD WINAPI AngleStepsThread(LPVOID) {
   ::Sleep(3000);
@@ -1638,7 +1650,64 @@ DWORD WINAPI AngleStepsThread(LPVOID) {
   finish();
   say(L"5: cleared and finished");
 
-  Log::WriteFromFault(L"anglestep: all five steps passed with the window still up");
+  // 6. the context the engine actually asks for: ES 3, robust access with
+  // lose-context-on-reset, no-error, not backwards compatible -- the attribs
+  // GLContextProviderEGL builds. Then made current on the same pbuffer.
+  const EGLintT geckoCtxAttribs[] = {
+      0x3098, 3,            // CONTEXT_MAJOR_VERSION 3
+      0x3483, 0,            // CONTEXT_OPENGL_BACKWARDS_COMPATIBLE_ANGLE false
+      0x31B3, 1,            // CONTEXT_OPENGL_NO_ERROR_KHR true
+      0x3138, 0x31BF,       // RESET_NOTIFICATION_STRATEGY_EXT = LOSE_CONTEXT_ON_RESET_EXT
+      0x30BF, 1,            // CONTEXT_OPENGL_ROBUST_ACCESS_EXT true
+      0x3038};
+  EGLContextT geckoContext = createContext(display, config, nullptr, geckoCtxAttribs);
+  bool geckoCurrent = geckoContext && makeCurrent(display, surface, surface, geckoContext);
+  say(geckoCurrent ? L"6: the engine's kind of context made and current"
+                   : L"6: the engine's kind of context FAILED");
+  if (!geckoCurrent) return 0;
+
+  // 7. a second context sharing the first, as WebRender's render thread and
+  // the compositor's share.
+  EGLContextT shared = createContext(display, config, geckoContext, geckoCtxAttribs);
+  say(shared ? L"7: a shared context made" : L"7: shared context FAILED");
+
+  // 8. a shader program through ANGLE's translator and d3dcompiler, and a
+  // triangle drawn with it -- what WebRender does on its first frame.
+  auto createShader = reinterpret_cast<glCreateShaderFn>(::GetProcAddress(gles, "glCreateShader"));
+  auto shaderSource = reinterpret_cast<glShaderSourceFn>(::GetProcAddress(gles, "glShaderSource"));
+  auto compileShader = reinterpret_cast<glCompileShaderFn>(::GetProcAddress(gles, "glCompileShader"));
+  auto createProgram = reinterpret_cast<glCreateProgramFn>(::GetProcAddress(gles, "glCreateProgram"));
+  auto attachShader = reinterpret_cast<glAttachShaderFn>(::GetProcAddress(gles, "glAttachShader"));
+  auto linkProgram = reinterpret_cast<glLinkProgramFn>(::GetProcAddress(gles, "glLinkProgram"));
+  auto useProgram = reinterpret_cast<glUseProgramFn>(::GetProcAddress(gles, "glUseProgram"));
+  auto getProgramiv = reinterpret_cast<glGetProgramivFn>(::GetProcAddress(gles, "glGetProgramiv"));
+  auto attribPointer = reinterpret_cast<glVertexAttribPointerFn>(::GetProcAddress(gles, "glVertexAttribPointer"));
+  auto enableAttrib = reinterpret_cast<glEnableVertexAttribArrayFn>(::GetProcAddress(gles, "glEnableVertexAttribArray"));
+  auto drawArrays = reinterpret_cast<glDrawArraysFn>(::GetProcAddress(gles, "glDrawArrays"));
+  auto glError = reinterpret_cast<glGetErrorFn>(::GetProcAddress(gles, "glGetError"));
+  if (createShader && shaderSource && compileShader && createProgram && attachShader &&
+      linkProgram && useProgram && getProgramiv && attribPointer && enableAttrib &&
+      drawArrays && glError) {
+    const char* vs = "#version 300 es\nin vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+    const char* fs = "#version 300 es\nprecision mediump float; out vec4 c; void main(){ c = vec4(1.0, 0.5, 0.0, 1.0); }";
+    unsigned v = createShader(0x8B31); shaderSource(v, 1, &vs, nullptr); compileShader(v);
+    unsigned f = createShader(0x8B30); shaderSource(f, 1, &fs, nullptr); compileShader(f);
+    unsigned prog = createProgram(); attachShader(prog, v); attachShader(prog, f); linkProgram(prog);
+    int linked = 0; getProgramiv(prog, 0x8B82, &linked);  // GL_LINK_STATUS
+    useProgram(prog);
+    static const float tri[] = {-0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f};
+    attribPointer(0, 2, 0x1406, 0, 0, tri);  // GL_FLOAT
+    enableAttrib(0);
+    drawArrays(4, 0, 3);  // GL_TRIANGLES
+    finish();
+    Log::WriteFromFault(L"anglestep: 8: shaders compiled (linked " + std::to_wstring(linked) +
+                        L"), a triangle drawn, gl error " + Hex(glError()));
+    say(L"8: drawn through a compiled program");
+  } else {
+    Log::WriteFromFault(L"anglestep: 8: GL entry points missing, skipped");
+  }
+
+  Log::WriteFromFault(L"anglestep: all eight steps passed with the window still up");
   Log::FlushFromFault();
   return 0;
 }

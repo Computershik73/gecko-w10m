@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "MainPage.h"
 
+#include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Display.h>
 
@@ -54,7 +55,12 @@ MainPage::MainPage() {
 
   auto localState = ApplicationData::Current().LocalFolder().Path();
   Log::Init(std::wstring(localState));
-  Log::Write(L"shell starting");
+  {
+    auto v = winrt::Windows::ApplicationModel::Package::Current().Id().Version();
+    Log::Write(L"shell starting, version " + std::to_wstring(v.Major) + L"." +
+               std::to_wstring(v.Minor) + L"." + std::to_wstring(v.Build) + L"." +
+               std::to_wstring(v.Revision));
+  }
   Log::Write(L"LocalState", std::wstring(localState));
 
   // Before the engine, before the UI: a fault reported only once Gecko is
