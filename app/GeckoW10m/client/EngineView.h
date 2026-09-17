@@ -44,6 +44,12 @@ class EngineView {
   // The display in view pixels, as the window sees it; sent on to the engine
   // in device pixels so the headless screen turns with the phone.
   void SetScreen(double viewWidth, double viewHeight);
+  // Makes the room match the keyboard as it actually is. The pane's Hiding
+  // event is not delivered when the keyboard goes away with the app -- a
+  // suspend with it open, a focus change the shell never sees -- and the
+  // room then stayed short, with the browser in the top half of the screen
+  // and the placeholder showing under it.
+  void SyncKeyboardMargin();
   // Which half of the swap-chain hand-over this launch leaves out, if any:
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.

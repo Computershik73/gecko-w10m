@@ -208,6 +208,9 @@ pref("gfx.webrender.software.d3d11", false);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
+// No HTTP/3: QUIC over UDP on this phone's stack is an unknown, and a stuck
+// QUIC attempt looks exactly like a page that never loads.
+pref("network.http.http3.enable", false);
 
 // mobile-config-firefox (postmarketOS): a phone-shaped chrome for desktop
 // Firefox. Autoconfig loads its modules from mobile-config-firefox/ under the

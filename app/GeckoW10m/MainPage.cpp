@@ -192,9 +192,14 @@ void MainPage::ApplyVisibleBounds() {
   //
   // So these three are now on the record. None of them has ever been asked.
   Window::Current().VisibilityChanged(
-      [](auto&&, auto const& e) {
+      [this](auto&&, auto const& e) {
         if (e.Visible()) {
           client::Log::Write(L"window: visible");
+          // Back from the background: the keyboard that was up when the app
+          // left is gone, and nobody said so.
+          if (engineView_) {
+            engineView_->SyncKeyboardMargin();
+          }
           return;
         }
         client::Log::Write(L"window: NOT visible any more");

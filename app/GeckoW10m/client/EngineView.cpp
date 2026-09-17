@@ -509,7 +509,34 @@ void EngineView::FollowTextInput() {
   } else {
     Log::Write(L"view: engine no longer wants text input");
     pane.TryHide();
+    // TryHide does not always come back as a Hiding event; check for real a
+    // moment later.
+    PostToUi([this]() { SyncKeyboardMargin(); });
   }
+}
+
+void EngineView::SyncKeyboardMargin() {
+  if (!host_) {
+    return;
+  }
+  double covered = 0;
+  try {
+    auto pane = InputPane::GetForCurrentView();
+    if (pane.Visible()) {
+      covered = pane.OccludedRect().Height;
+    }
+  } catch (winrt::hresult_error const&) {
+    covered = 0;
+  }
+  const auto current = host_.Margin();
+  if (std::abs(current.Bottom - covered) < 0.5) {
+    return;
+  }
+  Log::Write(L"view: keyboard margin was " +
+             std::to_wstring(static_cast<int>(current.Bottom)) +
+             L" view px, the keyboard actually covers " +
+             std::to_wstring(static_cast<int>(covered)) + L" -- fixing the room");
+  host_.Margin(Thickness{0, 0, 0, covered});
 }
 
 void EngineView::Tick() {
