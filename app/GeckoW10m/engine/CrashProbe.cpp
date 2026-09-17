@@ -341,6 +341,8 @@ std::atomic<unsigned> gUiFrames{0};
 std::atomic<DWORD> gUiThread{0};
 std::atomic<HANDLE> gUiThreadHandle{nullptr};
 std::atomic<ULONGLONG> gLastFrameAt{0};
+std::atomic<HRESULT> gLastRemovedReason{S_OK};
+ID3D11Device* gProbeDevice = nullptr;
 
 DWORD WINAPI HeartbeatThread(LPVOID) {
   unsigned last = 0;
@@ -373,6 +375,16 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
                         L", ui frames " + std::to_wstring(frames) + L" (+" +
                         std::to_wstring(frames - last) + L"), last one " +
                         std::to_wstring(age) + L" ms ago";
+    if (gProbeDevice) {
+      const HRESULT removed = gProbeDevice->GetDeviceRemovedReason();
+      if (removed != gLastRemovedReason.load()) {
+        gLastRemovedReason.store(removed);
+        Log::WriteFromFault(L"gpu: the shell's device now says " +
+                            Hex(static_cast<uintptr_t>(removed)) +
+                            (removed == S_OK ? L" (alive)"
+                                             : L" -- THE GPU WAS RESET"));
+      }
+    }
     if (beat % 4 == 0) {
       const FreeSpace free = SurveyAddressSpace();
       line += L", address space " + std::to_wstring(free.totalMB) +
@@ -484,6 +496,10 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
                                                          : L""));
   LogMemory(L"first-chance:");
   LogAddressSpace(L"first-chance:");
+  if (gProbeDevice) {
+    Log::WriteFromFault(L"first-chance: gpu device removed reason " +
+                        Hex(static_cast<uintptr_t>(gProbeDevice->GetDeviceRemovedReason())));
+  }
   Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
   LogStack(L"first-chance:", *info->ContextRecord);
@@ -1360,7 +1376,6 @@ void NoteUiFrame() {
 
 std::atomic<int> gProbeWidth{1440};
 std::atomic<int> gProbeHeight{2560};
-ID3D11Device* gProbeDevice = nullptr;
 ID3D11DeviceContext* gProbeContext = nullptr;
 
 // The one thing the GPU path does that nothing else in this process does, and
@@ -1489,12 +1504,17 @@ void MakeSecondD3DDevice() {
     dxgi->Release();
   }
 
-  HANDLE chain = ::CreateThread(nullptr, 0, &CompositionChainThread, nullptr, 0, nullptr);
-  if (chain) {
-    ::CloseHandle(chain);
-  } else {
-    Log::WriteNum(L"chain: no thread, err", ::GetLastError());
-  }
+  // No chain this time; the device is kept for one question only, asked
+  // every quarter second by the heartbeat: has the GPU been reset. A device
+  // that has been reset answers GetDeviceRemovedReason with something other
+  // than S_OK, and every device in the process is reset together -- so the
+  // shell's own, which does nothing, is a clean witness to what the engine's
+  // does. WebRender drawing with real shaders on this Adreno is the one thing
+  // all three modes did and the shell's probes never did; a hang and reset
+  // would take the system compositor's device with it, and a shell rebuilding
+  // its views after that is the shape of a navigation client asserting on a
+  // hide.
+  Log::Write(L"gpu: watching the shell's device for a reset");
 }
 
 void SetProbeSurfaceSize(int width, int height) {
