@@ -962,10 +962,10 @@ index f45971a4ec..cea8861b57 100644
                                               "gfx.swap-interval");
  
 diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
-index 06ed553c01..5d520f846e 100644
+index 06ed553c01..98ebf68d2d 100644
 --- a/gfx/webrender_bindings/RenderCompositor.cpp
 +++ b/gfx/webrender_bindings/RenderCompositor.cpp
-@@ -1,336 +1,403 @@
+@@ -1,336 +1,438 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1320,6 +1320,8 @@ index 06ed553c01..5d520f846e 100644
 +#include "mozilla/webrender/RenderCompositorOGL.h"
 +#include "mozilla/webrender/RenderCompositorSWGL.h"
 +#include "mozilla/webrender/RenderThread.h"
++#include "mozilla/webrender/webrender_ffi.h"
++#include "mozilla/TimeStamp.h"
 +#include "mozilla/widget/CompositorWidget.h"
 +
 +#if defined(GECKO_W10M)
@@ -1563,6 +1565,39 @@ index 06ed553c01..5d520f846e 100644
 +          SprintfLiteral(note, "probe: made current, cleared and finished, gl error 0x%04x",
 +                         probeGl->fGetError());
 +          GeckoW10mNote(note);
++
++          // 0.2.3.7 showed the display and context alone are harmless. The
++          // hardware path's first frame then compiles WebRender's shaders on
++          // this context -- dozens of large programs through ANGLE's HLSL
++          // translator and d3dcompiler. Do all of that here, the way the
++          // engine's own warm-up does, and note the progress so a hide can be
++          // placed against a shader count.
++          GeckoW10mNote("probe: compiling every WebRender shader on this context");
++          const TimeStamp shaderStart = TimeStamp::Now();
++          wr::WrShaders* probeShaders = wr_shaders_new(probeGl, nullptr, true);
++          if (probeShaders) {
++            uint32_t steps = 0;
++            while (wr_shaders_resume_warmup(probeShaders)) {
++              ++steps;
++              if (steps % 10 == 0) {
++                SprintfLiteral(note, "probe: %u shader steps, %.0f ms so far, gl error 0x%04x",
++                               steps,
++                               (TimeStamp::Now() - shaderStart).ToMilliseconds(),
++                               probeGl->fGetError());
++                GeckoW10mNote(note);
++              }
++            }
++            probeGl->fFinish();
++            SprintfLiteral(note, "probe: every shader compiled -- %u steps in %.0f ms, gl error 0x%04x",
++                           steps,
++                           (TimeStamp::Now() - shaderStart).ToMilliseconds(),
++                           probeGl->fGetError());
++            GeckoW10mNote(note);
++            wr_shaders_delete(probeShaders);
++            GeckoW10mNote("probe: shaders released");
++          } else {
++            GeckoW10mNote("probe: wr_shaders_new gave nothing");
++          }
 +        } else {
 +          GeckoW10mNote("probe: MakeCurrent failed");
 +        }
