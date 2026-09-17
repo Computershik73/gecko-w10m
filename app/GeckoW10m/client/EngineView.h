@@ -42,6 +42,10 @@ class EngineView {
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.
   void SetExperimentMode(int mode) { experimentMode_ = mode; }
+  // Whether the engine is given the panel at all. Without it ANGLE has no
+  // window, no EGL surface is made, and WebRender cannot draw on the GPU --
+  // while every other thing the engine does at first paint still happens.
+  void SetPanelWithheld(bool withheld) { panelWithheld_ = withheld; }
   // Invisible, and focused only when Gecko says something takes text. It is
   // what the on-screen keyboard types into and the only way its keys can be
   // caught at all.
@@ -128,6 +132,7 @@ class EngineView {
   bool touched_ = false;
   bool declinedUntilTouch_ = false;
   int experimentMode_ = 0;
+  bool panelWithheld_ = false;
   bool saidWaiting_ = false;
   unsigned long long lastResolveAttempt_ = 0;
   std::function<void()> firstFrame_;

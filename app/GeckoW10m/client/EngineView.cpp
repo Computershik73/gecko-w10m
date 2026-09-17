@@ -362,6 +362,14 @@ void EngineView::GivePanelToEngine() {
   if (!panel_ || fullWidth_ <= 0) {
     return;
   }
+  if (panelWithheld_) {
+    if (!panelGiven_) {
+      panelGiven_ = true;
+      Log::Write(L"view: the panel is WITHHELD from the engine this launch -- "
+                 L"no EGL surface, no GPU frames, everything else as usual");
+    }
+    return;
+  }
   if (panel_size_fn_) {
     panel_size_fn_(fullWidth_, fullHeight_);
   }

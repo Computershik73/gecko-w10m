@@ -431,16 +431,24 @@ void MainPage::BuildUi() {
       fprintf(f, "%d", launches);
       fclose(f);
     }
-    const int mode = (launches - 1) % 3;
+    // Rewired: the three ANGLE modes all hid the window, so they are retired
+    // and the cycle is now two launches. Odd launches are the real thing.
+    // Even launches withhold the panel from the engine altogether: hardware
+    // compositing initialises, the D3D11 device and ANGLE come up, and then
+    // there is no window for EGL, so WebRender never draws on the GPU -- but
+    // the address bar still takes focus, delayed start-up still runs, and
+    // everything the engine does at first paint that is not a GPU frame still
+    // happens. If the window is hidden on an even launch, the GPU path was
+    // never the cause and it is something the engine does regardless.
+    const int mode = 0;
+    const bool withheld = (launches % 2) == 0;
     engineView_->SetExperimentMode(mode);
+    engineView_->SetPanelWithheld(withheld);
     client::Log::Write(
-        L"experiment: launch " + std::to_wstring(launches) + L", mode " +
-        std::to_wstring(mode) + L" -- " +
-        (mode == 1   ? L"the swap chain is made and presented, but the panel "
-                       L"never gets it"
-         : mode == 2 ? L"the swap chain is made and handed over, but never "
-                       L"presented"
-                     : L"the real thing, nothing left out"));
+        L"experiment: launch " + std::to_wstring(launches) + L" -- " +
+        (withheld ? L"the PANEL IS WITHHELD: hardware compositing initialises "
+                    L"but the engine has nothing to draw on"
+                  : L"the real thing, nothing left out"));
   }
 
   // The status bar exists only on mobile; tint it to match so the chrome does

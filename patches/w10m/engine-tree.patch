@@ -16556,10 +16556,15 @@ index e313d971ec..38cdd933a9 100644
          env="MOZ_WINDOWS_APP_SDK_DIR",
          nargs=1,
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..b80d727a1a 100644
+index fe113c825c..b896e474c5 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -18,6 +18,176 @@ extern "C" int __llvm_profile_dump(void);
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+@@ -18,6 +19,184 @@ extern "C" int __llvm_profile_dump(void);
  #  endif
  #endif
  
@@ -16723,7 +16728,15 @@ index fe113c825c..b80d727a1a 100644
 +// names, immediately and flushed, which is enough to instrument a suspect
 +// function and read the answer off the device afterwards.
 +extern "C" void GeckoW10mNote(const char* text) {
-+  AppendLine(L"GECKO_W10M_NOTE_LOG", text);
++  // Stamped with the wall clock to the millisecond, in the same form as the
++  // shell's log, so the two can be laid side by side. The notes have said
++  // "the EGL compositor is up" for a month without ever saying when.
++  SYSTEMTIME now;
++  ::GetLocalTime(&now);
++  char line[512];
++  snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u  %s", now.wHour, now.wMinute,
++           now.wSecond, now.wMilliseconds, text ? text : "");
++  AppendLine(L"GECKO_W10M_NOTE_LOG", line);
 +}
 +
 +// The hook is const -- it was made so deliberately, a writable global function
@@ -16736,7 +16749,7 @@ index fe113c825c..b80d727a1a 100644
  namespace mozilla {
  
  class BootstrapImpl final : public Bootstrap {
-@@ -42,6 +212,11 @@ class BootstrapImpl final : public Bootstrap {
+@@ -42,6 +221,11 @@ class BootstrapImpl final : public Bootstrap {
  
    virtual int XRE_main(int argc, char* argv[],
                         const BootstrapConfig& aConfig) override {
