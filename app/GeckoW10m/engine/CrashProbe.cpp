@@ -148,6 +148,54 @@ void LogStackScan(const wchar_t* tag, DWORD sp) {
 // A phone gives an app a hard memory ceiling, and 132 MB of engine plus
 // everything Gecko allocates on startup is a real candidate for reaching it.
 // Whatever else a crash report says, it should say how close this was.
+// How much of the process's address space is left, and how large the biggest
+// unbroken piece of it is.
+//
+// AppMemoryUsage, which is all this has ever reported, is the commit charge
+// the system bills the app for. It is not the address space, and on a 32-bit
+// process the address space is the smaller of the two: two gigabytes, shared
+// between a 132 MB xul.dll, a 32 MB JIT reserve, Gecko's heaps, and every
+// texture a Direct3D driver maps into it. An allocation does not fail because
+// the total ran out; it fails because no single free run was big enough. That
+// distinction has never been measured here and the fault is an allocation
+// coming back null.
+struct FreeSpace {
+  unsigned totalMB;
+  unsigned largestMB;
+  unsigned pieces;
+};
+
+FreeSpace SurveyAddressSpace() {
+  FreeSpace out{0, 0, 0};
+  uint64_t total = 0;
+  uint64_t largest = 0;
+  uintptr_t at = 0x10000;
+  MEMORY_BASIC_INFORMATION info{};
+  while (::VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) ==
+         sizeof(info)) {
+    if (info.State == MEM_FREE) {
+      total += info.RegionSize;
+      if (info.RegionSize > largest) largest = info.RegionSize;
+      ++out.pieces;
+    }
+    const uintptr_t next =
+        reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    if (next <= at) break;
+    at = next;
+  }
+  out.totalMB = static_cast<unsigned>(total / (1024 * 1024));
+  out.largestMB = static_cast<unsigned>(largest / (1024 * 1024));
+  return out;
+}
+
+void LogAddressSpace(const wchar_t* tag) {
+  const FreeSpace free = SurveyAddressSpace();
+  Log::WriteFromFault(std::wstring(tag) + L" address space " +
+                      std::to_wstring(free.totalMB) + L" MB free in " +
+                      std::to_wstring(free.pieces) + L" pieces, largest " +
+                      std::to_wstring(free.largestMB) + L" MB");
+}
+
 void LogMemory(const wchar_t* tag) {
   auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
   auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
@@ -292,11 +340,18 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
     const ULONGLONG age = ::GetTickCount64() - gLastFrameAt.load();
     // The fault-safe path: the ordinary one ends by posting to the UI thread,
     // and a pulse that adds work to the thread it is watching measures itself.
-    Log::WriteFromFault(L"alive: beat " + std::to_wstring(++beat) +
-               L", ui frames " +
-               std::to_wstring(frames) + L" (+" +
-               std::to_wstring(frames - last) + L"), last one " +
-               std::to_wstring(age) + L" ms ago");
+    ++beat;
+    std::wstring line = L"alive: beat " + std::to_wstring(beat) +
+                        L", ui frames " + std::to_wstring(frames) + L" (+" +
+                        std::to_wstring(frames - last) + L"), last one " +
+                        std::to_wstring(age) + L" ms ago";
+    if (beat % 4 == 0) {
+      const FreeSpace free = SurveyAddressSpace();
+      line += L", address space " + std::to_wstring(free.totalMB) +
+              L" MB free in " + std::to_wstring(free.pieces) +
+              L" pieces, largest " + std::to_wstring(free.largestMB) + L" MB";
+    }
+    Log::WriteFromFault(line);
     last = frames;
   }
 }
@@ -321,6 +376,7 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
              (::GetCurrentThreadId() == gUiThread.load() ? L" (the UI thread)"
                                                          : L""));
   LogMemory(L"first-chance:");
+  LogAddressSpace(L"first-chance:");
   Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
   LogStack(L"first-chance:", *info->ContextRecord);
