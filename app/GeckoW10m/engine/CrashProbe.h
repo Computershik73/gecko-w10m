@@ -63,27 +63,27 @@ void StartHeartbeat();
 // Called from XAML's render callback. Costs one increment.
 void NoteUiFrame();
 
-// Makes a second D3D11 device -- the shell's own -- and then finds out how
-// much this phone will actually give it.
+// Makes a second D3D11 device -- the shell's own -- and then pushes work
+// through it, alongside the compositor, for fifteen seconds.
 //
-// A second device beside XAML's turned out to be harmless: one was made at
-// startup, used, and kept for a whole run, and the browser died exactly where
-// it always does, fifteen seconds later. So it is not the device. What is left
-// is what the engine asks of it, and the first thing WebRender does is
-// allocate: render targets the size of the screen, texture cache pages, a
-// staging pool. If this device has a ceiling an app container may not cross,
-// the compositor would be the first thing to fail an allocation on the other
-// side of it -- and failing an allocation and then writing through the null it
-// returned is exactly the instruction the UI thread dies on.
+// Two things about this device are now known and neither is the answer: a
+// second device beside XAML's is harmless, and so is taking memory from it --
+// forty-eight screen-sized render targets, six hundred and seventy-five
+// megabytes, while XAML went on drawing sixty frames a second. The adapter
+// says ninety-six megabytes dedicated and one and a half gigabytes shared, and
+// it never refused any of it.
 //
-// So this allocates screen-sized render targets, one at a time, saying how
-// much it has taken each time. Either it stops at a number, which is the
-// number we have to keep the engine under, or it does not, and allocation is
-// innocent too.
+// What the probe has never done is submit. On a phone the user-mode driver is
+// one library shared by every device in the process, and the compositor is
+// pushing through it from the UI thread all the while. That is the last thing
+// the engine does that this has not, it starts the moment hardware compositing
+// comes on, and that is the line every dying run since 0.1.9.5 is on the wrong
+// side of.
 void MakeSecondD3DDevice();
 
-// How large a screen-sized render target is, for the ceiling probe. Set from
-// the shell, which is the only thing that knows the screen.
+// How large a frame the traffic probe pushes, which is the size of the ones
+// WebRender pushes. Set from the shell, which is the only thing that knows
+// the screen.
 void SetProbeSurfaceSize(int width, int height);
 
 }  // namespace gecko_w10m::engine

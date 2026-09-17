@@ -920,14 +920,25 @@ void NoteUiFrame() {
 std::atomic<int> gProbeWidth{1440};
 std::atomic<int> gProbeHeight{2560};
 ID3D11Device* gProbeDevice = nullptr;
+ID3D11DeviceContext* gProbeContext = nullptr;
 
-// Runs on its own thread, a few seconds in, so that XAML is up and compositing
-// normally while the ground is taken out from under it.
-DWORD WINAPI CeilingThread(LPVOID) {
+// Everything the shell's own device has done so far, it did without drawing:
+// it was made, it was given textures -- forty-eight of them, six hundred and
+// seventy-five megabytes, and neither the device nor the ceiling was the
+// wall. What it never did was submit work.
+//
+// That is the last thing the engine does that this has not. A phone's user
+// mode driver is one library shared by every device in the process, and the
+// XAML compositor is submitting through it from the UI thread sixty times a
+// second. Making resources from another thread has now been shown to be
+// harmless; issuing commands alongside it has not been tried, and it is
+// exactly what WebRender's renderer thread does from the moment hardware
+// compositing comes on -- which is the one line every dying run since 0.1.9.5
+// is on the wrong side of.
+DWORD WINAPI TrafficThread(LPVOID) {
   ::Sleep(3000);
   const UINT width = static_cast<UINT>(gProbeWidth.load());
   const UINT height = static_cast<UINT>(gProbeHeight.load());
-  const double each = double(width) * height * 4.0 / (1024.0 * 1024.0);
 
   D3D11_TEXTURE2D_DESC desc{};
   desc.Width = width;
@@ -939,36 +950,36 @@ DWORD WINAPI CeilingThread(LPVOID) {
   desc.Usage = D3D11_USAGE_DEFAULT;
   desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-  constexpr int kMost = 48;
-  ID3D11Texture2D* held[kMost] = {};
-  int taken = 0;
-  for (; taken < kMost; ++taken) {
-    HRESULT hr = gProbeDevice->CreateTexture2D(&desc, nullptr, &held[taken]);
-    if (FAILED(hr)) {
-      wchar_t line[192];
-      ::swprintf_s(line,
-                   L"ceiling: refused at %d surfaces, %.0f MB, hr 0x%08lx -- "
-                   L"this is the wall",
-                   taken + 1, (taken + 1) * each,
-                   static_cast<unsigned long>(hr));
-      Log::WriteFromFault(line);
-      break;
+  ID3D11Texture2D* target = nullptr;
+  ID3D11Texture2D* copy = nullptr;
+  ID3D11RenderTargetView* view = nullptr;
+  if (FAILED(gProbeDevice->CreateTexture2D(&desc, nullptr, &target)) ||
+      FAILED(gProbeDevice->CreateTexture2D(&desc, nullptr, &copy)) ||
+      FAILED(gProbeDevice->CreateRenderTargetView(target, nullptr, &view))) {
+    Log::WriteFromFault(L"traffic: could not set up, not pushing any work");
+    return 0;
+  }
+  Log::WriteFromFault(L"traffic: pushing GPU work at about sixty a second");
+
+  for (int frame = 1; frame <= 900; ++frame) {
+    const float colour[4] = {float(frame % 60) / 60.0f, 0.2f, 0.6f, 1.0f};
+    gProbeContext->ClearRenderTargetView(view, colour);
+    // A whole-screen copy, so the work reaches the driver rather than being
+    // folded away.
+    gProbeContext->CopyResource(copy, target);
+    gProbeContext->Flush();
+    if (frame % 60 == 0) {
+      Log::WriteFromFault(L"traffic: " + std::to_wstring(frame) +
+                          L" frames of GPU work pushed");
     }
-    wchar_t line[128];
-    ::swprintf_s(line, L"ceiling: %d surfaces of %ux%u, %.0f MB taken", taken + 1,
-                 width, height, (taken + 1) * each);
-    Log::WriteFromFault(line);
-    // Slowly, so the compositor has whole frames to fail in and the heartbeat
-    // says which surface it died on.
-    ::Sleep(150);
+    ::Sleep(16);
   }
-  if (taken == kMost) {
-    Log::WriteFromFault(L"ceiling: no wall found -- allocation is innocent too");
-  }
-  for (int i = 0; i < taken; ++i) {
-    if (held[i]) held[i]->Release();
-  }
-  Log::WriteFromFault(L"ceiling: given back");
+  Log::WriteFromFault(
+      L"traffic: nine hundred frames and the compositor did not care -- "
+      L"submitting alongside it is innocent too");
+  view->Release();
+  copy->Release();
+  target->Release();
   return 0;
 }
 
@@ -994,12 +1005,11 @@ void MakeSecondD3DDevice() {
   const D3D_FEATURE_LEVEL levels[] = {
       D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
       D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
-  ID3D11DeviceContext* context = nullptr;
   D3D_FEATURE_LEVEL got = static_cast<D3D_FEATURE_LEVEL>(0);
   HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                       D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
                       ARRAYSIZE(levels), D3D11_SDK_VERSION, &gProbeDevice, &got,
-                      &context);
+                      &gProbeContext);
   if (FAILED(hr)) {
     Log::Write(L"second device: refused, " + Hex(static_cast<uintptr_t>(hr)));
     return;
@@ -1030,11 +1040,11 @@ void MakeSecondD3DDevice() {
     dxgi->Release();
   }
 
-  HANDLE ceiling = ::CreateThread(nullptr, 0, &CeilingThread, nullptr, 0, nullptr);
-  if (ceiling) {
-    ::CloseHandle(ceiling);
+  HANDLE traffic = ::CreateThread(nullptr, 0, &TrafficThread, nullptr, 0, nullptr);
+  if (traffic) {
+    ::CloseHandle(traffic);
   } else {
-    Log::WriteNum(L"ceiling: no thread, err", ::GetLastError());
+    Log::WriteNum(L"traffic: no thread, err", ::GetLastError());
   }
 }
 
