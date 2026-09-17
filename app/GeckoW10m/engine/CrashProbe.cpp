@@ -10,6 +10,7 @@
 #include <delayimp.h>
 
 #include <atomic>
+#include <setjmp.h>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -753,6 +754,30 @@ HMODULE WINAPI HookLoadPackagedLibrary(LPCWSTR name, DWORD reserved) {
   return module;
 }
 
+// longjmp on 32-bit ARM unwinds the stack frame by frame on its way back to
+// the setjmp, the way a C++ exception would, and it trusts the unwind tables
+// to describe every frame in between. clang's do not, on this target, and
+// the unwinder stops with STATUS_BAD_STACK -- a fatal that no handler sees.
+// libpng and libjpeg report a bad image exactly this way (png_error ->
+// longjmp), so any truncated PNG on a page ended the browser: 0.2.5.2 died on
+// a Spotify page in MOZ_PNG_longjmp.
+//
+// x86 never unwound on longjmp and Gecko is written for that, so the unwind
+// is simply switched off: a jump buffer whose Frame is zero is restored
+// register by register, and nothing in between is visited.
+using LongjmpFn = void(__cdecl*)(jmp_buf, int);
+LongjmpFn gRealLongjmp = nullptr;
+std::atomic<int> gLongjmpsTaken{0};
+
+__declspec(noreturn) void __cdecl HookLongjmp(jmp_buf buffer, int value) {
+  reinterpret_cast<_JUMP_BUFFER*>(buffer)->Frame = 0;
+  if (gLongjmpsTaken.fetch_add(1) < 5) {
+    Log::WriteFromFault(L"longjmp: taken without unwinding the stack");
+  }
+  gRealLongjmp(buffer, value);
+  ::TerminateProcess(::GetCurrentProcess(), 3);  // not reached
+}
+
 struct Hook {
   const char* name;
   void* replacement;
@@ -774,6 +799,8 @@ const Hook kHooks[] = {
      reinterpret_cast<void**>(&gRealLoadLibraryExW)},
     {"LoadPackagedLibrary", reinterpret_cast<void*>(&HookLoadPackagedLibrary),
      reinterpret_cast<void**>(&gRealLoadPackagedLibrary)},
+    {"longjmp", reinterpret_cast<void*>(&HookLongjmp),
+     reinterpret_cast<void**>(&gRealLongjmp)},
 };
 
 // Writes one import slot, saving what was there. The import table sits in
@@ -2026,7 +2053,7 @@ void InstallEngineProbes() {
   // TerminateProcess through ucrtbase's own import table, not xul's -- so
   // every abort in the engine has passed these hooks untouched.
   for (const wchar_t* name :
-       {L"xul.dll", L"mozglue.dll", L"nss3.dll", L"ucrtbase.dll"}) {
+       {L"xul.dll", L"mozglue.dll", L"nss3.dll", L"ucrtbase.dll", L"gkcodecs.dll", L"mozavcodec.dll"}) {
     // LoadPackagedLibrary only finds modules inside the package, and ucrtbase
     // is not one -- it is the system's. Asking it for ucrtbase reported "not
     // loaded" about a library that was loaded all along, so the hooks that
