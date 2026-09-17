@@ -335,9 +335,21 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
     // fault reports the same thirty frames whether the thread died at the
     // fault or drew straight through it -- which is exactly the reading I got
     // wrong.
+    const ULONGLONG before = ::GetTickCount64();
     ::Sleep(250);
+    const ULONGLONG slept = ::GetTickCount64() - before;
     const unsigned frames = gUiFrames.load();
     const ULONGLONG age = ::GetTickCount64() - gLastFrameAt.load();
+    // A quarter-second sleep that took two seconds is not a slow thread, it is
+    // a stopped process: the last run drew frames for two and a half seconds
+    // past the mended fault and then everything, this thread included, went
+    // quiet at once. That is a suspend or a kill, not a fault, and the two
+    // should not look alike in the log.
+    if (slept > 1000) {
+      Log::WriteFromFault(L"alive: the whole process was frozen for " +
+                          std::to_wstring(slept) +
+                          L" ms -- nothing ran, not even this");
+    }
     // The fault-safe path: the ordinary one ends by posting to the UI thread,
     // and a pulse that adds work to the thread it is watching measures itself.
     ++beat;
@@ -352,6 +364,10 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
               L" pieces, largest " + std::to_wstring(free.largestMB) + L" MB";
     }
     Log::WriteFromFault(line);
+    // Flushed every beat now. The log has ended mid-thought twice and there is
+    // no way to tell a process that stopped from a line that never reached the
+    // disk.
+    Log::FlushFromFault();
     last = frames;
   }
 }
