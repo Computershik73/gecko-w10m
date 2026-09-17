@@ -354,7 +354,10 @@ using CounterFn = uint32_t (*)();
 DeviceFn gGeckoDeviceFn = nullptr;
 CounterFn gWrPulseFn = nullptr;
 CounterFn gWrWhereFn = nullptr;
+CounterFn gWrThreadFn = nullptr;
 std::atomic<HRESULT> gGeckoRemovedReason{S_OK};
+std::atomic<bool> gAutopsyDone{false};
+void AutopsyRendererThread(const wchar_t* tag);
 std::atomic<uint32_t> gLastWrPulse{0};
 std::atomic<unsigned> gWrStillBeats{0};
 
@@ -369,6 +372,7 @@ void ResolveEngineProbes() {
   gGeckoDeviceFn = reinterpret_cast<DeviceFn>(::GetProcAddress(xul, "gecko_w10m_gecko_device"));
   gWrPulseFn = reinterpret_cast<CounterFn>(::GetProcAddress(xul, "gecko_w10m_wr_pulse"));
   gWrWhereFn = reinterpret_cast<CounterFn>(::GetProcAddress(xul, "gecko_w10m_wr_where"));
+  gWrThreadFn = reinterpret_cast<CounterFn>(::GetProcAddress(xul, "gecko_w10m_wr_thread"));
   Log::WriteFromFault(std::wstring(L"engine probes: ") +
                       (gGeckoDeviceFn ? L"device " : L"NO device ") +
                       (gWrPulseFn ? L"pulse " : L"NO pulse ") +
@@ -448,6 +452,9 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
               std::to_wstring(where);
       if (where != 0 && gWrStillBeats.load() >= 2) {
         line += L" -- THE RENDERER THREAD IS STUCK THERE";
+      }
+      if (pulse > 0 && gWrStillBeats.load() == 8) {
+        AutopsyRendererThread(L"autopsy(quiet):");
       }
     }
     if (beat % 4 == 0) {
@@ -609,6 +616,7 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
     Log::WriteFromFault(L"first-chance: wr pulse " + std::to_wstring(gWrPulseFn()) +
                         L" where " + std::to_wstring(gWrWhereFn()));
   }
+  AutopsyRendererThread(L"autopsy(fault):");
   Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
   LogStack(L"first-chance:", *info->ContextRecord);
@@ -1260,6 +1268,70 @@ bool ResolveSamplingApis() {
   gGetThreadContext = reinterpret_cast<GetThreadContextFn>(
       ::GetProcAddress(k32, "GetThreadContext"));
   return gSuspendThread && gResumeThread && gGetThreadContext;
+}
+
+// The renderer thread went quiet between use_program(ps_clear) and the next
+// GL call, and nothing -- no fault, no abort, no exit -- was ever reported
+// for it. Suspend it, read its registers and walk its stack, so the log says
+// where it is: parked in a kernel wait, deep in the driver, or gone.
+using OpenThreadFn = HANDLE(WINAPI*)(DWORD, BOOL, DWORD);
+void AutopsyRendererThread(const wchar_t* tag) {
+  if (gAutopsyDone.exchange(true)) {
+    return;
+  }
+  const std::wstring t(tag);
+  if (!gWrThreadFn) {
+    Log::WriteFromFault(t + L" no renderer thread id export");
+    return;
+  }
+  const DWORD tid = gWrThreadFn();
+  if (!tid) {
+    Log::WriteFromFault(t + L" the renderer thread has not reported an id yet");
+    return;
+  }
+  HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+  auto openThread = k32 ? reinterpret_cast<OpenThreadFn>(::GetProcAddress(k32, "OpenThread")) : nullptr;
+  if (!openThread || !ResolveSamplingApis()) {
+    Log::WriteFromFault(t + L" thread inspection unavailable in this container");
+    return;
+  }
+  // THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | SYNCHRONIZE
+  HANDLE thread = openThread(0x0040 | 0x0008 | 0x0002 | 0x00100000, FALSE, tid);
+  if (!thread) {
+    Log::WriteFromFault(t + L" OpenThread(" + std::to_wstring(tid) + L") failed, error " +
+                        std::to_wstring(::GetLastError()));
+    return;
+  }
+  DWORD exitCode = 0;
+  const bool haveExit = ::GetExitCodeThread(thread, &exitCode) != 0;
+  const DWORD wait = ::WaitForSingleObject(thread, 0);
+  Log::WriteFromFault(t + L" renderer thread " + std::to_wstring(tid) +
+                      (wait == WAIT_OBJECT_0 ? L" has EXITED" : L" is still alive") +
+                      (haveExit ? L", exit code " + Hex(exitCode) : L""));
+  if (wait == WAIT_OBJECT_0) {
+    ::CloseHandle(thread);
+    return;
+  }
+  const DWORD previous = gSuspendThread(thread);
+  if (previous == static_cast<DWORD>(-1)) {
+    Log::WriteFromFault(t + L" SuspendThread failed, error " + std::to_wstring(::GetLastError()));
+    ::CloseHandle(thread);
+    return;
+  }
+  Log::WriteFromFault(t + L" suspended (previous suspend count " + std::to_wstring(previous) +
+                      (previous > 0 ? L" -- SOMEONE ELSE HAD ALREADY SUSPENDED IT)" : L")"));
+  __declspec(align(8)) CONTEXT context{};
+  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  if (gGetThreadContext(thread, &context)) {
+    Log::WriteFromFault(t + L" registers" + Registers(context));
+    LogInstruction(tag, reinterpret_cast<void*>(context.Pc));
+    LogStack(tag, context);
+    LogStackScan(tag, static_cast<DWORD>(context.Sp));
+  } else {
+    Log::WriteFromFault(t + L" GetThreadContext failed, error " + std::to_wstring(::GetLastError()));
+  }
+  gResumeThread(thread);
+  ::CloseHandle(thread);
 }
 
 // The trace file. A raw address is worthless in the next process -- ASLR moves
