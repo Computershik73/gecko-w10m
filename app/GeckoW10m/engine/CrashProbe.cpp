@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <winrt/Windows.System.h>
 
 #include <delayimp.h>
@@ -1297,64 +1298,72 @@ std::atomic<int> gProbeHeight{2560};
 ID3D11Device* gProbeDevice = nullptr;
 ID3D11DeviceContext* gProbeContext = nullptr;
 
-// Everything the shell's own device has done so far, it did without drawing:
-// it was made, it was given textures -- forty-eight of them, six hundred and
-// seventy-five megabytes, and neither the device nor the ceiling was the
-// wall. What it never did was submit work.
+// The one thing the GPU path does that nothing else in this process does, and
+// that every experiment so far has left in place: it creates a composition
+// swap chain. Hand it to the panel or not, present to it or not, the window
+// is hidden four tenths of a second after the chain exists -- and the module
+// that hides it is the shell's navigation client, driven from the shell's
+// side over a message proxy. A composition swap chain is a new connection
+// from this process to the system compositor, and a phone shell that counts
+// connections as views would see one appear, switch to it, find nothing
+// there, and leave the real one behind.
 //
-// That is the last thing the engine does that this has not. A phone's user
-// mode driver is one library shared by every device in the process, and the
-// XAML compositor is submitting through it from the UI thread sixty times a
-// second. Making resources from another thread has now been shown to be
-// harmless; issuing commands alongside it has not been tried, and it is
-// exactly what WebRender's renderer thread does from the moment hardware
-// compositing comes on -- which is the one line every dying run since 0.1.9.5
-// is on the wrong side of.
-DWORD WINAPI TrafficThread(LPVOID) {
+// So the shell's own device makes one, three seconds in, long before the
+// engine touches the GPU, with the very description ANGLE uses. If the window
+// is hidden four tenths of a second after this, the engine is innocent and
+// the answer is a different way of getting a frame into XAML.
+DWORD WINAPI CompositionChainThread(LPVOID) {
   ::Sleep(3000);
-  const UINT width = static_cast<UINT>(gProbeWidth.load());
-  const UINT height = static_cast<UINT>(gProbeHeight.load());
-
-  D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = width;
-  desc.Height = height;
-  desc.MipLevels = 1;
-  desc.ArraySize = 1;
-  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  desc.Usage = D3D11_USAGE_DEFAULT;
-  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-  ID3D11Texture2D* target = nullptr;
-  ID3D11Texture2D* copy = nullptr;
-  ID3D11RenderTargetView* view = nullptr;
-  if (FAILED(gProbeDevice->CreateTexture2D(&desc, nullptr, &target)) ||
-      FAILED(gProbeDevice->CreateTexture2D(&desc, nullptr, &copy)) ||
-      FAILED(gProbeDevice->CreateRenderTargetView(target, nullptr, &view))) {
-    Log::WriteFromFault(L"traffic: could not set up, not pushing any work");
+  HMODULE dxgi = ::LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+  auto createFactory = dxgi ? reinterpret_cast<CreateFactoryFn>(
+                                  ::GetProcAddress(dxgi, "CreateDXGIFactory1"))
+                            : nullptr;
+  if (!createFactory) {
+    Log::WriteFromFault(L"chain: no CreateDXGIFactory1");
     return 0;
   }
-  Log::WriteFromFault(L"traffic: pushing GPU work at about sixty a second");
-
-  for (int frame = 1; frame <= 900; ++frame) {
-    const float colour[4] = {float(frame % 60) / 60.0f, 0.2f, 0.6f, 1.0f};
-    gProbeContext->ClearRenderTargetView(view, colour);
-    // A whole-screen copy, so the work reaches the driver rather than being
-    // folded away.
-    gProbeContext->CopyResource(copy, target);
-    gProbeContext->Flush();
-    if (frame % 60 == 0) {
-      Log::WriteFromFault(L"traffic: " + std::to_wstring(frame) +
-                          L" frames of GPU work pushed");
-    }
-    ::Sleep(16);
+  IDXGIFactory2* factory = nullptr;
+  HRESULT hr = createFactory(__uuidof(IDXGIFactory2),
+                             reinterpret_cast<void**>(&factory));
+  if (FAILED(hr) || !factory) {
+    Log::WriteFromFault(L"chain: no IDXGIFactory2, " +
+                        Hex(static_cast<uintptr_t>(hr)));
+    return 0;
   }
-  Log::WriteFromFault(
-      L"traffic: nine hundred frames and the compositor did not care -- "
-      L"submitting alongside it is innocent too");
-  view->Release();
-  copy->Release();
-  target->Release();
+
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  desc.Width = static_cast<UINT>(gProbeWidth.load());
+  desc.Height = static_cast<UINT>(gProbeHeight.load()) - 252;  // the room, as ANGLE gets it
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER |
+                     DXGI_USAGE_SHADER_INPUT;
+  desc.BufferCount = 2;
+  desc.Scaling = DXGI_SCALING_STRETCH;
+  desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+  desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+  Log::WriteFromFault(L"chain: making a composition swap chain from the shell, " +
+                      std::to_wstring(desc.Width) + L"x" +
+                      std::to_wstring(desc.Height));
+  Log::FlushFromFault();
+  IDXGISwapChain1* chain = nullptr;
+  hr = factory->CreateSwapChainForComposition(gProbeDevice, &desc, nullptr, &chain);
+  if (FAILED(hr) || !chain) {
+    Log::WriteFromFault(L"chain: refused, " + Hex(static_cast<uintptr_t>(hr)));
+    return 0;
+  }
+  Log::WriteFromFault(L"chain: it exists -- if the window is hidden in the "
+                      L"next half second, this is what hides it");
+  Log::FlushFromFault();
+
+  ::Sleep(1500);
+  DXGI_PRESENT_PARAMETERS params{};
+  hr = chain->Present1(1, 0, &params);
+  Log::WriteFromFault(L"chain: presented once, " + Hex(static_cast<uintptr_t>(hr)));
+  Log::FlushFromFault();
+  // Kept alive for the whole run, like the engine's.
   return 0;
 }
 
@@ -1415,11 +1424,11 @@ void MakeSecondD3DDevice() {
     dxgi->Release();
   }
 
-  HANDLE traffic = ::CreateThread(nullptr, 0, &TrafficThread, nullptr, 0, nullptr);
-  if (traffic) {
-    ::CloseHandle(traffic);
+  HANDLE chain = ::CreateThread(nullptr, 0, &CompositionChainThread, nullptr, 0, nullptr);
+  if (chain) {
+    ::CloseHandle(chain);
   } else {
-    Log::WriteNum(L"traffic: no thread, err", ::GetLastError());
+    Log::WriteNum(L"chain: no thread, err", ::GetLastError());
   }
 }
 
