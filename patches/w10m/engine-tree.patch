@@ -6854,10 +6854,10 @@ index 8f7928c42a..1adb7a9a64 100644
 +
 +}  // extern C
 diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
-index 17d84a4c3c..90f27ebd75 100644
+index 17d84a4c3c..9cf2277c56 100644
 --- a/gfx/wr/webrender/src/device/gl.rs
 +++ b/gfx/wr/webrender/src/device/gl.rs
-@@ -1,4795 +1,4962 @@
+@@ -1,4795 +1,4979 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -14349,6 +14349,10 @@ index 17d84a4c3c..90f27ebd75 100644
 +        program.is_initialized = true;
 +        program.u_transform = self.gl.get_uniform_location(program.id, "uTransform");
 +        program.u_texture_size = self.gl.get_uniform_location(program.id, "uTextureSize");
++        gecko_w10m_note(&format!(
++            "wr: link {} -- {}: uTransform at {}, uTextureSize at {}",
++            gecko_w10m_link_n, info.full_name(), program.u_transform, program.u_texture_size
++        ));
 +
 +        Ok(())
 +    }
@@ -14919,6 +14923,19 @@ index 17d84a4c3c..90f27ebd75 100644
 +        #[cfg(debug_assertions)]
 +        debug_assert!(self.shader_is_ready);
 +
++        // The renderer thread died inside ANGLE's GL_UniformMatrix4fv on the
++        // phone: with validation off (EGL_CONTEXT_OPENGL_NO_ERROR_KHR) a
++        // location of -1 goes straight into a bounds-checked vector index and
++        // the STL check ends in __fastfail, which no handler ever sees. GL says
++        // -1 is to be ignored, so ignore it here, as set_shader_texture_size
++        // already does for its own uniform.
++        if program.u_transform == -1 {
++            gecko_w10m_note(&format!(
++                "wr: {} has no uTransform location -- not setting it",
++                program.source_info.full_name()
++            ));
++            return;
++        }
 +        self.gl
 +            .uniform_matrix_4fv(program.u_transform, false, &transform.to_array());
 +    }
