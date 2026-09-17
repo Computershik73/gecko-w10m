@@ -6854,10 +6854,10 @@ index 8f7928c42a..1adb7a9a64 100644
 +
 +}  // extern C
 diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
-index 17d84a4c3c..08153956fd 100644
+index 17d84a4c3c..df7cfc1bd1 100644
 --- a/gfx/wr/webrender/src/device/gl.rs
 +++ b/gfx/wr/webrender/src/device/gl.rs
-@@ -1,4795 +1,4881 @@
+@@ -1,4795 +1,4947 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -11688,7 +11688,27 @@ index 17d84a4c3c..08153956fd 100644
 +static GECKO_W10M_LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 +fn gecko_w10m_count(counter: &std::sync::atomic::AtomicU32, first: u32) -> Option<u32> {
 +    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++    GECKO_W10M_PULSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +    if n <= first || n % 100 == 0 { Some(n) } else { None }
++}
++// A pulse the shell can read from its heartbeat: it rises on every noted GL
++// call, and `where` says what the renderer thread is inside right now
++// (0 idle, 1 a draw call, 2 a program link, 3 an instance-buffer upload,
++// 4 use_program). If the pulse stops rising while `where` stays non-zero, the
++// renderer thread is stuck inside that call.
++pub static GECKO_W10M_PULSE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++pub static GECKO_W10M_WHERE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[no_mangle]
++pub extern "C" fn gecko_w10m_wr_pulse_rust() -> u32 {
++    GECKO_W10M_PULSE.load(std::sync::atomic::Ordering::Relaxed)
++}
++#[no_mangle]
++pub extern "C" fn gecko_w10m_wr_where_rust() -> u32 {
++    GECKO_W10M_WHERE.load(std::sync::atomic::Ordering::Relaxed)
++}
++fn gecko_w10m_where(stage: u32) {
++    GECKO_W10M_WHERE.store(stage, std::sync::atomic::Ordering::Relaxed);
++    GECKO_W10M_PULSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +}
 +fn gecko_w10m_frame_noted(frame: u32) -> bool {
 +    frame <= 4 || frame == 10 || frame == 30 || frame == 60 || frame == 120 || frame == 300
@@ -14183,6 +14203,7 @@ index 17d84a4c3c..08153956fd 100644
 +        let info = &program.source_info;
 +        let gecko_w10m_link_started = std::time::Instant::now();
 +        let gecko_w10m_link_n = GECKO_W10M_LINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        gecko_w10m_where(2);
 +        gecko_w10m_note(&format!("wr: link {} -- {} begins", gecko_w10m_link_n, info.full_name()));
 +
 +        // See if we hit the binary shader cache
@@ -14273,6 +14294,7 @@ index 17d84a4c3c..08153956fd 100644
 +                gecko_w10m_link_n, info.full_name(),
 +                gecko_w10m_link_started.elapsed().as_millis()
 +            ));
++            gecko_w10m_where(0);
 +
 +            // GL recommends detaching and deleting shaders once the link
 +            // is complete (whether successful or not). This allows the driver
@@ -14328,9 +14350,15 @@ index 17d84a4c3c..08153956fd 100644
 +        }
 +
 +        if self.bound_program != program.id {
++            gecko_w10m_where(4);
 +            self.gl.use_program(program.id);
++            gecko_w10m_where(0);
 +            self.bound_program = program.id;
 +            self.bound_program_name = program.source_info.full_name_cstr.clone();
++            static USES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            if let Some(n) = gecko_w10m_count(&USES, 40) {
++                gecko_w10m_note(&format!("wr: use program {} -- {:?}", n, self.bound_program_name));
++            }
 +        }
 +        true
 +    }
@@ -15252,6 +15280,17 @@ index 17d84a4c3c..08153956fd 100644
 +    ) {
 +        debug_assert_eq!(self.bound_vao, vao.id);
 +        debug_assert_eq!(vao.instance_stride as usize, mem::size_of::<V>());
++        static INSTANCE_UPLOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        if let Some(n) = gecko_w10m_count(&INSTANCE_UPLOADS, 40) {
++            gecko_w10m_note(&format!(
++                "wr: instances {} -- {} x {} bytes, repeat {:?}",
++                n, instances.len(), mem::size_of::<V>(), repeat
++            ));
++        }
++        gecko_w10m_where(3);
++        struct WhereGuard;
++        impl Drop for WhereGuard { fn drop(&mut self) { gecko_w10m_where(0); } }
++        let _where_guard = WhereGuard;
 +
 +        match repeat {
 +            Some(count) => {
@@ -15428,15 +15467,22 @@ index 17d84a4c3c..08153956fd 100644
 +            None
 +        };
 +
-+        if let Some(n) = gecko_w10m_count(&GECKO_W10M_DRAWS, 40) {
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
 +            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices", n, self.bound_program_name, index_count));
 +        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
 +        self.gl.draw_elements(
 +            gl::TRIANGLES,
 +            index_count,
 +            gl::UNSIGNED_SHORT,
 +            0,
 +        );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
 +    }
 +
 +    pub fn draw_indexed_triangles_instanced_u16(&mut self, index_count: i32, instance_count: i32) {
@@ -15454,9 +15500,12 @@ index 17d84a4c3c..08153956fd 100644
 +            None
 +        };
 +
-+        if let Some(n) = gecko_w10m_count(&GECKO_W10M_DRAWS, 40) {
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
 +            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices x {} instances", n, self.bound_program_name, index_count, instance_count));
 +        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
 +        self.gl.draw_elements_instanced(
 +            gl::TRIANGLES,
 +            index_count,
@@ -15464,6 +15513,10 @@ index 17d84a4c3c..08153956fd 100644
 +            0,
 +            instance_count,
 +        );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
 +    }
 +
 +    pub fn draw_indexed_triangles_instanced_base_instance_u16(
@@ -15486,6 +15539,15 @@ index 17d84a4c3c..08153956fd 100644
 +            None
 +        };
 +
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!(
++                "wr: draw {} -- {:?}, {} indices x {} instances from base {}",
++                n, self.bound_program_name, index_count, instance_count, base_instance
++            ));
++        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
 +        self.gl.draw_elements_instanced_base_instance(
 +            gl::TRIANGLES,
 +            index_count,
@@ -15494,6 +15556,10 @@ index 17d84a4c3c..08153956fd 100644
 +            instance_count,
 +            base_instance,
 +        );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
 +    }
 +
 +    pub fn end_frame(&mut self) {
@@ -32480,13 +32546,66 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..9c2571bbe4 100644
+index 8484851f67..545a67c024 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -7,6 +7,102 @@
- #include "VsyncDispatcher.h"
- #include "mozilla/widget/PlatformWidgetTypes.h"
- 
+@@ -1,46 +1,647 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "HeadlessCompositorWidget.h"
+-
+-#include "VsyncDispatcher.h"
+-#include "mozilla/widget/PlatformWidgetTypes.h"
+-
+-namespace mozilla {
+-namespace widget {
+-
+-HeadlessCompositorWidget::HeadlessCompositorWidget(
+-    const HeadlessCompositorWidgetInitData& aInitData,
+-    const layers::CompositorOptions& aOptions, HeadlessWidget* aWindow)
+-    : CompositorWidget(aOptions),
+-      mWidget(aWindow),
+-      mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
+-                  "HeadlessCompositorWidget::mClientSize") {}
+-
+-void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
+-  if (RefPtr<CompositorVsyncDispatcher> cvd =
+-          mWidget->GetCompositorVsyncDispatcher()) {
+-    cvd->SetCompositorVsyncObserver(aObserver);
+-  }
+-}
+-
+-nsIWidget* HeadlessCompositorWidget::RealWidget() { return mWidget; }
+-
+-void HeadlessCompositorWidget::NotifyClientSizeChanged(
+-    const LayoutDeviceIntSize& aClientSize) {
+-  auto size = mClientSize.Lock();
+-  *size = aClientSize;
+-}
+-
+-LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
+-  auto size = mClientSize.Lock();
+-  return *size;
+-}
+-
+-uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
+-  return reinterpret_cast<uintptr_t>(mWidget);
+-}
+-
+-}  // namespace widget
+-}  // namespace mozilla
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "HeadlessCompositorWidget.h"
++
++#include "VsyncDispatcher.h"
++#include "mozilla/widget/PlatformWidgetTypes.h"
++#include "mozilla/gfx/DeviceManagerDx.h"
++
 +#if defined(GECKO_W10M)
 +#  include <string.h>
 +
@@ -32583,14 +32702,15 @@ index 8484851f67..9c2571bbe4 100644
 +}  // namespace
 +#endif
 +
- namespace mozilla {
- namespace widget {
- 
-@@ -16,7 +112,34 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
-     : CompositorWidget(aOptions),
-       mWidget(aWindow),
-       mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
--                  "HeadlessCompositorWidget::mClientSize") {}
++namespace mozilla {
++namespace widget {
++
++HeadlessCompositorWidget::HeadlessCompositorWidget(
++    const HeadlessCompositorWidgetInitData& aInitData,
++    const layers::CompositorOptions& aOptions, HeadlessWidget* aWindow)
++    : CompositorWidget(aOptions),
++      mWidget(aWindow),
++      mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
 +                  "HeadlessCompositorWidget::mClientSize")
 +#if defined(GECKO_W10M)
 +      ,
@@ -32619,13 +32739,22 @@ index 8484851f67..9c2571bbe4 100644
 +  }
 +}
 +#endif
- 
- void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
-   if (RefPtr<CompositorVsyncDispatcher> cvd =
-@@ -33,6 +156,18 @@ void HeadlessCompositorWidget::NotifyClientSizeChanged(
-   *size = aClientSize;
- }
- 
++
++void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
++  if (RefPtr<CompositorVsyncDispatcher> cvd =
++          mWidget->GetCompositorVsyncDispatcher()) {
++    cvd->SetCompositorVsyncObserver(aObserver);
++  }
++}
++
++nsIWidget* HeadlessCompositorWidget::RealWidget() { return mWidget; }
++
++void HeadlessCompositorWidget::NotifyClientSizeChanged(
++    const LayoutDeviceIntSize& aClientSize) {
++  auto size = mClientSize.Lock();
++  *size = aClientSize;
++}
++
 +#if defined(GECKO_W10M)
 +void HeadlessCompositorWidget::NotifyOriginChanged(
 +    const LayoutDeviceIntPoint& aOrigin) {
@@ -32638,13 +32767,15 @@ index 8484851f67..9c2571bbe4 100644
 +}
 +#endif
 +
- LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
-   auto size = mClientSize.Lock();
-   return *size;
-@@ -42,5 +177,450 @@ uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
-   return reinterpret_cast<uintptr_t>(mWidget);
- }
- 
++LayoutDeviceIntSize HeadlessCompositorWidget::GetClientSize() {
++  auto size = mClientSize.Lock();
++  return *size;
++}
++
++uintptr_t HeadlessCompositorWidget::GetWidgetKey() {
++  return reinterpret_cast<uintptr_t>(mWidget);
++}
++
 +#if defined(GECKO_W10M)
 +already_AddRefed<gfx::DrawTarget>
 +HeadlessCompositorWidget::StartRemoteDrawingInRegion(
@@ -32801,8 +32932,8 @@ index 8484851f67..9c2571bbe4 100644
 +}
 +#endif
 +
- }  // namespace widget
- }  // namespace mozilla
++}  // namespace widget
++}  // namespace mozilla
 +
 +#if defined(GECKO_W10M)
 +// Read by the shell, which has no other way to see what Gecko drew. Frames are
@@ -32858,6 +32989,26 @@ index 8484851f67..9c2571bbe4 100644
 +            mozilla::LayoutDeviceIntPoint(aX, aY), 0, aDeltaX, aDeltaY, 0,
 +            nsIWidget::NativeModifiers::NO_MODIFIERS, 0, nullptr);
 +      }));
++}
++
++// For the shell's heartbeat: the engine's own D3D11 device, so its
++// GetDeviceRemovedReason can be polled from outside the renderer thread, and
++// the renderer thread's pulse/where counters from WebRender's device code.
++extern "C" uint32_t gecko_w10m_wr_pulse_rust();
++extern "C" uint32_t gecko_w10m_wr_where_rust();
++extern "C" __declspec(dllexport) void* gecko_w10m_gecko_device() {
++  auto* dm = mozilla::gfx::DeviceManagerDx::Get();
++  if (!dm) {
++    return nullptr;
++  }
++  RefPtr<ID3D11Device> device = dm->GetCompositorDevice();
++  return device.get();  // the manager keeps its own reference
++}
++extern "C" __declspec(dllexport) uint32_t gecko_w10m_wr_pulse() {
++  return gecko_w10m_wr_pulse_rust();
++}
++extern "C" __declspec(dllexport) uint32_t gecko_w10m_wr_where() {
++  return gecko_w10m_wr_where_rust();
 +}
 +
 +extern "C" __declspec(dllexport) int32_t gecko_w10m_frame_copy(

@@ -345,6 +345,44 @@ std::atomic<ULONGLONG> gLastFrameAt{0};
 std::atomic<HRESULT> gLastRemovedReason{S_OK};
 ID3D11Device* gProbeDevice = nullptr;
 
+// The engine's own device and renderer-thread counters, resolved from xul.dll
+// once it is loaded. The hardware path hides the window while the renderer
+// thread is inside its first content frame; polling from here tells whether
+// that thread is stuck in a GL call and whether the engine's device was reset.
+using DeviceFn = void* (*)();
+using CounterFn = uint32_t (*)();
+DeviceFn gGeckoDeviceFn = nullptr;
+CounterFn gWrPulseFn = nullptr;
+CounterFn gWrWhereFn = nullptr;
+std::atomic<HRESULT> gGeckoRemovedReason{S_OK};
+std::atomic<uint32_t> gLastWrPulse{0};
+std::atomic<unsigned> gWrStillBeats{0};
+
+void ResolveEngineProbes() {
+  if (gGeckoDeviceFn) {
+    return;
+  }
+  HMODULE xul = ::GetModuleHandleW(L"xul.dll");
+  if (!xul) {
+    return;
+  }
+  gGeckoDeviceFn = reinterpret_cast<DeviceFn>(::GetProcAddress(xul, "gecko_w10m_gecko_device"));
+  gWrPulseFn = reinterpret_cast<CounterFn>(::GetProcAddress(xul, "gecko_w10m_wr_pulse"));
+  gWrWhereFn = reinterpret_cast<CounterFn>(::GetProcAddress(xul, "gecko_w10m_wr_where"));
+  Log::WriteFromFault(std::wstring(L"engine probes: ") +
+                      (gGeckoDeviceFn ? L"device " : L"NO device ") +
+                      (gWrPulseFn ? L"pulse " : L"NO pulse ") +
+                      (gWrWhereFn ? L"where" : L"NO where"));
+}
+
+HRESULT GeckoDeviceRemovedReason() {
+  if (!gGeckoDeviceFn) {
+    return S_OK;
+  }
+  auto* device = static_cast<ID3D11Device*>(gGeckoDeviceFn());
+  return device ? device->GetDeviceRemovedReason() : S_OK;
+}
+
 DWORD WINAPI HeartbeatThread(LPVOID) {
   unsigned last = 0;
   unsigned beat = 0;
@@ -384,6 +422,32 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
                             Hex(static_cast<uintptr_t>(removed)) +
                             (removed == S_OK ? L" (alive)"
                                              : L" -- THE GPU WAS RESET"));
+      }
+    }
+    ResolveEngineProbes();
+    if (gGeckoDeviceFn) {
+      const HRESULT removed = GeckoDeviceRemovedReason();
+      if (removed != gGeckoRemovedReason.load()) {
+        gGeckoRemovedReason.store(removed);
+        Log::WriteFromFault(L"gpu: the ENGINE's device now says " +
+                            Hex(static_cast<uintptr_t>(removed)) +
+                            (removed == S_OK ? L" (alive)"
+                                             : L" -- THE ENGINE'S DEVICE WAS RESET"));
+      }
+    }
+    if (gWrPulseFn && gWrWhereFn) {
+      const uint32_t pulse = gWrPulseFn();
+      const uint32_t where = gWrWhereFn();
+      if (pulse == gLastWrPulse.load()) {
+        ++gWrStillBeats;
+      } else {
+        gWrStillBeats = 0;
+      }
+      gLastWrPulse.store(pulse);
+      line += L", wr pulse " + std::to_wstring(pulse) + L" where " +
+              std::to_wstring(where);
+      if (where != 0 && gWrStillBeats.load() >= 2) {
+        line += L" -- THE RENDERER THREAD IS STUCK THERE";
       }
     }
     if (beat % 4 == 0) {
@@ -536,6 +600,14 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   if (gProbeDevice) {
     Log::WriteFromFault(L"first-chance: gpu device removed reason " +
                         Hex(static_cast<uintptr_t>(gProbeDevice->GetDeviceRemovedReason())));
+  }
+  if (gGeckoDeviceFn) {
+    Log::WriteFromFault(L"first-chance: the ENGINE's device removed reason " +
+                        Hex(static_cast<uintptr_t>(GeckoDeviceRemovedReason())));
+  }
+  if (gWrPulseFn && gWrWhereFn) {
+    Log::WriteFromFault(L"first-chance: wr pulse " + std::to_wstring(gWrPulseFn()) +
+                        L" where " + std::to_wstring(gWrWhereFn()));
   }
   Log::WriteFromFault(L"first-chance: code" + Registers(*info->ContextRecord));
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
