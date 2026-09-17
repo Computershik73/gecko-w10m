@@ -10,6 +10,7 @@
 #include <delayimp.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <string>
 
@@ -1528,6 +1529,120 @@ DWORD WINAPI CompositionChainThread(LPVOID) {
   return 0;
 }
 
+// --- ANGLE, step by step -------------------------------------------------------
+//
+// With software WebRender the browser lives: 85 seconds, typing, pages, the
+// keyboard up and down, and a normal exit. Everything else in that
+// configuration is what the dying builds had. The one thing missing is ANGLE
+// coming up -- the EGL display and renderer the engine makes when its window's
+// compositor starts, panel or no panel.
+//
+// So the shell brings ANGLE up itself, here, on the shell's own device, in the
+// steps the engine takes, three seconds apart, saying each one. Whichever
+// step the window is hidden after is the call to fix; if all of them pass,
+// it is something the engine does on top of ANGLE and not ANGLE itself.
+using EGLDisplayT = void*;
+using EGLConfigT = void*;
+using EGLContextT = void*;
+using EGLSurfaceT = void*;
+using EGLDeviceEXTT = void*;
+using EGLBooleanT = unsigned;
+using EGLintT = int;
+using eglGetProcAddressFn = void* (*)(const char*);
+using eglCreateDeviceANGLEFn = EGLDeviceEXTT (*)(EGLintT, void*, const intptr_t*);
+using eglGetPlatformDisplayEXTFn = EGLDisplayT (*)(EGLintT, void*, const EGLintT*);
+using eglInitializeFn = EGLBooleanT (*)(EGLDisplayT, EGLintT*, EGLintT*);
+using eglChooseConfigFn = EGLBooleanT (*)(EGLDisplayT, const EGLintT*, EGLConfigT*, EGLintT, EGLintT*);
+using eglCreateContextFn = EGLContextT (*)(EGLDisplayT, EGLConfigT, EGLContextT, const EGLintT*);
+using eglCreatePbufferSurfaceFn = EGLSurfaceT (*)(EGLDisplayT, EGLConfigT, const EGLintT*);
+using eglMakeCurrentFn = EGLBooleanT (*)(EGLDisplayT, EGLSurfaceT, EGLSurfaceT, EGLContextT);
+using eglGetErrorFn = EGLintT (*)();
+using glClearColorFn = void (*)(float, float, float, float);
+using glClearFn = void (*)(unsigned);
+using glFinishFn = void (*)();
+
+DWORD WINAPI AngleStepsThread(LPVOID) {
+  ::Sleep(3000);
+  HMODULE egl = ::LoadPackagedLibrary(L"libEGL.dll", 0);
+  HMODULE gles = ::LoadPackagedLibrary(L"libGLESv2.dll", 0);
+  if (!egl || !gles) {
+    Log::WriteFromFault(L"anglestep: libEGL or libGLESv2 would not load");
+    return 0;
+  }
+  auto getProc = reinterpret_cast<eglGetProcAddressFn>(::GetProcAddress(egl, "eglGetProcAddress"));
+  auto initialize = reinterpret_cast<eglInitializeFn>(::GetProcAddress(egl, "eglInitialize"));
+  auto chooseConfig = reinterpret_cast<eglChooseConfigFn>(::GetProcAddress(egl, "eglChooseConfig"));
+  auto createContext = reinterpret_cast<eglCreateContextFn>(::GetProcAddress(egl, "eglCreateContext"));
+  auto createPbuffer = reinterpret_cast<eglCreatePbufferSurfaceFn>(::GetProcAddress(egl, "eglCreatePbufferSurface"));
+  auto makeCurrent = reinterpret_cast<eglMakeCurrentFn>(::GetProcAddress(egl, "eglMakeCurrent"));
+  auto getError = reinterpret_cast<eglGetErrorFn>(::GetProcAddress(egl, "eglGetError"));
+  auto clearColor = reinterpret_cast<glClearColorFn>(::GetProcAddress(gles, "glClearColor"));
+  auto clear = reinterpret_cast<glClearFn>(::GetProcAddress(gles, "glClear"));
+  auto finish = reinterpret_cast<glFinishFn>(::GetProcAddress(gles, "glFinish"));
+  if (!getProc || !initialize || !chooseConfig || !createContext || !createPbuffer ||
+      !makeCurrent || !getError || !clearColor || !clear || !finish) {
+    Log::WriteFromFault(L"anglestep: an EGL or GL entry point is missing");
+    return 0;
+  }
+  auto createDevice = reinterpret_cast<eglCreateDeviceANGLEFn>(getProc("eglCreateDeviceANGLE"));
+  auto getPlatformDisplay = reinterpret_cast<eglGetPlatformDisplayEXTFn>(getProc("eglGetPlatformDisplayEXT"));
+  if (!createDevice || !getPlatformDisplay) {
+    Log::WriteFromFault(L"anglestep: eglCreateDeviceANGLE or eglGetPlatformDisplayEXT is missing");
+    return 0;
+  }
+  auto say = [&](const wchar_t* what) {
+    Log::WriteFromFault(std::wstring(L"anglestep: ") + what + L" -- egl error " +
+                        Hex(static_cast<uintptr_t>(getError())) +
+                        L"; if the window is hidden in the next three seconds, this step did it");
+    Log::FlushFromFault();
+    ::Sleep(3000);
+  };
+
+  // 1. the display, the way the engine makes it: from the D3D11 device.
+  const EGLintT kD3D11Device = 0x33A1;          // EGL_D3D11_DEVICE_ANGLE
+  const EGLintT kPlatformDevice = 0x313F;        // EGL_PLATFORM_DEVICE_EXT
+  EGLDeviceEXTT device = createDevice(kD3D11Device, gProbeDevice, nullptr);
+  const EGLintT none[] = {0x3038};
+  EGLDisplayT display = device ? getPlatformDisplay(kPlatformDevice, device, none) : nullptr;
+  EGLintT major = 0, minor = 0;
+  const bool inited = display && initialize(display, &major, &minor);
+  say(inited ? L"1: display made and initialised" : L"1: display FAILED");
+  if (!inited) return 0;
+
+  // 2. a config and a context.
+  const EGLintT configAttribs[] = {0x3033, 0x0001,   // SURFACE_TYPE: PBUFFER
+                                   0x3040, 0x0004,   // RENDERABLE_TYPE: ES2
+                                   0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8,  // RGBA 8
+                                   0x3038};
+  EGLConfigT config = nullptr; EGLintT count = 0;
+  chooseConfig(display, configAttribs, &config, 1, &count);
+  const EGLintT ctxAttribs[] = {0x3098, 2, 0x3038};  // CONTEXT_CLIENT_VERSION 2
+  EGLContextT context = count ? createContext(display, config, nullptr, ctxAttribs) : nullptr;
+  say(context ? L"2: context made" : L"2: context FAILED");
+  if (!context) return 0;
+
+  // 3. an offscreen surface.
+  const EGLintT pbAttribs[] = {0x3057, 64, 0x3056, 64, 0x3038};  // WIDTH, HEIGHT
+  EGLSurfaceT surface = createPbuffer(display, config, pbAttribs);
+  say(surface ? L"3: pbuffer made" : L"3: pbuffer FAILED");
+  if (!surface) return 0;
+
+  // 4. current.
+  const bool current = makeCurrent(display, surface, surface, context);
+  say(current ? L"4: made current" : L"4: MakeCurrent FAILED");
+  if (!current) return 0;
+
+  // 5. a drawn frame.
+  clearColor(0.2f, 0.4f, 0.6f, 1.0f);
+  clear(0x00004000);  // GL_COLOR_BUFFER_BIT
+  finish();
+  say(L"5: cleared and finished");
+
+  Log::WriteFromFault(L"anglestep: all five steps passed with the window still up");
+  Log::FlushFromFault();
+  return 0;
+}
+
 void MakeSecondD3DDevice() {
   HMODULE d3d11 = ::LoadLibraryExW(L"d3d11.dll", nullptr,
                                    LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1596,6 +1711,8 @@ void MakeSecondD3DDevice() {
   // its views after that is the shape of a navigation client asserting on a
   // hide.
   Log::Write(L"gpu: watching the shell's device for a reset");
+  HANDLE steps = ::CreateThread(nullptr, 0, &AngleStepsThread, nullptr, 0, nullptr);
+  if (steps) ::CloseHandle(steps);
 }
 
 void SetProbeSurfaceSize(int width, int height) {
