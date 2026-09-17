@@ -646,6 +646,213 @@ bool ReplaceSlot(void** slot, void* replacement, void** original) {
   return true;
 }
 
+// --- windows -----------------------------------------------------------------
+//
+// The window is hidden with nothing raised and none of the shell's own signals
+// -- no EnteredBackground, no Consolidated, the splash dismissed in the first
+// second. On a phone one top-level window is visible at a time, and the one
+// thing that makes a visible window stop being visible without the shell's
+// hand in it is another window being shown in front of it. The engine creates
+// windows: USER32!CreateWindowExW is among the delayed imports it has actually
+// resolved. These say what it creates, shows and raises, and when.
+//
+// Delay-loaded, so the slots live in the delay-load IAT, and a slot not yet
+// resolved holds the address of the resolver thunk rather than of USER32. The
+// real function is therefore looked up directly and the slot's old value is
+// never called.
+using CreateWindowExWFn = HWND(WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int,
+                                        int, int, HWND, HMENU, HINSTANCE, LPVOID);
+using ShowWindowFn = BOOL(WINAPI*)(HWND, int);
+using SetWindowPosFn = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+using HwndToBoolFn = BOOL(WINAPI*)(HWND);
+using HwndToHwndFn = HWND(WINAPI*)(HWND);
+using SetWindowLongWFn = LONG(WINAPI*)(HWND, int, LONG);
+
+CreateWindowExWFn gRealCreateWindowExW = nullptr;
+ShowWindowFn gRealShowWindow = nullptr;
+ShowWindowFn gRealShowWindowAsync = nullptr;
+SetWindowPosFn gRealSetWindowPos = nullptr;
+HwndToBoolFn gRealSetForegroundWindow = nullptr;
+HwndToHwndFn gRealSetActiveWindow = nullptr;
+HwndToHwndFn gRealSetFocus = nullptr;
+HwndToBoolFn gRealDestroyWindow = nullptr;
+HwndToBoolFn gRealBringWindowToTop = nullptr;
+SetWindowLongWFn gRealSetWindowLongW = nullptr;
+
+std::wstring HwndLabel(HWND hwnd) { return Hex(reinterpret_cast<uintptr_t>(hwnd)); }
+
+std::wstring ClassLabel(LPCWSTR cls) {
+  if (!cls) return L"(null)";
+  // An atom rather than a string, when the high word is clear.
+  if ((reinterpret_cast<uintptr_t>(cls) >> 16) == 0) {
+    return L"atom " + std::to_wstring(reinterpret_cast<uintptr_t>(cls));
+  }
+  return L"[" + std::wstring(cls) + L"]";
+}
+
+void WinNote(const std::wstring& line) {
+  Log::WriteFromFault(L"win: " + line + L", thread " +
+                      std::to_wstring(::GetCurrentThreadId()));
+  Log::FlushFromFault();
+}
+
+HWND WINAPI HookCreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name,
+                                DWORD style, int x, int y, int w, int h,
+                                HWND parent, HMENU menu, HINSTANCE inst,
+                                LPVOID param) {
+  HWND made = gRealCreateWindowExW
+                  ? gRealCreateWindowExW(exStyle, cls, name, style, x, y, w, h,
+                                         parent, menu, inst, param)
+                  : nullptr;
+  WinNote(L"CreateWindowExW class " + ClassLabel(cls) + L" title " +
+          (name ? L"[" + std::wstring(name) + L"]" : L"(null)") + L" style " +
+          Hex(style) + L" ex " + Hex(exStyle) + L" parent " + HwndLabel(parent) +
+          L" at " + std::to_wstring(x) + L"," + std::to_wstring(y) + L" " +
+          std::to_wstring(w) + L"x" + std::to_wstring(h) + L" -> " +
+          HwndLabel(made) +
+          (style & 0x10000000u ? L"  VISIBLE FROM BIRTH" : L""));
+  return made;
+}
+
+BOOL WINAPI HookShowWindow(HWND hwnd, int cmd) {
+  WinNote(L"ShowWindow " + HwndLabel(hwnd) + L" cmd " + std::to_wstring(cmd));
+  return gRealShowWindow ? gRealShowWindow(hwnd, cmd) : FALSE;
+}
+
+BOOL WINAPI HookShowWindowAsync(HWND hwnd, int cmd) {
+  WinNote(L"ShowWindowAsync " + HwndLabel(hwnd) + L" cmd " + std::to_wstring(cmd));
+  return gRealShowWindowAsync ? gRealShowWindowAsync(hwnd, cmd) : FALSE;
+}
+
+BOOL WINAPI HookSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy,
+                             UINT flags) {
+  WinNote(L"SetWindowPos " + HwndLabel(hwnd) + L" after " + HwndLabel(after) +
+          L" at " + std::to_wstring(x) + L"," + std::to_wstring(y) + L" " +
+          std::to_wstring(cx) + L"x" + std::to_wstring(cy) + L" flags " +
+          Hex(flags));
+  return gRealSetWindowPos ? gRealSetWindowPos(hwnd, after, x, y, cx, cy, flags)
+                           : FALSE;
+}
+
+BOOL WINAPI HookSetForegroundWindow(HWND hwnd) {
+  WinNote(L"SetForegroundWindow " + HwndLabel(hwnd));
+  return gRealSetForegroundWindow ? gRealSetForegroundWindow(hwnd) : FALSE;
+}
+
+HWND WINAPI HookSetActiveWindow(HWND hwnd) {
+  WinNote(L"SetActiveWindow " + HwndLabel(hwnd));
+  return gRealSetActiveWindow ? gRealSetActiveWindow(hwnd) : nullptr;
+}
+
+HWND WINAPI HookSetFocus(HWND hwnd) {
+  WinNote(L"SetFocus " + HwndLabel(hwnd));
+  return gRealSetFocus ? gRealSetFocus(hwnd) : nullptr;
+}
+
+BOOL WINAPI HookDestroyWindow(HWND hwnd) {
+  WinNote(L"DestroyWindow " + HwndLabel(hwnd));
+  return gRealDestroyWindow ? gRealDestroyWindow(hwnd) : FALSE;
+}
+
+BOOL WINAPI HookBringWindowToTop(HWND hwnd) {
+  WinNote(L"BringWindowToTop " + HwndLabel(hwnd));
+  return gRealBringWindowToTop ? gRealBringWindowToTop(hwnd) : FALSE;
+}
+
+LONG WINAPI HookSetWindowLongW(HWND hwnd, int index, LONG value) {
+  WinNote(L"SetWindowLongW " + HwndLabel(hwnd) + L" index " +
+          std::to_wstring(index) + L" value " + Hex(static_cast<uintptr_t>(value)));
+  return gRealSetWindowLongW ? gRealSetWindowLongW(hwnd, index, value) : 0;
+}
+
+struct WindowHook {
+  const char* name;
+  void* replacement;
+  void** real;
+};
+
+const WindowHook kWindowHooks[] = {
+    {"CreateWindowExW", reinterpret_cast<void*>(&HookCreateWindowExW),
+     reinterpret_cast<void**>(&gRealCreateWindowExW)},
+    {"ShowWindow", reinterpret_cast<void*>(&HookShowWindow),
+     reinterpret_cast<void**>(&gRealShowWindow)},
+    {"ShowWindowAsync", reinterpret_cast<void*>(&HookShowWindowAsync),
+     reinterpret_cast<void**>(&gRealShowWindowAsync)},
+    {"SetWindowPos", reinterpret_cast<void*>(&HookSetWindowPos),
+     reinterpret_cast<void**>(&gRealSetWindowPos)},
+    {"SetForegroundWindow", reinterpret_cast<void*>(&HookSetForegroundWindow),
+     reinterpret_cast<void**>(&gRealSetForegroundWindow)},
+    {"SetActiveWindow", reinterpret_cast<void*>(&HookSetActiveWindow),
+     reinterpret_cast<void**>(&gRealSetActiveWindow)},
+    {"SetFocus", reinterpret_cast<void*>(&HookSetFocus),
+     reinterpret_cast<void**>(&gRealSetFocus)},
+    {"DestroyWindow", reinterpret_cast<void*>(&HookDestroyWindow),
+     reinterpret_cast<void**>(&gRealDestroyWindow)},
+    {"BringWindowToTop", reinterpret_cast<void*>(&HookBringWindowToTop),
+     reinterpret_cast<void**>(&gRealBringWindowToTop)},
+    {"SetWindowLongW", reinterpret_cast<void*>(&HookSetWindowLongW),
+     reinterpret_cast<void**>(&gRealSetWindowLongW)},
+};
+
+// The same eight words as DelayDescriptor below, which is declared after this
+// is needed.
+struct DelayDescriptorEarly {
+  DWORD attributes, nameRva, moduleHandleRva, iatRva, intRva, boundIatRva,
+      unloadIatRva, timestamp;
+};
+
+int HookWindowImports(HMODULE module) {
+  auto* base = reinterpret_cast<unsigned char*>(module);
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+  DWORD rva = nt->OptionalHeader
+                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+                  .VirtualAddress;
+  if (!rva) return 0;
+
+  HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+  if (!user32) {
+    user32 = ::LoadLibraryExW(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  }
+  if (!user32) {
+    Log::WriteFromFault(L"win: no user32 to forward to, windows not watched");
+    return 0;
+  }
+
+  int hooked = 0;
+  auto* desc = reinterpret_cast<DelayDescriptorEarly*>(base + rva);
+  for (; desc->nameRva; ++desc) {
+    if (!(desc->attributes & 1) || !desc->intRva || !desc->iatRva) continue;
+    const char* moduleName = reinterpret_cast<const char*>(base + desc->nameRva);
+    if (_stricmp(moduleName, "USER32.dll") != 0) continue;
+
+    auto* names = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->intRva);
+    auto* slots = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->iatRva);
+    for (; names->u1.AddressOfData; ++names, ++slots) {
+      if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+      auto* byName =
+          reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+      for (const WindowHook& hook : kWindowHooks) {
+        if (std::strcmp(byName->Name, hook.name) != 0) continue;
+        FARPROC real = ::GetProcAddress(user32, hook.name);
+        if (!real) {
+          Log::WriteFromFault(L"win: " + Widen(hook.name) +
+                              L" is not in this user32, left alone");
+          break;
+        }
+        *hook.real = reinterpret_cast<void*>(real);
+        void* ignored = nullptr;
+        void** slot = reinterpret_cast<void**>(&slots->u1.Function);
+        if (ReplaceSlot(slot, hook.replacement, &ignored)) ++hooked;
+        break;
+      }
+    }
+  }
+  Log::WriteFromFault(L"win: watching " + std::to_wstring(hooked) +
+                      L" window calls out of the engine");
+  return hooked;
+}
+
 int HookImports(HMODULE module) {
   auto* base = reinterpret_cast<unsigned char*>(module);
   auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -1328,6 +1535,7 @@ void InstallEngineProbes() {
   if (!xul) return;
 
   ProbeDelayLoads(xul);
+  HookWindowImports(xul);
 
   // Anything the engine reports as a raw address -- and it has no way to
   // report anything else -- is only meaningful against the base it was loaded
