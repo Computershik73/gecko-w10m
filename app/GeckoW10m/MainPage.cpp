@@ -144,7 +144,7 @@ MainPage::MainPage() {
   {
     const std::wstring counter =
         std::wstring(ApplicationData::Current().LocalFolder().Path()) +
-        L"\launches.txt";
+        L"\\launches.txt";
     if (FILE* f = _wfopen(counter.c_str(), L"r")) {
       fscanf_s(f, "%d", &launches_);
       fclose(f);
