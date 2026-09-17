@@ -225,6 +225,19 @@ bool IsFatal(DWORD code) {
     case EXCEPTION_INT_DIVIDE_BY_ZERO:
     case EXCEPTION_BREAKPOINT:
     case STATUS_HEAP_CORRUPTION:
+    // The fail-fast family, which this filter has been dropping on the floor
+    // for the whole project. A stack cookie check, a Control Flow Guard
+    // violation, abort(), an invalid CRT parameter and every MOZ_RELEASE_ASSERT
+    // that goes through RaiseFailFastException end the process with one of
+    // these -- and being outside this switch, they were reported as nothing at
+    // all. The hardware build dies with no first-chance of any kind before the
+    // compositor's teardown, and this is the most likely reason we cannot see
+    // it.
+    case 0xC0000409:  // STATUS_STACK_BUFFER_OVERRUN -- also __fastfail
+    case 0xC0000602:  // STATUS_FAIL_FAST_EXCEPTION
+    case 0xC0000417:  // STATUS_INVALID_CRUNTIME_PARAMETER
+    case 0xC0000420:  // STATUS_ASSERTION_FAILURE
+    case 0xC000041D:  // STATUS_FATAL_USER_CALLBACK_EXCEPTION
       return true;
     default:
       return false;
@@ -1292,7 +1305,11 @@ void InstallEngineProbes() {
   // mozglue and nss3 reach the same exits and load the same way, and a call
   // through either of them would otherwise pass unseen.
   int hooked = 0;
-  for (const wchar_t* name : {L"xul.dll", L"mozglue.dll", L"nss3.dll"}) {
+  // ucrtbase is on the list because abort() lives there, and abort() reaches
+  // TerminateProcess through ucrtbase's own import table, not xul's -- so
+  // every abort in the engine has passed these hooks untouched.
+  for (const wchar_t* name :
+       {L"xul.dll", L"mozglue.dll", L"nss3.dll", L"ucrtbase.dll"}) {
     HMODULE module = ::LoadPackagedLibrary(name, 0);
     if (!module) {
       Log::WriteFromFault(std::wstring(L"probe crash: ") + name + L" not loaded");

@@ -163,18 +163,25 @@ if [ -d "$DIST" ]; then
   if [ -d "$STAGE/browser/defaults/preferences" ]; then
     cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
 // GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
-// The control experiment, and a browser that works while it runs.
+// Back on. The control experiment answered: with the GPU path switched off
+// entirely the window was still hidden, so nothing about the swap chain hides
+// it -- but the software build died of its own separate fault on the way, in
+// CompositorD3D11::Initialize, which is the line below.
+pref("gfx.webrender.software", false);
+
+// Never the D3D11 software compositor, whichever way the pref above goes.
 //
-// With this true, RenderCompositor::Create takes the software branch and
-// returns before it ever reaches the GECKO_W10M one: no EGL surface, no
-// composition swap chain, no panel handed to ANGLE. Everything else about the
-// build is identical. So if "window: NOT visible any more" still appears half
-// a minute in, the thing that hides this window is not the GPU path and never
-// was; if it does not, it is, and the hunt has a floor to stand on.
-//
-// The hardware path is not removed by this and not one line of it has changed.
-// It is this pref away.
-pref("gfx.webrender.software", true);
+// RenderCompositorD3D11SWGL::Create builds a CompositorD3D11, and
+// CompositorD3D11::Initialize reaches through the widget for an HWND. This
+// widget is headless and has none, so it reads 0x1c out of a null pointer and
+// the engine dies -- which is exactly what the software control did, on an
+// NSPR thread, thirteen instructions into Initialize. It only became reachable
+// when headless stopped force-disabling hardware compositing for the sake of
+// the GPU path, so it is my regression, and this is the pref that closes it:
+// CompositorOptions::AllowSoftwareWebRenderD3D11 gates that whole branch, and
+// with it false the software path falls through to RenderCompositorSWGL, which
+// wants no window at all.
+pref("gfx.webrender.software.d3d11", false);
 
 // The XAML compositor dies about two and a half seconds after these load, and
 // the last thing in the log before it is always the same run: mozavcodec,
