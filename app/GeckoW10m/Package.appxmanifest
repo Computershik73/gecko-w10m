@@ -24,7 +24,7 @@
   <Identity
       Name="GeckoW10m.W10M"
       Publisher="CN=GeckoW10m"
-      Version="0.2.5.6"
+      Version="0.2.6.1"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -67,15 +67,43 @@
       </uap:VisualElements>
 
       <Extensions>
-        <!-- Register gecko_w10m:// and default-browser protocol handling. -->
+        <!--
+          What makes the phone offer GeckoW10m under Settings > System >
+          Default apps > Web browser: an app registered for both http and
+          https, with a name and an icon to show there. The app is then
+          activated with the URL, which App::OnActivated passes to the engine.
+        -->
         <uap:Extension Category="windows.protocol">
-          <uap:Protocol Name="gecko_w10m" />
+          <uap:Protocol Name="http">
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+          </uap:Protocol>
         </uap:Extension>
         <uap:Extension Category="windows.protocol">
-          <uap:Protocol Name="http" />
+          <uap:Protocol Name="https">
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+          </uap:Protocol>
         </uap:Extension>
         <uap:Extension Category="windows.protocol">
-          <uap:Protocol Name="https" />
+          <uap:Protocol Name="gecko_w10m">
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+
+        <!-- Local pages, so "open with" offers the browser for them too. -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="geckow10mweb">
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <uap:DisplayName>Web page</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.html</uap:FileType>
+              <uap:FileType>.htm</uap:FileType>
+              <uap:FileType>.xhtml</uap:FileType>
+              <uap:FileType>.svg</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
         </uap:Extension>
       </Extensions>
     </Application>

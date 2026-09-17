@@ -3,6 +3,7 @@
 
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Interop.h>
+#include <winrt/Windows.Storage.h>
 
 #include "MainPage.h"
 #include "client/Log.h"
@@ -110,9 +111,45 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     Window::Current().Activate();
   }
 
-  void OnActivated(IActivatedEventArgs const&) {
-    // Protocol activation (gecko_w10m:// , http:// , https://) lands here.
+  void OnActivated(IActivatedEventArgs const& args) {
+    // This is how the phone hands a browser a link: it activates the app that
+    // is registered for http and https with the URL. Without this the app
+    // merely opened, which is what "default browser" looked like before.
+    std::wstring url;
+    try {
+      const auto kind = args.Kind();
+      client::Log::Write(L"activation: kind " +
+                         std::to_wstring(static_cast<int>(kind)));
+      if (kind == ActivationKind::Protocol) {
+        auto protocolArgs = args.as<ProtocolActivatedEventArgs>();
+        if (auto uri = protocolArgs.Uri()) {
+          url = uri.AbsoluteUri();
+        }
+      } else if (kind == ActivationKind::File) {
+        auto fileArgs = args.as<FileActivatedEventArgs>();
+        auto files = fileArgs.Files();
+        if (files && files.Size() > 0) {
+          if (auto file =
+                  files.GetAt(0)
+                      .try_as<winrt::Windows::Storage::IStorageItem>()) {
+            // A local file is a URL like any other once it has a scheme.
+            std::wstring path(file.Path());
+            for (auto& ch : path) {
+              if (ch == L'\\') ch = L'/';
+            }
+            url = L"file:///" + path;
+          }
+        }
+      }
+    } catch (winrt::hresult_error const& error) {
+      client::Log::Write(L"activation: could not read it",
+                         std::wstring(error.message()));
+    }
+
     EnsureContent();
+    if (!url.empty() && page_) {
+      page_->OpenExternalUrl(url);
+    }
     Window::Current().Activate();
   }
 

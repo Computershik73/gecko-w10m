@@ -25,6 +25,13 @@ using namespace winrt::Windows::UI::Xaml::Media::Imaging;
 using winrt::Windows::UI::ViewManagement::InputPane;
 
 namespace gecko_w10m::client {
+
+namespace {
+// The UI thread's dispatcher, kept for the launcher callback, which is called
+// from Gecko's threads and has no way to ask for one.
+winrt::Windows::UI::Core::CoreDispatcher gUiDispatcher{nullptr};
+}  // namespace
+
 namespace {
 // Set by ANGLE's logger, which is a plain function pointer and can carry no
 // state of its own.
@@ -54,6 +61,12 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     panel_.VerticalAlignment(VerticalAlignment::Stretch);
   } else {
     panelWithheld_ = true;
+  }
+
+  try {
+    gUiDispatcher =
+        winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Dispatcher();
+  } catch (winrt::hresult_error const&) {
   }
 
   image_ = Image();
@@ -304,6 +317,16 @@ bool EngineView::Resolve() {
   touch_ = reinterpret_cast<TouchFn>(::GetProcAddress(xul, "gecko_w10m_input_touch"));
   screen_fn_ =
       reinterpret_cast<ScreenFn>(::GetProcAddress(xul, "gecko_w10m_set_screen"));
+  open_url_ =
+      reinterpret_cast<OpenUrlFn>(::GetProcAddress(xul, "gecko_w10m_open_url"));
+  if (!set_launcher_) {
+    set_launcher_ = reinterpret_cast<SetLauncherFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_uri_launcher"));
+    if (set_launcher_) {
+      set_launcher_(&LaunchSystemUri);
+      Log::Write(L"open: the engine can now hand system URIs to the shell");
+    }
+  }
   if (screen_fn_ && screenWidth_ > 0) {
     screen_fn_(screenWidth_, screenHeight_);
   }
@@ -516,6 +539,51 @@ void EngineView::FollowTextInput() {
   }
 }
 
+// Gecko calls this from its main thread; Launcher wants the UI thread, so
+// the work is posted to the dispatcher captured when the view was built.
+void EngineView::LaunchSystemUri(const char* utf8) {
+  if (!utf8 || !*utf8 || !gUiDispatcher) {
+    return;
+  }
+  const int size =
+      ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+  if (size <= 1) {
+    return;
+  }
+  std::wstring wide(static_cast<size_t>(size) - 1, L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(), size);
+
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+      [wide]() {
+        try {
+          winrt::Windows::Foundation::Uri uri(winrt::hstring{wide});
+          winrt::Windows::System::Launcher::LaunchUriAsync(uri);
+          Log::Write(L"open: asked the system to open " + wide);
+        } catch (winrt::hresult_error const& error) {
+          Log::Write(L"open: the system refused " + wide,
+                     std::wstring(error.message()));
+        }
+      });
+}
+
+void EngineView::OpenUrl(std::wstring_view url) {
+  if (url.empty()) {
+    return;
+  }
+  const int size = ::WideCharToMultiByte(CP_UTF8, 0, url.data(),
+                                         static_cast<int>(url.size()), nullptr,
+                                         0, nullptr, nullptr);
+  std::string utf8(size > 0 ? size : 0, '\0');
+  if (size > 0) {
+    ::WideCharToMultiByte(CP_UTF8, 0, url.data(), static_cast<int>(url.size()),
+                          utf8.data(), size, nullptr, nullptr);
+  }
+  pendingUrl_ = std::move(utf8);
+  lastOpenAttempt_ = 0;
+  Log::Write(L"open: the phone handed us " + std::wstring(url));
+}
+
 void EngineView::SyncKeyboardMargin() {
   if (!host_) {
     return;
@@ -558,6 +626,19 @@ void EngineView::Tick() {
 
   if (!Resolve()) {
     return;
+  }
+
+  // A URL from outside waits here for a browser window to exist. The engine
+  // answers 0 while it has none, so this simply keeps asking.
+  if (!pendingUrl_.empty() && open_url_) {
+    const unsigned long long now = ::GetTickCount64();
+    if (!lastOpenAttempt_ || now - lastOpenAttempt_ >= 1000) {
+      lastOpenAttempt_ = now;
+      if (open_url_(pendingUrl_.c_str()) == 1) {
+        Log::Write(L"open: the engine took the URL");
+        pendingUrl_.clear();
+      }
+    }
   }
   // Taking focus and raising the keyboard are not things to do from in here.
   // This runs inside CompositionTarget::Rendering -- XAML's own render pass --

@@ -596,6 +596,13 @@ void MainPage::AppendLogLine(std::wstring line) {
   logScroller_.ChangeView(nullptr, logScroller_.ScrollableHeight(), nullptr);
 }
 
+void MainPage::OpenExternalUrl(std::wstring_view url) {
+  client::Log::Write(L"open: activation with " + std::wstring(url));
+  if (engineView_) {
+    engineView_->OpenUrl(url);
+  }
+}
+
 void MainPage::Navigate(std::wstring_view entry) {
   using client::Log;
 

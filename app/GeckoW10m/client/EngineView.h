@@ -50,6 +50,12 @@ class EngineView {
   // room then stayed short, with the browser in the top half of the screen
   // and the placeholder showing under it.
   void SyncKeyboardMargin();
+  // Hands a URL to the engine as soon as it can take one. Safe to call before
+  // the engine has started.
+  void OpenUrl(std::wstring_view url);
+  // Handed to the engine so it can open mailto:, tel: and ms-settings: URIs
+  // through the system. Static because the engine keeps a plain pointer.
+  static void LaunchSystemUri(const char* utf8);
   // Which half of the swap-chain hand-over this launch leaves out, if any:
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.
@@ -114,6 +120,8 @@ class EngineView {
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using TouchFn = void (*)(int32_t pointerId, int32_t state, int32_t x, int32_t y);
   using ScreenFn = void (*)(int32_t width, int32_t height);
+  using OpenUrlFn = int32_t (*)(const char* url);
+  using SetLauncherFn = void (*)(void (*)(const char*));
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
   using PanelScaleFn = void (*)(float x, float y);
@@ -130,6 +138,13 @@ class EngineView {
   ResizeFn resize_ = nullptr;
   TouchFn touch_ = nullptr;
   ScreenFn screen_fn_ = nullptr;
+  OpenUrlFn open_url_ = nullptr;
+  SetLauncherFn set_launcher_ = nullptr;
+  // A URL the phone handed us -- from a tap on a link in another app, or from
+  // this being the browser it opens links with. Kept until the engine has a
+  // window to put it in.
+  std::string pendingUrl_;
+  unsigned long long lastOpenAttempt_ = 0;
   int32_t screenWidth_ = 0;
   int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;

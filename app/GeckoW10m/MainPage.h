@@ -18,6 +18,10 @@ class MainPage {
   // The root visual to set as Window content.
   winrt::Windows::UI::Xaml::UIElement Root() const { return root_; }
 
+  // A URL from outside the app: another app launching us for a link, or this
+  // being the system's browser. Opens in the running browser as a new tab.
+  void OpenExternalUrl(std::wstring_view url);
+
  private:
   void BuildUi();
   void WireEngine();

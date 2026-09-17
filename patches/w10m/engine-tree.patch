@@ -238,10 +238,10 @@ index 36e7517b4a..9d4ef3bc9f 100644
    mozilla::CreateAndStorePreXULSkeletonUI(GetModuleHandle(nullptr), argc, argv);
  
 diff --git a/browser/components/preferences/config/about-firefox.mjs b/browser/components/preferences/config/about-firefox.mjs
-index 18124ddaa2..355a3b0b81 100644
+index 18124ddaa2..5f4755a809 100644
 --- a/browser/components/preferences/config/about-firefox.mjs
 +++ b/browser/components/preferences/config/about-firefox.mjs
-@@ -1,590 +1,670 @@
+@@ -1,590 +1,679 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 - * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1117,6 +1117,7 @@ index 18124ddaa2..355a3b0b81 100644
 +Preferences.addSetting({ id: "geckoW10mPortTelegram" });
 +Preferences.addSetting({ id: "geckoW10mPortDonate" });
 +Preferences.addSetting({ id: "geckoW10mPortDonateAbroad" });
++Preferences.addSetting({ id: "geckoW10mDefaultBrowser" });
 +
 +Preferences.addSetting({
 +  id: "disableShowUpdateHistory",
@@ -1435,6 +1436,14 @@ index 18124ddaa2..355a3b0b81 100644
 +        id: "geckoW10mPortGroup",
 +        control: "moz-box-group",
 +        items: [
++          {
++            id: "geckoW10mDefaultBrowser",
++            l10nId: "gecko-w10m-default-browser",
++            control: "moz-box-link",
++            controlAttrs: {
++              href: "ms-settings:defaultapps",
++            },
++          },
 +          {
 +            id: "geckoW10mPortAuthor",
 +            l10nId: "gecko-w10m-port-author",
@@ -3871,10 +3880,10 @@ index 9a3da29023..5318768c58 100644
  #include "nsWindowsShellServiceInternal.h"
  #include "WindowsShellServiceRust.h"
 diff --git a/browser/locales/en-US/browser/preferences/preferences.ftl b/browser/locales/en-US/browser/preferences/preferences.ftl
-index 8227dc4b84..c70962c5e2 100644
+index 8227dc4b84..0bccd9c84c 100644
 --- a/browser/locales/en-US/browser/preferences/preferences.ftl
 +++ b/browser/locales/en-US/browser/preferences/preferences.ftl
-@@ -1,2792 +1,2815 @@
+@@ -1,2792 +1,2819 @@
 -# This Source Code Form is subject to the terms of the Mozilla Public
 -# License, v. 2.0. If a copy of the MPL was not distributed with this
 -# file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -7487,6 +7496,10 @@ index 8227dc4b84..c70962c5e2 100644
 +gecko-w10m-port-heading =
 +    .label = О порте на Windows 10 Mobile
 +    .description = GeckoW10m — это Firefox (движок Gecko { -brand-short-name }), перенесённый на Windows 10 Mobile.
++
++gecko-w10m-default-browser =
++    .label = Сделать браузером по умолчанию
++    .description = Открывает системные параметры: Приложения по умолчанию → Веб-браузер.
 +
 +gecko-w10m-port-author =
 +    .label = Автор порта: Computershik
@@ -73630,11 +73643,3149 @@ index 2e0f09cbfd..f6217dfe47 100644
  #  include "mozilla/ProfilerState.h"
  
  #  include <windows.h>
+diff --git a/uriloader/exthandler/win/nsMIMEInfoWin.cpp b/uriloader/exthandler/win/nsMIMEInfoWin.cpp
+index 1a0e710c5c..d5a5a2cc25 100644
+--- a/uriloader/exthandler/win/nsMIMEInfoWin.cpp
++++ b/uriloader/exthandler/win/nsMIMEInfoWin.cpp
+@@ -1,930 +1,945 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "nsArrayEnumerator.h"
+-#include "nsComponentManagerUtils.h"
+-#include "nsCOMArray.h"
+-#include "nsLocalFile.h"
+-#include "nsMIMEInfoWin.h"
+-#include "nsLocalHandlerAppWin.h"
+-#include "nsIMIMEService.h"
+-#include "nsNetUtil.h"
+-#include <windows.h>
+-#include <shellapi.h>
+-#include "nsIMutableArray.h"
+-#include "nsTArray.h"
+-#include <shlobj.h>
+-#include "nsIWindowsRegKey.h"
+-#include "nsUnicharUtils.h"
+-#include "nsTextToSubURI.h"
+-#include "nsVariant.h"
+-#include "mozilla/CmdLineAndEnvUtils.h"
+-#include "mozilla/ShellHeaderOnlyUtils.h"
+-#include "mozilla/StaticPrefs_browser.h"
+-#include "mozilla/UrlmonHeaderOnlyUtils.h"
+-#include "mozilla/UniquePtrExtensions.h"
+-
+-#define RUNDLL32_EXE L"\\rundll32.exe"
+-
+-NS_IMPL_ISUPPORTS_INHERITED(nsMIMEInfoWin, nsMIMEInfoBase, nsIPropertyBag)
+-
+-nsresult nsMIMEInfoWin::LaunchDefaultWithFile(nsIFile* aFile) {
+-  // Launch the file, unless it is an executable.
+-  bool executable = true;
+-  aFile->IsExecutable(&executable);
+-  if (executable) return NS_ERROR_FAILURE;
+-
+-  return aFile->Launch();
+-}
+-
+-nsresult nsMIMEInfoWin::ShellExecuteWithIFile(nsIFile* aExecutable, int aArgc,
+-                                              const wchar_t** aArgv) {
+-  nsresult rv;
+-
+-  NS_ASSERTION(aArgc >= 1, "aArgc must be at least 1");
+-
+-  nsAutoString execPath;
+-  rv = aExecutable->GetTarget(execPath);
+-  if (NS_FAILED(rv) || execPath.IsEmpty()) {
+-    rv = aExecutable->GetPath(execPath);
+-  }
+-  if (NS_FAILED(rv)) {
+-    return rv;
+-  }
+-
+-  auto assembledArgs = mozilla::MakeCommandLine(aArgc, aArgv);
+-  if (!assembledArgs) {
+-    return NS_ERROR_FILE_EXECUTION_FAILED;
+-  }
+-
+-  _bstr_t execPathBStr(execPath.get());
+-  // Pass VT_ERROR/DISP_E_PARAMNOTFOUND to omit an optional RPC parameter
+-  // to execute a file with the default verb.
+-  _variant_t verbDefault(DISP_E_PARAMNOTFOUND, VT_ERROR);
+-  _variant_t workingDir;
+-  _variant_t showCmd(SW_SHOWNORMAL);
+-
+-  // Ask Explorer to ShellExecute on our behalf, as some applications such as
+-  // Skype for Business do not start correctly when inheriting our process's
+-  // migitation policies.
+-  // It does not work in a special environment such as Citrix.  In such a case
+-  // we fall back to launching an application as a child process.  We need to
+-  // find a way to handle the combination of these interop issues.
+-  mozilla::LauncherVoidResult shellExecuteOk = mozilla::ShellExecuteByExplorer(
+-      execPathBStr, assembledArgs.get(), verbDefault, workingDir, showCmd);
+-  if (shellExecuteOk.isErr()) {
+-    // No need to pass assembledArgs to LaunchWithIProcess.  aArgv will be
+-    // processed in nsProcess::RunProcess.
+-    return LaunchWithIProcess(aExecutable, aArgc,
+-                              reinterpret_cast<const char16_t**>(aArgv));
+-  }
+-
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsMIMEInfoWin::LaunchWithFile(nsIFile* aFile) {
+-  nsresult rv;
+-
+-  // it doesn't make any sense to call this on protocol handlers
+-  NS_ASSERTION(mClass == eMIMEInfo,
+-               "nsMIMEInfoBase should have mClass == eMIMEInfo");
+-
+-  if (AutomationOnlyCheckIfLaunchStubbed(aFile)) {
+-    return NS_OK;
+-  }
+-
+-  if (mPreferredAction == useSystemDefault) {
+-    nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
+-    if (defaultApp &&
+-        mozilla::StaticPrefs::browser_pdf_launchDefaultEdgeAsApp()) {
+-      // Since Edgium is the default handler for PDF and other kinds of files,
+-      // if we're using the OS default and it's Edgium prefer its app mode so it
+-      // operates as a viewer (without browser toolbars). Bug 1632277.
+-      nsAutoCString defaultAppExecutable;
+-      rv = defaultApp->GetNativeLeafName(defaultAppExecutable);
+-      if (NS_SUCCEEDED(rv) &&
+-          defaultAppExecutable.LowerCaseEqualsLiteral("msedge.exe")) {
+-        nsAutoString path;
+-        rv = aFile->GetPath(path);
+-        if (NS_SUCCEEDED(rv)) {
+-          // If the --app flag doesn't work we'll want to fallback to a
+-          // regular path. Send two args so we call `msedge.exe --app={path}
+-          // {path}`.
+-          nsAutoString appArg;
+-          appArg.AppendLiteral("--app=");
+-          appArg.Append(path);
+-          const wchar_t* argv[] = {appArg.get(), path.get()};
+-
+-          return ShellExecuteWithIFile(defaultApp, std::size(argv), argv);
+-        }
+-      }
+-    }
+-    return LaunchDefaultWithFile(aFile);
+-  }
+-
+-  if (mPreferredAction == useHelperApp) {
+-    if (!mPreferredApplication) return NS_ERROR_FILE_NOT_FOUND;
+-
+-    // at the moment, we only know how to hand files off to local handlers
+-    nsCOMPtr<nsILocalHandlerApp> localHandler =
+-        do_QueryInterface(mPreferredApplication, &rv);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+-    nsCOMPtr<nsIFile> executable;
+-    rv = localHandler->GetExecutable(getter_AddRefs(executable));
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+-    // Deal with local dll based handlers
+-    nsCString filename;
+-    executable->GetNativeLeafName(filename);
+-    if (filename.Length() > 4) {
+-      nsCString extension(Substring(filename, filename.Length() - 4, 4));
+-
+-      if (extension.LowerCaseEqualsLiteral(".dll")) {
+-        nsAutoString args;
+-
+-        // executable is rundll32, everything else is a list of parameters,
+-        // including the dll handler.
+-        if (!GetDllLaunchInfo(executable, aFile, args, false))
+-          return NS_ERROR_INVALID_ARG;
+-
+-        WCHAR rundll32Path[MAX_PATH + sizeof(RUNDLL32_EXE) / sizeof(WCHAR) +
+-                           1] = {L'\0'};
+-        if (!GetSystemDirectoryW(rundll32Path, MAX_PATH)) {
+-          return NS_ERROR_FILE_NOT_FOUND;
+-        }
+-        lstrcatW(rundll32Path, RUNDLL32_EXE);
+-
+-        SHELLEXECUTEINFOW seinfo;
+-        memset(&seinfo, 0, sizeof(seinfo));
+-        seinfo.cbSize = sizeof(SHELLEXECUTEINFOW);
+-        seinfo.fMask = 0;
+-        seinfo.hwnd = nullptr;
+-        seinfo.lpVerb = nullptr;
+-        seinfo.lpFile = rundll32Path;
+-        seinfo.lpParameters = args.get();
+-        seinfo.lpDirectory = nullptr;
+-        seinfo.nShow = SW_SHOWNORMAL;
+-        if (ShellExecuteExW(&seinfo)) return NS_OK;
+-
+-        switch ((LONG_PTR)seinfo.hInstApp) {
+-          case 0:
+-          case SE_ERR_OOM:
+-            return NS_ERROR_OUT_OF_MEMORY;
+-          case SE_ERR_ACCESSDENIED:
+-            return NS_ERROR_FILE_ACCESS_DENIED;
+-          case SE_ERR_ASSOCINCOMPLETE:
+-          case SE_ERR_NOASSOC:
+-            return NS_ERROR_UNEXPECTED;
+-          case SE_ERR_DDEBUSY:
+-          case SE_ERR_DDEFAIL:
+-          case SE_ERR_DDETIMEOUT:
+-            return NS_ERROR_NOT_AVAILABLE;
+-          case SE_ERR_DLLNOTFOUND:
+-            return NS_ERROR_FAILURE;
+-          case SE_ERR_SHARE:
+-            return NS_ERROR_FILE_IS_LOCKED;
+-          default:
+-            switch (GetLastError()) {
+-              case ERROR_FILE_NOT_FOUND:
+-                return NS_ERROR_FILE_NOT_FOUND;
+-              case ERROR_PATH_NOT_FOUND:
+-                return NS_ERROR_FILE_UNRECOGNIZED_PATH;
+-              case ERROR_BAD_FORMAT:
+-                return NS_ERROR_FILE_CORRUPTED;
+-            }
+-        }
+-        return NS_ERROR_FILE_EXECUTION_FAILED;
+-      }
+-    }
+-    nsAutoString path;
+-    aFile->GetPath(path);
+-    const wchar_t* argv[] = {path.get()};
+-    return ShellExecuteWithIFile(executable, std::size(argv), argv);
+-  }
+-
+-  return NS_ERROR_INVALID_ARG;
+-}
+-
+-NS_IMETHODIMP
+-nsMIMEInfoWin::GetHasDefaultHandler(bool* _retval) {
+-  // We have a default application if we have a description
+-  // We can ShellExecute anything; however, callers are probably interested if
+-  // there is really an application associated with this type of file
+-  *_retval = !mDefaultAppDescription.IsEmpty();
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP nsMIMEInfoWin::GetDefaultExecutable(nsIFile** aExecutable) {
+-  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
+-  if (defaultApp) {
+-    defaultApp.forget(aExecutable);
+-    return NS_OK;
+-  }
+-
+-  return NS_ERROR_FAILURE;
+-}
+-
+-NS_IMETHODIMP nsMIMEInfoWin::GetDefaultDescription(nsAString& aDescription) {
+-  UpdateDefaultInfoIfStale();
+-  aDescription = mDefaultAppDescription;
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsMIMEInfoWin::GetEnumerator(nsISimpleEnumerator** _retval) {
+-  nsCOMArray<nsIVariant> properties;
+-
+-  nsCOMPtr<nsIVariant> variant;
+-  GetProperty(u"defaultApplicationIconURL"_ns, getter_AddRefs(variant));
+-  if (variant) properties.AppendObject(variant);
+-
+-  GetProperty(u"customApplicationIconURL"_ns, getter_AddRefs(variant));
+-  if (variant) properties.AppendObject(variant);
+-
+-  return NS_NewArrayEnumerator(_retval, properties, NS_GET_IID(nsIVariant));
+-}
+-
+-static nsresult GetIconURLVariant(nsIFile* aApplication, nsIVariant** _retval) {
+-  nsAutoCString fileURLSpec;
+-  NS_GetURLSpecFromFile(aApplication, fileURLSpec);
+-  nsAutoCString iconURLSpec;
+-  iconURLSpec.AssignLiteral("moz-icon://");
+-  iconURLSpec += fileURLSpec;
+-  RefPtr<nsVariant> writable(new nsVariant());
+-  writable->SetAsAUTF8String(iconURLSpec);
+-  writable.forget(_retval);
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsMIMEInfoWin::GetProperty(const nsAString& aName, nsIVariant** _retval) {
+-  nsresult rv;
+-  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
+-  if (defaultApp && aName.EqualsLiteral(PROPERTY_DEFAULT_APP_ICON_URL)) {
+-    rv = GetIconURLVariant(defaultApp, _retval);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-  } else if (mPreferredApplication &&
+-             aName.EqualsLiteral(PROPERTY_CUSTOM_APP_ICON_URL)) {
+-    nsCOMPtr<nsILocalHandlerApp> localHandler =
+-        do_QueryInterface(mPreferredApplication, &rv);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+-    nsCOMPtr<nsIFile> executable;
+-    rv = localHandler->GetExecutable(getter_AddRefs(executable));
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+-    rv = GetIconURLVariant(executable, _retval);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-  }
+-
+-  return NS_OK;
+-}
+-
+-// this implementation was pretty much copied verbatime from
+-// Tony Robinson's code in nsExternalProtocolWin.cpp
+-nsresult nsMIMEInfoWin::LoadUriInternal(nsIURI* aURL) {
+-  nsresult rv = NS_OK;
+-
+-  // 1. Find the default app for this protocol
+-  // 2. Set up the command line
+-  // 3. Launch the app.
+-
+-  // For now, we'll just cheat essentially, check for the command line
+-  // then just call ShellExecute()!
+-
+-  if (aURL) {
+-    // extract the url spec from the url
+-    nsAutoCString urlSpec;
+-    aURL->GetAsciiSpec(urlSpec);
+-
+-    // Unescape non-ASCII characters in the URL
+-    nsAutoString utf16Spec;
+-    if (NS_FAILED(nsTextToSubURI::UnEscapeNonAsciiURI("UTF-8"_ns, urlSpec,
+-                                                      utf16Spec))) {
+-      CopyASCIItoUTF16(urlSpec, utf16Spec);
+-    }
+-
+-    // Ask the shell/urlmon to parse |utf16Spec| to avoid malformed URLs.
+-    // Failure is indicative of a potential security issue so we should
+-    // bail out if so.
+-    mozilla::LauncherResult<_bstr_t> validatedUri =
+-        mozilla::UrlmonValidateUri(utf16Spec.get());
+-    if (validatedUri.isErr()) {
+-      return NS_ERROR_FAILURE;
+-    }
+-
+-    _variant_t args;
+-    _variant_t verb(L"open");
+-    _variant_t workingDir;
+-    _variant_t showCmd(SW_SHOWNORMAL);
+-
+-    // To open a uri, we first try ShellExecuteByExplorer, which starts a new
+-    // process as a child process of explorer.exe, because applications may not
+-    // support the mitigation policies inherited from our process.  If it fails,
+-    // we fall back to ShellExecuteExW.
+-    //
+-    // For Thunderbird, however, there is a known issue that
+-    // ShellExecuteByExplorer succeeds but explorer.exe shows an error popup
+-    // if a uri to open includes credentials.  This does not happen in Firefox
+-    // because Firefox does not have to launch a process to open a uri.
+-    //
+-    // Since Thunderbird does not use mitigation policies which could cause
+-    // compatibility issues, we get no benefit from using
+-    // ShellExecuteByExplorer.  Thus we skip it and go straight to
+-    // ShellExecuteExW for Thunderbird.
+-#ifndef MOZ_THUNDERBIRD
+-    mozilla::LauncherVoidResult shellExecuteOk =
+-        mozilla::ShellExecuteByExplorer(validatedUri.inspect(), args, verb,
+-                                        workingDir, showCmd);
+-    if (shellExecuteOk.isOk()) {
+-      return NS_OK;
+-    }
+-#endif  // MOZ_THUNDERBIRD
+-
+-    SHELLEXECUTEINFOW sinfo = {sizeof(sinfo)};
+-    sinfo.fMask = SEE_MASK_NOASYNC;
+-    sinfo.lpVerb = V_BSTR(&verb);
+-    sinfo.nShow = showCmd;
+-    sinfo.lpFile = validatedUri.inspect();
+-
+-    BOOL result = ShellExecuteExW(&sinfo);
+-    if (!result || reinterpret_cast<LONG_PTR>(sinfo.hInstApp) < 32) {
+-      rv = NS_ERROR_FAILURE;
+-    }
+-  }
+-
+-  return rv;
+-}
+-
+-void nsMIMEInfoWin::UpdateDefaultInfoIfStale() {
+-  if (!mIsDefaultAppInfoFresh) {
+-    nsCOMPtr<nsIMIMEService> mime = do_GetService("@mozilla.org/mime;1");
+-    if (mime) {
+-      mime->UpdateDefaultAppInfo(static_cast<nsIMIMEInfo*>(this));
+-    }
+-    mIsDefaultAppInfoFresh = true;
+-  }
+-}
+-
+-// Given a path to a local file, return its nsILocalHandlerApp instance.
+-bool nsMIMEInfoWin::GetLocalHandlerApp(const nsAString& aCommandHandler,
+-                                       nsCOMPtr<nsILocalHandlerApp>& aApp) {
+-  nsCOMPtr<nsIFile> locfile;
+-  nsresult rv = NS_NewLocalFile(aCommandHandler, getter_AddRefs(locfile));
+-  if (NS_FAILED(rv)) return false;
+-
+-  aApp = do_CreateInstance("@mozilla.org/uriloader/local-handler-app;1");
+-  if (!aApp) return false;
+-
+-  aApp->SetExecutable(locfile);
+-  return true;
+-}
+-
+-// Return the cleaned up file path associated with a command verb
+-// located in root/Applications.
+-bool nsMIMEInfoWin::GetAppsVerbCommandHandler(const nsAString& appExeName,
+-                                              nsAString& applicationPath,
+-                                              bool edit) {
+-  nsCOMPtr<nsIWindowsRegKey> appKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!appKey) return false;
+-
+-  // HKEY_CLASSES_ROOT\Applications\iexplore.exe
+-  nsAutoString applicationsPath;
+-  applicationsPath.AppendLiteral("Applications\\");
+-  applicationsPath.Append(appExeName);
+-
+-  nsresult rv =
+-      appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  // Check for the NoOpenWith flag, if it exists
+-  uint32_t value;
+-  if (NS_SUCCEEDED(appKey->ReadIntValue(u"NoOpenWith"_ns, &value)) &&
+-      value == 1)
+-    return false;
+-
+-  nsAutoString dummy;
+-  if (NS_SUCCEEDED(appKey->ReadStringValue(u"NoOpenWith"_ns, dummy)))
+-    return false;
+-
+-  appKey->Close();
+-
+-  // HKEY_CLASSES_ROOT\Applications\iexplore.exe\shell\open\command
+-  applicationsPath.AssignLiteral("Applications\\");
+-  applicationsPath.Append(appExeName);
+-  if (!edit)
+-    applicationsPath.AppendLiteral("\\shell\\open\\command");
+-  else
+-    applicationsPath.AppendLiteral("\\shell\\edit\\command");
+-
+-  rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
+-                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  nsAutoString appFilesystemCommand;
+-  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
+-    // Expand environment vars, clean up any misc.
+-    if (!nsLocalFile::CleanupCmdHandlerPath(appFilesystemCommand)) return false;
+-
+-    applicationPath = appFilesystemCommand;
+-    return true;
+-  }
+-  return false;
+-}
+-
+-// Return a fully populated command string based on
+-// passing information. Used in launchWithFile to trace
+-// back to the full handler path based on the dll.
+-// (dll, targetfile, return args, open/edit)
+-bool nsMIMEInfoWin::GetDllLaunchInfo(nsIFile* aDll, nsIFile* aFile,
+-                                     nsAString& args, bool edit) {
+-  if (!aDll || !aFile) return false;
+-
+-  nsString appExeName;
+-  aDll->GetLeafName(appExeName);
+-
+-  nsCOMPtr<nsIWindowsRegKey> appKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!appKey) return false;
+-
+-  // HKEY_CLASSES_ROOT\Applications\iexplore.exe
+-  nsAutoString applicationsPath;
+-  applicationsPath.AppendLiteral("Applications\\");
+-  applicationsPath.Append(appExeName);
+-
+-  nsresult rv =
+-      appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  // Check for the NoOpenWith flag, if it exists
+-  uint32_t value;
+-  rv = appKey->ReadIntValue(u"NoOpenWith"_ns, &value);
+-  if (NS_SUCCEEDED(rv) && value == 1) return false;
+-
+-  nsAutoString dummy;
+-  if (NS_SUCCEEDED(appKey->ReadStringValue(u"NoOpenWith"_ns, dummy)))
+-    return false;
+-
+-  appKey->Close();
+-
+-  // HKEY_CLASSES_ROOT\Applications\iexplore.exe\shell\open\command
+-  applicationsPath.AssignLiteral("Applications\\");
+-  applicationsPath.Append(appExeName);
+-  if (!edit)
+-    applicationsPath.AppendLiteral("\\shell\\open\\command");
+-  else
+-    applicationsPath.AppendLiteral("\\shell\\edit\\command");
+-
+-  rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
+-                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  nsAutoString appFilesystemCommand;
+-  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
+-    // Replace embedded environment variables.
+-    uint32_t bufLength =
+-        ::ExpandEnvironmentStringsW(appFilesystemCommand.get(), nullptr, 0);
+-    if (bufLength == 0)  // Error
+-      return false;
+-
+-    auto destination = mozilla::MakeUniqueFallible<wchar_t[]>(bufLength);
+-    if (!destination) return false;
+-    if (!::ExpandEnvironmentStringsW(appFilesystemCommand.get(),
+-                                     destination.get(), bufLength))
+-      return false;
+-
+-    appFilesystemCommand.Assign(destination.get());
+-
+-    // C:\Windows\System32\rundll32.exe "C:\Program Files\Windows
+-    // Photo Gallery\PhotoViewer.dll", ImageView_Fullscreen %1
+-    nsAutoString params;
+-    constexpr auto rundllSegment = u"rundll32.exe "_ns;
+-    int32_t index = appFilesystemCommand.Find(rundllSegment);
+-    if (index > kNotFound) {
+-      params.Append(
+-          Substring(appFilesystemCommand, index + rundllSegment.Length()));
+-    } else {
+-      params.Append(appFilesystemCommand);
+-    }
+-
+-    // check to make sure we have a %1 and fill it
+-    constexpr auto percentOneParam = u"%1"_ns;
+-    index = params.Find(percentOneParam);
+-    if (index == kNotFound)  // no parameter
+-      return false;
+-
+-    nsString target;
+-    aFile->GetTarget(target);
+-    params.Replace(index, 2, target);
+-
+-    args = params;
+-
+-    return true;
+-  }
+-  return false;
+-}
+-
+-// Return the cleaned up file path associated with a progid command
+-// verb located in root.
+-bool nsMIMEInfoWin::GetProgIDVerbCommandHandler(const nsAString& appProgIDName,
+-                                                nsAString& applicationPath,
+-                                                bool edit) {
+-  nsCOMPtr<nsIWindowsRegKey> appKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!appKey) return false;
+-
+-  nsAutoString appProgId(appProgIDName);
+-
+-  // HKEY_CLASSES_ROOT\Windows.XPSReachViewer\shell\open\command
+-  if (!edit)
+-    appProgId.AppendLiteral("\\shell\\open\\command");
+-  else
+-    appProgId.AppendLiteral("\\shell\\edit\\command");
+-
+-  nsresult rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, appProgId,
+-                             nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  nsAutoString appFilesystemCommand;
+-  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
+-    // Expand environment vars, clean up any misc.
+-    if (!nsLocalFile::CleanupCmdHandlerPath(appFilesystemCommand)) return false;
+-
+-    applicationPath = appFilesystemCommand;
+-    return true;
+-  }
+-  return false;
+-}
+-
+-// Helper routine used in tracking app lists. Converts path
+-// entries to lower case and stores them in the trackList array.
+-void nsMIMEInfoWin::ProcessPath(nsCOMPtr<nsIMutableArray>& appList,
+-                                nsTArray<nsString>& trackList,
+-                                const nsAutoString& appIdOrName,
+-                                const nsAString& appFilesystemCommand) {
+-  nsAutoString lower(appFilesystemCommand);
+-  ToLowerCase(lower);
+-
+-  // Don't include firefox.exe in the list
+-  WCHAR exe[MAX_PATH + 1];
+-  uint32_t len = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+-  if (len < MAX_PATH && len != 0) {
+-    int32_t index = lower.Find(reinterpret_cast<const char16_t*>(exe));
+-    if (index != -1) return;
+-  }
+-
+-  nsCOMPtr<nsILocalHandlerApp> aApp;
+-  if (!GetLocalHandlerApp(appFilesystemCommand, aApp)) return;
+-
+-  // Track the app id so that the pretty name can be determined later
+-  (static_cast<nsLocalHandlerAppWin*>(aApp.get()))->SetAppIdOrName(appIdOrName);
+-
+-  // Save in our main tracking arrays
+-  appList->AppendElement(aApp);
+-  trackList.AppendElement(lower);
+-}
+-
+-// Helper routine that handles a compare between a path
+-// and an array of paths.
+-static bool IsPathInList(nsAString& appPath, nsTArray<nsString>& trackList) {
+-  // trackList data is always lowercase, see ProcessPath
+-  // above.
+-  nsAutoString tmp(appPath);
+-  ToLowerCase(tmp);
+-
+-  for (uint32_t i = 0; i < trackList.Length(); i++) {
+-    if (tmp.Equals(trackList[i])) return true;
+-  }
+-  return false;
+-}
+-
+-/**
+- * Returns a list of nsILocalHandlerApp objects containing local
+- * handlers associated with this mimeinfo. Implemented per
+- * platform using information in this object to generate the
+- * best list. Typically used for an "open with" style user
+- * option.
+- *
+- * @return nsIArray of nsILocalHandlerApp
+- */
+-NS_IMETHODIMP
+-nsMIMEInfoWin::GetPossibleLocalHandlers(nsIArray** _retval) {
+-  nsresult rv;
+-
+-  *_retval = nullptr;
+-
+-  nsCOMPtr<nsIMutableArray> appList = do_CreateInstance("@mozilla.org/array;1");
+-
+-  if (!appList) return NS_ERROR_FAILURE;
+-
+-  nsTArray<nsString> trackList;
+-
+-  nsAutoCString fileExt;
+-  GetPrimaryExtension(fileExt);
+-
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return NS_ERROR_FAILURE;
+-  nsCOMPtr<nsIWindowsRegKey> appKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!appKey) return NS_ERROR_FAILURE;
+-
+-  nsAutoString workingRegistryPath;
+-
+-  bool extKnown = false;
+-  if (fileExt.IsEmpty()) {
+-    extKnown = true;
+-    // Mime type discovery is possible in some cases, through
+-    // HKEY_CLASSES_ROOT\MIME\Database\Content Type, however, a number
+-    // of file extensions related to mime type are simply not defined,
+-    // (application/rss+xml & application/atom+xml are good examples)
+-    // in which case we can only provide a generic list.
+-    nsAutoCString mimeType;
+-    GetMIMEType(mimeType);
+-    if (!mimeType.IsEmpty()) {
+-      workingRegistryPath.AppendLiteral("MIME\\Database\\Content Type\\");
+-      workingRegistryPath.Append(NS_ConvertASCIItoUTF16(mimeType));
+-
+-      rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                        workingRegistryPath,
+-                        nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-      if (NS_SUCCEEDED(rv)) {
+-        nsAutoString mimeFileExt;
+-        if (NS_SUCCEEDED(regKey->ReadStringValue(u""_ns, mimeFileExt))) {
+-          CopyUTF16toUTF8(mimeFileExt, fileExt);
+-          extKnown = false;
+-        }
+-      }
+-    }
+-  }
+-
+-  nsAutoString fileExtToUse;
+-  if (!fileExt.IsEmpty() && fileExt.First() != '.') {
+-    fileExtToUse = char16_t('.');
+-  }
+-  fileExtToUse.Append(NS_ConvertUTF8toUTF16(fileExt));
+-
+-  // Note, the order in which these occur has an effect on the
+-  // validity of the resulting display list.
+-
+-  if (!extKnown) {
+-    // 1) Get the default handler if it exists
+-    workingRegistryPath = fileExtToUse;
+-
+-    rv =
+-        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      nsAutoString appProgId;
+-      if (NS_SUCCEEDED(regKey->ReadStringValue(u""_ns, appProgId))) {
+-        // Bug 358297 - ignore the embedded internet explorer handler
+-        if (appProgId != u"XPSViewer.Document"_ns) {
+-          nsAutoString appFilesystemCommand;
+-          if (GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
+-                                          false) &&
+-              !IsPathInList(appFilesystemCommand, trackList)) {
+-            ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
+-          }
+-        }
+-      }
+-      regKey->Close();
+-    }
+-
+-    // 2) list HKEY_CLASSES_ROOT\.ext\OpenWithList
+-
+-    workingRegistryPath = fileExtToUse;
+-    workingRegistryPath.AppendLiteral("\\OpenWithList");
+-
+-    rv =
+-        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      uint32_t count = 0;
+-      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-        for (uint32_t index = 0; index < count; index++) {
+-          nsAutoString appName;
+-          if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
+-
+-          // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
+-          nsAutoString appFilesystemCommand;
+-          if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand,
+-                                         false) ||
+-              IsPathInList(appFilesystemCommand, trackList))
+-            continue;
+-          ProcessPath(appList, trackList, appName, appFilesystemCommand);
+-        }
+-      }
+-      regKey->Close();
+-    }
+-
+-    // 3) List HKEY_CLASSES_ROOT\.ext\OpenWithProgids, with the
+-    // different step of resolving the progids for the command handler.
+-
+-    workingRegistryPath = fileExtToUse;
+-    workingRegistryPath.AppendLiteral("\\OpenWithProgids");
+-
+-    rv =
+-        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      uint32_t count = 0;
+-      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-        for (uint32_t index = 0; index < count; index++) {
+-          // HKEY_CLASSES_ROOT\.ext\OpenWithProgids\Windows.XPSReachViewer
+-          nsAutoString appProgId;
+-          if (NS_FAILED(regKey->GetValueName(index, appProgId))) continue;
+-
+-          nsAutoString appFilesystemCommand;
+-          if (!GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
+-                                           false) ||
+-              IsPathInList(appFilesystemCommand, trackList))
+-            continue;
+-          ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
+-        }
+-      }
+-      regKey->Close();
+-    }
+-
+-    // 4) Add any non configured applications located in the MRU list
+-
+-    // HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion
+-    // \Explorer\FileExts\.ext\OpenWithList
+-    workingRegistryPath = nsLiteralString(
+-        u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\");
+-    workingRegistryPath += fileExtToUse;
+-    workingRegistryPath.AppendLiteral("\\OpenWithList");
+-
+-    rv =
+-        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CURRENT_USER,
+-                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      uint32_t count = 0;
+-      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-        for (uint32_t index = 0; index < count; index++) {
+-          nsAutoString appName, appValue;
+-          if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
+-          if (appName.EqualsLiteral("MRUList")) continue;
+-          if (NS_FAILED(regKey->ReadStringValue(appName, appValue))) continue;
+-
+-          // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
+-          nsAutoString appFilesystemCommand;
+-          if (!GetAppsVerbCommandHandler(appValue, appFilesystemCommand,
+-                                         false) ||
+-              IsPathInList(appFilesystemCommand, trackList))
+-            continue;
+-          ProcessPath(appList, trackList, appValue, appFilesystemCommand);
+-        }
+-      }
+-    }
+-
+-    // 5) Add any non configured progids in the MRU list, with the
+-    // different step of resolving the progids for the command handler.
+-
+-    // HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion
+-    // \Explorer\FileExts\.ext\OpenWithProgids
+-    workingRegistryPath = nsLiteralString(
+-        u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\");
+-    workingRegistryPath += fileExtToUse;
+-    workingRegistryPath.AppendLiteral("\\OpenWithProgids");
+-
+-    regKey->Open(nsIWindowsRegKey::ROOT_KEY_CURRENT_USER, workingRegistryPath,
+-                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      uint32_t count = 0;
+-      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-        for (uint32_t index = 0; index < count; index++) {
+-          nsAutoString appIndex, appProgId;
+-          if (NS_FAILED(regKey->GetValueName(index, appProgId))) continue;
+-
+-          nsAutoString appFilesystemCommand;
+-          if (!GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
+-                                           false) ||
+-              IsPathInList(appFilesystemCommand, trackList))
+-            continue;
+-          ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
+-        }
+-      }
+-      regKey->Close();
+-    }
+-
+-    // 6) Check the perceived type value, and use this to lookup the
+-    // perceivedtype open with list.
+-    // http://msdn2.microsoft.com/en-us/library/aa969373.aspx
+-
+-    workingRegistryPath = fileExtToUse;
+-
+-    regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, workingRegistryPath,
+-                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_SUCCEEDED(rv)) {
+-      nsAutoString perceivedType;
+-      rv = regKey->ReadStringValue(u"PerceivedType"_ns, perceivedType);
+-      if (NS_SUCCEEDED(rv)) {
+-        nsAutoString openWithListPath(u"SystemFileAssociations\\"_ns);
+-        openWithListPath.Append(perceivedType);  // no period
+-        openWithListPath.AppendLiteral("\\OpenWithList");
+-
+-        nsresult rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                                   openWithListPath,
+-                                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-        if (NS_SUCCEEDED(rv)) {
+-          uint32_t count = 0;
+-          if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-            for (uint32_t index = 0; index < count; index++) {
+-              nsAutoString appName;
+-              if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
+-
+-              // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
+-              nsAutoString appFilesystemCommand;
+-              if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand,
+-                                             false) ||
+-                  IsPathInList(appFilesystemCommand, trackList))
+-                continue;
+-              ProcessPath(appList, trackList, appName, appFilesystemCommand);
+-            }
+-          }
+-        }
+-      }
+-    }
+-  }  // extKnown == false
+-
+-  // 7) list global HKEY_CLASSES_ROOT\*\OpenWithList
+-  // Listing general purpose handlers, not specific to a mime type or file
+-  // extension
+-
+-  workingRegistryPath = u"*\\OpenWithList"_ns;
+-
+-  rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                    workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_SUCCEEDED(rv)) {
+-    uint32_t count = 0;
+-    if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
+-      for (uint32_t index = 0; index < count; index++) {
+-        nsAutoString appName;
+-        if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
+-
+-        // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
+-        nsAutoString appFilesystemCommand;
+-        if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand, false) ||
+-            IsPathInList(appFilesystemCommand, trackList))
+-          continue;
+-        ProcessPath(appList, trackList, appName, appFilesystemCommand);
+-      }
+-    }
+-    regKey->Close();
+-  }
+-
+-  // 8) General application's list - not file extension specific on windows
+-  workingRegistryPath = u"Applications"_ns;
+-
+-  rv =
+-      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, workingRegistryPath,
+-                   nsIWindowsRegKey::ACCESS_ENUMERATE_SUB_KEYS |
+-                       nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_SUCCEEDED(rv)) {
+-    uint32_t count = 0;
+-    if (NS_SUCCEEDED(regKey->GetChildCount(&count)) && count > 0) {
+-      for (uint32_t index = 0; index < count; index++) {
+-        nsAutoString appName;
+-        if (NS_FAILED(regKey->GetChildName(index, appName))) continue;
+-
+-        // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
+-        nsAutoString appFilesystemCommand;
+-        if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand, false) ||
+-            IsPathInList(appFilesystemCommand, trackList))
+-          continue;
+-        ProcessPath(appList, trackList, appName, appFilesystemCommand);
+-      }
+-    }
+-  }
+-
+-  // Return to the caller
+-  *_retval = appList;
+-  NS_ADDREF(*_retval);
+-
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsMIMEInfoWin::IsCurrentAppOSDefault(bool* _retval) {
+-  *_retval = false;
+-  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
+-  if (defaultApp) {
+-    // Determine if the default executable is our executable.
+-    nsCOMPtr<nsIFile> ourBinary;
+-    XRE_GetBinaryPath(getter_AddRefs(ourBinary));
+-    bool isSame = false;
+-    nsresult rv = defaultApp->Equals(ourBinary, &isSame);
+-    if (NS_FAILED(rv)) {
+-      return rv;
+-    }
+-    *_retval = isSame;
+-  }
+-  return NS_OK;
+-}
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsArrayEnumerator.h"
++#include "nsComponentManagerUtils.h"
++#include "nsCOMArray.h"
++#include "nsLocalFile.h"
++#include "nsMIMEInfoWin.h"
++#include "nsLocalHandlerAppWin.h"
++#include "nsIMIMEService.h"
++#include "nsNetUtil.h"
++#include <windows.h>
++#include <shellapi.h>
++#include "nsIMutableArray.h"
++#include "nsTArray.h"
++#include <shlobj.h>
++#include "nsIWindowsRegKey.h"
++#include "nsUnicharUtils.h"
++#include "nsTextToSubURI.h"
++#include "nsVariant.h"
++#include "mozilla/CmdLineAndEnvUtils.h"
++#include "mozilla/ShellHeaderOnlyUtils.h"
++#include "mozilla/StaticPrefs_browser.h"
++#include "mozilla/UrlmonHeaderOnlyUtils.h"
++#include "mozilla/UniquePtrExtensions.h"
++
++#define RUNDLL32_EXE L"\\rundll32.exe"
++
++NS_IMPL_ISUPPORTS_INHERITED(nsMIMEInfoWin, nsMIMEInfoBase, nsIPropertyBag)
++
++nsresult nsMIMEInfoWin::LaunchDefaultWithFile(nsIFile* aFile) {
++  // Launch the file, unless it is an executable.
++  bool executable = true;
++  aFile->IsExecutable(&executable);
++  if (executable) return NS_ERROR_FAILURE;
++
++  return aFile->Launch();
++}
++
++nsresult nsMIMEInfoWin::ShellExecuteWithIFile(nsIFile* aExecutable, int aArgc,
++                                              const wchar_t** aArgv) {
++  nsresult rv;
++
++  NS_ASSERTION(aArgc >= 1, "aArgc must be at least 1");
++
++  nsAutoString execPath;
++  rv = aExecutable->GetTarget(execPath);
++  if (NS_FAILED(rv) || execPath.IsEmpty()) {
++    rv = aExecutable->GetPath(execPath);
++  }
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  auto assembledArgs = mozilla::MakeCommandLine(aArgc, aArgv);
++  if (!assembledArgs) {
++    return NS_ERROR_FILE_EXECUTION_FAILED;
++  }
++
++  _bstr_t execPathBStr(execPath.get());
++  // Pass VT_ERROR/DISP_E_PARAMNOTFOUND to omit an optional RPC parameter
++  // to execute a file with the default verb.
++  _variant_t verbDefault(DISP_E_PARAMNOTFOUND, VT_ERROR);
++  _variant_t workingDir;
++  _variant_t showCmd(SW_SHOWNORMAL);
++
++  // Ask Explorer to ShellExecute on our behalf, as some applications such as
++  // Skype for Business do not start correctly when inheriting our process's
++  // migitation policies.
++  // It does not work in a special environment such as Citrix.  In such a case
++  // we fall back to launching an application as a child process.  We need to
++  // find a way to handle the combination of these interop issues.
++  mozilla::LauncherVoidResult shellExecuteOk = mozilla::ShellExecuteByExplorer(
++      execPathBStr, assembledArgs.get(), verbDefault, workingDir, showCmd);
++  if (shellExecuteOk.isErr()) {
++    // No need to pass assembledArgs to LaunchWithIProcess.  aArgv will be
++    // processed in nsProcess::RunProcess.
++    return LaunchWithIProcess(aExecutable, aArgc,
++                              reinterpret_cast<const char16_t**>(aArgv));
++  }
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsMIMEInfoWin::LaunchWithFile(nsIFile* aFile) {
++  nsresult rv;
++
++  // it doesn't make any sense to call this on protocol handlers
++  NS_ASSERTION(mClass == eMIMEInfo,
++               "nsMIMEInfoBase should have mClass == eMIMEInfo");
++
++  if (AutomationOnlyCheckIfLaunchStubbed(aFile)) {
++    return NS_OK;
++  }
++
++  if (mPreferredAction == useSystemDefault) {
++    nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
++    if (defaultApp &&
++        mozilla::StaticPrefs::browser_pdf_launchDefaultEdgeAsApp()) {
++      // Since Edgium is the default handler for PDF and other kinds of files,
++      // if we're using the OS default and it's Edgium prefer its app mode so it
++      // operates as a viewer (without browser toolbars). Bug 1632277.
++      nsAutoCString defaultAppExecutable;
++      rv = defaultApp->GetNativeLeafName(defaultAppExecutable);
++      if (NS_SUCCEEDED(rv) &&
++          defaultAppExecutable.LowerCaseEqualsLiteral("msedge.exe")) {
++        nsAutoString path;
++        rv = aFile->GetPath(path);
++        if (NS_SUCCEEDED(rv)) {
++          // If the --app flag doesn't work we'll want to fallback to a
++          // regular path. Send two args so we call `msedge.exe --app={path}
++          // {path}`.
++          nsAutoString appArg;
++          appArg.AppendLiteral("--app=");
++          appArg.Append(path);
++          const wchar_t* argv[] = {appArg.get(), path.get()};
++
++          return ShellExecuteWithIFile(defaultApp, std::size(argv), argv);
++        }
++      }
++    }
++    return LaunchDefaultWithFile(aFile);
++  }
++
++  if (mPreferredAction == useHelperApp) {
++    if (!mPreferredApplication) return NS_ERROR_FILE_NOT_FOUND;
++
++    // at the moment, we only know how to hand files off to local handlers
++    nsCOMPtr<nsILocalHandlerApp> localHandler =
++        do_QueryInterface(mPreferredApplication, &rv);
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    nsCOMPtr<nsIFile> executable;
++    rv = localHandler->GetExecutable(getter_AddRefs(executable));
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    // Deal with local dll based handlers
++    nsCString filename;
++    executable->GetNativeLeafName(filename);
++    if (filename.Length() > 4) {
++      nsCString extension(Substring(filename, filename.Length() - 4, 4));
++
++      if (extension.LowerCaseEqualsLiteral(".dll")) {
++        nsAutoString args;
++
++        // executable is rundll32, everything else is a list of parameters,
++        // including the dll handler.
++        if (!GetDllLaunchInfo(executable, aFile, args, false))
++          return NS_ERROR_INVALID_ARG;
++
++        WCHAR rundll32Path[MAX_PATH + sizeof(RUNDLL32_EXE) / sizeof(WCHAR) +
++                           1] = {L'\0'};
++        if (!GetSystemDirectoryW(rundll32Path, MAX_PATH)) {
++          return NS_ERROR_FILE_NOT_FOUND;
++        }
++        lstrcatW(rundll32Path, RUNDLL32_EXE);
++
++        SHELLEXECUTEINFOW seinfo;
++        memset(&seinfo, 0, sizeof(seinfo));
++        seinfo.cbSize = sizeof(SHELLEXECUTEINFOW);
++        seinfo.fMask = 0;
++        seinfo.hwnd = nullptr;
++        seinfo.lpVerb = nullptr;
++        seinfo.lpFile = rundll32Path;
++        seinfo.lpParameters = args.get();
++        seinfo.lpDirectory = nullptr;
++        seinfo.nShow = SW_SHOWNORMAL;
++        if (ShellExecuteExW(&seinfo)) return NS_OK;
++
++        switch ((LONG_PTR)seinfo.hInstApp) {
++          case 0:
++          case SE_ERR_OOM:
++            return NS_ERROR_OUT_OF_MEMORY;
++          case SE_ERR_ACCESSDENIED:
++            return NS_ERROR_FILE_ACCESS_DENIED;
++          case SE_ERR_ASSOCINCOMPLETE:
++          case SE_ERR_NOASSOC:
++            return NS_ERROR_UNEXPECTED;
++          case SE_ERR_DDEBUSY:
++          case SE_ERR_DDEFAIL:
++          case SE_ERR_DDETIMEOUT:
++            return NS_ERROR_NOT_AVAILABLE;
++          case SE_ERR_DLLNOTFOUND:
++            return NS_ERROR_FAILURE;
++          case SE_ERR_SHARE:
++            return NS_ERROR_FILE_IS_LOCKED;
++          default:
++            switch (GetLastError()) {
++              case ERROR_FILE_NOT_FOUND:
++                return NS_ERROR_FILE_NOT_FOUND;
++              case ERROR_PATH_NOT_FOUND:
++                return NS_ERROR_FILE_UNRECOGNIZED_PATH;
++              case ERROR_BAD_FORMAT:
++                return NS_ERROR_FILE_CORRUPTED;
++            }
++        }
++        return NS_ERROR_FILE_EXECUTION_FAILED;
++      }
++    }
++    nsAutoString path;
++    aFile->GetPath(path);
++    const wchar_t* argv[] = {path.get()};
++    return ShellExecuteWithIFile(executable, std::size(argv), argv);
++  }
++
++  return NS_ERROR_INVALID_ARG;
++}
++
++NS_IMETHODIMP
++nsMIMEInfoWin::GetHasDefaultHandler(bool* _retval) {
++  // We have a default application if we have a description
++  // We can ShellExecute anything; however, callers are probably interested if
++  // there is really an application associated with this type of file
++  *_retval = !mDefaultAppDescription.IsEmpty();
++  return NS_OK;
++}
++
++NS_IMETHODIMP nsMIMEInfoWin::GetDefaultExecutable(nsIFile** aExecutable) {
++  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
++  if (defaultApp) {
++    defaultApp.forget(aExecutable);
++    return NS_OK;
++  }
++
++  return NS_ERROR_FAILURE;
++}
++
++NS_IMETHODIMP nsMIMEInfoWin::GetDefaultDescription(nsAString& aDescription) {
++  UpdateDefaultInfoIfStale();
++  aDescription = mDefaultAppDescription;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsMIMEInfoWin::GetEnumerator(nsISimpleEnumerator** _retval) {
++  nsCOMArray<nsIVariant> properties;
++
++  nsCOMPtr<nsIVariant> variant;
++  GetProperty(u"defaultApplicationIconURL"_ns, getter_AddRefs(variant));
++  if (variant) properties.AppendObject(variant);
++
++  GetProperty(u"customApplicationIconURL"_ns, getter_AddRefs(variant));
++  if (variant) properties.AppendObject(variant);
++
++  return NS_NewArrayEnumerator(_retval, properties, NS_GET_IID(nsIVariant));
++}
++
++static nsresult GetIconURLVariant(nsIFile* aApplication, nsIVariant** _retval) {
++  nsAutoCString fileURLSpec;
++  NS_GetURLSpecFromFile(aApplication, fileURLSpec);
++  nsAutoCString iconURLSpec;
++  iconURLSpec.AssignLiteral("moz-icon://");
++  iconURLSpec += fileURLSpec;
++  RefPtr<nsVariant> writable(new nsVariant());
++  writable->SetAsAUTF8String(iconURLSpec);
++  writable.forget(_retval);
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsMIMEInfoWin::GetProperty(const nsAString& aName, nsIVariant** _retval) {
++  nsresult rv;
++  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
++  if (defaultApp && aName.EqualsLiteral(PROPERTY_DEFAULT_APP_ICON_URL)) {
++    rv = GetIconURLVariant(defaultApp, _retval);
++    NS_ENSURE_SUCCESS(rv, rv);
++  } else if (mPreferredApplication &&
++             aName.EqualsLiteral(PROPERTY_CUSTOM_APP_ICON_URL)) {
++    nsCOMPtr<nsILocalHandlerApp> localHandler =
++        do_QueryInterface(mPreferredApplication, &rv);
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    nsCOMPtr<nsIFile> executable;
++    rv = localHandler->GetExecutable(getter_AddRefs(executable));
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    rv = GetIconURLVariant(executable, _retval);
++    NS_ENSURE_SUCCESS(rv, rv);
++  }
++
++  return NS_OK;
++}
++
++// this implementation was pretty much copied verbatime from
++// Tony Robinson's code in nsExternalProtocolWin.cpp
++#if defined(GECKO_W10M)
++extern "C" bool gecko_w10m_launch_uri(const char* aUri);
++#endif
++
++nsresult nsMIMEInfoWin::LoadUriInternal(nsIURI* aURL) {
++  nsresult rv = NS_OK;
++#if defined(GECKO_W10M)
++  // ShellExecute is not available to an app container, and the phone opens
++  // URIs through the shell's Launcher instead. mailto:, tel:, ms-settings:
++  // and the like all arrive here.
++  if (aURL) {
++    nsAutoCString spec;
++    if (NS_SUCCEEDED(aURL->GetSpec(spec)) && gecko_w10m_launch_uri(spec.get())) {
++      return NS_OK;
++    }
++  }
++#endif
++
++  // 1. Find the default app for this protocol
++  // 2. Set up the command line
++  // 3. Launch the app.
++
++  // For now, we'll just cheat essentially, check for the command line
++  // then just call ShellExecute()!
++
++  if (aURL) {
++    // extract the url spec from the url
++    nsAutoCString urlSpec;
++    aURL->GetAsciiSpec(urlSpec);
++
++    // Unescape non-ASCII characters in the URL
++    nsAutoString utf16Spec;
++    if (NS_FAILED(nsTextToSubURI::UnEscapeNonAsciiURI("UTF-8"_ns, urlSpec,
++                                                      utf16Spec))) {
++      CopyASCIItoUTF16(urlSpec, utf16Spec);
++    }
++
++    // Ask the shell/urlmon to parse |utf16Spec| to avoid malformed URLs.
++    // Failure is indicative of a potential security issue so we should
++    // bail out if so.
++    mozilla::LauncherResult<_bstr_t> validatedUri =
++        mozilla::UrlmonValidateUri(utf16Spec.get());
++    if (validatedUri.isErr()) {
++      return NS_ERROR_FAILURE;
++    }
++
++    _variant_t args;
++    _variant_t verb(L"open");
++    _variant_t workingDir;
++    _variant_t showCmd(SW_SHOWNORMAL);
++
++    // To open a uri, we first try ShellExecuteByExplorer, which starts a new
++    // process as a child process of explorer.exe, because applications may not
++    // support the mitigation policies inherited from our process.  If it fails,
++    // we fall back to ShellExecuteExW.
++    //
++    // For Thunderbird, however, there is a known issue that
++    // ShellExecuteByExplorer succeeds but explorer.exe shows an error popup
++    // if a uri to open includes credentials.  This does not happen in Firefox
++    // because Firefox does not have to launch a process to open a uri.
++    //
++    // Since Thunderbird does not use mitigation policies which could cause
++    // compatibility issues, we get no benefit from using
++    // ShellExecuteByExplorer.  Thus we skip it and go straight to
++    // ShellExecuteExW for Thunderbird.
++#ifndef MOZ_THUNDERBIRD
++    mozilla::LauncherVoidResult shellExecuteOk =
++        mozilla::ShellExecuteByExplorer(validatedUri.inspect(), args, verb,
++                                        workingDir, showCmd);
++    if (shellExecuteOk.isOk()) {
++      return NS_OK;
++    }
++#endif  // MOZ_THUNDERBIRD
++
++    SHELLEXECUTEINFOW sinfo = {sizeof(sinfo)};
++    sinfo.fMask = SEE_MASK_NOASYNC;
++    sinfo.lpVerb = V_BSTR(&verb);
++    sinfo.nShow = showCmd;
++    sinfo.lpFile = validatedUri.inspect();
++
++    BOOL result = ShellExecuteExW(&sinfo);
++    if (!result || reinterpret_cast<LONG_PTR>(sinfo.hInstApp) < 32) {
++      rv = NS_ERROR_FAILURE;
++    }
++  }
++
++  return rv;
++}
++
++void nsMIMEInfoWin::UpdateDefaultInfoIfStale() {
++  if (!mIsDefaultAppInfoFresh) {
++    nsCOMPtr<nsIMIMEService> mime = do_GetService("@mozilla.org/mime;1");
++    if (mime) {
++      mime->UpdateDefaultAppInfo(static_cast<nsIMIMEInfo*>(this));
++    }
++    mIsDefaultAppInfoFresh = true;
++  }
++}
++
++// Given a path to a local file, return its nsILocalHandlerApp instance.
++bool nsMIMEInfoWin::GetLocalHandlerApp(const nsAString& aCommandHandler,
++                                       nsCOMPtr<nsILocalHandlerApp>& aApp) {
++  nsCOMPtr<nsIFile> locfile;
++  nsresult rv = NS_NewLocalFile(aCommandHandler, getter_AddRefs(locfile));
++  if (NS_FAILED(rv)) return false;
++
++  aApp = do_CreateInstance("@mozilla.org/uriloader/local-handler-app;1");
++  if (!aApp) return false;
++
++  aApp->SetExecutable(locfile);
++  return true;
++}
++
++// Return the cleaned up file path associated with a command verb
++// located in root/Applications.
++bool nsMIMEInfoWin::GetAppsVerbCommandHandler(const nsAString& appExeName,
++                                              nsAString& applicationPath,
++                                              bool edit) {
++  nsCOMPtr<nsIWindowsRegKey> appKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!appKey) return false;
++
++  // HKEY_CLASSES_ROOT\Applications\iexplore.exe
++  nsAutoString applicationsPath;
++  applicationsPath.AppendLiteral("Applications\\");
++  applicationsPath.Append(appExeName);
++
++  nsresult rv =
++      appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  // Check for the NoOpenWith flag, if it exists
++  uint32_t value;
++  if (NS_SUCCEEDED(appKey->ReadIntValue(u"NoOpenWith"_ns, &value)) &&
++      value == 1)
++    return false;
++
++  nsAutoString dummy;
++  if (NS_SUCCEEDED(appKey->ReadStringValue(u"NoOpenWith"_ns, dummy)))
++    return false;
++
++  appKey->Close();
++
++  // HKEY_CLASSES_ROOT\Applications\iexplore.exe\shell\open\command
++  applicationsPath.AssignLiteral("Applications\\");
++  applicationsPath.Append(appExeName);
++  if (!edit)
++    applicationsPath.AppendLiteral("\\shell\\open\\command");
++  else
++    applicationsPath.AppendLiteral("\\shell\\edit\\command");
++
++  rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
++                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  nsAutoString appFilesystemCommand;
++  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
++    // Expand environment vars, clean up any misc.
++    if (!nsLocalFile::CleanupCmdHandlerPath(appFilesystemCommand)) return false;
++
++    applicationPath = appFilesystemCommand;
++    return true;
++  }
++  return false;
++}
++
++// Return a fully populated command string based on
++// passing information. Used in launchWithFile to trace
++// back to the full handler path based on the dll.
++// (dll, targetfile, return args, open/edit)
++bool nsMIMEInfoWin::GetDllLaunchInfo(nsIFile* aDll, nsIFile* aFile,
++                                     nsAString& args, bool edit) {
++  if (!aDll || !aFile) return false;
++
++  nsString appExeName;
++  aDll->GetLeafName(appExeName);
++
++  nsCOMPtr<nsIWindowsRegKey> appKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!appKey) return false;
++
++  // HKEY_CLASSES_ROOT\Applications\iexplore.exe
++  nsAutoString applicationsPath;
++  applicationsPath.AppendLiteral("Applications\\");
++  applicationsPath.Append(appExeName);
++
++  nsresult rv =
++      appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  // Check for the NoOpenWith flag, if it exists
++  uint32_t value;
++  rv = appKey->ReadIntValue(u"NoOpenWith"_ns, &value);
++  if (NS_SUCCEEDED(rv) && value == 1) return false;
++
++  nsAutoString dummy;
++  if (NS_SUCCEEDED(appKey->ReadStringValue(u"NoOpenWith"_ns, dummy)))
++    return false;
++
++  appKey->Close();
++
++  // HKEY_CLASSES_ROOT\Applications\iexplore.exe\shell\open\command
++  applicationsPath.AssignLiteral("Applications\\");
++  applicationsPath.Append(appExeName);
++  if (!edit)
++    applicationsPath.AppendLiteral("\\shell\\open\\command");
++  else
++    applicationsPath.AppendLiteral("\\shell\\edit\\command");
++
++  rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, applicationsPath,
++                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  nsAutoString appFilesystemCommand;
++  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
++    // Replace embedded environment variables.
++    uint32_t bufLength =
++        ::ExpandEnvironmentStringsW(appFilesystemCommand.get(), nullptr, 0);
++    if (bufLength == 0)  // Error
++      return false;
++
++    auto destination = mozilla::MakeUniqueFallible<wchar_t[]>(bufLength);
++    if (!destination) return false;
++    if (!::ExpandEnvironmentStringsW(appFilesystemCommand.get(),
++                                     destination.get(), bufLength))
++      return false;
++
++    appFilesystemCommand.Assign(destination.get());
++
++    // C:\Windows\System32\rundll32.exe "C:\Program Files\Windows
++    // Photo Gallery\PhotoViewer.dll", ImageView_Fullscreen %1
++    nsAutoString params;
++    constexpr auto rundllSegment = u"rundll32.exe "_ns;
++    int32_t index = appFilesystemCommand.Find(rundllSegment);
++    if (index > kNotFound) {
++      params.Append(
++          Substring(appFilesystemCommand, index + rundllSegment.Length()));
++    } else {
++      params.Append(appFilesystemCommand);
++    }
++
++    // check to make sure we have a %1 and fill it
++    constexpr auto percentOneParam = u"%1"_ns;
++    index = params.Find(percentOneParam);
++    if (index == kNotFound)  // no parameter
++      return false;
++
++    nsString target;
++    aFile->GetTarget(target);
++    params.Replace(index, 2, target);
++
++    args = params;
++
++    return true;
++  }
++  return false;
++}
++
++// Return the cleaned up file path associated with a progid command
++// verb located in root.
++bool nsMIMEInfoWin::GetProgIDVerbCommandHandler(const nsAString& appProgIDName,
++                                                nsAString& applicationPath,
++                                                bool edit) {
++  nsCOMPtr<nsIWindowsRegKey> appKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!appKey) return false;
++
++  nsAutoString appProgId(appProgIDName);
++
++  // HKEY_CLASSES_ROOT\Windows.XPSReachViewer\shell\open\command
++  if (!edit)
++    appProgId.AppendLiteral("\\shell\\open\\command");
++  else
++    appProgId.AppendLiteral("\\shell\\edit\\command");
++
++  nsresult rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, appProgId,
++                             nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  nsAutoString appFilesystemCommand;
++  if (NS_SUCCEEDED(appKey->ReadStringValue(u""_ns, appFilesystemCommand))) {
++    // Expand environment vars, clean up any misc.
++    if (!nsLocalFile::CleanupCmdHandlerPath(appFilesystemCommand)) return false;
++
++    applicationPath = appFilesystemCommand;
++    return true;
++  }
++  return false;
++}
++
++// Helper routine used in tracking app lists. Converts path
++// entries to lower case and stores them in the trackList array.
++void nsMIMEInfoWin::ProcessPath(nsCOMPtr<nsIMutableArray>& appList,
++                                nsTArray<nsString>& trackList,
++                                const nsAutoString& appIdOrName,
++                                const nsAString& appFilesystemCommand) {
++  nsAutoString lower(appFilesystemCommand);
++  ToLowerCase(lower);
++
++  // Don't include firefox.exe in the list
++  WCHAR exe[MAX_PATH + 1];
++  uint32_t len = GetModuleFileNameW(nullptr, exe, MAX_PATH);
++  if (len < MAX_PATH && len != 0) {
++    int32_t index = lower.Find(reinterpret_cast<const char16_t*>(exe));
++    if (index != -1) return;
++  }
++
++  nsCOMPtr<nsILocalHandlerApp> aApp;
++  if (!GetLocalHandlerApp(appFilesystemCommand, aApp)) return;
++
++  // Track the app id so that the pretty name can be determined later
++  (static_cast<nsLocalHandlerAppWin*>(aApp.get()))->SetAppIdOrName(appIdOrName);
++
++  // Save in our main tracking arrays
++  appList->AppendElement(aApp);
++  trackList.AppendElement(lower);
++}
++
++// Helper routine that handles a compare between a path
++// and an array of paths.
++static bool IsPathInList(nsAString& appPath, nsTArray<nsString>& trackList) {
++  // trackList data is always lowercase, see ProcessPath
++  // above.
++  nsAutoString tmp(appPath);
++  ToLowerCase(tmp);
++
++  for (uint32_t i = 0; i < trackList.Length(); i++) {
++    if (tmp.Equals(trackList[i])) return true;
++  }
++  return false;
++}
++
++/**
++ * Returns a list of nsILocalHandlerApp objects containing local
++ * handlers associated with this mimeinfo. Implemented per
++ * platform using information in this object to generate the
++ * best list. Typically used for an "open with" style user
++ * option.
++ *
++ * @return nsIArray of nsILocalHandlerApp
++ */
++NS_IMETHODIMP
++nsMIMEInfoWin::GetPossibleLocalHandlers(nsIArray** _retval) {
++  nsresult rv;
++
++  *_retval = nullptr;
++
++  nsCOMPtr<nsIMutableArray> appList = do_CreateInstance("@mozilla.org/array;1");
++
++  if (!appList) return NS_ERROR_FAILURE;
++
++  nsTArray<nsString> trackList;
++
++  nsAutoCString fileExt;
++  GetPrimaryExtension(fileExt);
++
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return NS_ERROR_FAILURE;
++  nsCOMPtr<nsIWindowsRegKey> appKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!appKey) return NS_ERROR_FAILURE;
++
++  nsAutoString workingRegistryPath;
++
++  bool extKnown = false;
++  if (fileExt.IsEmpty()) {
++    extKnown = true;
++    // Mime type discovery is possible in some cases, through
++    // HKEY_CLASSES_ROOT\MIME\Database\Content Type, however, a number
++    // of file extensions related to mime type are simply not defined,
++    // (application/rss+xml & application/atom+xml are good examples)
++    // in which case we can only provide a generic list.
++    nsAutoCString mimeType;
++    GetMIMEType(mimeType);
++    if (!mimeType.IsEmpty()) {
++      workingRegistryPath.AppendLiteral("MIME\\Database\\Content Type\\");
++      workingRegistryPath.Append(NS_ConvertASCIItoUTF16(mimeType));
++
++      rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                        workingRegistryPath,
++                        nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++      if (NS_SUCCEEDED(rv)) {
++        nsAutoString mimeFileExt;
++        if (NS_SUCCEEDED(regKey->ReadStringValue(u""_ns, mimeFileExt))) {
++          CopyUTF16toUTF8(mimeFileExt, fileExt);
++          extKnown = false;
++        }
++      }
++    }
++  }
++
++  nsAutoString fileExtToUse;
++  if (!fileExt.IsEmpty() && fileExt.First() != '.') {
++    fileExtToUse = char16_t('.');
++  }
++  fileExtToUse.Append(NS_ConvertUTF8toUTF16(fileExt));
++
++  // Note, the order in which these occur has an effect on the
++  // validity of the resulting display list.
++
++  if (!extKnown) {
++    // 1) Get the default handler if it exists
++    workingRegistryPath = fileExtToUse;
++
++    rv =
++        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      nsAutoString appProgId;
++      if (NS_SUCCEEDED(regKey->ReadStringValue(u""_ns, appProgId))) {
++        // Bug 358297 - ignore the embedded internet explorer handler
++        if (appProgId != u"XPSViewer.Document"_ns) {
++          nsAutoString appFilesystemCommand;
++          if (GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
++                                          false) &&
++              !IsPathInList(appFilesystemCommand, trackList)) {
++            ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
++          }
++        }
++      }
++      regKey->Close();
++    }
++
++    // 2) list HKEY_CLASSES_ROOT\.ext\OpenWithList
++
++    workingRegistryPath = fileExtToUse;
++    workingRegistryPath.AppendLiteral("\\OpenWithList");
++
++    rv =
++        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      uint32_t count = 0;
++      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++        for (uint32_t index = 0; index < count; index++) {
++          nsAutoString appName;
++          if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
++
++          // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
++          nsAutoString appFilesystemCommand;
++          if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand,
++                                         false) ||
++              IsPathInList(appFilesystemCommand, trackList))
++            continue;
++          ProcessPath(appList, trackList, appName, appFilesystemCommand);
++        }
++      }
++      regKey->Close();
++    }
++
++    // 3) List HKEY_CLASSES_ROOT\.ext\OpenWithProgids, with the
++    // different step of resolving the progids for the command handler.
++
++    workingRegistryPath = fileExtToUse;
++    workingRegistryPath.AppendLiteral("\\OpenWithProgids");
++
++    rv =
++        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      uint32_t count = 0;
++      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++        for (uint32_t index = 0; index < count; index++) {
++          // HKEY_CLASSES_ROOT\.ext\OpenWithProgids\Windows.XPSReachViewer
++          nsAutoString appProgId;
++          if (NS_FAILED(regKey->GetValueName(index, appProgId))) continue;
++
++          nsAutoString appFilesystemCommand;
++          if (!GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
++                                           false) ||
++              IsPathInList(appFilesystemCommand, trackList))
++            continue;
++          ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
++        }
++      }
++      regKey->Close();
++    }
++
++    // 4) Add any non configured applications located in the MRU list
++
++    // HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion
++    // \Explorer\FileExts\.ext\OpenWithList
++    workingRegistryPath = nsLiteralString(
++        u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\");
++    workingRegistryPath += fileExtToUse;
++    workingRegistryPath.AppendLiteral("\\OpenWithList");
++
++    rv =
++        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CURRENT_USER,
++                     workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      uint32_t count = 0;
++      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++        for (uint32_t index = 0; index < count; index++) {
++          nsAutoString appName, appValue;
++          if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
++          if (appName.EqualsLiteral("MRUList")) continue;
++          if (NS_FAILED(regKey->ReadStringValue(appName, appValue))) continue;
++
++          // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
++          nsAutoString appFilesystemCommand;
++          if (!GetAppsVerbCommandHandler(appValue, appFilesystemCommand,
++                                         false) ||
++              IsPathInList(appFilesystemCommand, trackList))
++            continue;
++          ProcessPath(appList, trackList, appValue, appFilesystemCommand);
++        }
++      }
++    }
++
++    // 5) Add any non configured progids in the MRU list, with the
++    // different step of resolving the progids for the command handler.
++
++    // HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion
++    // \Explorer\FileExts\.ext\OpenWithProgids
++    workingRegistryPath = nsLiteralString(
++        u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\");
++    workingRegistryPath += fileExtToUse;
++    workingRegistryPath.AppendLiteral("\\OpenWithProgids");
++
++    regKey->Open(nsIWindowsRegKey::ROOT_KEY_CURRENT_USER, workingRegistryPath,
++                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      uint32_t count = 0;
++      if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++        for (uint32_t index = 0; index < count; index++) {
++          nsAutoString appIndex, appProgId;
++          if (NS_FAILED(regKey->GetValueName(index, appProgId))) continue;
++
++          nsAutoString appFilesystemCommand;
++          if (!GetProgIDVerbCommandHandler(appProgId, appFilesystemCommand,
++                                           false) ||
++              IsPathInList(appFilesystemCommand, trackList))
++            continue;
++          ProcessPath(appList, trackList, appProgId, appFilesystemCommand);
++        }
++      }
++      regKey->Close();
++    }
++
++    // 6) Check the perceived type value, and use this to lookup the
++    // perceivedtype open with list.
++    // http://msdn2.microsoft.com/en-us/library/aa969373.aspx
++
++    workingRegistryPath = fileExtToUse;
++
++    regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, workingRegistryPath,
++                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_SUCCEEDED(rv)) {
++      nsAutoString perceivedType;
++      rv = regKey->ReadStringValue(u"PerceivedType"_ns, perceivedType);
++      if (NS_SUCCEEDED(rv)) {
++        nsAutoString openWithListPath(u"SystemFileAssociations\\"_ns);
++        openWithListPath.Append(perceivedType);  // no period
++        openWithListPath.AppendLiteral("\\OpenWithList");
++
++        nsresult rv = appKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                                   openWithListPath,
++                                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++        if (NS_SUCCEEDED(rv)) {
++          uint32_t count = 0;
++          if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++            for (uint32_t index = 0; index < count; index++) {
++              nsAutoString appName;
++              if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
++
++              // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
++              nsAutoString appFilesystemCommand;
++              if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand,
++                                             false) ||
++                  IsPathInList(appFilesystemCommand, trackList))
++                continue;
++              ProcessPath(appList, trackList, appName, appFilesystemCommand);
++            }
++          }
++        }
++      }
++    }
++  }  // extKnown == false
++
++  // 7) list global HKEY_CLASSES_ROOT\*\OpenWithList
++  // Listing general purpose handlers, not specific to a mime type or file
++  // extension
++
++  workingRegistryPath = u"*\\OpenWithList"_ns;
++
++  rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                    workingRegistryPath, nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_SUCCEEDED(rv)) {
++    uint32_t count = 0;
++    if (NS_SUCCEEDED(regKey->GetValueCount(&count)) && count > 0) {
++      for (uint32_t index = 0; index < count; index++) {
++        nsAutoString appName;
++        if (NS_FAILED(regKey->GetValueName(index, appName))) continue;
++
++        // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
++        nsAutoString appFilesystemCommand;
++        if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand, false) ||
++            IsPathInList(appFilesystemCommand, trackList))
++          continue;
++        ProcessPath(appList, trackList, appName, appFilesystemCommand);
++      }
++    }
++    regKey->Close();
++  }
++
++  // 8) General application's list - not file extension specific on windows
++  workingRegistryPath = u"Applications"_ns;
++
++  rv =
++      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, workingRegistryPath,
++                   nsIWindowsRegKey::ACCESS_ENUMERATE_SUB_KEYS |
++                       nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_SUCCEEDED(rv)) {
++    uint32_t count = 0;
++    if (NS_SUCCEEDED(regKey->GetChildCount(&count)) && count > 0) {
++      for (uint32_t index = 0; index < count; index++) {
++        nsAutoString appName;
++        if (NS_FAILED(regKey->GetChildName(index, appName))) continue;
++
++        // HKEY_CLASSES_ROOT\Applications\firefox.exe = "path params"
++        nsAutoString appFilesystemCommand;
++        if (!GetAppsVerbCommandHandler(appName, appFilesystemCommand, false) ||
++            IsPathInList(appFilesystemCommand, trackList))
++          continue;
++        ProcessPath(appList, trackList, appName, appFilesystemCommand);
++      }
++    }
++  }
++
++  // Return to the caller
++  *_retval = appList;
++  NS_ADDREF(*_retval);
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsMIMEInfoWin::IsCurrentAppOSDefault(bool* _retval) {
++  *_retval = false;
++  nsCOMPtr<nsIFile> defaultApp = GetDefaultApplication();
++  if (defaultApp) {
++    // Determine if the default executable is our executable.
++    nsCOMPtr<nsIFile> ourBinary;
++    XRE_GetBinaryPath(getter_AddRefs(ourBinary));
++    bool isSame = false;
++    nsresult rv = defaultApp->Equals(ourBinary, &isSame);
++    if (NS_FAILED(rv)) {
++      return rv;
++    }
++    *_retval = isSame;
++  }
++  return NS_OK;
++}
+diff --git a/uriloader/exthandler/win/nsOSHelperAppService.cpp b/uriloader/exthandler/win/nsOSHelperAppService.cpp
+index b3049c3999..7cba1bc763 100644
+--- a/uriloader/exthandler/win/nsOSHelperAppService.cpp
++++ b/uriloader/exthandler/win/nsOSHelperAppService.cpp
+@@ -1,619 +1,634 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "nsComponentManagerUtils.h"
+-#include "nsOSHelperAppService.h"
+-#include "nsISupports.h"
+-#include "nsString.h"
+-#include "nsIMIMEInfo.h"
+-#include "nsMIMEInfoWin.h"
+-#include "nsMimeTypes.h"
+-#include "nsNativeCharsetUtils.h"
+-#include "nsLocalFile.h"
+-#include "nsIWindowsRegKey.h"
+-#include "nsXULAppAPI.h"
+-
+-// shellapi.h is needed to build with WIN32_LEAN_AND_MEAN
+-#include <shellapi.h>
+-#include <shlwapi.h>
+-
+-#define LOG(...) MOZ_LOG(sLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+-
+-// helper methods: forward declarations...
+-static nsresult GetExtensionFromWindowsMimeDatabase(const nsACString& aMimeType,
+-                                                    nsString& aFileExtension);
+-
+-nsOSHelperAppService::nsOSHelperAppService()
+-    : nsExternalHelperAppService(), mAppAssoc(nullptr) {
+-  CoInitialize(nullptr);
+-  CoCreateInstance(CLSID_ApplicationAssociationRegistration, nullptr,
+-                   CLSCTX_INPROC, IID_IApplicationAssociationRegistration,
+-                   (void**)&mAppAssoc);
+-}
+-
+-nsOSHelperAppService::~nsOSHelperAppService() {
+-  if (mAppAssoc) mAppAssoc->Release();
+-  mAppAssoc = nullptr;
+-  CoUninitialize();
+-}
+-
+-// The windows registry provides a mime database key which lists a set of mime
+-// types and corresponding "Extension" values. we can use this to look up our
+-// mime type to see if there is a preferred extension for the mime type.
+-static nsresult GetExtensionFromWindowsMimeDatabase(const nsACString& aMimeType,
+-                                                    nsString& aFileExtension) {
+-  nsAutoString mimeDatabaseKey;
+-  mimeDatabaseKey.AssignLiteral("MIME\\Database\\Content Type\\");
+-
+-  AppendASCIItoUTF16(aMimeType, mimeDatabaseKey);
+-
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
+-
+-  nsresult rv =
+-      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, mimeDatabaseKey,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-
+-  if (NS_SUCCEEDED(rv))
+-    regKey->ReadStringValue(u"Extension"_ns, aFileExtension);
+-
+-  return NS_OK;
+-}
+-
+-nsresult nsOSHelperAppService::OSProtocolHandlerExists(
+-    const char* aProtocolScheme, bool* aHandlerExists) {
+-  // look up the protocol scheme in the windows registry....if we find a match
+-  // then we have a handler for it...
+-  *aHandlerExists = false;
+-  if (aProtocolScheme && *aProtocolScheme) {
+-    NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
+-    wchar_t* pResult = nullptr;
+-    NS_ConvertASCIItoUTF16 scheme(aProtocolScheme);
+-    // We are responsible for freeing returned strings.
+-    HRESULT hr = mAppAssoc->QueryCurrentDefault(scheme.get(), AT_URLPROTOCOL,
+-                                                AL_EFFECTIVE, &pResult);
+-    if (SUCCEEDED(hr)) {
+-      CoTaskMemFree(pResult);
+-      nsCOMPtr<nsIWindowsRegKey> regKey =
+-          do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-      if (!regKey) {
+-        return NS_ERROR_NOT_AVAILABLE;
+-      }
+-
+-      nsresult rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                                 nsDependentString(scheme.get()),
+-                                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-      if (NS_FAILED(rv)) {
+-        // Open will fail if the registry key path doesn't exist.
+-        return NS_OK;
+-      }
+-
+-      bool hasValue;
+-      rv = regKey->HasValue(u"URL Protocol"_ns, &hasValue);
+-      if (NS_FAILED(rv)) {
+-        return NS_ERROR_FAILURE;
+-      }
+-      if (!hasValue) {
+-        return NS_OK;
+-      }
+-
+-      *aHandlerExists = true;
+-    }
+-  }
+-
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP nsOSHelperAppService::GetApplicationDescription(
+-    const nsACString& aScheme, nsAString& _retval) {
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
+-
+-  NS_ConvertASCIItoUTF16 buf(aScheme);
+-
+-  wchar_t result[1024];
+-  DWORD resultSize = 1024;
+-  HRESULT hr = AssocQueryString(0x1000 /* ASSOCF_IS_PROTOCOL */,
+-                                ASSOCSTR_FRIENDLYAPPNAME, buf.get(), NULL,
+-                                result, &resultSize);
+-  if (SUCCEEDED(hr)) {
+-    _retval = result;
+-    return NS_OK;
+-  }
+-
+-  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
+-  wchar_t* pResult = nullptr;
+-  // We are responsible for freeing returned strings.
+-  hr = mAppAssoc->QueryCurrentDefault(buf.get(), AT_URLPROTOCOL, AL_EFFECTIVE,
+-                                      &pResult);
+-  if (SUCCEEDED(hr)) {
+-    nsCOMPtr<nsIFile> app;
+-    nsAutoString appInfo(pResult);
+-    CoTaskMemFree(pResult);
+-    if (NS_SUCCEEDED(GetDefaultAppInfo(appInfo, _retval, getter_AddRefs(app))))
+-      return NS_OK;
+-  }
+-  return NS_ERROR_NOT_AVAILABLE;
+-}
+-
+-NS_IMETHODIMP nsOSHelperAppService::IsCurrentAppOSDefaultForProtocol(
+-    const nsACString& aScheme, bool* _retval) {
+-  *_retval = false;
+-
+-  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
+-
+-  NS_ConvertASCIItoUTF16 buf(aScheme);
+-
+-  // Find the progID
+-  wchar_t* pResult = nullptr;
+-  HRESULT hr = mAppAssoc->QueryCurrentDefault(buf.get(), AT_URLPROTOCOL,
+-                                              AL_EFFECTIVE, &pResult);
+-  if (FAILED(hr)) {
+-    return NS_ERROR_FAILURE;
+-  }
+-  nsAutoString progID(pResult);
+-  // We are responsible for freeing returned strings.
+-  CoTaskMemFree(pResult);
+-
+-  // Find the default executable.
+-  nsAutoString description;
+-  nsCOMPtr<nsIFile> appFile;
+-  nsresult rv = GetDefaultAppInfo(progID, description, getter_AddRefs(appFile));
+-  if (NS_FAILED(rv)) {
+-    return rv;
+-  }
+-  // Determine if the default executable is our executable.
+-  nsCOMPtr<nsIFile> ourBinary;
+-  XRE_GetBinaryPath(getter_AddRefs(ourBinary));
+-  bool isSame = false;
+-  rv = appFile->Equals(ourBinary, &isSame);
+-  if (NS_FAILED(rv)) {
+-    return rv;
+-  }
+-  *_retval = isSame;
+-  return NS_OK;
+-}
+-
+-// GetMIMEInfoFromRegistry: This function obtains the values of some of the
+-// nsIMIMEInfo attributes for the mimeType/extension associated with the input
+-// registry key.  The default entry for that key is the name of a registry key
+-// under HKEY_CLASSES_ROOT.  The default value for *that* key is the descriptive
+-// name of the type.  The EditFlags value is a binary value; the low order bit
+-// of the third byte of which indicates that the user does not need to be
+-// prompted.
+-//
+-// This function sets only the Description attribute of the input nsIMIMEInfo.
+-/* static */
+-nsresult nsOSHelperAppService::GetMIMEInfoFromRegistry(const nsString& fileType,
+-                                                       nsIMIMEInfo* pInfo) {
+-  nsresult rv = NS_OK;
+-
+-  NS_ENSURE_ARG(pInfo);
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
+-
+-  rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileType,
+-                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return NS_ERROR_FAILURE;
+-
+-  // OK, the default value here is the description of the type.
+-  nsAutoString description;
+-  rv = regKey->ReadStringValue(u""_ns, description);
+-  if (NS_SUCCEEDED(rv)) pInfo->SetDescription(description);
+-
+-  return NS_OK;
+-}
+-
+-/////////////////////////////////////////////////////////////////////////////////////////////////
+-// method overrides used to gather information from the windows registry for
+-// various mime types.
+-////////////////////////////////////////////////////////////////////////////////////////////////
+-
+-/// Looks up the type for the extension aExt and compares it to aType
+-/* static */
+-bool nsOSHelperAppService::typeFromExtEquals(const char16_t* aExt,
+-                                             const char* aType) {
+-  if (!aType) return false;
+-  nsAutoString fileExtToUse;
+-  if (aExt[0] != char16_t('.')) fileExtToUse = char16_t('.');
+-
+-  fileExtToUse.Append(aExt);
+-
+-  bool eq = false;
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return eq;
+-
+-  nsresult rv =
+-      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileExtToUse,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return eq;
+-
+-  nsAutoString type;
+-  rv = regKey->ReadStringValue(u"Content Type"_ns, type);
+-  if (NS_SUCCEEDED(rv)) eq = type.LowerCaseEqualsASCII(aType);
+-
+-  return eq;
+-}
+-
+-// The "real" name of a given helper app (as specified by the path to the
+-// executable file held in various registry keys) is stored n the VERSIONINFO
+-// block in the file's resources. We need to find the path to the executable
+-// and then retrieve the "FileDescription" field value from the file.
+-nsresult nsOSHelperAppService::GetDefaultAppInfo(
+-    const nsAString& aAppInfo, nsAString& aDefaultDescription,
+-    nsIFile** aDefaultApplication) {
+-  nsAutoString handlerCommand;
+-
+-  // If all else fails, use the file type key name, which will be
+-  // something like "pngfile" for .pngs, "WMVFile" for .wmvs, etc.
+-  aDefaultDescription = aAppInfo;
+-  *aDefaultApplication = nullptr;
+-
+-  if (aAppInfo.IsEmpty()) return NS_ERROR_FAILURE;
+-
+-  // aAppInfo may be a file, file path, program id, or
+-  // Applications reference -
+-  // c:\dir\app.exe
+-  // Applications\appfile.exe/dll (shell\open...)
+-  // ProgID.progid (shell\open...)
+-
+-  nsAutoString handlerKeyName(aAppInfo);
+-
+-  nsCOMPtr<nsIWindowsRegKey> chkKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!chkKey) return NS_ERROR_FAILURE;
+-
+-  nsresult rv =
+-      chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, handlerKeyName,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) {
+-    // It's a file system path to a handler
+-    handlerCommand.Assign(aAppInfo);
+-  } else {
+-    handlerKeyName.AppendLiteral("\\shell\\open\\command");
+-    nsCOMPtr<nsIWindowsRegKey> regKey =
+-        do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-    if (!regKey) return NS_ERROR_FAILURE;
+-
+-    nsresult rv =
+-        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, handlerKeyName,
+-                     nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-    if (NS_FAILED(rv)) return NS_ERROR_FAILURE;
+-
+-    // OK, the default value here is the description of the type.
+-    rv = regKey->ReadStringValue(u""_ns, handlerCommand);
+-    if (NS_FAILED(rv)) {
+-      // Check if there is a DelegateExecute string
+-      nsAutoString delegateExecute;
+-      rv = regKey->ReadStringValue(u"DelegateExecute"_ns, delegateExecute);
+-      NS_ENSURE_SUCCESS(rv, rv);
+-
+-      // Look for InProcServer32
+-      nsAutoString delegateExecuteRegPath;
+-      delegateExecuteRegPath.AssignLiteral("CLSID\\");
+-      delegateExecuteRegPath.Append(delegateExecute);
+-      delegateExecuteRegPath.AppendLiteral("\\InProcServer32");
+-      rv = chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                        delegateExecuteRegPath,
+-                        nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-      if (NS_SUCCEEDED(rv)) {
+-        rv = chkKey->ReadStringValue(u""_ns, handlerCommand);
+-      }
+-
+-      if (NS_FAILED(rv)) {
+-        // Look for LocalServer32
+-        delegateExecuteRegPath.AssignLiteral("CLSID\\");
+-        delegateExecuteRegPath.Append(delegateExecute);
+-        delegateExecuteRegPath.AppendLiteral("\\LocalServer32");
+-        rv = chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
+-                          delegateExecuteRegPath,
+-                          nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-        NS_ENSURE_SUCCESS(rv, rv);
+-        rv = chkKey->ReadStringValue(u""_ns, handlerCommand);
+-        NS_ENSURE_SUCCESS(rv, rv);
+-      }
+-    }
+-
+-    LOG("AppInfo \"%s\" - Determined handler command: %s\n",
+-        NS_ConvertUTF16toUTF8(aAppInfo).get(),
+-        NS_ConvertUTF16toUTF8(handlerCommand).get());
+-  }
+-
+-  // XXX FIXME: If this fails, the UI will display the full command
+-  // string.
+-  // There are some rare cases this can happen - ["url.dll" -foo]
+-  // for example won't resolve correctly to the system dir. The
+-  // subsequent launch of the helper app will work though.
+-  nsCOMPtr<nsILocalFileWin> lf = new nsLocalFile();
+-  rv = lf->InitWithCommandLine(handlerCommand);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-  lf.forget(aDefaultApplication);
+-
+-  wchar_t friendlyName[1024];
+-  DWORD friendlyNameSize = 1024;
+-  HRESULT hr = AssocQueryString(ASSOCF_NONE, ASSOCSTR_FRIENDLYAPPNAME,
+-                                PromiseFlatString(aAppInfo).get(), NULL,
+-                                friendlyName, &friendlyNameSize);
+-  if (SUCCEEDED(hr) && friendlyNameSize > 1) {
+-    aDefaultDescription.Assign(friendlyName, friendlyNameSize - 1);
+-  }
+-
+-  if (MOZ_LOG_TEST(sLog, mozilla::LogLevel::Debug)) {
+-    nsAutoString path;
+-    if (*aDefaultApplication) {
+-      (*aDefaultApplication)->GetPath(path);
+-    }
+-
+-    LOG("AppInfo \"%s\" - default application (name: %s ; path: %s)\n",
+-        NS_ConvertUTF16toUTF8(aAppInfo).get(),
+-        NS_ConvertUTF16toUTF8(aDefaultDescription).get(),
+-        NS_ConvertUTF16toUTF8(path).get());
+-  }
+-
+-  return NS_OK;
+-}
+-
+-already_AddRefed<nsMIMEInfoWin> nsOSHelperAppService::GetByExtension(
+-    const nsString& aFileExt, const char* aTypeHint) {
+-  if (aFileExt.IsEmpty()) return nullptr;
+-
+-  // Determine the mime type.
+-  nsAutoCString typeToUse;
+-  if (aTypeHint && *aTypeHint) {
+-    typeToUse.Assign(aTypeHint);
+-  } else if (!GetMIMETypeFromOSForExtension(NS_ConvertUTF16toUTF8(aFileExt),
+-                                            typeToUse)) {
+-    return nullptr;
+-  }
+-
+-  RefPtr mimeInfo = mozilla::MakeRefPtr<nsMIMEInfoWin>(typeToUse);
+-
+-  // Our extension APIs expect extensions without the '.', so normalize:
+-  uint32_t dotlessIndex = aFileExt.First() != char16_t('.') ? 0 : 1;
+-  nsAutoCString lowerFileExt =
+-      NS_ConvertUTF16toUTF8(Substring(aFileExt, dotlessIndex));
+-  ToLowerCase(lowerFileExt);
+-  mimeInfo->AppendExtension(lowerFileExt);
+-  mimeInfo->SetPreferredAction(nsIMIMEInfo::saveToDisk);
+-
+-  if (NS_FAILED(InternalSetDefaultsOnMIME(mimeInfo))) {
+-    return nullptr;
+-  }
+-
+-  return mimeInfo.forget();
+-}
+-
+-nsresult nsOSHelperAppService::InternalSetDefaultsOnMIME(
+-    nsMIMEInfoWin* aMIMEInfo) {
+-  NS_ENSURE_ARG(aMIMEInfo);
+-
+-  nsAutoCString primaryExt;
+-  aMIMEInfo->GetPrimaryExtension(primaryExt);
+-
+-  if (primaryExt.IsEmpty()) {
+-    return NS_ERROR_FAILURE;
+-  }
+-
+-  // windows registry assumes your file extension is going to include the '.',
+-  // but our APIs don't have it, so add it:
+-  nsAutoString assocType = NS_ConvertUTF8toUTF16(primaryExt);
+-  if (assocType.First() != char16_t('.')) {
+-    assocType.Insert(char16_t('.'), 0);
+-  }
+-
+-  nsAutoString appInfo;
+-  bool found;
+-
+-  // Retrieve the default application for this extension
+-  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
+-  wchar_t* pResult = nullptr;
+-  HRESULT hr = mAppAssoc->QueryCurrentDefault(assocType.get(), AT_FILEEXTENSION,
+-                                              AL_EFFECTIVE, &pResult);
+-  if (SUCCEEDED(hr)) {
+-    found = true;
+-    appInfo.Assign(pResult);
+-    CoTaskMemFree(pResult);
+-  } else {
+-    found = false;
+-  }
+-
+-  // Bug 358297 - ignore the default handler, force the user to choose app
+-  if (appInfo.EqualsLiteral("XPSViewer.Document")) found = false;
+-
+-  if (!found) {
+-    return NS_ERROR_NOT_AVAILABLE;
+-  }
+-
+-  // Get other nsIMIMEInfo fields from registry, if possible.
+-  nsAutoString defaultDescription;
+-  nsCOMPtr<nsIFile> defaultApplication;
+-
+-  if (NS_FAILED(GetDefaultAppInfo(appInfo, defaultDescription,
+-                                  getter_AddRefs(defaultApplication)))) {
+-    return NS_ERROR_NOT_AVAILABLE;
+-  }
+-
+-  aMIMEInfo->SetDefaultDescription(defaultDescription);
+-  aMIMEInfo->SetDefaultApplicationHandler(defaultApplication);
+-
+-  // Grab the general description
+-  GetMIMEInfoFromRegistry(appInfo, aMIMEInfo);
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsOSHelperAppService::GetMIMEInfoFromOS(const nsACString& aMIMEType,
+-                                        const nsACString& aFileExt,
+-                                        bool* aFound, nsIMIMEInfo** aMIMEInfo) {
+-  *aFound = false;
+-
+-  const nsCString& flatType = PromiseFlatCString(aMIMEType);
+-  nsAutoString fileExtension;
+-  CopyUTF8toUTF16(aFileExt, fileExtension);
+-
+-  /* XXX The octet-stream check is a gross hack to wallpaper over the most
+-   * common Win32 extension issues caused by the fix for bug 116938.  See bug
+-   * 120327, comment 271 for why this is needed.  Not even sure we
+-   * want to remove this once we have fixed all this stuff to work
+-   * right; any info we get from the OS on this type is pretty much
+-   * useless....
+-   */
+-  bool haveMeaningfulMimeType =
+-      !aMIMEType.IsEmpty() &&
+-      !aMIMEType.LowerCaseEqualsLiteral(APPLICATION_OCTET_STREAM);
+-  LOG("Extension lookup on '%S' with mimetype '%s'%s\n", fileExtension.getW(),
+-      flatType.get(), haveMeaningfulMimeType ? " (treated as meaningful)" : "");
+-
+-  RefPtr<nsMIMEInfoWin> mi;
+-
+-  // We should have *something* to go on here.
+-  nsAutoString extensionFromMimeType;
+-  if (haveMeaningfulMimeType) {
+-    GetExtensionFromWindowsMimeDatabase(aMIMEType, extensionFromMimeType);
+-  }
+-  if (fileExtension.IsEmpty() && extensionFromMimeType.IsEmpty()) {
+-    // Without an extension from the mimetype or the file, we can't
+-    // do anything here.
+-    mi = new nsMIMEInfoWin(flatType.get());
+-    mi.forget(aMIMEInfo);
+-    return NS_OK;
+-  }
+-
+-  // Either fileExtension or extensionFromMimeType must now be non-empty.
+-
+-  *aFound = true;
+-
+-  // On Windows, we prefer the file extension for lookups over the mimetype,
+-  // because that's how windows does things.
+-  // If we have no file extension or it doesn't match the mimetype, use the
+-  // mime type's default file extension instead.
+-  bool usedMimeTypeExtensionForLookup = false;
+-  if (fileExtension.IsEmpty() ||
+-      (!extensionFromMimeType.IsEmpty() &&
+-       !typeFromExtEquals(fileExtension.get(), flatType.get()))) {
+-    usedMimeTypeExtensionForLookup = true;
+-    fileExtension = extensionFromMimeType;
+-    LOG("Now using '%s' mimetype's default file extension '%S' for lookup\n",
+-        flatType.get(), fileExtension.getW());
+-  }
+-
+-  // If we have an extension, use it for lookup:
+-  mi = GetByExtension(fileExtension, flatType.get());
+-  LOG("Extension lookup on '%S' found: 0x%p\n", fileExtension.getW(), mi.get());
+-
+-  if (mi) {
+-    bool hasDefault = false;
+-    mi->GetHasDefaultHandler(&hasDefault);
+-    // If we don't find a default handler description, see if we can find one
+-    // using the mimetype.
+-    if (!hasDefault && !usedMimeTypeExtensionForLookup) {
+-      RefPtr<nsMIMEInfoWin> miFromMimeType =
+-          GetByExtension(extensionFromMimeType, flatType.get());
+-      LOG("Mime-based ext. lookup for '%S' found 0x%p\n",
+-          extensionFromMimeType.getW(), miFromMimeType.get());
+-      if (miFromMimeType) {
+-        nsAutoString desc;
+-        miFromMimeType->GetDefaultDescription(desc);
+-        mi->SetDefaultDescription(desc);
+-      }
+-    }
+-    mi.forget(aMIMEInfo);
+-    return NS_OK;
+-  }
+-
+-  // The extension didn't work. Try the extension from the mimetype if
+-  // different:
+-  if (!extensionFromMimeType.IsEmpty() && !usedMimeTypeExtensionForLookup) {
+-    mi = GetByExtension(extensionFromMimeType, flatType.get());
+-    LOG("Mime-based ext. lookup for '%S' found 0x%p\n",
+-        extensionFromMimeType.getW(), mi.get());
+-  }
+-  if (mi) {
+-    mi.forget(aMIMEInfo);
+-    return NS_OK;
+-  }
+-  // This didn't work either, so just return an empty dummy mimeinfo.
+-  *aFound = false;
+-  mi = new nsMIMEInfoWin(flatType.get());
+-  // If we didn't resort to the mime type's extension, we must have had a
+-  // valid extension, so stick its lowercase version on the mime info.
+-  if (!usedMimeTypeExtensionForLookup) {
+-    nsAutoCString lowerFileExt;
+-    ToLowerCase(aFileExt, lowerFileExt);
+-    mi->AppendExtension(lowerFileExt);
+-  }
+-  mi.forget(aMIMEInfo);
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsOSHelperAppService::UpdateDefaultAppInfo(nsIMIMEInfo* aMIMEInfo) {
+-  InternalSetDefaultsOnMIME(static_cast<nsMIMEInfoWin*>(aMIMEInfo));
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsOSHelperAppService::GetProtocolHandlerInfoFromOS(const nsACString& aScheme,
+-                                                   bool* found,
+-                                                   nsIHandlerInfo** _retval) {
+-  NS_ASSERTION(!aScheme.IsEmpty(), "No scheme was specified!");
+-
+-  nsresult rv =
+-      OSProtocolHandlerExists(nsPromiseFlatCString(aScheme).get(), found);
+-  if (NS_FAILED(rv)) return rv;
+-
+-  nsMIMEInfoWin* handlerInfo =
+-      new nsMIMEInfoWin(aScheme, nsMIMEInfoBase::eProtocolInfo);
+-  NS_ENSURE_TRUE(handlerInfo, NS_ERROR_OUT_OF_MEMORY);
+-  NS_ADDREF(*_retval = handlerInfo);
+-
+-  if (!*found) {
+-    // Code that calls this requires an object regardless if the OS has
+-    // something for us, so we return the empty object.
+-    return NS_OK;
+-  }
+-
+-  nsAutoString desc;
+-  GetApplicationDescription(aScheme, desc);
+-  handlerInfo->SetDefaultDescription(desc);
+-
+-  return NS_OK;
+-}
+-
+-bool nsOSHelperAppService::GetMIMETypeFromOSForExtension(
+-    const nsACString& aExtension, nsACString& aMIMEType) {
+-  if (aExtension.IsEmpty()) return false;
+-
+-  // windows registry assumes your file extension is going to include the '.'.
+-  // so make sure it's there...
+-  nsAutoString fileExtToUse;
+-  if (aExtension.First() != '.') fileExtToUse = char16_t('.');
+-
+-  AppendUTF8toUTF16(aExtension, fileExtToUse);
+-
+-  // Try to get an entry from the windows registry.
+-  nsCOMPtr<nsIWindowsRegKey> regKey =
+-      do_CreateInstance("@mozilla.org/windows-registry-key;1");
+-  if (!regKey) return false;
+-
+-  nsresult rv =
+-      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileExtToUse,
+-                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
+-  if (NS_FAILED(rv)) return false;
+-
+-  nsAutoString mimeType;
+-  if (NS_FAILED(regKey->ReadStringValue(u"Content Type"_ns, mimeType)) ||
+-      mimeType.IsEmpty()) {
+-    return false;
+-  }
+-  // Content-Type is always in ASCII
+-  aMIMEType.Truncate();
+-  LossyAppendUTF16toASCII(mimeType, aMIMEType);
+-  return true;
+-}
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsComponentManagerUtils.h"
++#include "nsOSHelperAppService.h"
++#include "nsISupports.h"
++#include "nsString.h"
++#include "nsIMIMEInfo.h"
++#include "nsMIMEInfoWin.h"
++#include "nsMimeTypes.h"
++#include "nsNativeCharsetUtils.h"
++#include "nsLocalFile.h"
++#include "nsIWindowsRegKey.h"
++#include "nsXULAppAPI.h"
++
++// shellapi.h is needed to build with WIN32_LEAN_AND_MEAN
++#include <shellapi.h>
++#include <shlwapi.h>
++
++#define LOG(...) MOZ_LOG(sLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
++
++// helper methods: forward declarations...
++static nsresult GetExtensionFromWindowsMimeDatabase(const nsACString& aMimeType,
++                                                    nsString& aFileExtension);
++
++nsOSHelperAppService::nsOSHelperAppService()
++    : nsExternalHelperAppService(), mAppAssoc(nullptr) {
++  CoInitialize(nullptr);
++  CoCreateInstance(CLSID_ApplicationAssociationRegistration, nullptr,
++                   CLSCTX_INPROC, IID_IApplicationAssociationRegistration,
++                   (void**)&mAppAssoc);
++}
++
++nsOSHelperAppService::~nsOSHelperAppService() {
++  if (mAppAssoc) mAppAssoc->Release();
++  mAppAssoc = nullptr;
++  CoUninitialize();
++}
++
++// The windows registry provides a mime database key which lists a set of mime
++// types and corresponding "Extension" values. we can use this to look up our
++// mime type to see if there is a preferred extension for the mime type.
++static nsresult GetExtensionFromWindowsMimeDatabase(const nsACString& aMimeType,
++                                                    nsString& aFileExtension) {
++  nsAutoString mimeDatabaseKey;
++  mimeDatabaseKey.AssignLiteral("MIME\\Database\\Content Type\\");
++
++  AppendASCIItoUTF16(aMimeType, mimeDatabaseKey);
++
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
++
++  nsresult rv =
++      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, mimeDatabaseKey,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++
++  if (NS_SUCCEEDED(rv))
++    regKey->ReadStringValue(u"Extension"_ns, aFileExtension);
++
++  return NS_OK;
++}
++
++#if defined(GECKO_W10M)
++extern "C" bool gecko_w10m_has_uri_launcher();
++#endif
++
++nsresult nsOSHelperAppService::OSProtocolHandlerExists(
++    const char* aProtocolScheme, bool* aHandlerExists) {
++#if defined(GECKO_W10M)
++  // The registry this would read is closed to an app container, so it always
++  // said "no handler" and Gecko refused every external link. The shell's
++  // launcher knows better: let the system decide whether it can open the
++  // scheme.
++  if (gecko_w10m_has_uri_launcher()) {
++    *aHandlerExists = true;
++    return NS_OK;
++  }
++#endif
++
++  // look up the protocol scheme in the windows registry....if we find a match
++  // then we have a handler for it...
++  *aHandlerExists = false;
++  if (aProtocolScheme && *aProtocolScheme) {
++    NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
++    wchar_t* pResult = nullptr;
++    NS_ConvertASCIItoUTF16 scheme(aProtocolScheme);
++    // We are responsible for freeing returned strings.
++    HRESULT hr = mAppAssoc->QueryCurrentDefault(scheme.get(), AT_URLPROTOCOL,
++                                                AL_EFFECTIVE, &pResult);
++    if (SUCCEEDED(hr)) {
++      CoTaskMemFree(pResult);
++      nsCOMPtr<nsIWindowsRegKey> regKey =
++          do_CreateInstance("@mozilla.org/windows-registry-key;1");
++      if (!regKey) {
++        return NS_ERROR_NOT_AVAILABLE;
++      }
++
++      nsresult rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                                 nsDependentString(scheme.get()),
++                                 nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++      if (NS_FAILED(rv)) {
++        // Open will fail if the registry key path doesn't exist.
++        return NS_OK;
++      }
++
++      bool hasValue;
++      rv = regKey->HasValue(u"URL Protocol"_ns, &hasValue);
++      if (NS_FAILED(rv)) {
++        return NS_ERROR_FAILURE;
++      }
++      if (!hasValue) {
++        return NS_OK;
++      }
++
++      *aHandlerExists = true;
++    }
++  }
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP nsOSHelperAppService::GetApplicationDescription(
++    const nsACString& aScheme, nsAString& _retval) {
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
++
++  NS_ConvertASCIItoUTF16 buf(aScheme);
++
++  wchar_t result[1024];
++  DWORD resultSize = 1024;
++  HRESULT hr = AssocQueryString(0x1000 /* ASSOCF_IS_PROTOCOL */,
++                                ASSOCSTR_FRIENDLYAPPNAME, buf.get(), NULL,
++                                result, &resultSize);
++  if (SUCCEEDED(hr)) {
++    _retval = result;
++    return NS_OK;
++  }
++
++  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
++  wchar_t* pResult = nullptr;
++  // We are responsible for freeing returned strings.
++  hr = mAppAssoc->QueryCurrentDefault(buf.get(), AT_URLPROTOCOL, AL_EFFECTIVE,
++                                      &pResult);
++  if (SUCCEEDED(hr)) {
++    nsCOMPtr<nsIFile> app;
++    nsAutoString appInfo(pResult);
++    CoTaskMemFree(pResult);
++    if (NS_SUCCEEDED(GetDefaultAppInfo(appInfo, _retval, getter_AddRefs(app))))
++      return NS_OK;
++  }
++  return NS_ERROR_NOT_AVAILABLE;
++}
++
++NS_IMETHODIMP nsOSHelperAppService::IsCurrentAppOSDefaultForProtocol(
++    const nsACString& aScheme, bool* _retval) {
++  *_retval = false;
++
++  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
++
++  NS_ConvertASCIItoUTF16 buf(aScheme);
++
++  // Find the progID
++  wchar_t* pResult = nullptr;
++  HRESULT hr = mAppAssoc->QueryCurrentDefault(buf.get(), AT_URLPROTOCOL,
++                                              AL_EFFECTIVE, &pResult);
++  if (FAILED(hr)) {
++    return NS_ERROR_FAILURE;
++  }
++  nsAutoString progID(pResult);
++  // We are responsible for freeing returned strings.
++  CoTaskMemFree(pResult);
++
++  // Find the default executable.
++  nsAutoString description;
++  nsCOMPtr<nsIFile> appFile;
++  nsresult rv = GetDefaultAppInfo(progID, description, getter_AddRefs(appFile));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  // Determine if the default executable is our executable.
++  nsCOMPtr<nsIFile> ourBinary;
++  XRE_GetBinaryPath(getter_AddRefs(ourBinary));
++  bool isSame = false;
++  rv = appFile->Equals(ourBinary, &isSame);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  *_retval = isSame;
++  return NS_OK;
++}
++
++// GetMIMEInfoFromRegistry: This function obtains the values of some of the
++// nsIMIMEInfo attributes for the mimeType/extension associated with the input
++// registry key.  The default entry for that key is the name of a registry key
++// under HKEY_CLASSES_ROOT.  The default value for *that* key is the descriptive
++// name of the type.  The EditFlags value is a binary value; the low order bit
++// of the third byte of which indicates that the user does not need to be
++// prompted.
++//
++// This function sets only the Description attribute of the input nsIMIMEInfo.
++/* static */
++nsresult nsOSHelperAppService::GetMIMEInfoFromRegistry(const nsString& fileType,
++                                                       nsIMIMEInfo* pInfo) {
++  nsresult rv = NS_OK;
++
++  NS_ENSURE_ARG(pInfo);
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return NS_ERROR_NOT_AVAILABLE;
++
++  rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileType,
++                    nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return NS_ERROR_FAILURE;
++
++  // OK, the default value here is the description of the type.
++  nsAutoString description;
++  rv = regKey->ReadStringValue(u""_ns, description);
++  if (NS_SUCCEEDED(rv)) pInfo->SetDescription(description);
++
++  return NS_OK;
++}
++
++/////////////////////////////////////////////////////////////////////////////////////////////////
++// method overrides used to gather information from the windows registry for
++// various mime types.
++////////////////////////////////////////////////////////////////////////////////////////////////
++
++/// Looks up the type for the extension aExt and compares it to aType
++/* static */
++bool nsOSHelperAppService::typeFromExtEquals(const char16_t* aExt,
++                                             const char* aType) {
++  if (!aType) return false;
++  nsAutoString fileExtToUse;
++  if (aExt[0] != char16_t('.')) fileExtToUse = char16_t('.');
++
++  fileExtToUse.Append(aExt);
++
++  bool eq = false;
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return eq;
++
++  nsresult rv =
++      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileExtToUse,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return eq;
++
++  nsAutoString type;
++  rv = regKey->ReadStringValue(u"Content Type"_ns, type);
++  if (NS_SUCCEEDED(rv)) eq = type.LowerCaseEqualsASCII(aType);
++
++  return eq;
++}
++
++// The "real" name of a given helper app (as specified by the path to the
++// executable file held in various registry keys) is stored n the VERSIONINFO
++// block in the file's resources. We need to find the path to the executable
++// and then retrieve the "FileDescription" field value from the file.
++nsresult nsOSHelperAppService::GetDefaultAppInfo(
++    const nsAString& aAppInfo, nsAString& aDefaultDescription,
++    nsIFile** aDefaultApplication) {
++  nsAutoString handlerCommand;
++
++  // If all else fails, use the file type key name, which will be
++  // something like "pngfile" for .pngs, "WMVFile" for .wmvs, etc.
++  aDefaultDescription = aAppInfo;
++  *aDefaultApplication = nullptr;
++
++  if (aAppInfo.IsEmpty()) return NS_ERROR_FAILURE;
++
++  // aAppInfo may be a file, file path, program id, or
++  // Applications reference -
++  // c:\dir\app.exe
++  // Applications\appfile.exe/dll (shell\open...)
++  // ProgID.progid (shell\open...)
++
++  nsAutoString handlerKeyName(aAppInfo);
++
++  nsCOMPtr<nsIWindowsRegKey> chkKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!chkKey) return NS_ERROR_FAILURE;
++
++  nsresult rv =
++      chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, handlerKeyName,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) {
++    // It's a file system path to a handler
++    handlerCommand.Assign(aAppInfo);
++  } else {
++    handlerKeyName.AppendLiteral("\\shell\\open\\command");
++    nsCOMPtr<nsIWindowsRegKey> regKey =
++        do_CreateInstance("@mozilla.org/windows-registry-key;1");
++    if (!regKey) return NS_ERROR_FAILURE;
++
++    nsresult rv =
++        regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, handlerKeyName,
++                     nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++    if (NS_FAILED(rv)) return NS_ERROR_FAILURE;
++
++    // OK, the default value here is the description of the type.
++    rv = regKey->ReadStringValue(u""_ns, handlerCommand);
++    if (NS_FAILED(rv)) {
++      // Check if there is a DelegateExecute string
++      nsAutoString delegateExecute;
++      rv = regKey->ReadStringValue(u"DelegateExecute"_ns, delegateExecute);
++      NS_ENSURE_SUCCESS(rv, rv);
++
++      // Look for InProcServer32
++      nsAutoString delegateExecuteRegPath;
++      delegateExecuteRegPath.AssignLiteral("CLSID\\");
++      delegateExecuteRegPath.Append(delegateExecute);
++      delegateExecuteRegPath.AppendLiteral("\\InProcServer32");
++      rv = chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                        delegateExecuteRegPath,
++                        nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++      if (NS_SUCCEEDED(rv)) {
++        rv = chkKey->ReadStringValue(u""_ns, handlerCommand);
++      }
++
++      if (NS_FAILED(rv)) {
++        // Look for LocalServer32
++        delegateExecuteRegPath.AssignLiteral("CLSID\\");
++        delegateExecuteRegPath.Append(delegateExecute);
++        delegateExecuteRegPath.AppendLiteral("\\LocalServer32");
++        rv = chkKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT,
++                          delegateExecuteRegPath,
++                          nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++        NS_ENSURE_SUCCESS(rv, rv);
++        rv = chkKey->ReadStringValue(u""_ns, handlerCommand);
++        NS_ENSURE_SUCCESS(rv, rv);
++      }
++    }
++
++    LOG("AppInfo \"%s\" - Determined handler command: %s\n",
++        NS_ConvertUTF16toUTF8(aAppInfo).get(),
++        NS_ConvertUTF16toUTF8(handlerCommand).get());
++  }
++
++  // XXX FIXME: If this fails, the UI will display the full command
++  // string.
++  // There are some rare cases this can happen - ["url.dll" -foo]
++  // for example won't resolve correctly to the system dir. The
++  // subsequent launch of the helper app will work though.
++  nsCOMPtr<nsILocalFileWin> lf = new nsLocalFile();
++  rv = lf->InitWithCommandLine(handlerCommand);
++  NS_ENSURE_SUCCESS(rv, rv);
++  lf.forget(aDefaultApplication);
++
++  wchar_t friendlyName[1024];
++  DWORD friendlyNameSize = 1024;
++  HRESULT hr = AssocQueryString(ASSOCF_NONE, ASSOCSTR_FRIENDLYAPPNAME,
++                                PromiseFlatString(aAppInfo).get(), NULL,
++                                friendlyName, &friendlyNameSize);
++  if (SUCCEEDED(hr) && friendlyNameSize > 1) {
++    aDefaultDescription.Assign(friendlyName, friendlyNameSize - 1);
++  }
++
++  if (MOZ_LOG_TEST(sLog, mozilla::LogLevel::Debug)) {
++    nsAutoString path;
++    if (*aDefaultApplication) {
++      (*aDefaultApplication)->GetPath(path);
++    }
++
++    LOG("AppInfo \"%s\" - default application (name: %s ; path: %s)\n",
++        NS_ConvertUTF16toUTF8(aAppInfo).get(),
++        NS_ConvertUTF16toUTF8(aDefaultDescription).get(),
++        NS_ConvertUTF16toUTF8(path).get());
++  }
++
++  return NS_OK;
++}
++
++already_AddRefed<nsMIMEInfoWin> nsOSHelperAppService::GetByExtension(
++    const nsString& aFileExt, const char* aTypeHint) {
++  if (aFileExt.IsEmpty()) return nullptr;
++
++  // Determine the mime type.
++  nsAutoCString typeToUse;
++  if (aTypeHint && *aTypeHint) {
++    typeToUse.Assign(aTypeHint);
++  } else if (!GetMIMETypeFromOSForExtension(NS_ConvertUTF16toUTF8(aFileExt),
++                                            typeToUse)) {
++    return nullptr;
++  }
++
++  RefPtr mimeInfo = mozilla::MakeRefPtr<nsMIMEInfoWin>(typeToUse);
++
++  // Our extension APIs expect extensions without the '.', so normalize:
++  uint32_t dotlessIndex = aFileExt.First() != char16_t('.') ? 0 : 1;
++  nsAutoCString lowerFileExt =
++      NS_ConvertUTF16toUTF8(Substring(aFileExt, dotlessIndex));
++  ToLowerCase(lowerFileExt);
++  mimeInfo->AppendExtension(lowerFileExt);
++  mimeInfo->SetPreferredAction(nsIMIMEInfo::saveToDisk);
++
++  if (NS_FAILED(InternalSetDefaultsOnMIME(mimeInfo))) {
++    return nullptr;
++  }
++
++  return mimeInfo.forget();
++}
++
++nsresult nsOSHelperAppService::InternalSetDefaultsOnMIME(
++    nsMIMEInfoWin* aMIMEInfo) {
++  NS_ENSURE_ARG(aMIMEInfo);
++
++  nsAutoCString primaryExt;
++  aMIMEInfo->GetPrimaryExtension(primaryExt);
++
++  if (primaryExt.IsEmpty()) {
++    return NS_ERROR_FAILURE;
++  }
++
++  // windows registry assumes your file extension is going to include the '.',
++  // but our APIs don't have it, so add it:
++  nsAutoString assocType = NS_ConvertUTF8toUTF16(primaryExt);
++  if (assocType.First() != char16_t('.')) {
++    assocType.Insert(char16_t('.'), 0);
++  }
++
++  nsAutoString appInfo;
++  bool found;
++
++  // Retrieve the default application for this extension
++  NS_ENSURE_TRUE(mAppAssoc, NS_ERROR_NOT_AVAILABLE);
++  wchar_t* pResult = nullptr;
++  HRESULT hr = mAppAssoc->QueryCurrentDefault(assocType.get(), AT_FILEEXTENSION,
++                                              AL_EFFECTIVE, &pResult);
++  if (SUCCEEDED(hr)) {
++    found = true;
++    appInfo.Assign(pResult);
++    CoTaskMemFree(pResult);
++  } else {
++    found = false;
++  }
++
++  // Bug 358297 - ignore the default handler, force the user to choose app
++  if (appInfo.EqualsLiteral("XPSViewer.Document")) found = false;
++
++  if (!found) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  // Get other nsIMIMEInfo fields from registry, if possible.
++  nsAutoString defaultDescription;
++  nsCOMPtr<nsIFile> defaultApplication;
++
++  if (NS_FAILED(GetDefaultAppInfo(appInfo, defaultDescription,
++                                  getter_AddRefs(defaultApplication)))) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  aMIMEInfo->SetDefaultDescription(defaultDescription);
++  aMIMEInfo->SetDefaultApplicationHandler(defaultApplication);
++
++  // Grab the general description
++  GetMIMEInfoFromRegistry(appInfo, aMIMEInfo);
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsOSHelperAppService::GetMIMEInfoFromOS(const nsACString& aMIMEType,
++                                        const nsACString& aFileExt,
++                                        bool* aFound, nsIMIMEInfo** aMIMEInfo) {
++  *aFound = false;
++
++  const nsCString& flatType = PromiseFlatCString(aMIMEType);
++  nsAutoString fileExtension;
++  CopyUTF8toUTF16(aFileExt, fileExtension);
++
++  /* XXX The octet-stream check is a gross hack to wallpaper over the most
++   * common Win32 extension issues caused by the fix for bug 116938.  See bug
++   * 120327, comment 271 for why this is needed.  Not even sure we
++   * want to remove this once we have fixed all this stuff to work
++   * right; any info we get from the OS on this type is pretty much
++   * useless....
++   */
++  bool haveMeaningfulMimeType =
++      !aMIMEType.IsEmpty() &&
++      !aMIMEType.LowerCaseEqualsLiteral(APPLICATION_OCTET_STREAM);
++  LOG("Extension lookup on '%S' with mimetype '%s'%s\n", fileExtension.getW(),
++      flatType.get(), haveMeaningfulMimeType ? " (treated as meaningful)" : "");
++
++  RefPtr<nsMIMEInfoWin> mi;
++
++  // We should have *something* to go on here.
++  nsAutoString extensionFromMimeType;
++  if (haveMeaningfulMimeType) {
++    GetExtensionFromWindowsMimeDatabase(aMIMEType, extensionFromMimeType);
++  }
++  if (fileExtension.IsEmpty() && extensionFromMimeType.IsEmpty()) {
++    // Without an extension from the mimetype or the file, we can't
++    // do anything here.
++    mi = new nsMIMEInfoWin(flatType.get());
++    mi.forget(aMIMEInfo);
++    return NS_OK;
++  }
++
++  // Either fileExtension or extensionFromMimeType must now be non-empty.
++
++  *aFound = true;
++
++  // On Windows, we prefer the file extension for lookups over the mimetype,
++  // because that's how windows does things.
++  // If we have no file extension or it doesn't match the mimetype, use the
++  // mime type's default file extension instead.
++  bool usedMimeTypeExtensionForLookup = false;
++  if (fileExtension.IsEmpty() ||
++      (!extensionFromMimeType.IsEmpty() &&
++       !typeFromExtEquals(fileExtension.get(), flatType.get()))) {
++    usedMimeTypeExtensionForLookup = true;
++    fileExtension = extensionFromMimeType;
++    LOG("Now using '%s' mimetype's default file extension '%S' for lookup\n",
++        flatType.get(), fileExtension.getW());
++  }
++
++  // If we have an extension, use it for lookup:
++  mi = GetByExtension(fileExtension, flatType.get());
++  LOG("Extension lookup on '%S' found: 0x%p\n", fileExtension.getW(), mi.get());
++
++  if (mi) {
++    bool hasDefault = false;
++    mi->GetHasDefaultHandler(&hasDefault);
++    // If we don't find a default handler description, see if we can find one
++    // using the mimetype.
++    if (!hasDefault && !usedMimeTypeExtensionForLookup) {
++      RefPtr<nsMIMEInfoWin> miFromMimeType =
++          GetByExtension(extensionFromMimeType, flatType.get());
++      LOG("Mime-based ext. lookup for '%S' found 0x%p\n",
++          extensionFromMimeType.getW(), miFromMimeType.get());
++      if (miFromMimeType) {
++        nsAutoString desc;
++        miFromMimeType->GetDefaultDescription(desc);
++        mi->SetDefaultDescription(desc);
++      }
++    }
++    mi.forget(aMIMEInfo);
++    return NS_OK;
++  }
++
++  // The extension didn't work. Try the extension from the mimetype if
++  // different:
++  if (!extensionFromMimeType.IsEmpty() && !usedMimeTypeExtensionForLookup) {
++    mi = GetByExtension(extensionFromMimeType, flatType.get());
++    LOG("Mime-based ext. lookup for '%S' found 0x%p\n",
++        extensionFromMimeType.getW(), mi.get());
++  }
++  if (mi) {
++    mi.forget(aMIMEInfo);
++    return NS_OK;
++  }
++  // This didn't work either, so just return an empty dummy mimeinfo.
++  *aFound = false;
++  mi = new nsMIMEInfoWin(flatType.get());
++  // If we didn't resort to the mime type's extension, we must have had a
++  // valid extension, so stick its lowercase version on the mime info.
++  if (!usedMimeTypeExtensionForLookup) {
++    nsAutoCString lowerFileExt;
++    ToLowerCase(aFileExt, lowerFileExt);
++    mi->AppendExtension(lowerFileExt);
++  }
++  mi.forget(aMIMEInfo);
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsOSHelperAppService::UpdateDefaultAppInfo(nsIMIMEInfo* aMIMEInfo) {
++  InternalSetDefaultsOnMIME(static_cast<nsMIMEInfoWin*>(aMIMEInfo));
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++nsOSHelperAppService::GetProtocolHandlerInfoFromOS(const nsACString& aScheme,
++                                                   bool* found,
++                                                   nsIHandlerInfo** _retval) {
++  NS_ASSERTION(!aScheme.IsEmpty(), "No scheme was specified!");
++
++  nsresult rv =
++      OSProtocolHandlerExists(nsPromiseFlatCString(aScheme).get(), found);
++  if (NS_FAILED(rv)) return rv;
++
++  nsMIMEInfoWin* handlerInfo =
++      new nsMIMEInfoWin(aScheme, nsMIMEInfoBase::eProtocolInfo);
++  NS_ENSURE_TRUE(handlerInfo, NS_ERROR_OUT_OF_MEMORY);
++  NS_ADDREF(*_retval = handlerInfo);
++
++  if (!*found) {
++    // Code that calls this requires an object regardless if the OS has
++    // something for us, so we return the empty object.
++    return NS_OK;
++  }
++
++  nsAutoString desc;
++  GetApplicationDescription(aScheme, desc);
++  handlerInfo->SetDefaultDescription(desc);
++
++  return NS_OK;
++}
++
++bool nsOSHelperAppService::GetMIMETypeFromOSForExtension(
++    const nsACString& aExtension, nsACString& aMIMEType) {
++  if (aExtension.IsEmpty()) return false;
++
++  // windows registry assumes your file extension is going to include the '.'.
++  // so make sure it's there...
++  nsAutoString fileExtToUse;
++  if (aExtension.First() != '.') fileExtToUse = char16_t('.');
++
++  AppendUTF8toUTF16(aExtension, fileExtToUse);
++
++  // Try to get an entry from the windows registry.
++  nsCOMPtr<nsIWindowsRegKey> regKey =
++      do_CreateInstance("@mozilla.org/windows-registry-key;1");
++  if (!regKey) return false;
++
++  nsresult rv =
++      regKey->Open(nsIWindowsRegKey::ROOT_KEY_CLASSES_ROOT, fileExtToUse,
++                   nsIWindowsRegKey::ACCESS_QUERY_VALUE);
++  if (NS_FAILED(rv)) return false;
++
++  nsAutoString mimeType;
++  if (NS_FAILED(regKey->ReadStringValue(u"Content Type"_ns, mimeType)) ||
++      mimeType.IsEmpty()) {
++    return false;
++  }
++  // Content-Type is always in ASCII
++  aMIMEType.Truncate();
++  LossyAppendUTF16toASCII(mimeType, aMIMEType);
++  return true;
++}
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..c7ad6dfd7c 100644
+index 8484851f67..f3c724c06e 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -1,46 +1,822 @@
+@@ -1,46 +1,906 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -73688,6 +76839,13 @@ index 8484851f67..c7ad6dfd7c 100644
 +#include "HeadlessCompositorWidget.h"
 +#include "HeadlessScreenHelper.h"
 +#include "nsPrintfCString.h"
++#if defined(GECKO_W10M)
++#  include "nsCommandLine.h"
++#  include "nsICommandLine.h"
++#  include "nsICommandLineRunner.h"
++#  include "nsIWindowMediator.h"
++#  include "mozIDOMWindow.h"
++#endif
 +
 +#include "VsyncDispatcher.h"
 +#include "mozilla/widget/PlatformWidgetTypes.h"
@@ -74172,6 +77330,83 @@ index 8484851f67..c7ad6dfd7c 100644
 +                          : mozilla::MouseButton::ePrimary,
 +            nsIWidget::NativeModifiers::NO_MODIFIERS, nullptr);
 +      }));
++}
++
++// Anything the browser itself cannot open -- mailto:, tel:, ms-settings: --
++// belongs to the system, and in an app container only the shell can ask for
++// it. The shell leaves a function here; the external protocol handler uses
++// it instead of ShellExecute, which the container refuses.
++static void (*gGeckoW10mUriLauncher)(const char*) = nullptr;
++
++extern "C" __declspec(dllexport) void gecko_w10m_set_uri_launcher(
++    void (*aLauncher)(const char*)) {
++  gGeckoW10mUriLauncher = aLauncher;
++  GeckoW10mNote(aLauncher ? "launcher: the shell can open system URIs"
++                        : "launcher: cleared");
++}
++
++// Called from the external protocol handler. True when the shell took it.
++extern "C" bool gecko_w10m_launch_uri(const char* aUri) {
++  if (!gGeckoW10mUriLauncher || !aUri || !*aUri) {
++    return false;
++  }
++  nsPrintfCString note("launcher: handing %s to the system", aUri);
++  GeckoW10mNote(note.get());
++  gGeckoW10mUriLauncher(aUri);
++  return true;
++}
++
++extern "C" bool gecko_w10m_has_uri_launcher() {
++  return gGeckoW10mUriLauncher != nullptr;
++}
++
++// Opens a URL the way another instance of Firefox would hand one over: a
++// remote command line, which the browser's own handler turns into a new tab
++// in the window that is already open. This is what makes GeckoW10m usable as
++// the system's browser -- the shell is handed a URL by the phone and passes
++// it here.
++//
++// Returns 1 when the URL was taken, 0 when the browser is not ready for it
++// yet (no window), so the shell can ask again.
++extern "C" __declspec(dllexport) int32_t gecko_w10m_open_url(const char* aUrl) {
++  if (!aUrl || !*aUrl) {
++    return 1;  // nothing to do, and nothing to retry
++  }
++  if (!NS_IsMainThread()) {
++    // Only the main thread may touch the command line, and the answer is
++    // wanted synchronously, so the caller is told to come back.
++    nsCString url(aUrl);
++    NS_DispatchToMainThread(NS_NewRunnableFunction(
++        "gecko_w10m_open_url", [url]() { gecko_w10m_open_url(url.get()); }));
++    return 1;
++  }
++
++  // Until a browser window exists there is nothing to open a tab in, and the
++  // handler would make a second window rather than a tab.
++  nsCOMPtr<nsIWindowMediator> mediator =
++      do_GetService(NS_WINDOWMEDIATOR_CONTRACTID);
++  if (!mediator) {
++    return 0;
++  }
++  nsCOMPtr<mozIDOMWindowProxy> window;
++  mediator->GetMostRecentWindow(u"navigator:browser",
++                                getter_AddRefs(window));
++  if (!window) {
++    return 0;
++  }
++
++  nsCString url(aUrl);
++  const char* argv[] = {"", "-url", url.get()};
++  nsCOMPtr<nsICommandLineRunner> cmdline(new nsCommandLine());
++  nsresult rv = cmdline->Init(3, argv, nullptr,
++                              nsICommandLine::STATE_REMOTE_AUTO);
++  if (NS_SUCCEEDED(rv)) {
++    rv = cmdline->Run();
++  }
++  nsPrintfCString note("open: %s -> 0x%08x", url.get(),
++                       static_cast<uint32_t>(rv));
++  GeckoW10mNote(note.get());
++  return NS_SUCCEEDED(rv) ? 1 : 0;
 +}
 +
 +// The display, in device pixels, whichever way the phone is held.
