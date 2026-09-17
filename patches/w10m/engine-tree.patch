@@ -61429,18 +61429,158 @@ index e313d971ec..38cdd933a9 100644
          env="MOZ_WINDOWS_APP_SDK_DIR",
          nargs=1,
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..b896e474c5 100644
+index fe113c825c..5dc99e8814 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -1,3 +1,4 @@
+@@ -1,127 +1,363 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "mozilla/Bootstrap.h"
+-#include "nsXPCOM.h"
+-
+-#include "AutoSQLiteLifetime.h"
+-
+-#if defined(XP_WIN) && defined(_M_X64) && defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+-#  include <windows.h>
+-#endif  // XP_WIN && _M_X64 && MOZ_DIAGNOSTIC_ASSERT_ENABLED
+-
+-#ifdef MOZ_WIDGET_ANDROID
+-#  include "mozilla/jni/Utils.h"
+-#  ifdef MOZ_PROFILE_GENERATE
+-extern "C" int __llvm_profile_dump(void);
+-#  endif
+-#endif
+-
+-namespace mozilla {
+-
+-class BootstrapImpl final : public Bootstrap {
+- protected:
+-  AutoSQLiteLifetime mSQLLT;
+-
+-  virtual void Dispose() override { delete this; }
+-
+- public:
+-  BootstrapImpl() = default;
+-
+-  ~BootstrapImpl() = default;
+-
+-  virtual void NS_LogInit() override { ::NS_LogInit(); }
+-
+-  virtual void NS_LogTerm() override { ::NS_LogTerm(); }
+-
+-  virtual void XRE_StartupTimelineRecord(int aEvent,
+-                                         mozilla::TimeStamp aWhen) override {
+-    ::XRE_StartupTimelineRecord(aEvent, aWhen);
+-  }
+-
+-  virtual int XRE_main(int argc, char* argv[],
+-                       const BootstrapConfig& aConfig) override {
+-    return ::XRE_main(argc, argv, aConfig);
+-  }
+-
+-  virtual void XRE_StopLateWriteChecks() override {
+-    ::XRE_StopLateWriteChecks();
+-  }
+-
+-  virtual int XRE_XPCShellMain(int argc, char** argv, char** envp,
+-                               const XREShellData* aShellData) override {
+-    return ::XRE_XPCShellMain(argc, argv, envp, aShellData);
+-  }
+-
+-  virtual nsresult XRE_InitChildProcess(
+-      int argc, char* argv[], const XREChildData* aChildData) override {
+-    return ::XRE_InitChildProcess(argc, argv, aChildData);
+-  }
+-
+-  virtual void XRE_EnableSameExecutableForContentProc() override {
+-    ::XRE_EnableSameExecutableForContentProc();
+-  }
+-
+-#ifdef MOZ_WIDGET_ANDROID
+-  virtual void XRE_SetGeckoThreadEnv(JNIEnv* aEnv) override {
+-    mozilla::jni::SetGeckoThreadEnv(aEnv);
+-  }
+-
+-  virtual void XRE_SetAndroidChildFds(JNIEnv* aEnv, jintArray aFds) override {
+-    ::XRE_SetAndroidChildFds(aEnv, aFds);
+-  }
+-
+-#  ifdef MOZ_PROFILE_GENERATE
+-  virtual void XRE_WriteLLVMProfData() override {
+-    __android_log_print(ANDROID_LOG_INFO, "GeckoLibLoad",
+-                        "Calling __llvm_profile_dump()");
+-    __llvm_profile_dump();
+-  }
+-#  endif
+-#endif
+-
+-#ifdef LIBFUZZER
+-  virtual void XRE_LibFuzzerSetDriver(LibFuzzerDriver aDriver) override {
+-    ::XRE_LibFuzzerSetDriver(aDriver);
+-  }
+-#endif
+-
+-#ifdef MOZ_ENABLE_FORKSERVER
+-  virtual int XRE_ForkServer(int* argc, char*** argv) override {
+-    return ::XRE_ForkServer(argc, argv);
+-  }
+-#endif
+-};
+-
+-#if defined(XP_WIN) && defined(_M_X64) && defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+-extern "C" uint32_t _tls_index;
+-
+-extern "C" NS_EXPORT bool XRE_CheckBlockScopeStaticVarInit(
+-    uint32_t* aTlsIndex) {
+-  // Copy the value of xul's _tls_index for diagnostics.
+-  if (aTlsIndex) {
+-    *aTlsIndex = _tls_index;
+-  }
+-
+-  // Check that block-scope static variable initialization works. We use
+-  // volatile here to keep the compiler honest - we want it to generate the code
+-  // that will ensure that only a single thread goes through the lambda.
+-  static bool sItWorks = []() -> bool {
+-    bool const volatile value = true;
+-    return value;
+-  }();
+-  return sItWorks;
+-}
+-#endif  // XP_WIN && _M_X64 && MOZ_DIAGNOSTIC_ASSERT_ENABLED
+-
+-extern "C" NS_EXPORT void NS_FROZENCALL
+-XRE_GetBootstrap(Bootstrap::UniquePtr& b) {
+-  static bool sBootstrapInitialized = false;
+-  MOZ_RELEASE_ASSERT(!sBootstrapInitialized);
+-
+-  sBootstrapInitialized = true;
+-  b.reset(new BootstrapImpl());
+-}
+-
+-}  // namespace mozilla
 +#include <cstdio>
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-@@ -18,6 +19,184 @@ extern "C" int __llvm_profile_dump(void);
- #  endif
- #endif
- 
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/Bootstrap.h"
++#include "nsXPCOM.h"
++
++#include "AutoSQLiteLifetime.h"
++
++#if defined(XP_WIN) && defined(_M_X64) && defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
++#  include <windows.h>
++#endif  // XP_WIN && _M_X64 && MOZ_DIAGNOSTIC_ASSERT_ENABLED
++
++#ifdef MOZ_WIDGET_ANDROID
++#  include "mozilla/jni/Utils.h"
++#  ifdef MOZ_PROFILE_GENERATE
++extern "C" int __llvm_profile_dump(void);
++#  endif
++#endif
++
 +#if defined(GECKO_W10M)
 +#  include <windows.h>
 +
@@ -61543,6 +61683,56 @@ index fe113c825c..b896e474c5 100644
 +// fallback for a machine with no compositor, and this is one.
 +HRESULT WINAPI GeckoW10mFailingHresult() { return E_FAIL; }
 +
++// GetSysColor is not on the phone either, and a stub answering zero paints
++// every system colour black: the menus, the address bar's drop-down and the
++// autocomplete panel over a page all came out as solid black rectangles,
++// because their backgrounds are -moz-Dialog, Menu and Window, which the
++// Windows look-and-feel reads straight from here. These are the Windows 10
++// light-theme defaults, COLORREF byte order (0x00BBGGRR).
++DWORD WINAPI GeckoW10mGetSysColor(int aIndex) {
++  static const DWORD kColors[] = {
++      0x00C8C8C8,  // 0  COLOR_SCROLLBAR
++      0x00000000,  // 1  COLOR_BACKGROUND
++      0x00D1B499,  // 2  COLOR_ACTIVECAPTION
++      0x00DBCDBF,  // 3  COLOR_INACTIVECAPTION
++      0x00F0F0F0,  // 4  COLOR_MENU
++      0x00FFFFFF,  // 5  COLOR_WINDOW
++      0x00646464,  // 6  COLOR_WINDOWFRAME
++      0x00000000,  // 7  COLOR_MENUTEXT
++      0x00000000,  // 8  COLOR_WINDOWTEXT
++      0x00000000,  // 9  COLOR_CAPTIONTEXT
++      0x00B4B4B4,  // 10 COLOR_ACTIVEBORDER
++      0x00FCF7F4,  // 11 COLOR_INACTIVEBORDER
++      0x00ABABAB,  // 12 COLOR_APPWORKSPACE
++      0x00D77800,  // 13 COLOR_HIGHLIGHT
++      0x00FFFFFF,  // 14 COLOR_HIGHLIGHTTEXT
++      0x00F0F0F0,  // 15 COLOR_BTNFACE
++      0x00A0A0A0,  // 16 COLOR_BTNSHADOW
++      0x006D6D6D,  // 17 COLOR_GRAYTEXT
++      0x00000000,  // 18 COLOR_BTNTEXT
++      0x00000000,  // 19 COLOR_INACTIVECAPTIONTEXT
++      0x00FFFFFF,  // 20 COLOR_BTNHIGHLIGHT
++      0x00696969,  // 21 COLOR_3DDKSHADOW
++      0x00E3E3E3,  // 22 COLOR_3DLIGHT
++      0x00000000,  // 23 COLOR_INFOTEXT
++      0x00E1FFFF,  // 24 COLOR_INFOBK
++      0x00000000,  // 25 (unused)
++      0x00CC6600,  // 26 COLOR_HOTLIGHT
++      0x00EAD1B9,  // 27 COLOR_GRADIENTACTIVECAPTION
++      0x00F2E4D7,  // 28 COLOR_GRADIENTINACTIVECAPTION
++      0x00D77800,  // 29 COLOR_MENUHILIGHT
++      0x00F0F0F0,  // 30 COLOR_MENUBAR
++  };
++  if (aIndex < 0 || aIndex >= int(sizeof(kColors) / sizeof(kColors[0]))) {
++    return 0;
++  }
++  return kColors[aIndex];
++}
++
++// A caret that blinks every half second, as on the desktop; zero here means
++// "never blink", which reads as a dead field.
++UINT WINAPI GeckoW10mGetCaretBlinkTime() { return 530; }
++
 +struct Substitute {
 +  const char* name;
 +  FARPROC stub;
@@ -61561,6 +61751,8 @@ index fe113c825c..b896e474c5 100644
 +    {"GetThemePartSize", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
 +    {"GetThemeSysFont", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
 +    {"CloseThemeData", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetSysColor", reinterpret_cast<FARPROC>(&GeckoW10mGetSysColor)},
++    {"GetCaretBlinkTime", reinterpret_cast<FARPROC>(&GeckoW10mGetCaretBlinkTime)},
 +};
 +
 +FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
@@ -61619,21 +61811,118 @@ index fe113c825c..b896e474c5 100644
 +extern "C" const PfnDliHook __pfnDliFailureHook2 = &GeckoW10mDelayLoadFailure;
 +#endif  // GECKO_W10M
 +
- namespace mozilla {
- 
- class BootstrapImpl final : public Bootstrap {
-@@ -42,6 +221,11 @@ class BootstrapImpl final : public Bootstrap {
- 
-   virtual int XRE_main(int argc, char* argv[],
-                        const BootstrapConfig& aConfig) override {
++namespace mozilla {
++
++class BootstrapImpl final : public Bootstrap {
++ protected:
++  AutoSQLiteLifetime mSQLLT;
++
++  virtual void Dispose() override { delete this; }
++
++ public:
++  BootstrapImpl() = default;
++
++  ~BootstrapImpl() = default;
++
++  virtual void NS_LogInit() override { ::NS_LogInit(); }
++
++  virtual void NS_LogTerm() override { ::NS_LogTerm(); }
++
++  virtual void XRE_StartupTimelineRecord(int aEvent,
++                                         mozilla::TimeStamp aWhen) override {
++    ::XRE_StartupTimelineRecord(aEvent, aWhen);
++  }
++
++  virtual int XRE_main(int argc, char* argv[],
++                       const BootstrapConfig& aConfig) override {
 +#if defined(GECKO_W10M)
 +    // First line in the file, so its absence means the channel is broken
 +    // rather than the code being instrumented never running.
 +    GeckoW10mNote("XRE_main entered");
 +#endif
-     return ::XRE_main(argc, argv, aConfig);
-   }
- 
++    return ::XRE_main(argc, argv, aConfig);
++  }
++
++  virtual void XRE_StopLateWriteChecks() override {
++    ::XRE_StopLateWriteChecks();
++  }
++
++  virtual int XRE_XPCShellMain(int argc, char** argv, char** envp,
++                               const XREShellData* aShellData) override {
++    return ::XRE_XPCShellMain(argc, argv, envp, aShellData);
++  }
++
++  virtual nsresult XRE_InitChildProcess(
++      int argc, char* argv[], const XREChildData* aChildData) override {
++    return ::XRE_InitChildProcess(argc, argv, aChildData);
++  }
++
++  virtual void XRE_EnableSameExecutableForContentProc() override {
++    ::XRE_EnableSameExecutableForContentProc();
++  }
++
++#ifdef MOZ_WIDGET_ANDROID
++  virtual void XRE_SetGeckoThreadEnv(JNIEnv* aEnv) override {
++    mozilla::jni::SetGeckoThreadEnv(aEnv);
++  }
++
++  virtual void XRE_SetAndroidChildFds(JNIEnv* aEnv, jintArray aFds) override {
++    ::XRE_SetAndroidChildFds(aEnv, aFds);
++  }
++
++#  ifdef MOZ_PROFILE_GENERATE
++  virtual void XRE_WriteLLVMProfData() override {
++    __android_log_print(ANDROID_LOG_INFO, "GeckoLibLoad",
++                        "Calling __llvm_profile_dump()");
++    __llvm_profile_dump();
++  }
++#  endif
++#endif
++
++#ifdef LIBFUZZER
++  virtual void XRE_LibFuzzerSetDriver(LibFuzzerDriver aDriver) override {
++    ::XRE_LibFuzzerSetDriver(aDriver);
++  }
++#endif
++
++#ifdef MOZ_ENABLE_FORKSERVER
++  virtual int XRE_ForkServer(int* argc, char*** argv) override {
++    return ::XRE_ForkServer(argc, argv);
++  }
++#endif
++};
++
++#if defined(XP_WIN) && defined(_M_X64) && defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
++extern "C" uint32_t _tls_index;
++
++extern "C" NS_EXPORT bool XRE_CheckBlockScopeStaticVarInit(
++    uint32_t* aTlsIndex) {
++  // Copy the value of xul's _tls_index for diagnostics.
++  if (aTlsIndex) {
++    *aTlsIndex = _tls_index;
++  }
++
++  // Check that block-scope static variable initialization works. We use
++  // volatile here to keep the compiler honest - we want it to generate the code
++  // that will ensure that only a single thread goes through the lambda.
++  static bool sItWorks = []() -> bool {
++    bool const volatile value = true;
++    return value;
++  }();
++  return sItWorks;
++}
++#endif  // XP_WIN && _M_X64 && MOZ_DIAGNOSTIC_ASSERT_ENABLED
++
++extern "C" NS_EXPORT void NS_FROZENCALL
++XRE_GetBootstrap(Bootstrap::UniquePtr& b) {
++  static bool sBootstrapInitialized = false;
++  MOZ_RELEASE_ASSERT(!sBootstrapInitialized);
++
++  sBootstrapInitialized = true;
++  b.reset(new BootstrapImpl());
++}
++
++}  // namespace mozilla
 diff --git a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h b/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
 index 8702b227d2..173176c637 100644
 --- a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
