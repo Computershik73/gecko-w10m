@@ -167,7 +167,18 @@ if [ -d "$DIST" ]; then
 // entirely the window was still hidden, so nothing about the swap chain hides
 // it -- but the software build died of its own separate fault on the way, in
 // CompositorD3D11::Initialize, which is the line below.
-pref("gfx.webrender.software", false);
+// Software WebRender, hardware compositing left on. This is the one
+// configuration that has never run to first paint: the earlier software
+// control died in CompositorD3D11 before it got there, and that path is now
+// closed by the pref below. The window is hidden at first paint with no
+// panel, no swap chain and no GPU frame -- and the one thing every dying run
+// has that every living run lacked is ANGLE and EGL coming up. With this true
+// they never do: RenderCompositor::Create takes the software branch and
+// falls through to RenderCompositorSWGL, while gfxConfig still says hardware
+// compositing is on and the D3D11 device is still made. If the window lives,
+// the hider is inside ANGLE's initialisation and the hardware path has one
+// file to fix. If it is hidden anyway, it is the gfx configuration itself.
+pref("gfx.webrender.software", true);
 
 // Never the D3D11 software compositor, whichever way the pref above goes.
 //
