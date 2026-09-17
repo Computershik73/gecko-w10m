@@ -33,17 +33,28 @@ std::atomic<bool> g_panelPresenting{false};
 
 
 EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
-                       double rawPerView)
+                       double rawPerView, bool withPanel)
     : fullWidth_(pixelWidth),
       fullHeight_(pixelHeight),
       rawPerView_(rawPerView > 0 ? rawPerView : 1.0) {
-  // What the engine presents to when it draws on the GPU. It is created
+  // What the engine presents to when it draws on the GPU. Normally created
   // whether or not that succeeds: it stays empty and invisible under the
   // picture if the engine falls back to drawing in software, so there is no
   // mode to switch and no way for the two to disagree.
-  panel_ = SwapChainPanel();
-  panel_.HorizontalAlignment(HorizontalAlignment::Stretch);
-  panel_.VerticalAlignment(VerticalAlignment::Stretch);
+  //
+  // Except on the launches that leave it out entirely. The window is hidden
+  // by the shell at the engine's first paint with no GPU frame, no swap
+  // chain and no EGL surface anywhere -- and this object is the one thing
+  // this shell has that the builds which lived did not. It has been taken
+  // out of the tree before and the window was hidden anyway; it has never
+  // been not made.
+  if (withPanel) {
+    panel_ = SwapChainPanel();
+    panel_.HorizontalAlignment(HorizontalAlignment::Stretch);
+    panel_.VerticalAlignment(VerticalAlignment::Stretch);
+  } else {
+    panelWithheld_ = true;
+  }
 
   image_ = Image();
   // The engine paints a whole window; show all of it, keeping its shape. The

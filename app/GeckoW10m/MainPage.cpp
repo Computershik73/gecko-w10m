@@ -138,8 +138,31 @@ MainPage::MainPage() {
   Log::WriteNum(L"cpu: cores visible to the process",
                 static_cast<int>(std::thread::hardware_concurrency()));
 
+  // One launch, one experiment, alternating; the count lives in LocalState,
+  // which a reinstall wipes, so a fresh install always starts with the real
+  // thing. Even launches make no SwapChainPanel at all -- see EngineView.
+  {
+    const std::wstring counter =
+        std::wstring(ApplicationData::Current().LocalFolder().Path()) +
+        L"\launches.txt";
+    if (FILE* f = _wfopen(counter.c_str(), L"r")) {
+      fscanf_s(f, "%d", &launches_);
+      fclose(f);
+    }
+    ++launches_;
+    if (FILE* f = _wfopen(counter.c_str(), L"w")) {
+      fprintf(f, "%d", launches_);
+      fclose(f);
+    }
+  }
+  const bool noPanel = (launches_ % 2) == 0;
+  client::Log::Write(
+      L"experiment: launch " + std::to_wstring(launches_) + L" -- " +
+      (noPanel ? L"NO SwapChainPanel is created at all this launch"
+               : L"the real thing, nothing left out"));
+
   engineView_ = std::make_unique<client::EngineView>(pixelWidth, pixelHeight,
-                                                     raw);
+                                                     raw, !noPanel);
 
   BuildUi();
   WireEngine();
@@ -288,7 +311,9 @@ void MainPage::BuildUi() {
   // swap chain made and handed over and never composited -- so what the
   // compositor does with our swap chain is not what kills this process, and
   // there is no reason left to keep the picture off the screen.
-  contentStack.Children().Append(engineView_->Panel());
+  if (engineView_->Panel()) {
+    contentStack.Children().Append(engineView_->Panel());
+  }
   contentStack.Children().Append(engineView_->Surface());
 
   // The browser's own logo, out of the browser's own package. It is the thing
@@ -408,48 +433,6 @@ void MainPage::BuildUi() {
   // drew, which is the frame, which would make the frame decide its own size.
   engineView_->WatchRoom(contentHost_);
 
-  // One launch, one experiment, cycling. The window is hidden by the system
-  // six tenths of a second after the swap chain exists, with nothing raised
-  // in between, and only two things happen in that gap: the chain is handed
-  // to the panel, and frames are presented to it. Each launch leaves one of
-  // them out. The count lives in LocalState, which a reinstall wipes, so a
-  // fresh install always starts at the real thing.
-  //
-  //   launch 1  mode 0  everything, as shipped
-  //   launch 2  mode 1  the panel never gets the chain
-  //   launch 3  mode 2  the chain is never presented
-  //   launch 4  mode 0  again
-  {
-    int launches = 0;
-    const std::wstring counter = std::wstring(ApplicationData::Current().LocalFolder().Path()) + L"\\launches.txt";
-    if (FILE* f = _wfopen(counter.c_str(), L"r")) {
-      fscanf_s(f, "%d", &launches);
-      fclose(f);
-    }
-    ++launches;
-    if (FILE* f = _wfopen(counter.c_str(), L"w")) {
-      fprintf(f, "%d", launches);
-      fclose(f);
-    }
-    // Rewired: the three ANGLE modes all hid the window, so they are retired
-    // and the cycle is now two launches. Odd launches are the real thing.
-    // Even launches withhold the panel from the engine altogether: hardware
-    // compositing initialises, the D3D11 device and ANGLE come up, and then
-    // there is no window for EGL, so WebRender never draws on the GPU -- but
-    // the address bar still takes focus, delayed start-up still runs, and
-    // everything the engine does at first paint that is not a GPU frame still
-    // happens. If the window is hidden on an even launch, the GPU path was
-    // never the cause and it is something the engine does regardless.
-    const int mode = 0;
-    const bool withheld = (launches % 2) == 0;
-    engineView_->SetExperimentMode(mode);
-    engineView_->SetPanelWithheld(withheld);
-    client::Log::Write(
-        L"experiment: launch " + std::to_wstring(launches) + L" -- " +
-        (withheld ? L"the PANEL IS WITHHELD: hardware compositing initialises "
-                    L"but the engine has nothing to draw on"
-                  : L"the real thing, nothing left out"));
-  }
 
   // The status bar exists only on mobile; tint it to match so the chrome does
   // not look like it is floating under a foreign strip.

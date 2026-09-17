@@ -36,6 +36,7 @@ class MainPage {
   std::shared_ptr<engine::Runtime> runtime_;
   std::unique_ptr<client::TabManager> tabManager_;
   std::unique_ptr<client::EngineView> engineView_;
+  int launches_ = 0;
 
   // Views
   winrt::Windows::UI::Xaml::Controls::Grid root_{nullptr};

@@ -26,7 +26,10 @@ class EngineView {
   // The window size in physical pixels and the number of them Windows puts in
   // a view pixel -- the same two numbers the engine was started with, because
   // the keyboard is measured in one and the window in the other.
-  EngineView(int32_t pixelWidth, int32_t pixelHeight, double rawPerView);
+  // withPanel false makes no SwapChainPanel at all: the one structural thing
+  // this shell has that the builds which lived did not.
+  EngineView(int32_t pixelWidth, int32_t pixelHeight, double rawPerView,
+             bool withPanel);
 
   winrt::Windows::UI::Xaml::Controls::Image Surface() const { return image_; }
   // What the engine presents to when it is drawing on the GPU. It sits under
