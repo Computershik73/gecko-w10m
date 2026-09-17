@@ -453,6 +453,21 @@ void MainPage::BuildUi() {
   }
 
   auto view = ApplicationView::GetForCurrentView();
+  // Consolidated is the view being removed from the switcher -- the shell's
+  // word for "gone", as opposed to merely behind something.
+  view.Consolidated([](auto const&, auto const&) {
+    client::Log::Write(L"window: the view was CONSOLIDATED -- removed from "
+                       L"the task switcher");
+    client::Log::FlushFromFault();
+  });
+  Window::Current().CoreWindow().Closed([](auto const&, auto const&) {
+    client::Log::Write(L"window: the CoreWindow was CLOSED");
+    client::Log::FlushFromFault();
+  });
+  Window::Current().Closed([](auto const&, auto const&) {
+    client::Log::Write(L"window: the XAML window was closed");
+    client::Log::FlushFromFault();
+  });
   view.SetDesiredBoundsMode(ApplicationViewBoundsMode::UseVisible);
   view.VisibleBoundsChanged(
       [this](auto&&, auto&&) { ApplyVisibleBounds(); });

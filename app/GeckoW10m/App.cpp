@@ -63,9 +63,49 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     Resuming([](auto const&, auto const&) {
       client::Log::Write(L"app: resuming");
     });
+
+    // The module that hides the window turned out to be the phone's navigation
+    // client -- the thing the shell talks to when it switches what is in
+    // front. So the shell is switching away from us, and these are the ways an
+    // app is told that. None has been on the record.
+    CoreApplication::EnteredBackground([](auto const&, auto const&) {
+      client::Log::Write(L"app: ENTERED the background -- the shell put "
+                         L"something else in front");
+      client::Log::FlushFromFault();
+    });
+    CoreApplication::LeavingBackground([](auto const&, auto const&) {
+      client::Log::Write(L"app: leaving the background");
+    });
   }
 
-  void OnLaunched(LaunchActivatedEventArgs const&) {
+  void OnLaunched(LaunchActivatedEventArgs const& args) {
+    // The system splash: the shell's own full-screen surface with the package
+    // image, held up until the app is ready. If it is still up thirty seconds
+    // in, the window that reports itself visible has never actually been on
+    // screen -- and its dismissal is a navigation, done by the very module
+    // whose assertion this has been.
+    try {
+      client::Log::Write(L"splash: previous execution state",
+                         std::to_wstring(static_cast<int>(args.PreviousExecutionState())));
+      auto splash = args.SplashScreen();
+      if (splash) {
+        auto where = splash.ImageLocation();
+        client::Log::Write(L"splash: the system splash is up, image at " +
+                           std::to_wstring(static_cast<int>(where.X)) + L"," +
+                           std::to_wstring(static_cast<int>(where.Y)) + L" " +
+                           std::to_wstring(static_cast<int>(where.Width)) + L"x" +
+                           std::to_wstring(static_cast<int>(where.Height)));
+        splash.Dismissed([](auto const&, auto const&) {
+          client::Log::Write(L"splash: the system splash was DISMISSED");
+          client::Log::FlushFromFault();
+        });
+      } else {
+        client::Log::Write(L"splash: no system splash object");
+      }
+    } catch (winrt::hresult_error const& error) {
+      client::Log::Write(L"splash: could not ask about it",
+                         std::wstring(error.message()));
+    }
     EnsureContent();
     Window::Current().Activate();
   }
