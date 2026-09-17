@@ -197,6 +197,7 @@ void EngineView::WireKeyboard() {
       case 39:  // Right
       case 40:  // Down
       case 46:  // Delete
+        Log::Write(L"key: " + std::to_wstring(code) + L" sent to the engine");
         key_(code);
         args.Handled(true);
         break;
