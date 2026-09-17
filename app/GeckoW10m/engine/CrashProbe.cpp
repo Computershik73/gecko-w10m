@@ -467,6 +467,42 @@ bool TryRepair(PEXCEPTION_POINTERS info) {
   return true;
 }
 
+// Words of an object, each resolved to module+offset when it points into
+// one, and followed one level when it points at something that itself points
+// into a module -- which is what a vtable pointer looks like from outside.
+void DumpObject(const wchar_t* tag, uintptr_t at, size_t bytes) {
+  MEMORY_BASIC_INFORMATION page = {};
+  if (!at || !::VirtualQuery(reinterpret_cast<void*>(at), &page, sizeof(page)) ||
+      page.State != MEM_COMMIT) {
+    Log::WriteFromFault(std::wstring(L"object ") + tag + L": unreadable");
+    return;
+  }
+  const uintptr_t end = reinterpret_cast<uintptr_t>(page.BaseAddress) + page.RegionSize;
+  Log::WriteFromFault(std::wstring(L"object ") + tag + L" at " + Hex(at));
+  for (size_t off = 0; off < bytes && at + off + 4 <= end; off += 4) {
+    const uintptr_t word = *reinterpret_cast<const uintptr_t*>(at + off);
+    if (!word) continue;
+    std::wstring where = DescribeAddress(reinterpret_cast<void*>(word));
+    std::wstring line = L"  +" + Hex(off) + L"  " + Hex(word);
+    if (where.find(L"(no module)") == std::wstring::npos) {
+      line += L"  -> " + where;
+    } else {
+      // A heap pointer: is its first word a vtable?
+      MEMORY_BASIC_INFORMATION inner = {};
+      if (::VirtualQuery(reinterpret_cast<void*>(word), &inner, sizeof(inner)) &&
+          inner.State == MEM_COMMIT && !(inner.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        const uintptr_t first = *reinterpret_cast<const uintptr_t*>(word);
+        std::wstring vt = DescribeAddress(reinterpret_cast<void*>(first));
+        if (first && vt.find(L"(no module)") == std::wstring::npos) {
+          line += L"  -> object whose vtable is " + vt;
+        }
+      }
+    }
+    Log::WriteFromFault(line);
+  }
+  Log::FlushFromFault();
+}
+
 LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
@@ -507,6 +543,13 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   Log::FlushFromFault();
 
   if (mendable) {
+    // The object the assertion is about. r0 is `this` for the state setter
+    // and r6 and r4 hold copies of it. Its fields are the pointers that name
+    // things: +0x12c the state, +0xb4 the interface asked whether the view is
+    // shown, +0xc0 an object with a vtable, +0x128 a window handle. Every
+    // word that points into a module is written as module+offset, and a word
+    // at a vtable is a class once the module's RTTI is read against it.
+    DumpObject(L"this", info->ContextRecord->R0, 0x140);
     Log::WriteFromFault(
         L"repair: r8 had nowhere to point, so it was given somewhere -- "
         L"carrying on from the instruction that faulted");
