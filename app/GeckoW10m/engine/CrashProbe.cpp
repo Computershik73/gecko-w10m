@@ -356,9 +356,84 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
   }
 }
 
+// Somewhere to put the word CoreUIComponents wants to write, since it has
+// nowhere of its own. A bump pointer over a megabyte, sixteen bytes at a time:
+// sixty-five thousand repairs, which is far more than a run has frames.
+std::atomic<uintptr_t> gScratchNext{0};
+uintptr_t gScratchEnd = 0;
+std::atomic<int> gRepairs{0};
+
+void ReserveScratch() {
+  void* block = ::VirtualAllocFromApp(nullptr, 1u << 20, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+  if (!block) {
+    Log::WriteNum(L"repair: no scratch, err", ::GetLastError());
+    return;
+  }
+  gScratchNext.store(reinterpret_cast<uintptr_t>(block));
+  gScratchEnd = reinterpret_cast<uintptr_t>(block) + (1u << 20);
+}
+
+// The fault is one instruction: STR.W r8, [r8] with r8 zero, which is a list
+// head being made to point at itself -- head->next = head -- in memory that
+// was asked for and not given. Seven measurements have now shown that nothing
+// about this process is short of anything: not memory, not the address space,
+// not the GPU, which went on taking work for a full second after the UI thread
+// had stopped. The allocation that failed is the system's own, inside a
+// component we cannot build, and there is no version of this browser in which
+// we fix it.
+//
+// What we can do is give the store an address. r8 is popped off the stack by
+// the very next instruction, so the substitution lives for exactly one write
+// and changes nothing else; and what it writes is a list head pointing at
+// itself, which is precisely what an empty list looks like. If that word was
+// all the component needed, the compositor carries on. If it needed the object
+// the word was supposed to live in, it will fault again somewhere new -- which
+// is a different address, and a different thing to chase.
+bool TryRepair(PEXCEPTION_POINTERS info) {
+  const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+  if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return false;
+  if (record.NumberParameters < 2) return false;
+  if (record.ExceptionInformation[0] != 1) return false;   // a write
+  if (record.ExceptionInformation[1] != 0) return false;   // through zero
+  if (info->ContextRecord->R8 != 0) return false;
+
+  // And it is that instruction, not merely a write through zero that happens
+  // to look like it.
+  const uint8_t* at = reinterpret_cast<const uint8_t*>(
+      reinterpret_cast<uintptr_t>(record.ExceptionAddress) & ~uintptr_t(1));
+  MEMORY_BASIC_INFORMATION page = {};
+  if (!::VirtualQuery(at, &page, sizeof(page)) || page.State != MEM_COMMIT) {
+    return false;
+  }
+  if (!(at[0] == 0xc8 && at[1] == 0xf8 && at[2] == 0x00 && at[3] == 0x80)) {
+    return false;
+  }
+
+  const uintptr_t where = gScratchNext.fetch_add(16);
+  if (!where || where + 16 > gScratchEnd) return false;
+
+  info->ContextRecord->R8 = static_cast<DWORD>(where);
+  const int nth = gRepairs.fetch_add(1) + 1;
+  if (nth <= 3 || nth % 100 == 0) {
+    Log::WriteFromFault(L"repair: gave the compositor somewhere to write, " +
+                        std::to_wstring(nth) + L" so far");
+    Log::FlushFromFault();
+  }
+  return true;
+}
+
 LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
+  // Reported in full the first time, then mended every time. Without the
+  // report there is no evidence it is still the same fault; without the mend
+  // there is no browser.
+  const bool mendable = TryRepair(info);
+  if (mendable && gReported.load() > 0) {
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+
   const int nth = gReported.fetch_add(1);
   if (nth == kMaxReports) {
     Log::WriteFromFault(
@@ -382,6 +457,14 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   LogStack(L"first-chance:", *info->ContextRecord);
   LogStackScan(L"first-chance:", info->ContextRecord->Sp);
   Log::FlushFromFault();
+
+  if (mendable) {
+    Log::WriteFromFault(
+        L"repair: r8 had nowhere to point, so it was given somewhere -- "
+        L"carrying on from the instruction that faulted");
+    Log::FlushFromFault();
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
 
   // Not ours to handle -- only to record.
   return EXCEPTION_CONTINUE_SEARCH;
@@ -1181,6 +1264,7 @@ void InstallProcessProbes(const std::wstring& localStatePath) {
     Log::WriteNum(L"trace: could not map the trace file, err", ::GetLastError());
   }
 
+  ReserveScratch();
   PVOID handler = ::AddVectoredExceptionHandler(1, &OnException);
   Log::Write(L"probe crash: vectored handler",
              handler ? L"installed" : L"REFUSED");
