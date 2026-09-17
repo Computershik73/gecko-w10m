@@ -48,6 +48,7 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
 
     Suspending([](auto const&, auto const&) {
       client::Log::Write(L"app: suspending");
+      client::Log::FlushFromFault();
     });
 
     // Gecko runs a dozen threads of its own and shuts itself down by calling

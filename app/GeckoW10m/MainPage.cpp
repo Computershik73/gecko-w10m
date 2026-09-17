@@ -182,8 +182,32 @@ void MainPage::ApplyVisibleBounds() {
   // So these three are now on the record. None of them has ever been asked.
   Window::Current().VisibilityChanged(
       [](auto&&, auto const& e) {
-        client::Log::Write(e.Visible() ? L"window: visible"
-                                       : L"window: NOT visible any more");
+        if (e.Visible()) {
+          client::Log::Write(L"window: visible");
+          return;
+        }
+        client::Log::Write(L"window: NOT visible any more");
+        // Asked once, and only once, because this is the whole question now.
+        //
+        // In the hardware build nothing in the engine raises anything before
+        // this -- no fault, no fail-fast, nothing -- and what follows is the
+        // process freezing whole, which is a phone suspending an app it thinks
+        // has gone away. So: does it think that because it was told, or
+        // because it decided? If asking to be activated brings the window
+        // back, the app is still the foreground app and something merely
+        // dropped it; if the ask is refused or nothing follows, it has already
+        // been taken off the front and the browser is being suspended, not
+        // crashed -- which are two entirely different things to fix.
+        static bool asked = false;
+        if (asked) return;
+        asked = true;
+        try {
+          Window::Current().Activate();
+          client::Log::Write(L"window: asked to be activated again");
+        } catch (winrt::hresult_error const& error) {
+          client::Log::Write(L"window: the ask was refused",
+                             std::wstring(error.message()));
+        }
       });
   Window::Current().Activated(
       [](auto&&, auto const& e) {

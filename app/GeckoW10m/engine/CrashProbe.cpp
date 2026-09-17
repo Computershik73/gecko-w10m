@@ -1310,7 +1310,12 @@ void InstallEngineProbes() {
   // every abort in the engine has passed these hooks untouched.
   for (const wchar_t* name :
        {L"xul.dll", L"mozglue.dll", L"nss3.dll", L"ucrtbase.dll"}) {
+    // LoadPackagedLibrary only finds modules inside the package, and ucrtbase
+    // is not one -- it is the system's. Asking it for ucrtbase reported "not
+    // loaded" about a library that was loaded all along, so the hooks that
+    // matter most for abort() were never placed.
     HMODULE module = ::LoadPackagedLibrary(name, 0);
+    if (!module) module = ::GetModuleHandleW(name);
     if (!module) {
       Log::WriteFromFault(std::wstring(L"probe crash: ") + name + L" not loaded");
       continue;
