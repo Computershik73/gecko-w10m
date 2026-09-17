@@ -193,6 +193,9 @@ pref("gfx.webrender.software", false);
 // with it false the software path falls through to RenderCompositorSWGL, which
 // wants no window at all.
 pref("gfx.webrender.software.d3d11", false);
+// Closing the last tab opens a fresh one instead of quitting the browser: on a
+// phone a quit is a black screen and a relaunch, not something anyone asked for.
+pref("browser.tabs.closeWindowWithLastTab", false);
 
 // The XAML compositor dies about two and a half seconds after these load, and
 // the last thing in the log before it is always the same run: mozavcodec,

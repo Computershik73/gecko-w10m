@@ -144,31 +144,13 @@ MainPage::MainPage() {
   Log::WriteNum(L"cpu: cores visible to the process",
                 static_cast<int>(std::thread::hardware_concurrency()));
 
-  // One launch, one experiment, alternating; the count lives in LocalState,
-  // which a reinstall wipes, so a fresh install always starts with the real
-  // thing. Even launches make no SwapChainPanel at all -- see EngineView.
-  {
-    const std::wstring counter =
-        std::wstring(ApplicationData::Current().LocalFolder().Path()) +
-        L"\\launches.txt";
-    if (FILE* f = _wfopen(counter.c_str(), L"r")) {
-      fscanf_s(f, "%d", &launches_);
-      fclose(f);
-    }
-    ++launches_;
-    if (FILE* f = _wfopen(counter.c_str(), L"w")) {
-      fprintf(f, "%d", launches_);
-      fclose(f);
-    }
-  }
-  const bool noPanel = (launches_ % 2) == 0;
-  client::Log::Write(
-      L"experiment: launch " + std::to_wstring(launches_) + L" -- " +
-      (noPanel ? L"NO SwapChainPanel is created at all this launch"
-               : L"the real thing, nothing left out"));
-
+  // The alternating no-panel experiment is over: it was there to ask whether
+  // the panel itself hid the window, and the answer was no (the hide was a
+  // clobbered uniform location in ANGLE, see 0.2.4.6). On the hardware path
+  // a launch without a panel has nothing to present and nothing to copy, so
+  // the splash never came down -- which is what every second launch did.
   engineView_ = std::make_unique<client::EngineView>(pixelWidth, pixelHeight,
-                                                     raw, !noPanel);
+                                                     raw, /*withPanel*/ true);
 
   BuildUi();
   WireEngine();

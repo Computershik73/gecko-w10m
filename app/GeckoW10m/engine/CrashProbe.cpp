@@ -1924,8 +1924,11 @@ void MakeSecondD3DDevice() {
   // its views after that is the shape of a navigation client asserting on a
   // hide.
   Log::Write(L"gpu: watching the shell's device for a reset");
-  HANDLE steps = ::CreateThread(nullptr, 0, &AngleStepsThread, nullptr, 0, nullptr);
-  if (steps) ::CloseHandle(steps);
+  // The eight-step ANGLE replica stays as code but no longer runs: it proved
+  // the shell's own use of ANGLE harmless (0.2.3.6), and the real fault was
+  // found elsewhere. Keeping it running only costs a second GPU device and
+  // twenty seconds of noise in the log.
+  (void)&AngleStepsThread;
 }
 
 void SetProbeSurfaceSize(int width, int height) {
