@@ -172,6 +172,31 @@ MainPage::MainPage() {
 }
 
 void MainPage::ApplyVisibleBounds() {
+  // The compositor's own state machine, read out of CoreUIComponents itself,
+  // turns out to be about activation: state 5 is activated, 6 deactivated, and
+  // the assertion that has been ending every run fires because something asks
+  // it to deactivate out of a state that forbids it. And what follows in the
+  // log is a process that freezes whole -- heartbeat thread included -- which
+  // is what a phone does to an app it has decided is no longer in front.
+  //
+  // So these three are now on the record. None of them has ever been asked.
+  Window::Current().VisibilityChanged(
+      [](auto&&, auto const& e) {
+        client::Log::Write(e.Visible() ? L"window: visible"
+                                       : L"window: NOT visible any more");
+      });
+  Window::Current().Activated(
+      [](auto&&, auto const& e) {
+        using winrt::Windows::UI::Core::CoreWindowActivationState;
+        const auto which = e.WindowActivationState();
+        client::Log::Write(
+            which == CoreWindowActivationState::Deactivated
+                ? L"window: deactivated"
+                : (which == CoreWindowActivationState::PointerActivated
+                       ? L"window: activated by a pointer"
+                       : L"window: activated"));
+      });
+
   auto view = ApplicationView::GetForCurrentView();
   auto visible = view.VisibleBounds();
   auto window = Window::Current().Bounds();
