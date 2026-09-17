@@ -145,6 +145,18 @@ fi
 # The ported engine.
 if [ -d "$DIST" ]; then
   cp -r "$DIST/." "$STAGE/"
+  # mobile-config-firefox: autoconfig at the root (the GRE directory, where
+  # general.config.filename is looked for), modules and themes beside it,
+  # policies in the app's distribution directory.
+  MCF="$ROOT/vendor/mobile-config-firefox"
+  if [ -d "$MCF" ]; then
+    cp "$MCF/mobile-config-autoconfig.js" "$STAGE/mobile-config-autoconfig.js"
+    mkdir -p "$STAGE/mobile-config-firefox" "$STAGE/browser/distribution"
+    cp -r "$MCF/modules/." "$STAGE/mobile-config-firefox/"
+    cp -r "$MCF/themes" "$STAGE/mobile-config-firefox/themes"
+    cp "$MCF/policies.json" "$STAGE/browser/distribution/policies.json"
+    echo "    mobile-config-firefox staged"
+  fi
   echo "    engine payload from $DIST"
   # resource:/// and chrome://browser/ resolve against the directory holding
   # the application.ini that XRE_main is given, and for a browser build that
@@ -196,6 +208,20 @@ pref("gfx.webrender.software.d3d11", false);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
+
+// mobile-config-firefox (postmarketOS): a phone-shaped chrome for desktop
+// Firefox. Autoconfig loads its modules from mobile-config-firefox/ under the
+// engine directory; see vendor/mobile-config-firefox/README-GECKO-W10M.md.
+pref("general.config.filename", "mobile-config-autoconfig.js");
+pref("general.config.obscure_value", 0);
+pref("general.config.sandbox_enabled", false);
+pref("browser.uidensity", 2);
+// A phone: touch events on, mobile viewport handling on, pinch zoom on.
+pref("dom.w3c_touch_events.enabled", 1);
+pref("dom.meta-viewport.enabled", true);
+pref("apz.allow_zooming", true);
+pref("apz.allow_double_tap_zooming", true);
+pref("ui.touch.radius.enabled", true);
 
 // The XAML compositor dies about two and a half seconds after these load, and
 // the last thing in the log before it is always the same run: mozavcodec,

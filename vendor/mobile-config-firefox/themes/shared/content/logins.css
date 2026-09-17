@@ -1,0 +1,24 @@
+/* Copyright 2022 Anri Dellal
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@-moz-document url("about:logins") {
+    .container {
+        min-width: 300px !important;
+    }
+
+    @media (max-width: 700px) {
+        body {
+            --sidebar-width: 200px !important;
+            grid-template-columns: var(--sidebar-width) 1fr !important;
+        }
+
+        .edit-button, .delete-button {
+            font-size: 0 !important;
+            background-position: center;
+        }
+
+        #branding-logo {
+            display: none;
+        }
+    }
+}

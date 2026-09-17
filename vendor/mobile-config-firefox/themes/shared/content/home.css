@@ -1,0 +1,18 @@
+/* Copyright 2022 Oliver Smith
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@namespace url("http://www.w3.org/1999/xhtml");
+
+@-moz-document url("about:home"), url("about:blank"), url("about:newtab") {
+    @media (max-width: 700px) {
+
+        .outer-wrapper.only-search {
+            padding-top: 50px !important;
+        }
+
+        .customize-menu {
+            width: 100% !important;
+        }
+
+    }
+}

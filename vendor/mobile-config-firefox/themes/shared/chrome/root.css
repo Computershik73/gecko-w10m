@@ -1,0 +1,7 @@
+/* Copyright 2022 Oliver Smith
+ * SPDX-License-Identifier: MPL-2.0 */
+
+/* Reduce minimum window width */
+:root {
+    min-width: 300px !important;
+}

@@ -1,0 +1,55 @@
+/* Copyright 2022 Tim Magee
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@-moz-document url-prefix("about:reader") {
+    @media (max-width: 800px) {
+        .toolbar-container {
+            margin-inline-start: 0px !important;
+            position: fixed !important;
+            top: 0px !important;
+            height: 74px !important;
+            width: 100% !important;
+            left: 0px !important;
+            background-color: rgba(255,255,255,1);
+        }
+
+        .dark .toolbar-container {
+            background-color: rgba(3,3,3,1);
+        }
+
+        .sepia .toolbar-container {
+            background-color: rgba(244,236,216,1);
+        }
+
+        .toolbar {
+            margin-inline-start: unset !important;
+            width: unset !important;
+        }
+
+        .dropdown li {
+            display: inline !important;
+        }
+
+        .dropdown {
+            display: inline;
+        }
+
+        body {
+            padding: 74px 0px !important;
+            margin: 15px 15px 0px !important;
+            --content-width: unset !important;
+        }
+
+        .header > h1 {
+            margin: 10px 0 !important;
+        }
+
+        .header > .meta-data {
+            margin: 0 0 5px !important;
+        }
+
+        .header > .credits {
+            margin: 0 0 5px !important;
+        }
+    }
+}

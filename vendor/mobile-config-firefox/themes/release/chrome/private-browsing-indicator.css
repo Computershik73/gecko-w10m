@@ -1,0 +1,21 @@
+/* Copyright 2026 Peter Mack
+ * SPDX-License-Identifier: MPL-2.0
+ * Private browsing indicator — top-right corner of the counter badge */
+@media (max-width: 700px) {
+    :root[privatebrowsingmode="temporary"] #alltabs-button > .toolbarbutton-badge-stack::after,
+    :root[privatebrowsingmode="temporary"] #sidebar-button > .toolbarbutton-badge-stack::after {
+        content: "";
+        display: block;
+        width: 10px;
+        height: 10px;
+        background-image: url("chrome://global/skin/icons/indicator-private-browsing.svg");
+        background-size: contain;
+        background-repeat: no-repeat;
+        background-position: center;
+        position: absolute;
+        top: 0;
+        right: 0;
+        transform: translate(40%, -40%);
+        pointer-events: none;
+    }
+}

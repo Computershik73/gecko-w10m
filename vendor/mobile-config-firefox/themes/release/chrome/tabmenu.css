@@ -1,0 +1,80 @@
+/* Copyright 2025 Peter Mack, Oliver Smith
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@media (max-width: 700px) {
+    /* Increase tab width, to have more space for displaying the title of the
+     * website.
+     * The following values are for FF 144+ */
+    #tabbrowser-tabs {
+        border-inline-start: 0 !important;
+        padding-inline-start: 0 !important;
+        margin-inline-start: 0 !important;
+        --tab-min-width-pref: calc(100vw - 71px) !important;
+    }
+
+    #TabsToolbar {
+        padding-right: 7px !important;
+    }
+
+    #new-tab-button {
+        padding-left: 4px !important;
+    }
+
+    /* Hide private browsing indicator, it's re-added in
+     * private-browsing-indicator.css */
+    hbox.private-browsing-indicator-with-label {
+        display: none;
+    }
+
+    /* Remove empty space at start/end */
+    .titlebar-spacer[type="pre-tabs"], .titlebar-spacer[type="post-tabs"] {
+        width: 0px !important;
+    }
+
+    /* Hide firefox-view tab, as none of the options in about:config hides it on FF 123 */
+    #firefox-view-button {
+        display: none;
+    }
+
+    /* Option to show multiple tabs in tab bar */
+    @media not (-moz-pref("mcf.tabs.showFocusedTabOnly.enabled")) {
+        /* Set small tabs width for small screens */
+        #tabbrowser-tabs,
+        :root[privatebrowsingmode="temporary"] #tabbrowser-tabs {
+            --tab-min-width: 75px !important;
+            --tab-min-width-pref: 75px !important;
+            --tab-max-width: 150px !important;
+            --tab-max-width-pref: 150px !important;
+        }
+
+        /* Optionally show close button on all tabs */
+        @media -moz-pref("mcf.tabs.alwaysShowCloseButton") {
+            .tab-close-button, .close-icon, #tabbrowser-tabs[closebuttons="activetab"][orient="horizontal"] &:not([selected]) {
+                display: block !important;
+            }
+        }
+    }
+
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        /* Replace the arrow on the "all tabs" button to point upwards, when the
+         * tabs and searchbar are moved to the bottom. */
+        @media not -moz-pref("mcf.toolbar.tabCounter.enabled") {
+            #alltabs-button {
+                #TabsToolbar & {
+                    list-style-image: url("chrome://global/skin/icons/arrow-up.svg") !important;
+                }
+            }
+        }
+    }
+
+    /* All tabs menu: hide scroll buttons */
+    #scrollbutton-up, #scrollbutton-down {
+        display: none !important;
+    }
+
+    /* All tabs menu: hide the search and the separator below it. */
+    #allTabsMenu-searchTabs,
+    #allTabsMenu-tabsSeparator {
+        display: none;
+    }
+}

@@ -1,0 +1,49 @@
+/* Copyright 2022 Anri Dellal
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@-moz-document url("about:protections") {
+    #report-content {
+        width: calc(100% - 16px) !important;
+        max-width: 800px !important;
+    }
+
+    /* hide element with Firefox for Android and iOS ad */
+    .lockwise-card .card-body,
+    #mobile-hanger {
+        display: none !important;
+    }
+
+    @media (max-width: 800px) {
+        #report-content {
+            margin: 16px 8px !important;
+        }
+
+        .icon {
+            width: 32px !important;
+            height: 32px !important;
+        }
+
+        .body-wrapper {
+            /* make trackers report to fill the entire card width */
+            grid-column-start: 1 !important;
+            grid-column-end: -1 !important;
+        }
+
+        #manage-protections,
+        #sign-up-for-monitor-link,
+        #save-passwords-button,
+        #get-proxy-extension-link {
+            /* move button on a separate row */
+            grid-area: 2 / 1 / 2 / 6 !important;
+        }
+
+        .card-header .wrapper {
+            grid-row-gap: 8px !important;
+        }
+
+        .card:not(.has-logins) .wrapper div:nth-child(1) {
+            /* make card title to use more width */
+            grid-column-end: -1 !important;
+        }
+    }
+}

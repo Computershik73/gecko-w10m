@@ -1,0 +1,26 @@
+/* Copyright 2025 Danny Colin
+ * SPDX-License-Identifier: MPL-2.0 */
+
+/* Chrome Stylesheets */
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/browser.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/findbar.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/popups.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/private-browsing-indicator.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/root.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/sidebar.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/tabcounter.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/tabmenu.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/chrome/urlbar.css";
+
+/* Content Stylesheets */
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/addons.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/config.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/home.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/license.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/logins.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/policies.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/preferences.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/protections.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/reader.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/rights.css";
+@import "chrome://mobileconfigfirefox/content/themes/shared/content/sidebar.css";

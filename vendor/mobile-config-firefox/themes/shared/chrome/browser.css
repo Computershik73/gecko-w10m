@@ -1,0 +1,25 @@
+/* Copyright 2022 plata
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@media (max-width: 700px) {
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        /* Move navigation bar to bottom */
+        #browser {
+            order: -1 !important; /* since FF 113 */
+        }
+    }
+
+    /* Hide navigation bar in kiosk mode (to prevent bug #29). We can assume FF
+     * is in kiosk mode when fullscreen and max-width conditions are met,
+     * because at this max-width the fullscreen button is hidden
+     * (see appMenu.css). */
+    #nav-bar[inFullscreen],
+    #TabsToolbar[inFullscreen] {
+        display: none;
+    }
+
+    /* Hide minimize/maximize/close buttons */
+    .titlebar-buttonbox-container {
+        display: none;
+    }
+}

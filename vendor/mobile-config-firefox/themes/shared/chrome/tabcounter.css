@@ -1,0 +1,101 @@
+/* Copyright 2026 user0, Peter Mack
+ * SPDX-License-Identifier: MPL-2.0 */
+
+/* Source from reddit users /u/BatDogOnBatMobile, /u/moko1960, and /u/It_Was_The_Other_Guy
+ * https://old.reddit.com/r/FirefoxCSS/comments/s4wsww/
+ * https://old.reddit.com/r/FirefoxCSS/comments/yb8tr9/ */
+
+@media (-moz-pref("mcf.toolbar.tabCounter.enabled")) and (not (-moz-pref("sidebar.verticalTabs"))) {
+    /* Show Tab Manager Menu button */
+    #alltabs-button {
+        display: -moz-box !important;
+    }
+
+    /* Tab Manager Menu button tab counter */
+    #alltabs-button > .toolbarbutton-badge-stack > .toolbarbutton-icon {
+        visibility: collapse !important;
+    }
+
+    #alltabs-button > .toolbarbutton-badge-stack {
+         position: relative !important;
+    }
+
+    #alltabs-button > .toolbarbutton-badge-stack::before {
+        content: var(--tab-count, "0");
+        color: var(--toolbarbutton-icon-fill);
+        opacity: var(--toolbarbutton-icon-fill-opacity);
+        position: absolute;
+        bottom: var(--toolbarbutton-inner-padding, var(--toolbarbutton-padding-inner));
+        left: 50%;
+        transform: translateX(-50%);
+        /* Tab Manager Menu button styling inspired by Firefox for Android */
+        border: 1px solid var(--toolbarbutton-icon-fill);
+        border-radius: 3px;
+        padding: 1px 5px;
+        font-size: 10px !important;
+        font-weight: 600 !important;
+    }
+
+    #alltabs-button > .toolbarbutton-badge-stack {
+        border-radius: var(--toolbarbutton-border-radius);
+    }
+}
+
+@media (-moz-pref("mcf.toolbar.tabCounter.enabled")) and (-moz-pref("sidebar.verticalTabs")) {
+    /* Show sidebar button */
+    #sidebar-button {
+        display: -moz-box !important;
+    }
+
+    /* ESR 140 has no .toolbarbutton-badge-stack */
+    #sidebar-button > .toolbarbutton-badge-stack > .toolbarbutton-icon,
+    #sidebar-button:not(:has(.toolbarbutton-badge-stack)) > .toolbarbutton-icon {
+        visibility: collapse !important;
+    }
+
+    #sidebar-button > .toolbarbutton-badge-stack {
+        position: relative !important;
+    }
+
+    /* ESR 140 */
+    #sidebar-button:not(:has(.toolbarbutton-badge-stack)) {
+        position: relative !important;
+        min-width: 32px !important;
+        min-height: 32px !important;
+    }
+
+    #sidebar-button > .toolbarbutton-badge-stack::before {
+        content: var(--tab-count, "0");
+        color: var(--toolbarbutton-icon-fill);
+        opacity: var(--toolbarbutton-icon-fill-opacity);
+        position: absolute;
+        bottom: var(--toolbarbutton-inner-padding, var(--toolbarbutton-padding-inner));
+        left: 50%;
+        transform: translateX(-50%);
+        border: 1px solid var(--toolbarbutton-icon-fill);
+        border-radius: 3px;
+        padding: 1px 5px;
+        font-size: 10px !important;
+        font-weight: 600 !important;
+    }
+
+    /* ESR 140 */
+    #sidebar-button:not(:has(.toolbarbutton-badge-stack))::before {
+        content: var(--tab-count, "0");
+        color: var(--toolbarbutton-icon-fill);
+        opacity: var(--toolbarbutton-icon-fill-opacity);
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        border: 1px solid var(--toolbarbutton-icon-fill);
+        border-radius: 3px;
+        padding: 1px 5px;
+        font-size: 10px !important;
+        font-weight: 600 !important;
+    }
+
+    #sidebar-button > .toolbarbutton-badge-stack {
+        border-radius: var(--toolbarbutton-border-radius);
+    }
+}

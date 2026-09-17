@@ -1,0 +1,23 @@
+/* Copyright 2026 Peter Mack *
+ * SPDX-License-Identifier: MPL-2.0 */
+
+/* Optionally show close button on all tabs */
+@media -moz-pref("mcf.tabs.alwaysShowCloseButton") {
+    .tab-close-button, .close-icon, #tabbrowser-tabs[closebuttons="activetab"][orient="horizontal"] &:not([selected]) {
+        display: block !important;
+    }
+}
+
+/* Apply this customization only on smaller screens in portrait mode */
+@media (orientation: portrait) and (max-width: 720px) {
+    /* Hide the vertical tab strip unless it's expanded */
+    #sidebar-main:not([sidebar-launcher-expanded]),      /* FF 152 and earlier */
+    #sidebar-container:not([sidebar-launcher-expanded]), /* FF 153+ */
+
+    /* The launcher splitter is the drag handle for the tab strip's width.
+    Hiding the strip alone leaves it behind as a stray few-pixel column. */
+    #sidebar-launcher-splitter:not([sidebar-launcher-expanded]),      /* FF 138+ */
+    #sidebar-main:not([sidebar-launcher-expanded]) + #sidebar-launcher-splitter { /* FF 135-137: splitter had no attribute yet */
+        display: none !important;
+    }
+}

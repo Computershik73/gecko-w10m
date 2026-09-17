@@ -1,0 +1,55 @@
+/* Copyright 2026 plata, Anri Dellal, Peter Mack
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@-moz-document regexp("about:(preferences|addons|policies).*") {
+    .category-icon {
+        user-select: none !important;
+    }
+
+    @media (max-width: 700px) {
+        /* avoid that sidebar is too wide */
+        :root, :host(.anonymous-content-host) {
+            --in-content-sidebar-width: 50px !important;
+            --sidebar-width: 50px !important;
+            --size-sidebar-narrow: 50px !important;
+        }
+
+        /* fix sidebar width by reducing margins on FF 151+ */
+        moz-page-nav[data-l10n-id="aboutaddons-sidebar"],
+        #categories,
+        #categories-nav {
+            margin-inline-start: 5px !important;
+        }
+
+        /* fix empty space at the top */
+        .page-nav-heading-wrapper {
+            margin-block-start: 10px !important;
+        }
+
+        /* reduce space around category icons */
+        #categories > .category {
+            margin-inline-start: auto !important;
+            padding-inline: auto !important;
+        }
+
+        .category-name {
+            display: none !important;
+        }
+
+        /* reduce space around footer icons (addons, help) */
+        .sidebar-footer-list {
+            margin-inline: auto !important;
+            padding-inline: auto !important;
+        }
+
+        .sidebar-footer-label {
+            display: none !important;
+        }
+    }
+
+    @media (max-height: 400px) {
+        #categories {
+            margin-top: 8px !important;
+        }
+    }
+}

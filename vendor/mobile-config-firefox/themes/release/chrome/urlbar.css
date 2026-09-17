@@ -1,0 +1,233 @@
+/* Copyright 2026 Oliver Smith, Jesús Higueras, Peter Mack
+ * SPDX-License-Identifier: MPL-2.0 */
+
+/* Reduce minimum window width */
+#urlbar-container {
+    min-width: 150px !important;
+    flex-shrink: 1 !important;
+}
+
+@media (max-width: 700px) {
+    /* Remove various buttons left and right of the URL bar:
+       - forward-button: also reachable via longpress of back button
+       - home-button: not important enough
+       - customizableui-special-spring: empty space
+       - library-button: also reachable via PanelUI-menu-button
+       - sidebar-button: not useful on mobile (we try to gain horizontal space)
+       - fxa-toolbar-menu-button: firefox cloud stuff, also reachable via
+         #PanelUI-menu-button
+    */
+    /* #back-button */
+    #forward-button,
+    /* #reload-button */
+    #home-button,
+    #customizableui-special-spring1,
+    /* (urlbar) */
+    #customizableui-special-spring2,
+    #library-button,
+    #sidebar-button,
+    #fxa-toolbar-menu-button
+    /* #PanelUI-menu-button */ {
+        display: none !important;
+    }
+
+    /* Show sidebar-button when vertical tabs are enabled */
+    @media -moz-pref("sidebar.verticalTabs") {
+        #sidebar-button {
+            display: flex !important;
+        }
+        /* Hide spacer and alltabs-button*/
+        #alltabs-button,
+        #vertical-spacer {
+            display: none;
+        }
+    }
+
+    /* Show the forward button if the back button is disabled */
+    #back-button[disabled] ~ #forward-button {
+        display: flex !important;
+    }
+
+    #back-button[disabled] {
+        display: none !important;
+    }
+
+    #urlbar {
+        padding: 0px 5px;
+    }
+
+    /* Smaller font: show more of the URL */
+    #urlbar-input {
+        font-size: 9pt !important;
+        padding: 0px 4px !important;
+        /* Fade rightmost part with a gradient so it's clear that the URL is truncated */
+        mask-image: linear-gradient(to right, black 90%, transparent 100%);
+    }
+
+    #urlbar[focused] #urlbar-input {
+        mask-image: none;
+    }
+
+    #identity-box {
+        margin: 0 !important;
+    }
+
+    /* urlbar: Hide translate and other icons */
+    #urlbar #translations-button,
+    #urlbar #identity-box #identity-permission-box {
+        display: none !important;
+    }
+
+    /* hide protections container by default */
+    @media not (-moz-pref("mfc.urlbar.showTrustButton")) {
+        #tracking-protection-icon-container {
+            display: none !important;
+        }
+    }
+
+    /* Focused urlbar: hide all icons around it, so we have more space to edit the URL */
+    #urlbar[focused] #remote-control-box,
+    #urlbar[focused] #identity-box,
+    #urlbar[focused] #tracking-protection-icon-container,
+    /* #urlbar-input */
+    #urlbar[focused] #reader-mode-button,
+    #urlbar[focused] #page-action-buttons,
+    #urlbar[focused] .urlbar-go-button {
+        display: none;
+    }
+
+
+    /* Fixing invisible URL bar on FF 133+
+     * Making the active URL bar wider for better text input and
+     * a wider popout */
+    #urlbar[breakout][breakout-extend] {
+        left: 11vw !important; /* should be 10, but 10 looks off-center */
+        width: 80vw !important;
+        bottom: 0 !important;
+        z-index: 5 !important;
+    }
+
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        #urlbar[breakout][breakout-extend] {
+            top: 0 !important;
+            align-content: flex-end !important;
+        }
+    }
+
+    @media -moz-pref("mcf.toolbar.positionOnTop") {
+        #urlbar[breakout][breakout-extend] {
+            top: calc(1.1 * --urlbar-container-height) !important;
+            align-content: flex-start !important;
+        }
+    }
+
+    /* Label of "identity icons", e.g. firefox specific pages look weird
+     * when ellipsed, e.g. "F..x" instead of "Firefox". So just hide this
+     * label. The icon itself is still visible. */
+    #identity-icon-label {
+        display: none;
+    }
+
+    /* Hide label of the new Trust indicator (FF 149+), that shows a giant
+     * 'Not secure' when on http:// only pages. The icon itself is still
+     * visible. */
+    #trust-icon-container #trust-label {
+        display: none;
+    }
+
+    /* Move urlbar results to cover the whole displayed website, instead of
+     * being below the urlbar. */
+    .urlbarView {
+        position: fixed !important;
+        inset: 84px 0px 0px 0px;
+        width: 100% !important;
+        background: var(--arrowpanel-background);
+        margin: 0px !important;
+        margin-inline: 0px !important;
+        border-inline: 0px !important;
+        overflow-y: auto !important;
+        overflow-x: none !important;
+        scrollbar-width: none;
+    }
+
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        .urlbarView {
+            inset: 0px 0px 84px 0px;
+        }
+    }
+
+    /* Fix suggestions width for vertical tabs */
+    @media -moz-pref("sidebar.verticalTabs") {
+        .urlbarView {
+            left: 10vw !important;
+        }
+
+        .urlbarView-body-inner {
+            width: 80vw !important;
+        }
+    }
+
+    /* Bookmarks toolbar. Firefox shows it for some reason when opening a
+     * private browsing window, even if it is not enabled in the normal
+     * window view. Hide it for mobile, it eats precious space and can't be
+     * organized properly on mobile anyway. Using the searchbar to filter
+     * through bookmarks is much more efficient. */
+    #PersonalToolbar {
+        display: none;
+    }
+
+    /* If the bookmarks toolbar is configured to only show on the new tab page,
+     * Firefox makes the toolbar overlap the browser. When it's then hidden by
+     * the rule above, the urlbar is pushed off the bottom of the window. To
+     * prevent this, set the height of the overlapped toolbar to 0. */
+    :root {
+        --bookmarks-toolbar-overlapping-browser-height: 0 !important;
+    }
+
+    vbox.urlbarView {
+        position: fixed !important;
+        bottom: 82px !important;
+        box-shadow: rgba(0, 0, 0, 0.05) 0px -8px 8px 3px !important;
+        left: 0 !important;
+        right: 0 !important;
+        border-radius: 0 !important;
+        border: none !important;
+        width: unset !important;
+        margin: 0 !important;
+    }
+
+    vbox.urlbarView div#urlbar-results {
+        display: flex !important;
+        flex-direction: column-reverse;
+    }
+
+    /* Ensure search results are always shown at the very top */
+    vbox.urlbarView div#urlbar-results div[type="search"] {
+        order: 100 !important;
+    }
+
+    vbox.urlbarView div#urlbar-results div.urlbarView-row {
+        margin-top: 0 !important;
+    }
+
+    vbox.urlbarView div#urlbar-results div.urlbarView-row::before {
+        display: none !important;
+    }
+
+    hbox.search-panel-one-offs-header.search-panel-header {
+        margin-top: 1.5px !important;
+    }
+}
+
+/* Even though amazon is removed as search engine in policies.json, it gets
+ * installed when FF starts for the first time. Hide the button in "This time,
+ * search with" inside the urlbar. Match localizations like Amazon.de with this
+ * regex. */
+button[id^="urlbar-engine-one-off-item-Amazon"] {
+    display: none !important;
+}
+
+/* Ensure the URL bar's suggestions are always visible */
+#navigator-toolbox {
+    z-index: 9999 !important;
+}

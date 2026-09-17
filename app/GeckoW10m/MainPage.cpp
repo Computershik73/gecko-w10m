@@ -420,6 +420,10 @@ void MainPage::BuildUi() {
   // Not the size of the picture inside it: a stretched Image reports what it
   // drew, which is the frame, which would make the frame decide its own size.
   engineView_->WatchRoom(contentHost_);
+  {
+    auto bounds = Window::Current().Bounds();
+    engineView_->SetScreen(bounds.Width, bounds.Height);
+  }
 
 
   // The status bar exists only on mobile; tint it to match so the chrome does
@@ -457,7 +461,10 @@ void MainPage::BuildUi() {
       client::Log::Write(L"size: CoreWindow.ResizeCompleted");
       client::Log::FlushFromFault();
     });
-    Window::Current().SizeChanged([](auto const&, auto const& e) {
+    Window::Current().SizeChanged([this](auto const&, auto const& e) {
+      if (engineView_) {
+        engineView_->SetScreen(e.Size().Width, e.Size().Height);
+      }
       auto size = e.Size();
       client::Log::Write(L"size: Window.SizeChanged " +
                          std::to_wstring(static_cast<int>(size.Width)) + L"x" +

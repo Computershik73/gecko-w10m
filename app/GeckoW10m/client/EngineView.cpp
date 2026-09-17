@@ -300,6 +300,14 @@ bool EngineView::Resolve() {
   key_ = reinterpret_cast<KeyFn>(::GetProcAddress(xul, "gecko_w10m_input_key"));
   resize_ =
       reinterpret_cast<ResizeFn>(::GetProcAddress(xul, "gecko_w10m_resize"));
+  touch_ = reinterpret_cast<TouchFn>(::GetProcAddress(xul, "gecko_w10m_input_touch"));
+  screen_fn_ =
+      reinterpret_cast<ScreenFn>(::GetProcAddress(xul, "gecko_w10m_set_screen"));
+  if (screen_fn_ && screenWidth_ > 0) {
+    screen_fn_(screenWidth_, screenHeight_);
+  }
+  Log::Write(std::wstring(L"view: touch entry point ") +
+             (touch_ ? L"found -- fingers go to APZ" : L"MISSING -- taps and wheel"));
   panel_fn_ =
       reinterpret_cast<PanelFn>(::GetProcAddress(xul, "gecko_w10m_set_panel"));
   // The size goes to ANGLE rather than to the engine: ANGLE needs it on its
@@ -599,12 +607,11 @@ bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
     // its points arrive in view pixels.
     const double fx = point.X * rawPerView_;
     const double fy = point.Y * rawPerView_;
-    if (fx < 0 || fy < 0 || fx >= fullWidth_ || fy >= fullHeight_) {
-      return false;
-    }
-    *x = static_cast<int32_t>(fx);
-    *y = static_cast<int32_t>(fy);
-    return true;
+    // A finger that slides off the edge is still a finger; APZ wants to hear
+    // where it went, so the point is clamped rather than refused.
+    *x = static_cast<int32_t>(std::clamp(fx, 0.0, double(fullWidth_ - 1)));
+    *y = static_cast<int32_t>(std::clamp(fy, 0.0, double(fullHeight_ - 1)));
+    return fullWidth_ > 0 && fullHeight_ > 0;
   }
   if (width_ <= 0 || height_ <= 0) {
     return false;
@@ -643,6 +650,9 @@ void EngineView::OnPressed(winrt::Windows::Foundation::Point const& point) {
   travelled_ = 0;
   lastX_ = point.X;
   lastY_ = point.Y;
+  if (touch_) {
+    touch_(0, 0, x, y);
+  }
 }
 
 void EngineView::OnMoved(winrt::Windows::Foundation::Point const& point) {
@@ -661,6 +671,11 @@ void EngineView::OnMoved(winrt::Windows::Foundation::Point const& point) {
   lastY_ = point.Y;
   travelled_ += std::abs(dx) + std::abs(dy);
 
+  if (touch_) {
+    // The finger itself; APZ turns its path into a pan, a fling or a pinch.
+    touch_(0, 1, x, y);
+    return;
+  }
   // HeadlessWidget negates what it is given, so a finger moving up -- a
   // negative delta -- becomes a positive wheel delta, which is scrolling down.
   wheel_(x, y, dx, dy);
@@ -675,6 +690,13 @@ void EngineView::OnReleased(winrt::Windows::Foundation::Point const& point) {
   int32_t x = 0;
   int32_t y = 0;
   if (!ToFrame(point, &x, &y)) {
+    if (touch_) {
+      touch_(0, 3, x, y);  // off the picture: cancelled
+    }
+    return;
+  }
+  if (touch_) {
+    touch_(0, 2, x, y);
     return;
   }
   // A finger never holds still; anything under a few pixels was meant as a tap.
@@ -684,6 +706,20 @@ void EngineView::OnReleased(winrt::Windows::Foundation::Point const& point) {
   mouse_(0, x, y);
   mouse_(1, x, y);
   mouse_(2, x, y);
+}
+
+void EngineView::SetScreen(double viewWidth, double viewHeight) {
+  const int32_t width = static_cast<int32_t>(viewWidth * rawPerView_ + 0.5);
+  const int32_t height = static_cast<int32_t>(viewHeight * rawPerView_ + 0.5);
+  if (width <= 0 || height <= 0 ||
+      (width == screenWidth_ && height == screenHeight_)) {
+    return;
+  }
+  screenWidth_ = width;
+  screenHeight_ = height;
+  if (screen_fn_) {
+    screen_fn_(width, height);
+  }
 }
 
 void EngineView::Start() {

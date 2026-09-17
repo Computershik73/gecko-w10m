@@ -1,0 +1,137 @@
+/* Copyright 2025 Oliver Smith, Jesús Higueras, user0, Peter Mack *
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@media (max-width: 700px) {
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        /* If the navbar is at the bottom, we need to set an offset to have
+         * the notifications (like the one for installing addons) displayed
+         * on-screen. */
+        /* fixes for installing extensions */
+        .popup-notification-panel  {
+            margin-top: -100vh !important;
+        }
+    }
+
+    panel {
+        contain: strict !important;
+        margin: 0 !important;
+    }
+
+    panel, panel > box.panel-viewcontainer {
+        min-width: 100vw !important;
+        width: 100vw !important;
+        max-width: 100vw !important;
+        max-height: calc(100vh - 88px) !important;
+        min-height: calc(100vh - 88px) !important;
+    }
+
+    panelview {
+        max-height: 100% !important;
+    }
+
+    panelview.PanelUI-subView {
+        justify-content: flex-end;
+    }
+
+    panelview > .panel-subview-body {
+        flex: 0 !important;
+        flex-basis: min-content !important;
+    }
+
+    panel, box.panel-viewcontainer > box.panel-viewstack {
+        align-content: flex-end;
+    }
+
+    panelmultiview, box.panel-viewcontainer, box.panel-viewstack, panelview {
+        min-width: 100% !important;
+        max-width: 100% !important;
+        min-height: 0 !important;
+        outline: 0px transparent !important;
+        contain: layout !important;
+    }
+
+    /* Adjust dialogues like "Confirm before closing multiple
+     * tabs" or "Allow open in app" */
+    .dialogFrame {
+        max-width: 100%;
+    }
+
+    body:has(#urlbar[breakout][breakout-extend],
+    #urlbar[breakout][breakout-extend-disabled][open]) #mainPopupSet panel {
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
+}
+
+@media ((min-width: 701px) or (-moz-pref("mcf.toolbar.positionOnTop"))) {
+    panel, box.panel-viewcontainer > box.panel-viewstack {
+        align-content: flex-start;
+    }
+
+    panelview.PanelUI-subView {
+        justify-content: flex-start;
+    }
+}
+
+/* CAREFUL: Do not gate these (or anything that runs inside a popup/panel)
+ * behind a media query!
+ * If you do, there will be a size calculation conflict between the DOM in
+ * the main window and the popup/panel, and the popup/panel will be sized
+ * incorrectly.
+ */
+
+@media not (-moz-pref("mcf.appmenu.showAllEntries")) {
+    #appMenu-extensions-themes-button,
+    #appMenu-passwords-button,
+    #appMenu-help-button2,
+    #appMenu-help-button2 + toolbarseparator,
+    #appMenu-more-button2,
+    #appMenu-report-broken-site-button {
+        display: none !important;
+    }
+}
+
+/* Hide some context menu items,
+ * hide 'Customize Toolbar' in overflow menu */
+#context-inspect-a11y,
+#context-savelinktopocket,
+#context-searchselect,
+#context-sendlinktodevice,
+#context-viewpartialsource-selection,
+#context-sep-selectall,
+#frame-sep,
+#overflowMenu-customize-button {
+    display: none !important
+}
+
+/* Hide by default, but optionally unhide Inspector */
+@media not (-moz-pref("mcf.contextmenu.showInspector")) {
+    #context-inspect,
+    #inspect-separator {
+        display: none !important
+    }
+}
+
+menupopup {
+    width: max-content !important;
+    min-width: max-content !important;
+    max-width: max-content !important;
+    block-size: max-content !important;
+    max-block-size: max-content !important;
+    min-block-size: max-content !important;
+}
+
+/* Fix webextension popups */
+browser.webextension-popup-browser {
+    background: transparent !important;
+    min-height: 40vh !important;
+    max-height: 80vh !important;
+}
+
+/* Make large extensions (e.g., uBlock origin) popups useful
+ * by allowing them to be horizontally scrolled */
+.webextension-popup-browser, .webextension-popup-stack {
+    max-width: 100vw !important;
+    width: 100% !important;
+    overflow-x: scroll !important;
+}

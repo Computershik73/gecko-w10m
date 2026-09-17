@@ -41,6 +41,9 @@ class EngineView {
   // Hands the panel to the engine. Must happen before the engine starts, since
   // EGL asks for it as soon as it makes a surface.
   void GivePanelToEngine();
+  // The display in view pixels, as the window sees it; sent on to the engine
+  // in device pixels so the headless screen turns with the phone.
+  void SetScreen(double viewWidth, double viewHeight);
   // Which half of the swap-chain hand-over this launch leaves out, if any:
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.
@@ -103,6 +106,8 @@ class EngineView {
   using TextFn = void (*)(const uint16_t* text, int32_t length);
   using KeyFn = void (*)(int32_t keyCode);
   using ResizeFn = void (*)(int32_t width, int32_t height);
+  using TouchFn = void (*)(int32_t pointerId, int32_t state, int32_t x, int32_t y);
+  using ScreenFn = void (*)(int32_t width, int32_t height);
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
   using PanelScaleFn = void (*)(float x, float y);
@@ -117,6 +122,10 @@ class EngineView {
   TextFn text_ = nullptr;
   KeyFn key_ = nullptr;
   ResizeFn resize_ = nullptr;
+  TouchFn touch_ = nullptr;
+  ScreenFn screen_fn_ = nullptr;
+  int32_t screenWidth_ = 0;
+  int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;
   PanelSizeFn panel_size_fn_ = nullptr;
   PanelScaleFn panel_scale_fn_ = nullptr;

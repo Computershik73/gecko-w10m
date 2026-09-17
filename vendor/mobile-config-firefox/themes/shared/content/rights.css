@@ -1,0 +1,11 @@
+/* Copyright 2022 Anri Dellal
+ * SPDX-License-Identifier: MPL-2.0 */
+
+@-moz-document url("about:rights") {
+    @media (max-width: 500px) {
+        .rights-header {
+            background-image: none !important;
+            padding-inline-end: unset !important;
+        }
+    }
+}
