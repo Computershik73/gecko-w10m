@@ -67,7 +67,7 @@ MainPage::MainPage() {
   // it, and so is pushing work through it beside the compositor -- and leaving
   // it on would put its own textures in the address space that is now the
   // thing being measured.
-  engine::MakeSecondD3DDevice();
+  // engine::MakeSecondD3DDevice();  // answered: a composition chain of our own hides nothing
 
   // The compositor telling us it has lost its surfaces is the one warning a
   // GPU reset gives an application. If the phone's driver is being knocked

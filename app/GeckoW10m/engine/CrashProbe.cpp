@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <winstring.h>
+#include <inspectable.h>
 #include <winrt/Windows.System.h>
 
 #include <delayimp.h>
@@ -802,7 +804,68 @@ struct DelayDescriptorEarly {
       unloadIatRva, timestamp;
 };
 
+// --- WinRT activations --------------------------------------------------------
+//
+// The engine cannot make a window here, and the shell's own composition swap
+// chain hid nothing. What is left that reaches the shell from this process is
+// WinRT: the engine loads api-ms-win-core-winrt-l1-1-0 by name at start-up and
+// activates classes through it -- UISettings, UIViewSettings, InputPane,
+// SystemMediaTransportControls, the notification manager, and whatever
+// nsSystemInfo asks for at delayed start-up. Activating the wrong one, from the
+// wrong thread, a second after the browser window first paints, is the shape
+// of what is left. Every activation is written down: the class, and the thread.
+using RoGetActivationFactoryFn = HRESULT(WINAPI*)(HSTRING, REFIID, void**);
+using RoActivateInstanceFn = HRESULT(WINAPI*)(HSTRING, IInspectable**);
+RoGetActivationFactoryFn gRealRoGetActivationFactory = nullptr;
+RoActivateInstanceFn gRealRoActivateInstance = nullptr;
+
+std::wstring ClassName(HSTRING name) {
+  UINT32 length = 0;
+  const wchar_t* raw = ::WindowsGetStringRawBuffer(name, &length);
+  return raw ? std::wstring(raw, length) : L"(null)";
+}
+
+HRESULT WINAPI HookRoGetActivationFactory(HSTRING cls, REFIID iid, void** out) {
+  HRESULT hr = gRealRoGetActivationFactory
+                   ? gRealRoGetActivationFactory(cls, iid, out)
+                   : E_NOTIMPL;
+  Log::WriteFromFault(L"winrt: factory for " + ClassName(cls) + L" -> " +
+                      Hex(static_cast<uintptr_t>(hr)) + L", thread " +
+                      std::to_wstring(::GetCurrentThreadId()));
+  Log::FlushFromFault();
+  return hr;
+}
+
+HRESULT WINAPI HookRoActivateInstance(HSTRING cls, IInspectable** out) {
+  HRESULT hr = gRealRoActivateInstance ? gRealRoActivateInstance(cls, out)
+                                       : E_NOTIMPL;
+  Log::WriteFromFault(L"winrt: activated " + ClassName(cls) + L" -> " +
+                      Hex(static_cast<uintptr_t>(hr)) + L", thread " +
+                      std::to_wstring(::GetCurrentThreadId()));
+  Log::FlushFromFault();
+  return hr;
+}
+
+const WindowHook kWinRtHooks[] = {
+    {"RoGetActivationFactory", reinterpret_cast<void*>(&HookRoGetActivationFactory),
+     reinterpret_cast<void**>(&gRealRoGetActivationFactory)},
+    {"RoActivateInstance", reinterpret_cast<void*>(&HookRoActivateInstance),
+     reinterpret_cast<void**>(&gRealRoActivateInstance)},
+};
+
+int HookDelayImports(HMODULE module, const char* targetModule,
+                     const WindowHook* hooks, size_t count, const wchar_t* tag);
+
 int HookWindowImports(HMODULE module) {
+  int n = HookDelayImports(module, "USER32.dll", kWindowHooks,
+                           sizeof(kWindowHooks) / sizeof(kWindowHooks[0]), L"win");
+  n += HookDelayImports(module, "api-ms-win-core-winrt-l1-1-0.dll", kWinRtHooks,
+                        sizeof(kWinRtHooks) / sizeof(kWinRtHooks[0]), L"winrt");
+  return n;
+}
+
+int HookDelayImports(HMODULE module, const char* targetModule,
+                     const WindowHook* hooks, size_t count, const wchar_t* tag) {
   auto* base = reinterpret_cast<unsigned char*>(module);
   auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
   auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
@@ -811,12 +874,14 @@ int HookWindowImports(HMODULE module) {
                   .VirtualAddress;
   if (!rva) return 0;
 
-  HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
-  if (!user32) {
-    user32 = ::LoadLibraryExW(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  const std::wstring targetWide = Widen(targetModule);
+  HMODULE target = ::GetModuleHandleW(targetWide.c_str());
+  if (!target) {
+    target = ::LoadLibraryExW(targetWide.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
   }
-  if (!user32) {
-    Log::WriteFromFault(L"win: no user32 to forward to, windows not watched");
+  if (!target) {
+    Log::WriteFromFault(std::wstring(tag) + L": " + targetWide +
+                        L" is not loadable, nothing watched");
     return 0;
   }
 
@@ -825,7 +890,7 @@ int HookWindowImports(HMODULE module) {
   for (; desc->nameRva; ++desc) {
     if (!(desc->attributes & 1) || !desc->intRva || !desc->iatRva) continue;
     const char* moduleName = reinterpret_cast<const char*>(base + desc->nameRva);
-    if (_stricmp(moduleName, "USER32.dll") != 0) continue;
+    if (_stricmp(moduleName, targetModule) != 0) continue;
 
     auto* names = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->intRva);
     auto* slots = reinterpret_cast<IMAGE_THUNK_DATA32*>(base + desc->iatRva);
@@ -833,12 +898,12 @@ int HookWindowImports(HMODULE module) {
       if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
       auto* byName =
           reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-      for (const WindowHook& hook : kWindowHooks) {
+      for (size_t i = 0; i < count; ++i) {
+        const WindowHook& hook = hooks[i];
         if (std::strcmp(byName->Name, hook.name) != 0) continue;
-        FARPROC real = ::GetProcAddress(user32, hook.name);
+        FARPROC real = ::GetProcAddress(target, hook.name);
         if (!real) {
-          Log::WriteFromFault(L"win: " + Widen(hook.name) +
-                              L" is not in this user32, left alone");
+          // Quietly: the USER32 list is known to be mostly absent here.
           break;
         }
         *hook.real = reinterpret_cast<void*>(real);
@@ -849,8 +914,8 @@ int HookWindowImports(HMODULE module) {
       }
     }
   }
-  Log::WriteFromFault(L"win: watching " + std::to_wstring(hooked) +
-                      L" window calls out of the engine");
+  Log::WriteFromFault(std::wstring(tag) + L": watching " +
+                      std::to_wstring(hooked) + L" calls into " + targetWide);
   return hooked;
 }
 
