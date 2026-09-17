@@ -452,6 +452,47 @@ void MainPage::BuildUi() {
     status.ForegroundColor(ChromeFg());
   }
 
+  // The navigation client carries a property named
+  // CoreWindowResizeManager_ShouldWaitForLayoutCompletion, and a phone's
+  // resize manager is a protocol: the shell changes the window and waits for
+  // the app to say its layout is complete. An app that never says so, at a
+  // moment the shell thinks the window changed, is an app the shell stops
+  // waiting for. Nothing here has ever reported a size or bounds change, so
+  // whether one happens at first paint is unknown. Every one is on the record
+  // now, with the numbers.
+  {
+    auto core = Window::Current().CoreWindow();
+    core.SizeChanged([](auto const&, auto const& e) {
+      auto size = e.Size();
+      client::Log::Write(L"size: CoreWindow.SizeChanged " +
+                         std::to_wstring(static_cast<int>(size.Width)) + L"x" +
+                         std::to_wstring(static_cast<int>(size.Height)));
+      client::Log::FlushFromFault();
+    });
+    core.ResizeStarted([](auto const&, auto const&) {
+      client::Log::Write(L"size: CoreWindow.ResizeStarted -- the shell is "
+                         L"waiting for layout to complete");
+      client::Log::FlushFromFault();
+    });
+    core.ResizeCompleted([](auto const&, auto const&) {
+      client::Log::Write(L"size: CoreWindow.ResizeCompleted");
+      client::Log::FlushFromFault();
+    });
+    Window::Current().SizeChanged([](auto const&, auto const& e) {
+      auto size = e.Size();
+      client::Log::Write(L"size: Window.SizeChanged " +
+                         std::to_wstring(static_cast<int>(size.Width)) + L"x" +
+                         std::to_wstring(static_cast<int>(size.Height)));
+    });
+    auto display = winrt::Windows::Graphics::Display::DisplayInformation::GetForCurrentView();
+    display.OrientationChanged([](auto const&, auto const&) {
+      client::Log::Write(L"size: DisplayInformation.OrientationChanged");
+    });
+    display.DpiChanged([](auto const&, auto const&) {
+      client::Log::Write(L"size: DisplayInformation.DpiChanged");
+    });
+  }
+
   // On a phone an unhandled Back is a navigation away from the app: the shell
   // hides the view and suspends it a few seconds later -- which is, step for
   // step, what has been observed. Nobody presses anything, but the strings in
@@ -489,8 +530,15 @@ void MainPage::BuildUi() {
     client::Log::FlushFromFault();
   });
   view.SetDesiredBoundsMode(ApplicationViewBoundsMode::UseVisible);
-  view.VisibleBoundsChanged(
-      [this](auto&&, auto&&) { ApplyVisibleBounds(); });
+  view.VisibleBoundsChanged([this](auto&&, auto&&) {
+    auto b = ApplicationView::GetForCurrentView().VisibleBounds();
+    client::Log::Write(L"size: ApplicationView.VisibleBoundsChanged " +
+                       std::to_wstring(static_cast<int>(b.X)) + L"," +
+                       std::to_wstring(static_cast<int>(b.Y)) + L" " +
+                       std::to_wstring(static_cast<int>(b.Width)) + L"x" +
+                       std::to_wstring(static_cast<int>(b.Height)));
+    ApplyVisibleBounds();
+  });
   ApplyVisibleBounds();
 
   // --- Events ---
