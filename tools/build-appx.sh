@@ -234,6 +234,18 @@ PREFS
   # their bytes vary while the map names every one. See
   # tools/patch-vcall-thunks.py.
   python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")"     "$(cygpath -w "$STAGE/xul.dll")"     "$(cygpath -w "${DIST%/dist/bin}/toolkit/library/build/xul.map")"     | sed 's/^/    /'
+  # ANGLE's two DLLs have the same thunks and, until 0.2.4.6, no map -- so they
+  # went unpatched, and every glUniform* reached the D3D backend with the
+  # location replaced by the thunk's address (a fast fail under the hardened
+  # STL, and the reason hardware WebRender never survived its first frame).
+  for angle in libGLESv2 libEGL; do
+    map="${DIST%/dist/bin}/third_party/angle/${angle}_gn/${angle}.map"
+    if [ -f "$map" ]; then
+      python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")"         "$(cygpath -w "$STAGE/${angle}.dll")"         "$(cygpath -w "$map")"         | sed 's/^/    /'
+    else
+      echo "    WARNING: no linker map for ${angle}.dll -- its virtual-call thunks stay broken" >&2
+    fi
+  done
 else
   echo "    WARNING: $DIST not found, packaging the shell alone" >&2
 fi
