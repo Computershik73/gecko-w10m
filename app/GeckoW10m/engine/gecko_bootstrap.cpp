@@ -201,7 +201,11 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   SetEngineEnvironment(
       L"MOZ_LOG",
       L"timestamp,sync,nsAppRunner:5,XRE:5,nsComponentManager:5,"
-      L"nsChromeRegistry:5,nsIOService:5,URILoader:5");
+      L"nsChromeRegistry:5,nsIOService:5,URILoader:5,"
+      // Video: which decoder was asked, what it answered, and where the
+      // pipeline gave up.
+      L"MediaDecoder:4,MediaFormatReader:4,PlatformDecoderModule:5,"
+      L"WMFDecoderModule:5,MediaDemuxer:4,MediaSource:4,HTMLMediaElement:4");
   SetEngineEnvironment(L"MOZ_LOG_FILE", geckoLog.c_str());
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 
