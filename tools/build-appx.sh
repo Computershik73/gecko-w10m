@@ -163,7 +163,18 @@ if [ -d "$DIST" ]; then
   if [ -d "$STAGE/browser/defaults/preferences" ]; then
     cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
 // GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
-pref("gfx.webrender.software", false);
+// The control experiment, and a browser that works while it runs.
+//
+// With this true, RenderCompositor::Create takes the software branch and
+// returns before it ever reaches the GECKO_W10M one: no EGL surface, no
+// composition swap chain, no panel handed to ANGLE. Everything else about the
+// build is identical. So if "window: NOT visible any more" still appears half
+// a minute in, the thing that hides this window is not the GPU path and never
+// was; if it does not, it is, and the hunt has a floor to stand on.
+//
+// The hardware path is not removed by this and not one line of it has changed.
+// It is this pref away.
+pref("gfx.webrender.software", true);
 
 // The XAML compositor dies about two and a half seconds after these load, and
 // the last thing in the log before it is always the same run: mozavcodec,
