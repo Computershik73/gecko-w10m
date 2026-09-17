@@ -178,7 +178,7 @@ if [ -d "$DIST" ]; then
 // compositing is on and the D3D11 device is still made. If the window lives,
 // the hider is inside ANGLE's initialisation and the hardware path has one
 // file to fix. If it is hidden anyway, it is the gfx configuration itself.
-pref("gfx.webrender.software", true);
+pref("gfx.webrender.software", false);
 
 // Never the D3D11 software compositor, whichever way the pref above goes.
 //
