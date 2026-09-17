@@ -284,6 +284,14 @@ bool EngineView::Resolve() {
       Log::Write(std::wstring(L"view: ANGLE size entry point ") +
                  (panel_size_fn_ ? L"found" : L"MISSING") +
                  L", logging entry point " + (install ? L"found" : L"MISSING"));
+      // The mode goes in before the logger, so that ANGLE's own note about it
+      // is the first thing it says once it can be heard.
+      if (auto setMode = reinterpret_cast<AngleModeFn>(
+              ::GetProcAddress(gles, "angle_uwp_set_mode"))) {
+        setMode(experimentMode_);
+      } else {
+        Log::Write(L"view: ANGLE has no mode entry point -- an old engine");
+      }
       if (install) {
         install([](const char* text) {
           if (!text) {

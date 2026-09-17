@@ -38,6 +38,10 @@ class EngineView {
   // Hands the panel to the engine. Must happen before the engine starts, since
   // EGL asks for it as soon as it makes a surface.
   void GivePanelToEngine();
+  // Which half of the swap-chain hand-over this launch leaves out, if any:
+  // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
+  // presented. Passed on to ANGLE as soon as it can be reached.
+  void SetExperimentMode(int mode) { experimentMode_ = mode; }
   // Invisible, and focused only when Gecko says something takes text. It is
   // what the on-screen keyboard types into and the only way its keys can be
   // caught at all.
@@ -95,6 +99,7 @@ class EngineView {
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
   using AngleLogFn = void (*)(void (*)(const char*));
+  using AngleModeFn = void (*)(int32_t);
 
   CopyFn copy_ = nullptr;
   MouseFn mouse_ = nullptr;
@@ -122,6 +127,7 @@ class EngineView {
   bool textInputPending_ = false;
   bool touched_ = false;
   bool declinedUntilTouch_ = false;
+  int experimentMode_ = 0;
   bool saidWaiting_ = false;
   unsigned long long lastResolveAttempt_ = 0;
   std::function<void()> firstFrame_;

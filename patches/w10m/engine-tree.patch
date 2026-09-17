@@ -2634,12 +2634,77 @@ index fbce4d57e4..7fe2f88a7a 100644
 +# that work in one: emulated thread-local storage, no file writing, and
 +# the SwapChainPanel window instead of the HWND one.
 +DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+index 517e6fde6f..8724bab3ef 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+@@ -12,6 +12,12 @@
+ 
+ #include "libANGLE/renderer/d3d/d3d11/SwapChain11.h"
+ 
++#include <cstdio>
++
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++#    include "libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h"
++#endif
++
+ #include <EGL/eglext.h>
+ 
+ #include "libANGLE/features.h"
+@@ -907,6 +913,27 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+ 
+     HRESULT result = S_OK;
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // Nobody has ever confirmed that a frame reaches this swap chain. The log
++    // says the chain was made and the panel took it, and then the window is
++    // hidden -- and whether a single Present happened in between has been
++    // assumed both ways. Said once, the first time, and every time it fails.
++    if (mFirstSwap)
++    {
++        AngleUwpNote("angle: first present");
++    }
++    if (AngleUwpMode() == 2)
++    {
++        if (mFirstSwap)
++        {
++            AngleUwpNote("angle: mode 2 -- NOT presenting, this frame or any other");
++        }
++        mFirstSwap = false;
++        mRenderer->getStateManager()->invalidateRenderTarget();
++        return EGL_SUCCESS;
++    }
++#endif
++
+     // Use IDXGISwapChain1::Present1 with a dirty rect if DXGI 1.2 is available.
+     // Dirty rect present is not supported with a multisampled swapchain.
+     if (mSwapChain1 != nullptr && mEGLSamples <= 1)
+@@ -952,6 +979,19 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+         ERR() << "Present failed with " << gl::FmtHR(result);
+     }
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    if (result != S_OK)
++    {
++        // Including the S_ statuses -- DXGI_STATUS_OCCLUDED is 0x087A0001 and
++        // would mean the compositor considers this chain hidden, which is the
++        // very thing being asked about.
++        char note[96];
++        snprintf(note, sizeof(note), "angle: present returned 0x%08lx",
++                 static_cast<unsigned long>(result));
++        AngleUwpNote(note);
++    }
++#endif
++
+     mNativeWindow->commitChange();
+ 
+     return EGL_SUCCESS;
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..fd5acbe604
+index 0000000000..e080d88294
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,364 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -2679,6 +2744,7 @@ index 0000000000..fd5acbe604
 +// its own log, which is also where the crash trace goes, so the two can be
 +// read against each other.
 +std::atomic<void (*)(const char *)> sLogger{nullptr};
++std::atomic<int> sMode{0};
 +
 +void Note(const char *text)
 +{
@@ -2755,6 +2821,17 @@ index 0000000000..fd5acbe604
 +    sPanelHeight = height;
 +}
 +
++extern "C" __declspec(dllexport) void angle_uwp_set_mode(int32_t mode)
++{
++    sMode = mode;
++    char note[96];
++    snprintf(note, sizeof(note), "angle: mode %d -- %s", mode,
++             mode == 1   ? "the swap chain will never be handed to the panel"
++             : mode == 2 ? "the swap chain will never be presented"
++                         : "the real thing");
++    Note(note);
++}
++
 +extern "C" __declspec(dllexport) void angle_uwp_set_logger(void (*logger)(const char *))
 +{
 +    sLogger = logger;
@@ -2766,6 +2843,16 @@ index 0000000000..fd5acbe604
 +
 +namespace rx
 +{
++
++int AngleUwpMode()
++{
++    return sMode.load();
++}
++
++void AngleUwpNote(const char *text)
++{
++    Note(text);
++}
 +
 +NativeWindow11WinRT::NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha)
 +    : NativeWindow11(window),
@@ -2915,6 +3002,17 @@ index 0000000000..fd5acbe604
 +    }
 +    Note("angle: the swap chain exists, giving it to the panel");
 +
++    if (sMode.load() == 1)
++    {
++        // The experiment: everything but the hand-over. The chain exists and
++        // will be presented to; the panel never hears of it.
++        Note("angle: mode 1 -- NOT giving it to the panel");
++        mWidth     = static_cast<LONG>(width);
++        mHeight    = static_cast<LONG>(height);
++        *swapChain = static_cast<IDXGISwapChain *>(swapChain1);
++        return S_OK;
++    }
++
 +    ISwapChainPanelNative *panel = mPanel;
 +    result                       = RunOnUIThread(
 +        [panel, swapChain1]() -> HRESULT { return panel->SetSwapChain(swapChain1); },
@@ -2973,10 +3071,10 @@ index 0000000000..fd5acbe604
 +}  // namespace rx
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
 new file mode 100644
-index 0000000000..f01cb80cde
+index 0000000000..3eb2789726
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,96 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -3020,6 +3118,20 @@ index 0000000000..f01cb80cde
 +
 +namespace rx
 +{
++
++// What the shell asked this build to do with the swap chain, and where to say
++// what happened. Both live in NativeWindow11WinRT.cpp; SwapChain11 needs them
++// too, and it is generic code that knows nothing of panels.
++//
++//   0  make the swap chain, hand it to the panel, present -- the real thing
++//   1  make it, present, but never hand it to the panel
++//   2  make it, hand it over, but never present
++//
++// The window is hidden by the system six tenths of a second after the swap
++// chain exists, every time, and with nothing raised in between. These two
++// halves are the only two things that happen in that gap.
++int AngleUwpMode();
++void AngleUwpNote(const char *text);
 +
 +class NativeWindow11WinRT : public NativeWindow11
 +{

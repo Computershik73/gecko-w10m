@@ -408,6 +408,41 @@ void MainPage::BuildUi() {
   // drew, which is the frame, which would make the frame decide its own size.
   engineView_->WatchRoom(contentHost_);
 
+  // One launch, one experiment, cycling. The window is hidden by the system
+  // six tenths of a second after the swap chain exists, with nothing raised
+  // in between, and only two things happen in that gap: the chain is handed
+  // to the panel, and frames are presented to it. Each launch leaves one of
+  // them out. The count lives in LocalState, which a reinstall wipes, so a
+  // fresh install always starts at the real thing.
+  //
+  //   launch 1  mode 0  everything, as shipped
+  //   launch 2  mode 1  the panel never gets the chain
+  //   launch 3  mode 2  the chain is never presented
+  //   launch 4  mode 0  again
+  {
+    int launches = 0;
+    const std::wstring counter = std::wstring(ApplicationData::Current().LocalFolder().Path()) + L"\\launches.txt";
+    if (FILE* f = _wfopen(counter.c_str(), L"r")) {
+      fscanf_s(f, "%d", &launches);
+      fclose(f);
+    }
+    ++launches;
+    if (FILE* f = _wfopen(counter.c_str(), L"w")) {
+      fprintf(f, "%d", launches);
+      fclose(f);
+    }
+    const int mode = (launches - 1) % 3;
+    engineView_->SetExperimentMode(mode);
+    client::Log::Write(
+        L"experiment: launch " + std::to_wstring(launches) + L", mode " +
+        std::to_wstring(mode) + L" -- " +
+        (mode == 1   ? L"the swap chain is made and presented, but the panel "
+                       L"never gets it"
+         : mode == 2 ? L"the swap chain is made and handed over, but never "
+                       L"presented"
+                     : L"the real thing, nothing left out"));
+  }
+
   // The status bar exists only on mobile; tint it to match so the chrome does
   // not look like it is floating under a foreign strip.
   if (ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar")) {
