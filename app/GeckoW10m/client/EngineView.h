@@ -105,6 +105,7 @@ class EngineView {
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
+  using PanelScaleFn = void (*)(float x, float y);
   using AngleLogFn = void (*)(void (*)(const char*));
   using AngleModeFn = void (*)(int32_t);
 
@@ -118,6 +119,7 @@ class EngineView {
   ResizeFn resize_ = nullptr;
   PanelFn panel_fn_ = nullptr;
   PanelSizeFn panel_size_fn_ = nullptr;
+  PanelScaleFn panel_scale_fn_ = nullptr;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
   winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel_{nullptr};

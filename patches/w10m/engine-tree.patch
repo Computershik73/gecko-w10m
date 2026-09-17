@@ -35243,10 +35243,10 @@ index 517e6fde6f..8724bab3ef 100644
      return EGL_SUCCESS;
 diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
 new file mode 100644
-index 0000000000..e080d88294
+index 0000000000..cedd7ccc99
 --- /dev/null
 +++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,402 @@
 +//
 +// Copyright 2016 The ANGLE Project Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
@@ -35266,6 +35266,7 @@ index 0000000000..e080d88294
 +#include <cstdio>
 +#include <cstdint>
 +
++#include <dxgi1_3.h>
 +#include <windows.ui.core.h>
 +#include <windows.ui.xaml.h>
 +#include <windows.ui.xaml.media.dxinterop.h>
@@ -35280,6 +35281,12 @@ index 0000000000..e080d88294
 +// number arriving by a shorter road. Written rarely, read every resize.
 +std::atomic<LONG> sPanelWidth{0};
 +std::atomic<LONG> sPanelHeight{0};
++// The panel's composition scale, times 1000. XAML shows a swap chain's pixels
++// as logical units unless told otherwise; on a 350% phone that is a picture
++// three and a half times too big. The shell reads the scale from the panel
++// and it goes onto the chain as an inverse matrix transform.
++std::atomic<int> sPanelScaleX{1000};
++std::atomic<int> sPanelScaleY{1000};
 +
 +// Where this says what it did. The notes Gecko writes live in xul, which this
 +// library is not linked against, so the shell hands over somewhere to write --
@@ -35361,6 +35368,12 @@ index 0000000000..e080d88294
 +{
 +    sPanelWidth  = width;
 +    sPanelHeight = height;
++}
++
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_scale(float x, float y)
++{
++    sPanelScaleX = static_cast<int>((x > 0 ? x : 1.0f) * 1000.0f + 0.5f);
++    sPanelScaleY = static_cast<int>((y > 0 ? y : 1.0f) * 1000.0f + 0.5f);
 +}
 +
 +extern "C" __declspec(dllexport) void angle_uwp_set_mode(int32_t mode)
@@ -35569,6 +35582,31 @@ index 0000000000..e080d88294
 +        return result;
 +    }
 +    Note("angle: the panel took the swap chain");
++
++    {
++        const float scaleX = sPanelScaleX.load() / 1000.0f;
++        const float scaleY = sPanelScaleY.load() / 1000.0f;
++        IDXGISwapChain2 *swapChain2 = nullptr;
++        if (SUCCEEDED(swapChain1->QueryInterface(__uuidof(IDXGISwapChain2),
++                                                 reinterpret_cast<void **>(&swapChain2))) &&
++            swapChain2)
++        {
++            DXGI_MATRIX_3X2_F inverse = {};
++            inverse._11               = 1.0f / scaleX;
++            inverse._22               = 1.0f / scaleY;
++            const HRESULT scaled      = swapChain2->SetMatrixTransform(&inverse);
++            char note[160];
++            snprintf(note, sizeof(note),
++                     "angle: composition scale %.3fx%.3f, inverse transform set -> 0x%08lx", scaleX,
++                     scaleY, static_cast<unsigned long>(scaled));
++            Note(note);
++            swapChain2->Release();
++        }
++        else
++        {
++            Note("angle: no IDXGISwapChain2 -- the composition scale cannot be undone");
++        }
++    }
 +
 +    mWidth     = static_cast<LONG>(width);
 +    mHeight    = static_cast<LONG>(height);
@@ -49510,10 +49548,10 @@ index 2e0f09cbfd..f6217dfe47 100644
  
  #  include <windows.h>
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
-index 8484851f67..43af9d67ea 100644
+index 8484851f67..e194d921e1 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
-@@ -1,46 +1,651 @@
+@@ -1,46 +1,657 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -50196,11 +50234,17 @@ index 8484851f67..43af9d67ea 100644
 +
 +// The on-screen keyboard covers the bottom of the screen, and a window that
 +// does not know that puts the field being typed into underneath it.
++namespace mozilla::widget {
++extern int32_t gGeckoW10mPendingWidth;
++extern int32_t gGeckoW10mPendingHeight;
++}  // namespace mozilla::widget
 +extern "C" __declspec(dllexport) void gecko_w10m_resize(int32_t aWidth,
 +                                                     int32_t aHeight) {
 +  if (aWidth <= 0 || aHeight <= 0) {
 +    return;
 +  }
++  mozilla::widget::gGeckoW10mPendingWidth = aWidth;
++  mozilla::widget::gGeckoW10mPendingHeight = aHeight;
 +  NS_DispatchToMainThread(
 +      NS_NewRunnableFunction("gecko_w10m_resize", [aWidth, aHeight]() {
 +        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
@@ -50334,13 +50378,593 @@ index 02bd76ba38..bab37e25c5 100644
        rect, rect, 24, 24, 0, DesktopToLayoutDeviceScale(),
        CSSToLayoutDeviceScale(), 96.0f, Screen::IsPseudoDisplay::No,
 diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
-index 0c28540ee6..6835745603 100644
+index 0c28540ee6..2ae3849877 100644
 --- a/widget/headless/HeadlessWidget.cpp
 +++ b/widget/headless/HeadlessWidget.cpp
-@@ -3,6 +3,14 @@
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- #include "HeadlessWidget.h"
- 
+@@ -1,578 +1,714 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-#include "HeadlessWidget.h"
+-
+-#include "BasicEvents.h"
+-#include "ErrorList.h"
+-#include "HeadlessCompositorWidget.h"
+-#include "HeadlessKeyBindings.h"
+-#include "InputData.h"
+-#include "MouseEvents.h"
+-#include "UnitTransforms.h"
+-#include "mozilla/ClearOnShutdown.h"
+-#include "mozilla/Maybe.h"
+-#include "mozilla/NativeKeyBindingsType.h"
+-#include "mozilla/Preferences.h"
+-#include "mozilla/TextEventDispatcher.h"
+-#include "mozilla/TextEvents.h"
+-#include "mozilla/WritingModes.h"
+-#include "mozilla/gfx/gfxVars.h"
+-#include "mozilla/widget/HeadlessWidgetTypes.h"
+-#include "mozilla/widget/PlatformWidgetTypes.h"
+-#include "mozilla/widget/Screen.h"
+-#include "nsIScreen.h"
+-
+-using namespace mozilla;
+-using namespace mozilla::gfx;
+-using namespace mozilla::layers;
+-
+-using mozilla::LogLevel;
+-
+-#ifdef MOZ_LOGGING
+-
+-#  include "mozilla/Logging.h"
+-static mozilla::LazyLogModule sWidgetLog("Widget");
+-static mozilla::LazyLogModule sWidgetFocusLog("WidgetFocus");
+-#  define LOG(args) MOZ_LOG(sWidgetLog, mozilla::LogLevel::Debug, args)
+-#  define LOGFOCUS(args) \
+-    MOZ_LOG(sWidgetFocusLog, mozilla::LogLevel::Debug, args)
+-
+-#else
+-
+-#  define LOG(args)
+-#  define LOGFOCUS(args)
+-
+-#endif /* MOZ_LOGGING */
+-
+-/*static*/
+-already_AddRefed<nsIWidget> nsIWidget::CreateHeadlessWidget() {
+-  nsCOMPtr<nsIWidget> widget = new mozilla::widget::HeadlessWidget();
+-  return widget.forget();
+-}
+-
+-namespace mozilla {
+-namespace widget {
+-
+-StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sActiveWindows;
+-
+-already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
+-  if (!sActiveWindows) {
+-    return nullptr;
+-  }
+-  auto length = sActiveWindows->Length();
+-  if (length == 0) {
+-    return nullptr;
+-  }
+-  RefPtr<HeadlessWidget> widget = sActiveWindows->ElementAt(length - 1);
+-  return widget.forget();
+-}
+-
+-HeadlessWidget::HeadlessWidget()
+-    : mEnabled(true),
+-      mVisible(false),
+-      mDestroyed(false),
+-      mAlwaysOnTop(false),
+-      mCompositorWidget(nullptr),
+-      mSizeMode(nsSizeMode_Normal),
+-      mLastSizeMode(nsSizeMode_Normal),
+-      mEffectiveSizeMode(nsSizeMode_Normal),
+-      mRestoreBounds(0, 0, 0, 0) {
+-  mWidgetType = WidgetType::Headless;
+-  if (!sActiveWindows) {
+-    sActiveWindows = new nsTArray<HeadlessWidget*>();
+-    ClearOnShutdown(&sActiveWindows);
+-  }
+-}
+-
+-HeadlessWidget::~HeadlessWidget() {
+-  LOG(("HeadlessWidget::~HeadlessWidget() [%p]\n", (void*)this));
+-
+-  Destroy();
+-}
+-
+-void HeadlessWidget::Destroy() {
+-  if (mDestroyed) {
+-    return;
+-  }
+-  LOG(("HeadlessWidget::Destroy [%p]\n", (void*)this));
+-  mDestroyed = true;
+-
+-  if (sActiveWindows) {
+-    int32_t index = sActiveWindows->IndexOf(this);
+-    if (index != -1) {
+-      RefPtr<HeadlessWidget> activeWindow = GetActiveWindow();
+-      sActiveWindows->RemoveElementAt(index);
+-      // If this is the currently active widget and there's a previously active
+-      // widget, activate the previous widget.
+-      RefPtr<HeadlessWidget> previousActiveWindow = GetActiveWindow();
+-      if (this == activeWindow && previousActiveWindow &&
+-          previousActiveWindow->mWidgetListener) {
+-        previousActiveWindow->mWidgetListener->WindowActivated();
+-      }
+-    }
+-  }
+-
+-  nsIWidget::OnDestroy();
+-
+-  nsIWidget::Destroy();
+-}
+-
+-nsresult HeadlessWidget::Create(nsIWidget* aParent,
+-                                const LayoutDeviceIntRect& aRect,
+-                                const widget::InitData& aInitData) {
+-  BaseCreate(aParent, aInitData);
+-  mBounds = aRect;
+-  mRestoreBounds = aRect;
+-  mAlwaysOnTop = aInitData.mAlwaysOnTop;
+-  return NS_OK;
+-}
+-
+-void HeadlessWidget::GetCompositorWidgetInitData(
+-    mozilla::widget::CompositorWidgetInitData* aInitData) {
+-  *aInitData =
+-      mozilla::widget::HeadlessCompositorWidgetInitData(GetClientSize());
+-}
+-
+-void HeadlessWidget::RaiseWindow() {
+-  MOZ_ASSERT(
+-      mWindowType == WindowType::TopLevel || mWindowType == WindowType::Dialog,
+-      "Raising a non-toplevel window.");
+-
+-  // Do nothing if this is the currently active window.
+-  RefPtr<HeadlessWidget> activeWindow = GetActiveWindow();
+-  if (activeWindow == this) {
+-    return;
+-  }
+-
+-  // Deactivate the last active window.
+-  if (activeWindow && activeWindow->mWidgetListener) {
+-    activeWindow->mWidgetListener->WindowDeactivated();
+-  }
+-
+-  // Remove this window if it's already tracked.
+-  int32_t index = sActiveWindows->IndexOf(this);
+-  if (index != -1) {
+-    sActiveWindows->RemoveElementAt(index);
+-  }
+-
+-  // Activate this window.
+-  sActiveWindows->AppendElement(this);
+-  if (mWidgetListener) mWidgetListener->WindowActivated();
+-}
+-
+-void HeadlessWidget::Show(bool aState) {
+-  mVisible = aState;
+-
+-  LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
+-
+-  // Top-level window and dialogs are activated/raised when shown.
+-  // NB: alwaysontop windows are generally used for peripheral indicators.
+-  //     So we don't focus them by default unless they are a Document
+-  //     Picture-in-Picture.
+-  if (aState && (!mAlwaysOnTop || mPiPType == PiPType::DocumentPiP) &&
+-      (mWindowType == WindowType::TopLevel ||
+-       mWindowType == WindowType::Dialog)) {
+-    RaiseWindow();
+-  }
+-
+-  ApplySizeModeSideEffects();
+-}
+-
+-bool HeadlessWidget::IsVisible() const { return mVisible; }
+-
+-void HeadlessWidget::SetFocus(Raise aRaise,
+-                              mozilla::dom::CallerType aCallerType) {
+-  LOGFOCUS(("  SetFocus %d [%p]\n", aRaise == Raise::Yes, (void*)this));
+-
+-  // This means we request activation of our toplevel window.
+-  if (aRaise == Raise::Yes) {
+-    HeadlessWidget* topLevel = (HeadlessWidget*)GetTopLevelWidget();
+-
+-    // The toplevel only becomes active if it's currently visible; otherwise, it
+-    // will be activated anyway when it's shown.
+-    if (topLevel->IsVisible()) {
+-      topLevel->RaiseWindow();
+-    }
+-  }
+-}
+-
+-void HeadlessWidget::Enable(bool aState) { mEnabled = aState; }
+-
+-bool HeadlessWidget::IsEnabled() const { return mEnabled; }
+-
+-void HeadlessWidget::Move(const DesktopPoint& aPoint) {
+-  LOG(("HeadlessWidget::Move [%p] %f %f\n", this, aPoint.x.value,
+-       aPoint.y.value));
+-
+-  auto topLeft =
+-      LayoutDeviceIntPoint::Round(aPoint * GetDesktopToDeviceScale());
+-  if (mWindowType == WindowType::TopLevel ||
+-      mWindowType == WindowType::Dialog) {
+-    SetSizeMode(nsSizeMode_Normal);
+-  }
+-  MoveInternal(topLeft.x, topLeft.y);
+-}
+-
+-void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
+-  // Since a popup window's x/y coordinates are in relation to
+-  // the parent, the parent might have moved so we always move a
+-  // popup window.
+-  if (mBounds.IsEqualXY(aX, aY) && mWindowType != WindowType::Popup) {
+-    return;
+-  }
+-
+-  mBounds.MoveTo(aX, aY);
+-  NotifyWindowMoved(mBounds.TopLeft());
+-}
+-
+-LayoutDeviceIntPoint HeadlessWidget::WidgetToScreenOffset() {
+-  if (mWindowType == WindowType::Popup) {
+-    return mBounds.TopLeft();
+-  }
+-  return GetTopLevelWidget()->GetBounds().TopLeft();
+-}
+-
+-WindowRenderer* HeadlessWidget::GetWindowRenderer() {
+-  return nsIWidget::GetWindowRenderer();
+-}
+-
+-void HeadlessWidget::SetCompositorWidgetDelegate(
+-    CompositorWidgetDelegate* delegate) {
+-  if (delegate) {
+-    mCompositorWidget = delegate->AsHeadlessCompositorWidget();
+-    MOZ_ASSERT(mCompositorWidget,
+-               "HeadlessWidget::SetCompositorWidgetDelegate called with a "
+-               "non-HeadlessCompositorWidget");
+-  } else {
+-    mCompositorWidget = nullptr;
+-  }
+-}
+-
+-void HeadlessWidget::Resize(const DesktopSize& aSize, bool aRepaint) {
+-  int32_t width = NSToIntRound(aSize.width);
+-  int32_t height = NSToIntRound(aSize.height);
+-  ResizeInternal(width, height, aRepaint);
+-}
+-
+-void HeadlessWidget::ResizeInternal(int32_t aWidth, int32_t aHeight,
+-                                    bool aRepaint) {
+-  ConstrainSize(&aWidth, &aHeight);
+-  mBounds.SizeTo(LayoutDeviceIntSize(aWidth, aHeight));
+-
+-  if (mCompositorWidget) {
+-    mCompositorWidget->NotifyClientSizeChanged(mBounds.Size());
+-  }
+-  if (mWidgetListener) {
+-    mWidgetListener->WindowResized(this, mBounds.Size());
+-  }
+-  if (mAttachedWidgetListener) {
+-    mAttachedWidgetListener->WindowResized(this, mBounds.Size());
+-  }
+-}
+-
+-void HeadlessWidget::Resize(const DesktopRect& aRect, bool aRepaint) {
+-  auto tl =
+-      LayoutDeviceIntPoint::Round(aRect.TopLeft() * GetDesktopToDeviceScale());
+-  // Intentionally to avoid SetSizeMode() call in Move().
+-  MoveInternal(tl.x, tl.y);
+-  Resize(aRect.Size(), aRepaint);
+-}
+-
+-void HeadlessWidget::SetSizeMode(nsSizeMode aMode) {
+-  LOG(("HeadlessWidget::SetSizeMode [%p] %d\n", (void*)this, aMode));
+-
+-  if (aMode == mSizeMode) {
+-    return;
+-  }
+-
+-  if (aMode == nsSizeMode_Normal && mSizeMode == nsSizeMode_Fullscreen) {
+-    MakeFullScreen(false);
+-    return;
+-  }
+-
+-  mSizeMode = aMode;
+-
+-  // Normally in real widget backends a window event would be triggered that
+-  // would cause the window manager to handle resizing the window. In headless
+-  // the window must manually be resized.
+-  ApplySizeModeSideEffects();
+-}
+-
+-void HeadlessWidget::ApplySizeModeSideEffects() {
+-  if (!mVisible || mEffectiveSizeMode == mSizeMode) {
+-    return;
+-  }
+-
+-  if (mEffectiveSizeMode == nsSizeMode_Normal) {
+-    // Store the last normal size bounds so it can be restored when entering
+-    // normal mode again.
+-    mRestoreBounds = mBounds;
+-  }
+-
+-  switch (mSizeMode) {
+-    case nsSizeMode_Normal: {
+-      MoveInternal(mRestoreBounds.X(), mRestoreBounds.Y());
+-      ResizeInternal(mRestoreBounds.Width(), mRestoreBounds.Height(), false);
+-      break;
+-    }
+-    case nsSizeMode_Minimized:
+-      break;
+-    case nsSizeMode_Maximized: {
+-      nsCOMPtr<nsIScreen> screen = GetWidgetScreen();
+-      if (screen) {
+-        int32_t left, top, width, height;
+-        if (NS_SUCCEEDED(
+-                screen->GetRectDisplayPix(&left, &top, &width, &height))) {
+-          MoveInternal(0, 0);
+-          ResizeInternal(width, height, true);
+-        }
+-      }
+-      break;
+-    }
+-    case nsSizeMode_Fullscreen:
+-      // This will take care of resizing the window.
+-      nsIWidget::InfallibleMakeFullScreen(true);
+-      break;
+-    default:
+-      break;
+-  }
+-
+-  mEffectiveSizeMode = mSizeMode;
+-  if (mWidgetListener) {
+-    mWidgetListener->SizeModeChanged(mSizeMode);
+-  }
+-}
+-
+-nsresult HeadlessWidget::MakeFullScreen(bool aFullScreen) {
+-  // Directly update the size mode here so a later call SetSizeMode does
+-  // nothing.
+-  if (aFullScreen) {
+-    if (mSizeMode != nsSizeMode_Fullscreen) {
+-      mLastSizeMode = mSizeMode;
+-    }
+-    mSizeMode = nsSizeMode_Fullscreen;
+-  } else {
+-    mSizeMode = mLastSizeMode;
+-  }
+-
+-  // Notify the listener first so size mode change events are triggered before
+-  // resize events.
+-  if (mWidgetListener) {
+-    mWidgetListener->SizeModeChanged(mSizeMode);
+-  }
+-
+-  // Real widget backends don't seem to follow a common approach for
+-  // when and how many resize events are triggered during fullscreen
+-  // transitions. InfallibleMakeFullScreen will trigger a resize, but it
+-  // will be ignored if still transitioning to fullscreen, so it must be
+-  // triggered on the next tick.
+-  RefPtr<HeadlessWidget> self(this);
+-  NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+-      "HeadlessWidget::MakeFullScreen", [self, aFullScreen]() -> void {
+-        self->InfallibleMakeFullScreen(aFullScreen);
+-      }));
+-
+-  return NS_OK;
+-}
+-
+-nsresult HeadlessWidget::AttachNativeKeyEvent(WidgetKeyboardEvent& aEvent) {
+-  HeadlessKeyBindings& bindings = HeadlessKeyBindings::GetInstance();
+-  return bindings.AttachNativeKeyEvent(aEvent);
+-}
+-
+-bool HeadlessWidget::GetEditCommands(NativeKeyBindingsType aType,
+-                                     const WidgetKeyboardEvent& aEvent,
+-                                     nsTArray<CommandInt>& aCommands) {
+-  // Validate the arguments.
+-  if (NS_WARN_IF(!nsIWidget::GetEditCommands(aType, aEvent, aCommands))) {
+-    return false;
+-  }
+-
+-  Maybe<WritingMode> writingMode;
+-  if (aEvent.NeedsToRemapNavigationKey()) {
+-    if (RefPtr<TextEventDispatcher> dispatcher = GetTextEventDispatcher()) {
+-      writingMode = dispatcher->MaybeQueryWritingModeAtSelection();
+-    }
+-  }
+-
+-  HeadlessKeyBindings& bindings = HeadlessKeyBindings::GetInstance();
+-  bindings.GetEditCommands(aType, aEvent, writingMode, aCommands);
+-  return true;
+-}
+-
+-nsresult HeadlessWidget::SynthesizeNativeMouseEvent(
+-    LayoutDeviceIntPoint aPoint, NativeMouseMessage aNativeMessage,
+-    MouseButton aButton, nsIWidget::NativeModifiers aModifierFlags,
+-    nsISynthesizedEventCallback* aCallback) {
+-  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+-  EventMessage msg;
+-  switch (aNativeMessage) {
+-    case NativeMouseMessage::Move:
+-      msg = eMouseMove;
+-      break;
+-    case NativeMouseMessage::ButtonDown:
+-      msg = eMouseDown;
+-      break;
+-    case NativeMouseMessage::ButtonUp:
+-      msg = eMouseUp;
+-      break;
+-    case NativeMouseMessage::EnterWindow:
+-    case NativeMouseMessage::LeaveWindow:
+-      MOZ_ASSERT_UNREACHABLE("Unsupported synthesized mouse event");
+-      return NS_ERROR_UNEXPECTED;
+-  }
+-  WidgetMouseEvent event(true, msg, this, WidgetMouseEvent::eReal);
+-  event.mRefPoint = aPoint - WidgetToScreenOffset();
+-  if (msg == eMouseDown || msg == eMouseUp) {
+-    event.mButton = aButton;
+-  }
+-  if (msg == eMouseDown) {
+-    event.mClickCount = 1;
+-  }
+-  event.AssignEventTime(WidgetEventTime());
+-  DispatchInputEvent(&event);
+-  return NS_OK;
+-}
+-
+-nsresult HeadlessWidget::SynthesizeNativeMouseScrollEvent(
+-    mozilla::LayoutDeviceIntPoint aPoint, uint32_t aNativeMessage,
+-    double aDeltaX, double aDeltaY, double aDeltaZ,
+-    nsIWidget::NativeModifiers aModifierFlags, uint32_t aAdditionalFlags,
+-    nsISynthesizedEventCallback* aCallback) {
+-  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+-  // The various platforms seem to handle scrolling deltas differently,
+-  // but the following seems to emulate it well enough.
+-  WidgetWheelEvent event(true, eWheel, this);
+-  event.mDeltaMode = MOZ_HEADLESS_SCROLL_DELTA_MODE;
+-  event.mIsNoLineOrPageDelta = true;
+-  event.mDeltaX = -aDeltaX * MOZ_HEADLESS_SCROLL_MULTIPLIER;
+-  event.mDeltaY = -aDeltaY * MOZ_HEADLESS_SCROLL_MULTIPLIER;
+-  event.mDeltaZ = -aDeltaZ * MOZ_HEADLESS_SCROLL_MULTIPLIER;
+-  event.mRefPoint = aPoint - WidgetToScreenOffset();
+-  event.AssignEventTime(WidgetEventTime());
+-  DispatchInputEvent(&event);
+-  return NS_OK;
+-}
+-
+-nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+-    uint32_t aPointerId, TouchPointerState aPointerState,
+-    LayoutDeviceIntPoint aPoint, double aPointerPressure,
+-    uint32_t aPointerOrientation, nsISynthesizedEventCallback* aCallback) {
+-  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+-
+-  MOZ_ASSERT(NS_IsMainThread());
+-  if (aPointerState == TOUCH_HOVER) {
+-    return NS_ERROR_UNEXPECTED;
+-  }
+-
+-  if (!mSynthesizedTouchInput) {
+-    mSynthesizedTouchInput = MakeUnique<MultiTouchInput>();
+-  }
+-
+-  LayoutDeviceIntPoint pointInWindow = aPoint - WidgetToScreenOffset();
+-  MultiTouchInput inputToDispatch = UpdateSynthesizedTouchState(
+-      mSynthesizedTouchInput.get(), TimeStamp::Now(), aPointerId, aPointerState,
+-      pointInWindow, aPointerPressure, aPointerOrientation);
+-  DispatchTouchInput(inputToDispatch);
+-  return NS_OK;
+-}
+-
+-nsresult HeadlessWidget::SynthesizeNativeTouchPadPinch(
+-    TouchpadGesturePhase aEventPhase, float aScale, LayoutDeviceIntPoint aPoint,
+-    int32_t aModifierFlags) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  PinchGestureInput::PinchGestureType pinchGestureType =
+-      PinchGestureInput::PINCHGESTURE_SCALE;
+-  ScreenCoord CurrentSpan;
+-  ScreenCoord PreviousSpan;
+-  switch (aEventPhase) {
+-    case PHASE_BEGIN:
+-      pinchGestureType = PinchGestureInput::PINCHGESTURE_START;
+-      CurrentSpan = aScale;
+-      PreviousSpan = 0.999;
+-      break;
+-
+-    case PHASE_UPDATE:
+-      pinchGestureType = PinchGestureInput::PINCHGESTURE_SCALE;
+-      if (aScale == mLastPinchSpan) {
+-        return NS_ERROR_INVALID_ARG;
+-      }
+-      CurrentSpan = aScale;
+-      PreviousSpan = mLastPinchSpan;
+-      break;
+-
+-    case PHASE_END:
+-      pinchGestureType = PinchGestureInput::PINCHGESTURE_END;
+-      CurrentSpan = aScale;
+-      PreviousSpan = mLastPinchSpan;
+-      break;
+-
+-    default:
+-      return NS_ERROR_INVALID_ARG;
+-  }
+-
+-  ScreenPoint touchpadPoint = ViewAs<ScreenPixel>(
+-      aPoint - WidgetToScreenOffset(),
+-      PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
+-  // The headless widget does not support modifiers.
+-  // Do not pass `aModifierFlags` because it contains native modifier values.
+-  PinchGestureInput inputToDispatch(
+-      pinchGestureType, PinchGestureInput::TRACKPAD, TimeStamp::Now(),
+-      ExternalPoint(0, 0), touchpadPoint,
+-      100.0 * ((aEventPhase == PHASE_END) ? ScreenCoord(1.f) : CurrentSpan),
+-      100.0 * ((aEventPhase == PHASE_END) ? ScreenCoord(1.f) : PreviousSpan),
+-      0);
+-
+-  if (!inputToDispatch.SetLineOrPageDeltaY(this)) {
+-    return NS_ERROR_INVALID_ARG;
+-  }
+-
+-  mLastPinchSpan = aScale;
+-  DispatchPinchGestureInput(inputToDispatch);
+-  return NS_OK;
+-}
+-
+-nsresult HeadlessWidget::SynthesizeNativeTouchpadPan(
+-    TouchpadGesturePhase aEventPhase, LayoutDeviceIntPoint aPoint,
+-    double aDeltaX, double aDeltaY, int32_t aModifierFlags,
+-    nsISynthesizedEventCallback* aCallback) {
+-  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+-
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  PanGestureInput::PanGestureType eventType = PanGestureInput::PANGESTURE_PAN;
+-  switch (aEventPhase) {
+-    case PHASE_BEGIN:
+-      eventType = PanGestureInput::PANGESTURE_START;
+-      break;
+-    case PHASE_UPDATE:
+-      eventType = PanGestureInput::PANGESTURE_PAN;
+-      break;
+-    case PHASE_END:
+-      eventType = PanGestureInput::PANGESTURE_END;
+-      break;
+-    default:
+-      return NS_ERROR_INVALID_ARG;
+-  }
+-
+-  ScreenPoint touchpadPoint = ViewAs<ScreenPixel>(
+-      aPoint - WidgetToScreenOffset(),
+-      PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
+-  PanGestureInput input(eventType, TimeStamp::Now(), touchpadPoint,
+-                        ScreenPoint(float(aDeltaX), float(aDeltaY)),
+-                        // Same as SynthesizeNativeTouchPadPinch case we ignore
+-                        // aModifierFlags.
+-                        0);
+-
+-  input.mSimulateMomentum =
+-      Preferences::GetBool("apz.test.headless.simulate_momentum");
+-
+-  DispatchPanGestureInput(input);
+-
+-  return NS_OK;
+-}
+-
+-}  // namespace widget
+-}  // namespace mozilla
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#include "HeadlessWidget.h"
++
 +#include <algorithm>
 +
 +#if defined(GECKO_W10M)
@@ -50349,13 +50973,94 @@ index 0c28540ee6..6835745603 100644
 +extern "C" void GeckoW10mNote(const char* text);
 +#endif
 +
- #include "BasicEvents.h"
- #include "ErrorList.h"
- #include "HeadlessCompositorWidget.h"
-@@ -91,7 +99,43 @@ HeadlessWidget::~HeadlessWidget() {
-   Destroy();
- }
- 
++#include "BasicEvents.h"
++#include "ErrorList.h"
++#include "HeadlessCompositorWidget.h"
++#include "HeadlessKeyBindings.h"
++#include "InputData.h"
++#include "MouseEvents.h"
++#include "UnitTransforms.h"
++#include "mozilla/ClearOnShutdown.h"
++#include "mozilla/Maybe.h"
++#include "mozilla/NativeKeyBindingsType.h"
++#include "mozilla/Preferences.h"
++#include "mozilla/TextEventDispatcher.h"
++#include "mozilla/TextEvents.h"
++#include "mozilla/WritingModes.h"
++#include "mozilla/gfx/gfxVars.h"
++#include "mozilla/widget/HeadlessWidgetTypes.h"
++#include "mozilla/widget/PlatformWidgetTypes.h"
++#include "mozilla/widget/Screen.h"
++#include "nsIScreen.h"
++
++using namespace mozilla;
++using namespace mozilla::gfx;
++using namespace mozilla::layers;
++
++using mozilla::LogLevel;
++
++#ifdef MOZ_LOGGING
++
++#  include "mozilla/Logging.h"
++static mozilla::LazyLogModule sWidgetLog("Widget");
++static mozilla::LazyLogModule sWidgetFocusLog("WidgetFocus");
++#  define LOG(args) MOZ_LOG(sWidgetLog, mozilla::LogLevel::Debug, args)
++#  define LOGFOCUS(args) \
++    MOZ_LOG(sWidgetFocusLog, mozilla::LogLevel::Debug, args)
++
++#else
++
++#  define LOG(args)
++#  define LOGFOCUS(args)
++
++#endif /* MOZ_LOGGING */
++
++/*static*/
++already_AddRefed<nsIWidget> nsIWidget::CreateHeadlessWidget() {
++  nsCOMPtr<nsIWidget> widget = new mozilla::widget::HeadlessWidget();
++  return widget.forget();
++}
++
++namespace mozilla {
++namespace widget {
++
++StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sActiveWindows;
++
++already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
++  if (!sActiveWindows) {
++    return nullptr;
++  }
++  auto length = sActiveWindows->Length();
++  if (length == 0) {
++    return nullptr;
++  }
++  RefPtr<HeadlessWidget> widget = sActiveWindows->ElementAt(length - 1);
++  return widget.forget();
++}
++
++HeadlessWidget::HeadlessWidget()
++    : mEnabled(true),
++      mVisible(false),
++      mDestroyed(false),
++      mAlwaysOnTop(false),
++      mCompositorWidget(nullptr),
++      mSizeMode(nsSizeMode_Normal),
++      mLastSizeMode(nsSizeMode_Normal),
++      mEffectiveSizeMode(nsSizeMode_Normal),
++      mRestoreBounds(0, 0, 0, 0) {
++  mWidgetType = WidgetType::Headless;
++  if (!sActiveWindows) {
++    sActiveWindows = new nsTArray<HeadlessWidget*>();
++    ClearOnShutdown(&sActiveWindows);
++  }
++}
++
++HeadlessWidget::~HeadlessWidget() {
++  LOG(("HeadlessWidget::~HeadlessWidget() [%p]\n", (void*)this));
++
++  Destroy();
++}
++
 +#if defined(GECKO_W10M)
 +namespace {
 +// Raw, and main thread only. A strong reference here would keep a window
@@ -50387,19 +51092,92 @@ index 0c28540ee6..6835745603 100644
 +}
 +#endif
 +
- void HeadlessWidget::Destroy() {
++void HeadlessWidget::Destroy() {
 +#if defined(GECKO_W10M)
 +  if (sShownWidget == this) {
 +    sShownWidget = nullptr;
 +  }
 +#endif
-   if (mDestroyed) {
-     return;
-   }
-@@ -162,6 +206,16 @@ void HeadlessWidget::RaiseWindow() {
- }
- 
- void HeadlessWidget::Show(bool aState) {
++  if (mDestroyed) {
++    return;
++  }
++  LOG(("HeadlessWidget::Destroy [%p]\n", (void*)this));
++  mDestroyed = true;
++
++  if (sActiveWindows) {
++    int32_t index = sActiveWindows->IndexOf(this);
++    if (index != -1) {
++      RefPtr<HeadlessWidget> activeWindow = GetActiveWindow();
++      sActiveWindows->RemoveElementAt(index);
++      // If this is the currently active widget and there's a previously active
++      // widget, activate the previous widget.
++      RefPtr<HeadlessWidget> previousActiveWindow = GetActiveWindow();
++      if (this == activeWindow && previousActiveWindow &&
++          previousActiveWindow->mWidgetListener) {
++        previousActiveWindow->mWidgetListener->WindowActivated();
++      }
++    }
++  }
++
++  nsIWidget::OnDestroy();
++
++  nsIWidget::Destroy();
++}
++
++nsresult HeadlessWidget::Create(nsIWidget* aParent,
++                                const LayoutDeviceIntRect& aRect,
++                                const widget::InitData& aInitData) {
++  BaseCreate(aParent, aInitData);
++  mBounds = aRect;
++  mRestoreBounds = aRect;
++  mAlwaysOnTop = aInitData.mAlwaysOnTop;
++  return NS_OK;
++}
++
++void HeadlessWidget::GetCompositorWidgetInitData(
++    mozilla::widget::CompositorWidgetInitData* aInitData) {
++  *aInitData =
++      mozilla::widget::HeadlessCompositorWidgetInitData(GetClientSize());
++}
++
++void HeadlessWidget::RaiseWindow() {
++  MOZ_ASSERT(
++      mWindowType == WindowType::TopLevel || mWindowType == WindowType::Dialog,
++      "Raising a non-toplevel window.");
++
++  // Do nothing if this is the currently active window.
++  RefPtr<HeadlessWidget> activeWindow = GetActiveWindow();
++  if (activeWindow == this) {
++    return;
++  }
++
++  // Deactivate the last active window.
++  if (activeWindow && activeWindow->mWidgetListener) {
++    activeWindow->mWidgetListener->WindowDeactivated();
++  }
++
++  // Remove this window if it's already tracked.
++  int32_t index = sActiveWindows->IndexOf(this);
++  if (index != -1) {
++    sActiveWindows->RemoveElementAt(index);
++  }
++
++  // Activate this window.
++  sActiveWindows->AppendElement(this);
++  if (mWidgetListener) mWidgetListener->WindowActivated();
++}
++
++#if defined(GECKO_W10M)
++// The shell reports the room before the browser window exists, and the resize
++// it sent was dropped for want of a widget -- so the window kept the whole
++// screen it was first told about while the panel was shorter, and the
++// hardware frame was drawn 2560 tall into a 2308 surface. The last size seen
++// is kept and applied the moment a top-level window shows.
++int32_t gGeckoW10mPendingWidth = 0;
++int32_t gGeckoW10mPendingHeight = 0;
++#endif
++
++void HeadlessWidget::Show(bool aState) {
 +#if defined(GECKO_W10M)
 +  if (mCompositorWidget) {
 +    mCompositorWidget->NotifyVisibilityChanged(aState);
@@ -50408,15 +51186,79 @@ index 0c28540ee6..6835745603 100644
 +    // Last one shown wins, which after startup is the browser window: the
 +    // graphics sanity test shows and hides one of its own before it.
 +    sShownWidget = this;
++    if (gGeckoW10mPendingWidth > 0 && gGeckoW10mPendingHeight > 0) {
++      const int32_t width = gGeckoW10mPendingWidth;
++      const int32_t height = gGeckoW10mPendingHeight;
++      NS_DispatchToMainThread(NS_NewRunnableFunction(
++          "HeadlessWidget::ApplyPendingRoom", [width, height]() {
++            if (auto* widget = HeadlessWidget::ShownWidget()) {
++              widget->Resize(mozilla::DesktopSize(width, height), true);
++            }
++          }));
++    }
 +  }
 +#endif
-   mVisible = aState;
- 
-   LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
-@@ -223,6 +277,29 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
-   }
- 
-   mBounds.MoveTo(aX, aY);
++  mVisible = aState;
++
++  LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
++
++  // Top-level window and dialogs are activated/raised when shown.
++  // NB: alwaysontop windows are generally used for peripheral indicators.
++  //     So we don't focus them by default unless they are a Document
++  //     Picture-in-Picture.
++  if (aState && (!mAlwaysOnTop || mPiPType == PiPType::DocumentPiP) &&
++      (mWindowType == WindowType::TopLevel ||
++       mWindowType == WindowType::Dialog)) {
++    RaiseWindow();
++  }
++
++  ApplySizeModeSideEffects();
++}
++
++bool HeadlessWidget::IsVisible() const { return mVisible; }
++
++void HeadlessWidget::SetFocus(Raise aRaise,
++                              mozilla::dom::CallerType aCallerType) {
++  LOGFOCUS(("  SetFocus %d [%p]\n", aRaise == Raise::Yes, (void*)this));
++
++  // This means we request activation of our toplevel window.
++  if (aRaise == Raise::Yes) {
++    HeadlessWidget* topLevel = (HeadlessWidget*)GetTopLevelWidget();
++
++    // The toplevel only becomes active if it's currently visible; otherwise, it
++    // will be activated anyway when it's shown.
++    if (topLevel->IsVisible()) {
++      topLevel->RaiseWindow();
++    }
++  }
++}
++
++void HeadlessWidget::Enable(bool aState) { mEnabled = aState; }
++
++bool HeadlessWidget::IsEnabled() const { return mEnabled; }
++
++void HeadlessWidget::Move(const DesktopPoint& aPoint) {
++  LOG(("HeadlessWidget::Move [%p] %f %f\n", this, aPoint.x.value,
++       aPoint.y.value));
++
++  auto topLeft =
++      LayoutDeviceIntPoint::Round(aPoint * GetDesktopToDeviceScale());
++  if (mWindowType == WindowType::TopLevel ||
++      mWindowType == WindowType::Dialog) {
++    SetSizeMode(nsSizeMode_Normal);
++  }
++  MoveInternal(topLeft.x, topLeft.y);
++}
++
++void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
++  // Since a popup window's x/y coordinates are in relation to
++  // the parent, the parent might have moved so we always move a
++  // popup window.
++  if (mBounds.IsEqualXY(aX, aY) && mWindowType != WindowType::Popup) {
++    return;
++  }
++
++  mBounds.MoveTo(aX, aY);
 +#if defined(GECKO_W10M)
 +  // And having been made to fit, it has to be put somewhere it fits. A window
 +  // placed for a screen it is no longer the size of would hang off an edge,
@@ -50440,13 +51282,40 @@ index 0c28540ee6..6835745603 100644
 +    mCompositorWidget->NotifyOriginChanged(mBounds.TopLeft());
 +  }
 +#endif
-   NotifyWindowMoved(mBounds.TopLeft());
- }
- 
-@@ -257,8 +334,47 @@ void HeadlessWidget::Resize(const DesktopSize& aSize, bool aRepaint) {
- 
- void HeadlessWidget::ResizeInternal(int32_t aWidth, int32_t aHeight,
-                                     bool aRepaint) {
++  NotifyWindowMoved(mBounds.TopLeft());
++}
++
++LayoutDeviceIntPoint HeadlessWidget::WidgetToScreenOffset() {
++  if (mWindowType == WindowType::Popup) {
++    return mBounds.TopLeft();
++  }
++  return GetTopLevelWidget()->GetBounds().TopLeft();
++}
++
++WindowRenderer* HeadlessWidget::GetWindowRenderer() {
++  return nsIWidget::GetWindowRenderer();
++}
++
++void HeadlessWidget::SetCompositorWidgetDelegate(
++    CompositorWidgetDelegate* delegate) {
++  if (delegate) {
++    mCompositorWidget = delegate->AsHeadlessCompositorWidget();
++    MOZ_ASSERT(mCompositorWidget,
++               "HeadlessWidget::SetCompositorWidgetDelegate called with a "
++               "non-HeadlessCompositorWidget");
++  } else {
++    mCompositorWidget = nullptr;
++  }
++}
++
++void HeadlessWidget::Resize(const DesktopSize& aSize, bool aRepaint) {
++  int32_t width = NSToIntRound(aSize.width);
++  int32_t height = NSToIntRound(aSize.height);
++  ResizeInternal(width, height, aRepaint);
++}
++
++void HeadlessWidget::ResizeInternal(int32_t aWidth, int32_t aHeight,
++                                    bool aRepaint) {
 +#if defined(GECKO_W10M)
 +  // What was asked for, what the constraints allowed, and what kind of window
 +  // it was. This found the window that came out wider than the screen, and it
@@ -50454,7 +51323,7 @@ index 0c28540ee6..6835745603 100644
 +  const int32_t asked = aWidth;
 +  const int32_t askedHeight = aHeight;
 +#endif
-   ConstrainSize(&aWidth, &aHeight);
++  ConstrainSize(&aWidth, &aHeight);
 +#if defined(GECKO_W10M)
 +  // ConstrainSize knows only the minimum and maximum the front end asked for;
 +  // nothing in the path brings a window down to the size of the display. On a
@@ -50477,7 +51346,7 @@ index 0c28540ee6..6835745603 100644
 +    }
 +  }
 +#endif
-   mBounds.SizeTo(LayoutDeviceIntSize(aWidth, aHeight));
++  mBounds.SizeTo(LayoutDeviceIntSize(aWidth, aHeight));
 +#if defined(GECKO_W10M)
 +  {
 +    char note[160];
@@ -50488,9 +51357,323 @@ index 0c28540ee6..6835745603 100644
 +    GeckoW10mNote(note);
 +  }
 +#endif
- 
-   if (mCompositorWidget) {
-     mCompositorWidget->NotifyClientSizeChanged(mBounds.Size());
++
++  if (mCompositorWidget) {
++    mCompositorWidget->NotifyClientSizeChanged(mBounds.Size());
++  }
++  if (mWidgetListener) {
++    mWidgetListener->WindowResized(this, mBounds.Size());
++  }
++  if (mAttachedWidgetListener) {
++    mAttachedWidgetListener->WindowResized(this, mBounds.Size());
++  }
++}
++
++void HeadlessWidget::Resize(const DesktopRect& aRect, bool aRepaint) {
++  auto tl =
++      LayoutDeviceIntPoint::Round(aRect.TopLeft() * GetDesktopToDeviceScale());
++  // Intentionally to avoid SetSizeMode() call in Move().
++  MoveInternal(tl.x, tl.y);
++  Resize(aRect.Size(), aRepaint);
++}
++
++void HeadlessWidget::SetSizeMode(nsSizeMode aMode) {
++  LOG(("HeadlessWidget::SetSizeMode [%p] %d\n", (void*)this, aMode));
++
++  if (aMode == mSizeMode) {
++    return;
++  }
++
++  if (aMode == nsSizeMode_Normal && mSizeMode == nsSizeMode_Fullscreen) {
++    MakeFullScreen(false);
++    return;
++  }
++
++  mSizeMode = aMode;
++
++  // Normally in real widget backends a window event would be triggered that
++  // would cause the window manager to handle resizing the window. In headless
++  // the window must manually be resized.
++  ApplySizeModeSideEffects();
++}
++
++void HeadlessWidget::ApplySizeModeSideEffects() {
++  if (!mVisible || mEffectiveSizeMode == mSizeMode) {
++    return;
++  }
++
++  if (mEffectiveSizeMode == nsSizeMode_Normal) {
++    // Store the last normal size bounds so it can be restored when entering
++    // normal mode again.
++    mRestoreBounds = mBounds;
++  }
++
++  switch (mSizeMode) {
++    case nsSizeMode_Normal: {
++      MoveInternal(mRestoreBounds.X(), mRestoreBounds.Y());
++      ResizeInternal(mRestoreBounds.Width(), mRestoreBounds.Height(), false);
++      break;
++    }
++    case nsSizeMode_Minimized:
++      break;
++    case nsSizeMode_Maximized: {
++      nsCOMPtr<nsIScreen> screen = GetWidgetScreen();
++      if (screen) {
++        int32_t left, top, width, height;
++        if (NS_SUCCEEDED(
++                screen->GetRectDisplayPix(&left, &top, &width, &height))) {
++          MoveInternal(0, 0);
++          ResizeInternal(width, height, true);
++        }
++      }
++      break;
++    }
++    case nsSizeMode_Fullscreen:
++      // This will take care of resizing the window.
++      nsIWidget::InfallibleMakeFullScreen(true);
++      break;
++    default:
++      break;
++  }
++
++  mEffectiveSizeMode = mSizeMode;
++  if (mWidgetListener) {
++    mWidgetListener->SizeModeChanged(mSizeMode);
++  }
++}
++
++nsresult HeadlessWidget::MakeFullScreen(bool aFullScreen) {
++  // Directly update the size mode here so a later call SetSizeMode does
++  // nothing.
++  if (aFullScreen) {
++    if (mSizeMode != nsSizeMode_Fullscreen) {
++      mLastSizeMode = mSizeMode;
++    }
++    mSizeMode = nsSizeMode_Fullscreen;
++  } else {
++    mSizeMode = mLastSizeMode;
++  }
++
++  // Notify the listener first so size mode change events are triggered before
++  // resize events.
++  if (mWidgetListener) {
++    mWidgetListener->SizeModeChanged(mSizeMode);
++  }
++
++  // Real widget backends don't seem to follow a common approach for
++  // when and how many resize events are triggered during fullscreen
++  // transitions. InfallibleMakeFullScreen will trigger a resize, but it
++  // will be ignored if still transitioning to fullscreen, so it must be
++  // triggered on the next tick.
++  RefPtr<HeadlessWidget> self(this);
++  NS_DispatchToCurrentThread(NS_NewRunnableFunction(
++      "HeadlessWidget::MakeFullScreen", [self, aFullScreen]() -> void {
++        self->InfallibleMakeFullScreen(aFullScreen);
++      }));
++
++  return NS_OK;
++}
++
++nsresult HeadlessWidget::AttachNativeKeyEvent(WidgetKeyboardEvent& aEvent) {
++  HeadlessKeyBindings& bindings = HeadlessKeyBindings::GetInstance();
++  return bindings.AttachNativeKeyEvent(aEvent);
++}
++
++bool HeadlessWidget::GetEditCommands(NativeKeyBindingsType aType,
++                                     const WidgetKeyboardEvent& aEvent,
++                                     nsTArray<CommandInt>& aCommands) {
++  // Validate the arguments.
++  if (NS_WARN_IF(!nsIWidget::GetEditCommands(aType, aEvent, aCommands))) {
++    return false;
++  }
++
++  Maybe<WritingMode> writingMode;
++  if (aEvent.NeedsToRemapNavigationKey()) {
++    if (RefPtr<TextEventDispatcher> dispatcher = GetTextEventDispatcher()) {
++      writingMode = dispatcher->MaybeQueryWritingModeAtSelection();
++    }
++  }
++
++  HeadlessKeyBindings& bindings = HeadlessKeyBindings::GetInstance();
++  bindings.GetEditCommands(aType, aEvent, writingMode, aCommands);
++  return true;
++}
++
++nsresult HeadlessWidget::SynthesizeNativeMouseEvent(
++    LayoutDeviceIntPoint aPoint, NativeMouseMessage aNativeMessage,
++    MouseButton aButton, nsIWidget::NativeModifiers aModifierFlags,
++    nsISynthesizedEventCallback* aCallback) {
++  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
++  EventMessage msg;
++  switch (aNativeMessage) {
++    case NativeMouseMessage::Move:
++      msg = eMouseMove;
++      break;
++    case NativeMouseMessage::ButtonDown:
++      msg = eMouseDown;
++      break;
++    case NativeMouseMessage::ButtonUp:
++      msg = eMouseUp;
++      break;
++    case NativeMouseMessage::EnterWindow:
++    case NativeMouseMessage::LeaveWindow:
++      MOZ_ASSERT_UNREACHABLE("Unsupported synthesized mouse event");
++      return NS_ERROR_UNEXPECTED;
++  }
++  WidgetMouseEvent event(true, msg, this, WidgetMouseEvent::eReal);
++  event.mRefPoint = aPoint - WidgetToScreenOffset();
++  if (msg == eMouseDown || msg == eMouseUp) {
++    event.mButton = aButton;
++  }
++  if (msg == eMouseDown) {
++    event.mClickCount = 1;
++  }
++  event.AssignEventTime(WidgetEventTime());
++  DispatchInputEvent(&event);
++  return NS_OK;
++}
++
++nsresult HeadlessWidget::SynthesizeNativeMouseScrollEvent(
++    mozilla::LayoutDeviceIntPoint aPoint, uint32_t aNativeMessage,
++    double aDeltaX, double aDeltaY, double aDeltaZ,
++    nsIWidget::NativeModifiers aModifierFlags, uint32_t aAdditionalFlags,
++    nsISynthesizedEventCallback* aCallback) {
++  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
++  // The various platforms seem to handle scrolling deltas differently,
++  // but the following seems to emulate it well enough.
++  WidgetWheelEvent event(true, eWheel, this);
++  event.mDeltaMode = MOZ_HEADLESS_SCROLL_DELTA_MODE;
++  event.mIsNoLineOrPageDelta = true;
++  event.mDeltaX = -aDeltaX * MOZ_HEADLESS_SCROLL_MULTIPLIER;
++  event.mDeltaY = -aDeltaY * MOZ_HEADLESS_SCROLL_MULTIPLIER;
++  event.mDeltaZ = -aDeltaZ * MOZ_HEADLESS_SCROLL_MULTIPLIER;
++  event.mRefPoint = aPoint - WidgetToScreenOffset();
++  event.AssignEventTime(WidgetEventTime());
++  DispatchInputEvent(&event);
++  return NS_OK;
++}
++
++nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
++    uint32_t aPointerId, TouchPointerState aPointerState,
++    LayoutDeviceIntPoint aPoint, double aPointerPressure,
++    uint32_t aPointerOrientation, nsISynthesizedEventCallback* aCallback) {
++  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
++
++  MOZ_ASSERT(NS_IsMainThread());
++  if (aPointerState == TOUCH_HOVER) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  if (!mSynthesizedTouchInput) {
++    mSynthesizedTouchInput = MakeUnique<MultiTouchInput>();
++  }
++
++  LayoutDeviceIntPoint pointInWindow = aPoint - WidgetToScreenOffset();
++  MultiTouchInput inputToDispatch = UpdateSynthesizedTouchState(
++      mSynthesizedTouchInput.get(), TimeStamp::Now(), aPointerId, aPointerState,
++      pointInWindow, aPointerPressure, aPointerOrientation);
++  DispatchTouchInput(inputToDispatch);
++  return NS_OK;
++}
++
++nsresult HeadlessWidget::SynthesizeNativeTouchPadPinch(
++    TouchpadGesturePhase aEventPhase, float aScale, LayoutDeviceIntPoint aPoint,
++    int32_t aModifierFlags) {
++  MOZ_ASSERT(NS_IsMainThread());
++
++  PinchGestureInput::PinchGestureType pinchGestureType =
++      PinchGestureInput::PINCHGESTURE_SCALE;
++  ScreenCoord CurrentSpan;
++  ScreenCoord PreviousSpan;
++  switch (aEventPhase) {
++    case PHASE_BEGIN:
++      pinchGestureType = PinchGestureInput::PINCHGESTURE_START;
++      CurrentSpan = aScale;
++      PreviousSpan = 0.999;
++      break;
++
++    case PHASE_UPDATE:
++      pinchGestureType = PinchGestureInput::PINCHGESTURE_SCALE;
++      if (aScale == mLastPinchSpan) {
++        return NS_ERROR_INVALID_ARG;
++      }
++      CurrentSpan = aScale;
++      PreviousSpan = mLastPinchSpan;
++      break;
++
++    case PHASE_END:
++      pinchGestureType = PinchGestureInput::PINCHGESTURE_END;
++      CurrentSpan = aScale;
++      PreviousSpan = mLastPinchSpan;
++      break;
++
++    default:
++      return NS_ERROR_INVALID_ARG;
++  }
++
++  ScreenPoint touchpadPoint = ViewAs<ScreenPixel>(
++      aPoint - WidgetToScreenOffset(),
++      PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
++  // The headless widget does not support modifiers.
++  // Do not pass `aModifierFlags` because it contains native modifier values.
++  PinchGestureInput inputToDispatch(
++      pinchGestureType, PinchGestureInput::TRACKPAD, TimeStamp::Now(),
++      ExternalPoint(0, 0), touchpadPoint,
++      100.0 * ((aEventPhase == PHASE_END) ? ScreenCoord(1.f) : CurrentSpan),
++      100.0 * ((aEventPhase == PHASE_END) ? ScreenCoord(1.f) : PreviousSpan),
++      0);
++
++  if (!inputToDispatch.SetLineOrPageDeltaY(this)) {
++    return NS_ERROR_INVALID_ARG;
++  }
++
++  mLastPinchSpan = aScale;
++  DispatchPinchGestureInput(inputToDispatch);
++  return NS_OK;
++}
++
++nsresult HeadlessWidget::SynthesizeNativeTouchpadPan(
++    TouchpadGesturePhase aEventPhase, LayoutDeviceIntPoint aPoint,
++    double aDeltaX, double aDeltaY, int32_t aModifierFlags,
++    nsISynthesizedEventCallback* aCallback) {
++  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
++
++  MOZ_ASSERT(NS_IsMainThread());
++
++  PanGestureInput::PanGestureType eventType = PanGestureInput::PANGESTURE_PAN;
++  switch (aEventPhase) {
++    case PHASE_BEGIN:
++      eventType = PanGestureInput::PANGESTURE_START;
++      break;
++    case PHASE_UPDATE:
++      eventType = PanGestureInput::PANGESTURE_PAN;
++      break;
++    case PHASE_END:
++      eventType = PanGestureInput::PANGESTURE_END;
++      break;
++    default:
++      return NS_ERROR_INVALID_ARG;
++  }
++
++  ScreenPoint touchpadPoint = ViewAs<ScreenPixel>(
++      aPoint - WidgetToScreenOffset(),
++      PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
++  PanGestureInput input(eventType, TimeStamp::Now(), touchpadPoint,
++                        ScreenPoint(float(aDeltaX), float(aDeltaY)),
++                        // Same as SynthesizeNativeTouchPadPinch case we ignore
++                        // aModifierFlags.
++                        0);
++
++  input.mSimulateMomentum =
++      Preferences::GetBool("apz.test.headless.simulate_momentum");
++
++  DispatchPanGestureInput(input);
++
++  return NS_OK;
++}
++
++}  // namespace widget
++}  // namespace mozilla
 diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
 index 05ae8d02e8..4356920778 100644
 --- a/widget/headless/HeadlessWidget.h

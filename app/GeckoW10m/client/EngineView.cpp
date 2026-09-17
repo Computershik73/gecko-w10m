@@ -83,6 +83,30 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
       [this](winrt::Windows::Foundation::IInspectable const&,
              Input::PointerRoutedEventArgs const&) { pressed_ = false; });
 
+  // On the hardware path the picture is the panel, not the image -- the image
+  // never gets a source, so it has no size and no taps land on it. The panel
+  // takes the same gestures; ToFrame knows which one is showing.
+  if (panel_) {
+    panel_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
+                                 Input::PointerRoutedEventArgs const& args) {
+      touched_ = true;
+      OnPressed(args.GetCurrentPoint(panel_).Position());
+      panel_.CapturePointer(args.Pointer());
+    });
+    panel_.PointerMoved([this](winrt::Windows::Foundation::IInspectable const&,
+                               Input::PointerRoutedEventArgs const& args) {
+      OnMoved(args.GetCurrentPoint(panel_).Position());
+    });
+    panel_.PointerReleased([this](winrt::Windows::Foundation::IInspectable const&,
+                                  Input::PointerRoutedEventArgs const& args) {
+      OnReleased(args.GetCurrentPoint(panel_).Position());
+      panel_.ReleasePointerCapture(args.Pointer());
+    });
+    panel_.PointerCaptureLost(
+        [this](winrt::Windows::Foundation::IInspectable const&,
+               Input::PointerRoutedEventArgs const&) { pressed_ = false; });
+  }
+
 
   WireKeyboard();
 }
@@ -286,6 +310,8 @@ bool EngineView::Resolve() {
     if (HMODULE gles = ::LoadPackagedLibrary(L"libGLESv2.dll", 0)) {
       panel_size_fn_ = reinterpret_cast<PanelSizeFn>(
           ::GetProcAddress(gles, "angle_uwp_set_panel_size"));
+      panel_scale_fn_ = reinterpret_cast<PanelScaleFn>(
+          ::GetProcAddress(gles, "angle_uwp_set_panel_scale"));
       // And somewhere for it to say what it did. Its notes cannot go where
       // Gecko's do -- those live in xul, which ANGLE is not linked against --
       // so they come here, which is also where the crash trace lands, so the
@@ -383,6 +409,11 @@ void EngineView::GivePanelToEngine() {
   }
   if (panel_size_fn_) {
     panel_size_fn_(fullWidth_, fullHeight_);
+  }
+  if (panel_scale_fn_) {
+    // The chain is in physical pixels; XAML would show them as logical ones,
+    // scaled up by this, unless ANGLE undoes it on the chain.
+    panel_scale_fn_(panel_.CompositionScaleX(), panel_.CompositionScaleY());
   }
   if (!panel_fn_) {
     return;
@@ -563,6 +594,18 @@ void EngineView::Tick() {
 
 bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
                          int32_t* x, int32_t* y) const {
+  if (g_panelPresenting.load() && panel_) {
+    // The panel shows the frame at one physical pixel per frame pixel, and
+    // its points arrive in view pixels.
+    const double fx = point.X * rawPerView_;
+    const double fy = point.Y * rawPerView_;
+    if (fx < 0 || fy < 0 || fx >= fullWidth_ || fy >= fullHeight_) {
+      return false;
+    }
+    *x = static_cast<int32_t>(fx);
+    *y = static_cast<int32_t>(fy);
+    return true;
+  }
   if (width_ <= 0 || height_ <= 0) {
     return false;
   }
