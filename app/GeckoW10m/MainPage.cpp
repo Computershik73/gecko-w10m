@@ -452,6 +452,26 @@ void MainPage::BuildUi() {
     status.ForegroundColor(ChromeFg());
   }
 
+  // On a phone an unhandled Back is a navigation away from the app: the shell
+  // hides the view and suspends it a few seconds later -- which is, step for
+  // step, what has been observed. Nobody presses anything, but the strings in
+  // the navigation client name Windows.Phone.UI.Input.HardwareButtons and
+  // BackPressedEventArgs, and a Back that arrives from nowhere would look
+  // exactly like this. So it is logged, and handled, and if the hide stops
+  // that is the answer.
+  {
+    using winrt::Windows::UI::Core::SystemNavigationManager;
+    auto navigation = SystemNavigationManager::GetForCurrentView();
+    navigation.BackRequested([](auto const&, auto const& e) {
+      client::Log::Write(L"back: BackRequested arrived -- handling it so the "
+                         L"shell does not navigate away");
+      client::Log::FlushFromFault();
+      e.Handled(true);
+    });
+    // HardwareButtons.BackPressed lives in a phone extension SDK this build
+    // does not have; BackRequested is the same button by the newer road.
+  }
+
   auto view = ApplicationView::GetForCurrentView();
   // Consolidated is the view being removed from the switcher -- the shell's
   // word for "gone", as opposed to merely behind something.
