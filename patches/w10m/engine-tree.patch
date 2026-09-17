@@ -1812,7 +1812,7 @@ index 0a9e5b4a85..274943dd74 100644
    if (widget::GdkIsWaylandDisplay()) {
      mEGLSurface = CreateEGLSurface();
 diff --git a/gfx/webrender_bindings/RendererOGL.cpp b/gfx/webrender_bindings/RendererOGL.cpp
-index bdc8146983..33691f6c5b 100644
+index bdc8146983..8c0076668b 100644
 --- a/gfx/webrender_bindings/RendererOGL.cpp
 +++ b/gfx/webrender_bindings/RendererOGL.cpp
 @@ -1,600 +1,637 @@
@@ -2445,7 +2445,7 @@ index bdc8146983..33691f6c5b 100644
 +// placed against them.
 +static uint32_t gGeckoW10mFrame = 0;
 +static bool GeckoW10mFrameNoted(uint32_t frame) {
-+  return frame <= 4 || frame == 10 || frame == 30 || frame == 60 ||
++  return frame <= 8 || frame == 10 || frame == 30 || frame == 60 ||
 +         frame == 120 || frame == 300;
 +}
 +#endif
@@ -6854,10 +6854,10 @@ index 8f7928c42a..1adb7a9a64 100644
 +
 +}  // extern C
 diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
-index 17d84a4c3c..95d8eadff8 100644
+index 17d84a4c3c..08153956fd 100644
 --- a/gfx/wr/webrender/src/device/gl.rs
 +++ b/gfx/wr/webrender/src/device/gl.rs
-@@ -1,4795 +1,4842 @@
+@@ -1,4795 +1,4881 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -11671,15 +11671,25 @@ index 17d84a4c3c..95d8eadff8 100644
 +    fn GeckoW10mNote(text: *const std::os::raw::c_char);
 +}
 +#[cfg(windows)]
-+fn gecko_w10m_note(text: &str) {
++pub fn gecko_w10m_note(text: &str) {
 +    if let Ok(c) = std::ffi::CString::new(text) {
 +        unsafe { GeckoW10mNote(c.as_ptr()) }
 +    }
 +}
 +#[cfg(not(windows))]
-+fn gecko_w10m_note(_text: &str) {}
++pub fn gecko_w10m_note(_text: &str) {}
 +static GECKO_W10M_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 +static GECKO_W10M_TEXTURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_CLEARS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_BLITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_TARGETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_UPLOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++fn gecko_w10m_count(counter: &std::sync::atomic::AtomicU32, first: u32) -> Option<u32> {
++    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++    if n <= first || n % 100 == 0 { Some(n) } else { None }
++}
 +fn gecko_w10m_frame_noted(frame: u32) -> bool {
 +    frame <= 4 || frame == 10 || frame == 30 || frame == 60 || frame == 120 || frame == 300
 +}
@@ -14113,6 +14123,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +        };
 +
 +        self.depth_available = depth_available;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_TARGETS, 40) {
++            gecko_w10m_note(&format!("wr: draw target {} -- fbo {:?} rect {:?}", n, fbo_id, rect));
++        }
 +        self.bind_draw_target_impl(fbo_id);
 +        self.gl.viewport(
 +            rect.min.x,
@@ -14168,6 +14181,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +        assert!(!program.is_initialized());
 +        let mut build_program = true;
 +        let info = &program.source_info;
++        let gecko_w10m_link_started = std::time::Instant::now();
++        let gecko_w10m_link_n = GECKO_W10M_LINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        gecko_w10m_note(&format!("wr: link {} -- {} begins", gecko_w10m_link_n, info.full_name()));
 +
 +        // See if we hit the binary shader cache
 +        if let Some(ref cached_programs) = self.cached_programs {
@@ -14252,6 +14268,11 @@ index 17d84a4c3c..95d8eadff8 100644
 +
 +            // Link!
 +            self.gl.link_program(program.id);
++            gecko_w10m_note(&format!(
++                "wr: link {} -- {} linked in {} ms",
++                gecko_w10m_link_n, info.full_name(),
++                gecko_w10m_link_started.elapsed().as_millis()
++            ));
 +
 +            // GL recommends detaching and deleting shaders once the link
 +            // is complete (whether successful or not). This allows the driver
@@ -14658,6 +14679,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +
 +        let src_x0 = src_rect.min.x + self.bound_read_fbo.1.x;
 +        let src_y0 = src_rect.min.y + self.bound_read_fbo.1.y;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_BLITS, 30) {
++            gecko_w10m_note(&format!("wr: blit {} -- {:?} -> {:?}", n, src_rect, dest_rect));
++        }
 +
 +        self.gl.blit_framebuffer(
 +            src_x0,
@@ -15404,6 +15428,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +            None
 +        };
 +
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_DRAWS, 40) {
++            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices", n, self.bound_program_name, index_count));
++        }
 +        self.gl.draw_elements(
 +            gl::TRIANGLES,
 +            index_count,
@@ -15427,6 +15454,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +            None
 +        };
 +
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_DRAWS, 40) {
++            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices x {} instances", n, self.bound_program_name, index_count, instance_count));
++        }
 +        self.gl.draw_elements_instanced(
 +            gl::TRIANGLES,
 +            index_count,
@@ -15509,6 +15539,9 @@ index 17d84a4c3c..95d8eadff8 100644
 +        rect: Option<FramebufferIntRect>,
 +    ) {
 +        let mut clear_bits = 0;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_CLEARS, 40) {
++            gecko_w10m_note(&format!("wr: clear {} -- color {:?} depth {:?} rect {:?}", n, color, depth, rect));
++        }
 +
 +        if let Some(color) = color {
 +            self.gl.clear_color(color[0], color[1], color[2], color[3]);
@@ -16343,6 +16376,12 @@ index 17d84a4c3c..95d8eadff8 100644
 +
 +        let bytes_pp = texture.format.bytes_per_pixel() as usize;
 +        let width_bytes = rect.width() as usize * bytes_pp;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_UPLOADS, 40) {
++            gecko_w10m_note(&format!(
++                "wr: upload {} -- {:?} into {:?} {:?} via {:?}",
++                n, rect, texture.get_dimensions(), texture.format, device.upload_method
++            ));
++        }
 +
 +        let src_stride = stride.map_or(width_bytes, |stride| {
 +            assert!(stride >= 0);
@@ -16495,6 +16534,72 @@ index 17d84a4c3c..95d8eadff8 100644
 +        slice::from_raw_parts(texels.as_ptr() as *const u8, texels.len() * mem::size_of::<T>())
 +    }
 +}
+diff --git a/gfx/wr/webrender/src/device/query_gl.rs b/gfx/wr/webrender/src/device/query_gl.rs
+index db3dfcd6cf..ed3fee71c0 100644
+--- a/gfx/wr/webrender/src/device/query_gl.rs
++++ b/gfx/wr/webrender/src/device/query_gl.rs
+@@ -277,6 +277,13 @@ pub struct GpuMarker {
+ 
+ impl GpuMarker {
+     fn new(gl: &Rc<dyn gl::Gl>, message: &str, debug_method: GpuDebugMethod) -> Self {
++        {
++            static MARKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            let n = MARKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if n <= 30 {
++                crate::device::gecko_w10m_note(&format!("wr: marker {} -- {} via {:?}", n, message, debug_method));
++            }
++        }
+         let gl = match debug_method {
+             GpuDebugMethod::KHR => {
+               gl.push_debug_group_khr(gl::DEBUG_SOURCE_APPLICATION, 0, message);
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index 024e1b63c4..dc2689f2d2 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -3713,6 +3713,7 @@ impl Renderer {
+             frame.has_been_rendered = true;
+             return;
+         }
++        crate::device::gecko_w10m_note(&format!("wr: draw_frame -- {} passes, device size {:?}", frame.passes.len(), device_size));
+ 
+         {
+             let _gm = self.gpu_profiler.start_marker("gpu buffer update");
+@@ -3731,11 +3732,13 @@ impl Renderer {
+             );
+         }
+ 
++        crate::device::gecko_w10m_note("wr: gpu buffers updated");
+         self.device.disable_depth_write();
+         self.set_blend(false, FramebufferKind::Other);
+         self.device.disable_stencil();
+ 
+         self.bind_frame_data(frame);
++        crate::device::gecko_w10m_note("wr: frame data bound");
+ 
+         let bytes_to_mb = 1.0 / 1000000.0;
+         let gpu_buffer_bytes_f = frame.gpu_buffer_f.size.to_f32().area() * 16.0;
+@@ -3808,6 +3811,13 @@ impl Renderer {
+         }
+ 
+         for (_pass_index, pass) in frame.passes.iter_mut().enumerate() {
++            {
++                static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                let n = PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++                if n <= 60 {
++                    crate::device::gecko_w10m_note(&format!("wr: pass {} (index {} of this frame) begins", n, _pass_index));
++                }
++            }
+             #[cfg(not(target_os = "android"))]
+             let _gm = self.gpu_profiler.start_marker(&format!("pass {}", _pass_index));
+ 
+@@ -3939,6 +3949,7 @@ impl Renderer {
+             present_mode,
+         );
+ 
++        crate::device::gecko_w10m_note("wr: draw_frame done");
+         frame.has_been_rendered = true;
+ 
+         Self::maybe_evict_gpu_buffer_texture(
 diff --git a/gfx/ycbcr/moz.build b/gfx/ycbcr/moz.build
 index af79c8e59c..44b0bae9bc 100644
 --- a/gfx/ycbcr/moz.build
