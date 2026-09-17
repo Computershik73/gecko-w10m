@@ -912,6 +912,42 @@ const WindowHook kWinRtHooks[] = {
      reinterpret_cast<void**>(&gRealRoActivateInstance)},
 };
 
+// --- COM ----------------------------------------------------------------------
+//
+// WinRT turned out to be two harmless activations and nothing else, and both
+// Ro* entry points are delay-loaded, so that list is complete. CoCreateInstance
+// is the other door out of the process to the system, it is delay-loaded from
+// ole32 too, and it has never been watched. The class is written as a GUID;
+// naming it is a lookup afterwards.
+using CoCreateInstanceFn = HRESULT(WINAPI*)(REFCLSID, IUnknown*, DWORD, REFIID, void**);
+CoCreateInstanceFn gRealCoCreateInstance = nullptr;
+
+std::wstring GuidText(const GUID& g) {
+  wchar_t out[48];
+  ::swprintf_s(out, L"{%08lx-%04hx-%04hx-%02hhx%02hhx-%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx}",
+               static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0],
+               g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5],
+               g.Data4[6], g.Data4[7]);
+  return out;
+}
+
+HRESULT WINAPI HookCoCreateInstance(REFCLSID clsid, IUnknown* outer, DWORD context,
+                                    REFIID iid, void** out) {
+  HRESULT hr = gRealCoCreateInstance
+                   ? gRealCoCreateInstance(clsid, outer, context, iid, out)
+                   : REGDB_E_CLASSNOTREG;
+  Log::WriteFromFault(L"com: CoCreateInstance " + GuidText(clsid) + L" context " +
+                      Hex(context) + L" -> " + Hex(static_cast<uintptr_t>(hr)) +
+                      L", thread " + std::to_wstring(::GetCurrentThreadId()));
+  Log::FlushFromFault();
+  return hr;
+}
+
+const WindowHook kComHooks[] = {
+    {"CoCreateInstance", reinterpret_cast<void*>(&HookCoCreateInstance),
+     reinterpret_cast<void**>(&gRealCoCreateInstance)},
+};
+
 int HookDelayImports(HMODULE module, const char* targetModule,
                      const WindowHook* hooks, size_t count, const wchar_t* tag);
 
@@ -920,6 +956,8 @@ int HookWindowImports(HMODULE module) {
                            sizeof(kWindowHooks) / sizeof(kWindowHooks[0]), L"win");
   n += HookDelayImports(module, "api-ms-win-core-winrt-l1-1-0.dll", kWinRtHooks,
                         sizeof(kWinRtHooks) / sizeof(kWinRtHooks[0]), L"winrt");
+  n += HookDelayImports(module, "ole32.dll", kComHooks,
+                        sizeof(kComHooks) / sizeof(kComHooks[0]), L"com");
   return n;
 }
 
