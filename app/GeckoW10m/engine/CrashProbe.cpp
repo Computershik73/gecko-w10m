@@ -453,7 +453,9 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
       if (where != 0 && gWrStillBeats.load() >= 2) {
         line += L" -- THE RENDERER THREAD IS STUCK THERE";
       }
-      if (pulse > 0 && gWrStillBeats.load() == 8) {
+      // Only a thread that stopped inside a GL call is worth opening up; on
+      // the software path the pulse simply never moves.
+      if (pulse > 0 && where != 0 && gWrStillBeats.load() == 8) {
         AutopsyRendererThread(L"autopsy(quiet):");
       }
     }

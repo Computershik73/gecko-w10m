@@ -64449,10 +64449,10 @@ index 05ae8d02e8..4356920778 100644
  
    WindowRenderer* GetWindowRenderer() override;
 diff --git a/widget/windows/GfxInfo.cpp b/widget/windows/GfxInfo.cpp
-index 25b8066054..cd36cba0da 100644
+index 25b8066054..9a4932a489 100644
 --- a/widget/windows/GfxInfo.cpp
 +++ b/widget/windows/GfxInfo.cpp
-@@ -1,2012 +1,2089 @@
+@@ -1,2012 +1,2099 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -68393,7 +68393,17 @@ index 25b8066054..cd36cba0da 100644
 +      return NS_OK;
 +    }
 +
-+    if (OnlyAllowFeatureOnKnownConfig(aFeature) &&
++#if defined(GECKO_W10M)
++    // The one GPU this port runs on is the phone's Adreno, which DXGI reports
++    // under Qualcomm's "QCOM" vendor id (0x4d4f4351) rather than the PCI one
++    // the list knows. Blocking "unknown" vendors here turned D3D11
++    // compositing and WebRender off for the whole run once about:support
++    // started reporting the real adapter (0.2.5.0).
++    constexpr bool kGeckoW10mKnownVendor = true;
++#else
++    constexpr bool kGeckoW10mKnownVendor = false;
++#endif
++    if (OnlyAllowFeatureOnKnownConfig(aFeature) && !kGeckoW10mKnownVendor &&
 +        !adapterVendorID.Equals(
 +            GfxDriverInfo::GetDeviceVendor(DeviceVendor::Intel),
 +            nsCaseInsensitiveStringComparator) &&
