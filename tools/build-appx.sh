@@ -304,9 +304,17 @@ pref("ui.touch.radius.enabled", true);
 //
 // So this build does not ask. Hardware video decoding was already reported off
 // as a feature, which did not stop the probe from happening.
-pref("media.hardware-video-decoding.enabled", false);
-pref("media.wmf.dxva.enabled", false);
-pref("media.wmf.dxva.d3d11.enabled", false);
+// Hardware video decoding. Without it every frame above 360p is decoded by
+// four phone cores and then converted from YV12 to RGB by the same cores,
+// which is why 720p stuttered: the log said "wmf H264 codec software video
+// decoder - no DXVA, yv12". With DXVA the Adreno decodes H.264, VP9 and AV1
+// itself and hands the compositor an NV12 texture it can sample directly.
+// force-enabled skips the blocklist, which has nothing to say about a phone
+// GPU it has never heard of.
+pref("media.hardware-video-decoding.enabled", true);
+pref("media.hardware-video-decoding.force-enabled", true);
+pref("media.wmf.dxva.enabled", true);
+pref("media.wmf.dxva.d3d11.enabled", true);
 pref("media.sanity-test.disabled", true);
 PREFS
     echo "    app default preferences staged"

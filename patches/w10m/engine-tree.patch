@@ -11516,10 +11516,10 @@ index b159e14d6c..d3703ee280 100644
                                   reinterpret_cast<IUnknown**>(factory)),
           "Could not create DirectWrite factory.");
 diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
-index f45971a4ec..50e2b8005f 100644
+index f45971a4ec..77a1889e1e 100644
 --- a/gfx/thebes/gfxPlatform.cpp
 +++ b/gfx/thebes/gfxPlatform.cpp
-@@ -1,4356 +1,4411 @@
+@@ -1,4356 +1,4434 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -15881,6 +15881,9 @@ index f45971a4ec..50e2b8005f 100644
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +#include "gfxPlatform.h"
++#if defined(GECKO_W10M) && defined(XP_WIN)
++#  include "mozilla/gfx/DeviceManagerDx.h"
++#endif
 +
 +#if defined(GECKO_W10M)
 +#  include "mozilla/Sprintf.h"
@@ -19063,6 +19066,26 @@ index f45971a4ec..50e2b8005f 100644
 +  gfxVars::SetCanUseHardwareVideoDecoding(featureDec.IsEnabled() ||
 +                                          canUseVulkanDecode);
 +  gfxVars::SetCanUseHardwareVideoEncoding(featureEnc.IsEnabled());
++
++#if defined(GECKO_W10M)
++  {
++    // This runs long after the feature notes above, and it is the decision
++    // that decides whether video is decoded on the GPU or on four phone
++    // cores. Texture sharing is named too, because it is the one thing that
++    // can force the feature off no matter what the prefs say.
++    const char* why = featureDec.GetFailureMessage();
++    bool sharing = false;
++    if (auto* dm = gfx::DeviceManagerDx::Get()) {
++      sharing = dm->TextureSharingWorks();
++    }
++    char note[256];
++    SprintfLiteral(note, "gfx: hardware video decoding is %s%s%s (texture sharing %s)",
++                   featureDec.IsEnabled() ? "ON" : "off",
++                   (why && *why) ? " -- " : "", (why && *why) ? why : "",
++                   sharing ? "works" : "does NOT work");
++    GeckoW10mNote(note);
++  }
++#endif
 +
 +#ifdef MOZ_WIDGET_ANDROID
 +#  define CODEC_HW_FEATURE_SETUP_PLATFORM(name, type, encoder)             \
