@@ -252,6 +252,15 @@ pref("browser.startup.page", 1);
 // first launch after installing landed on about:blank. Do not skip it.
 pref("browser.startup.firstrunSkipsHomepage", false);
 
+// No gamepads on a phone, and looking for them is not free: the raw input
+// calls the service uses are absent from this device's USER32, so it ended up
+// allocating an array for an uninitialised device count and aborting the
+// browser. Fixed in the stub as well; this switches off a service that has
+// nothing to do here anyway.
+pref("dom.gamepad.enabled", false);
+pref("dom.gamepad.extensions.enabled", false);
+pref("dom.gamepad.haptic_feedback.enabled", false);
+
 // A phone suspends an app and then kills it, which Firefox cannot tell from a
 // crash -- so it restored the previous session on every launch and the start
 // page above was never reached. Start fresh instead. To keep tabs across a

@@ -190,14 +190,16 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // failure hook in toolkit/xre/Bootstrap.cpp.
   // Ad-hoc notes from inside the engine, for bringing this port up.
   ::SetEnvironmentVariableW(L"GECKO_W10M_NOTE_LOG",
-                            (profile + L"\gecko-notes.log").c_str());
+                            (profile + L"\\gecko-notes.log").c_str());
 
   ::SetEnvironmentVariableW(L"GECKO_W10M_DELAYLOAD_LOG",
                             (profile + L"\\delay-load-used.log").c_str());
 
   // Gecko's own logging, next to ours, so a failure inside the engine says
   // more than a return code.
-  const std::wstring geckoLog = profile + L"\\gecko.log";
+  // Not "gecko.log": that is the shell's own log, and two files a suffix
+  // apart in the same directory is a way to read the wrong one.
+  const std::wstring geckoLog = profile + L"\\gecko-moz.log";
   SetEngineEnvironment(
       L"MOZ_LOG",
       L"timestamp,sync,nsAppRunner:5,XRE:5,nsComponentManager:5,"

@@ -72962,10 +72962,10 @@ index e313d971ec..38cdd933a9 100644
          env="MOZ_WINDOWS_APP_SDK_DIR",
          nargs=1,
 diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
-index fe113c825c..5dc99e8814 100644
+index fe113c825c..bc9fa29f82 100644
 --- a/toolkit/xre/Bootstrap.cpp
 +++ b/toolkit/xre/Bootstrap.cpp
-@@ -1,127 +1,363 @@
+@@ -1,127 +1,377 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this
 - * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -73216,6 +73216,15 @@ index fe113c825c..5dc99e8814 100644
 +// fallback for a machine with no compositor, and this is one.
 +HRESULT WINAPI GeckoW10mFailingHresult() { return E_FAIL; }
 +
++// And zero is "it worked" for the raw input calls, which report failure as
++// (UINT)-1 and their result through an out parameter they never wrote. The
++// gamepad service asked GetRawInputDeviceList how many devices there are,
++// was told "none of my business went wrong", read an uninitialised count of
++// several hundred million, and tried to allocate an array for it -- which
++// ends in NS_ABORT_OOM and takes the browser with it. A page that touches
++// the Gamepad API, such as the player on vkvideo.ru, was enough.
++UINT WINAPI GeckoW10mFailingUint() { return static_cast<UINT>(-1); }
++
 +// GetSysColor is not on the phone either, and a stub answering zero paints
 +// every system colour black: the menus, the address bar's drop-down and the
 +// autocomplete panel over a page all came out as solid black rectangles,
@@ -73284,6 +73293,11 @@ index fe113c825c..5dc99e8814 100644
 +    {"GetThemePartSize", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
 +    {"GetThemeSysFont", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
 +    {"CloseThemeData", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetRawInputDeviceList", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputDeviceInfoW", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputDeviceInfoA", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputData", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputBuffer", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
 +    {"GetSysColor", reinterpret_cast<FARPROC>(&GeckoW10mGetSysColor)},
 +    {"GetCaretBlinkTime", reinterpret_cast<FARPROC>(&GeckoW10mGetCaretBlinkTime)},
 +};

@@ -44,7 +44,7 @@ void Log::Init(std::wstring_view localStatePath) {
 
   g_path.assign(localStatePath);
   if (!g_path.empty() && g_path.back() != L'\\') g_path += L'\\';
-  g_path += L"gecko_w10m.log";
+  g_path += L"gecko.log";
 
   // CreateFile2 is the app-container form of CreateFile; the app's own
   // LocalState is always writable, no capability required.
