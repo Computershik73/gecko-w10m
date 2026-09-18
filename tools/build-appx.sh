@@ -239,6 +239,10 @@ pref("browser.startup.homepage", "https://google.com");
 // Firefox's and is displayed beside it.
 pref("gecko_w10m.port.version", "$VERSION");
 pref("browser.startup.page", 1);
+// On a brand new profile Firefox skips the home page on purpose, because it
+// normally shows its onboarding tour instead -- and that is off here, so the
+// first launch after installing landed on about:blank. Do not skip it.
+pref("browser.startup.firstrunSkipsHomepage", false);
 
 // A phone suspends an app and then kills it, which Firefox cannot tell from a
 // crash -- so it restored the previous session on every launch and the start
@@ -349,6 +353,36 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -Package "$(cygpath -w "$PKG")" \
   -Certificate "$(cygpath -w "$CERT")" \
   -SdkBin "$(cygpath -w "$BIN")"
+
+# The certificate the package is signed with. A phone will not install a
+# sideloaded package whose signer it does not trust, so this travels with it.
+if [ -f "$APP/Gecko.cer" ]; then
+  cp "$APP/Gecko.cer" "$OUT/Gecko.cer"
+  cat > "$OUT/INSTALL.txt" <<'INSTALL'
+Gecko for Windows 10 Mobile
+===========================
+
+The package needs nothing else installed: the C++ runtime it uses is inside
+it, and there are no framework dependencies to fetch.
+
+Two things the phone does need, and both are about the phone, not the package:
+
+1. Trust the signing certificate. Copy Gecko.cer to the phone and open it,
+   or install it through Interop Tools / WPinternals. Without this the
+   installer refuses the package as untrusted, which is the usual reason a
+   sideload fails on a device that has never seen this signer before.
+
+2. Be interop-unlocked. The package asks for restricted capabilities --
+   codeGeneration (the JIT, without which no modern web engine runs) and
+   full file-system access for the profile. A stock, locked device will not
+   grant them and the install fails.
+
+Then install the .appx as usual (Device Portal, or an appx installer on the
+phone). If an older build signed by a different publisher is installed, it is
+a separate app: remove it if you do not want both.
+INSTALL
+  echo "    certificate and INSTALL.txt copied next to the package"
+fi
 
 echo
 echo "PACKAGE: $PKG"
