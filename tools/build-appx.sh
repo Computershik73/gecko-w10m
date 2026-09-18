@@ -316,6 +316,23 @@ pref("media.hardware-video-decoding.force-enabled", true);
 pref("media.wmf.dxva.enabled", true);
 pref("media.wmf.dxva.d3d11.enabled", true);
 pref("media.sanity-test.disabled", true);
+
+// The Adreno in this phone decodes H.264 and nothing else: Windows 10 Mobile
+// ships no VP9 or AV1 decoder, so those codecs land on the CPU, where four
+// ARM32 cores manage about 360p. Sites that offer a choice -- YouTube offers
+// VP9 first -- must be told we cannot take it, and they then serve H.264,
+// which the GPU decodes up to 1080p.
+pref("media.mediasource.vp9.enabled", false);
+pref("media.av1.enabled", false);
+
+// Canvas 2D was drawing on the CPU for a reason that does not apply here:
+// upstream only accelerates it in the GPU process, and there is none, so the
+// feature reported "Disabled by GPU Process disabled". allow-in-parent is the
+// switch upstream added for exactly this case; force-enabled is again for the
+// blocklist, which does not know this GPU.
+pref("gfx.canvas.accelerated", true);
+pref("gfx.canvas.accelerated.allow-in-parent", true);
+pref("gfx.canvas.accelerated.force-enabled", true);
 PREFS
     echo "    app default preferences staged"
   fi
