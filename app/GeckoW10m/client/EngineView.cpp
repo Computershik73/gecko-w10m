@@ -12,6 +12,8 @@
 
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
+#include <winrt/Windows.Foundation.Metadata.h>
+
 #include "winrt/Windows.UI.Core.h"
 #include "winrt/Windows.UI.Input.h"
 #include "winrt/Windows.UI.Xaml.Input.h"
@@ -22,7 +24,9 @@ using namespace winrt::Windows::UI::Xaml::Controls;
 namespace Input = winrt::Windows::UI::Xaml::Input;
 using namespace winrt::Windows::UI::Xaml::Media;
 using namespace winrt::Windows::UI::Xaml::Media::Imaging;
+using winrt::Windows::Foundation::Metadata::ApiInformation;
 using winrt::Windows::UI::ViewManagement::InputPane;
+using winrt::Windows::UI::ViewManagement::StatusBar;
 
 namespace gecko_w10m::client {
 
@@ -327,6 +331,14 @@ bool EngineView::Resolve() {
       Log::Write(L"open: the engine can now hand system URIs to the shell");
     }
   }
+  if (!set_fullscreen_) {
+    set_fullscreen_ = reinterpret_cast<SetFullscreenSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_fullscreen_sink"));
+    if (set_fullscreen_) {
+      set_fullscreen_(&FullscreenChanged);
+      Log::Write(L"view: the engine can now ask for the whole screen");
+    }
+  }
   if (screen_fn_ && screenWidth_ > 0) {
     screen_fn_(screenWidth_, screenHeight_);
   }
@@ -562,6 +574,50 @@ void EngineView::LaunchSystemUri(const char* utf8) {
           Log::Write(L"open: asked the system to open " + wide);
         } catch (winrt::hresult_error const& error) {
           Log::Write(L"open: the system refused " + wide,
+                     std::wstring(error.message()));
+        }
+      });
+}
+
+void EngineView::FullscreenChanged(int32_t on) {
+  if (!gUiDispatcher) {
+    return;
+  }
+  const bool wanted = on != 0;
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [wanted]() {
+        // Two separate things on a phone, and both have to go: the status bar
+        // at the top, and the back/start/search bar at the bottom. Hiding them
+        // grows the view's visible bounds, which is what the room and the
+        // screen are both measured from, so the engine hears about the new
+        // size the ordinary way.
+        try {
+          if (ApiInformation::IsTypePresent(
+                  L"Windows.UI.ViewManagement.StatusBar")) {
+            auto status = StatusBar::GetForCurrentView();
+            if (wanted) {
+              status.HideAsync();
+            } else {
+              status.ShowAsync();
+            }
+          }
+        } catch (winrt::hresult_error const& error) {
+          Log::Write(L"fullscreen: the status bar would not move",
+                     std::wstring(error.message()));
+        }
+        try {
+          auto view = winrt::Windows::UI::ViewManagement::ApplicationView::
+              GetForCurrentView();
+          if (wanted) {
+            const bool took = view.TryEnterFullScreenMode();
+            Log::Write(took ? L"fullscreen: on, the whole screen is ours"
+                            : L"fullscreen: on, but the view kept its bars");
+          } else {
+            view.ExitFullScreenMode();
+            Log::Write(L"fullscreen: off");
+          }
+        } catch (winrt::hresult_error const& error) {
+          Log::Write(L"fullscreen: the view refused",
                      std::wstring(error.message()));
         }
       });

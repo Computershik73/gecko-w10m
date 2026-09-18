@@ -219,6 +219,13 @@ void MainPage::ApplyVisibleBounds() {
   // is what a phone does to an app it has decided is no longer in front.
   //
   // So these three are now on the record. None of them has ever been asked.
+  //
+  // Once, though. This runs again on every VisibleBoundsChanged -- every
+  // rotation, and every time the bars come and go -- and each pass used to add
+  // another copy of all three handlers.
+  static bool handlersInstalled = false;
+  if (!handlersInstalled) {
+    handlersInstalled = true;
   Window::Current().VisibilityChanged(
       [this](auto&&, auto const& e) {
         if (e.Visible()) {
@@ -265,9 +272,22 @@ void MainPage::ApplyVisibleBounds() {
                        : L"window: activated"));
       });
 
+  }
+
   auto view = ApplicationView::GetForCurrentView();
   auto visible = view.VisibleBounds();
   auto window = Window::Current().Bounds();
+
+  // The screen, as far as the engine is concerned, is the part of the display
+  // this app may draw on -- not the display. Reporting the display instead is
+  // what made fullscreen resize the engine's window to 1440x2560 while the
+  // panel showing it was 1440x2308: a window taller than its own surface, with
+  // the chrome back in view and the video stuck. In fullscreen the two bars
+  // are gone, so this grows to the whole display exactly when the whole
+  // display is ours.
+  if (engineView_) {
+    engineView_->SetScreen(visible.Width, visible.Height);
+  }
 
   double left = visible.X - window.X;
   double top = visible.Y - window.Y;
@@ -453,10 +473,6 @@ void MainPage::BuildUi() {
   // Not the size of the picture inside it: a stretched Image reports what it
   // drew, which is the frame, which would make the frame decide its own size.
   engineView_->WatchRoom(contentHost_);
-  {
-    auto bounds = Window::Current().Bounds();
-    engineView_->SetScreen(bounds.Width, bounds.Height);
-  }
 
 
   // The status bar exists only on mobile; tint it to match so the chrome does
@@ -494,10 +510,9 @@ void MainPage::BuildUi() {
       client::Log::Write(L"size: CoreWindow.ResizeCompleted");
       client::Log::FlushFromFault();
     });
-    Window::Current().SizeChanged([this](auto const&, auto const& e) {
-      if (engineView_) {
-        engineView_->SetScreen(e.Size().Width, e.Size().Height);
-      }
+    Window::Current().SizeChanged([](auto const&, auto const& e) {
+      // The screen follows the visible bounds, not this: the window includes
+      // the two bars the app cannot draw on.
       auto size = e.Size();
       client::Log::Write(L"size: Window.SizeChanged " +
                          std::to_wstring(static_cast<int>(size.Width)) + L"x" +
