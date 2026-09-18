@@ -240,6 +240,13 @@ pref("browser.startup.homepage", "https://google.com");
 pref("gecko_w10m.port.version", "$VERSION");
 pref("browser.startup.page", 1);
 
+// A phone suspends an app and then kills it, which Firefox cannot tell from a
+// crash -- so it restored the previous session on every launch and the start
+// page above was never reached. Start fresh instead. To keep tabs across a
+// suspend instead of seeing the start page, set this back to true and
+// browser.startup.page to 3.
+pref("browser.sessionstore.resume_from_crash", false);
+
 // Nothing else opens a tab of its own on a first run: no privacy-notice tab
 // (that is the second tab that used to appear), no onboarding, no what's-new
 // page after an update.
