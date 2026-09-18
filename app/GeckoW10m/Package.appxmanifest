@@ -21,10 +21,21 @@
     xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
     IgnorableNamespaces="uap uap3 mp rescap">
 
+  <!--
+    Version: <Gecko major>.<port release>.<port fix>.<build>
+
+    The first three are set by hand and mean something: the engine this was
+    built from, the release of the port, and the fix within it. The fourth is
+    a counter the build script increments on every single build and never
+    resets, so no two packages ever carry the same number, installing over an
+    older one always works, and the line the shell writes at the top of the
+    log names exactly one package. See tools/build-appx.sh and
+    app/GeckoW10m/build-number.txt.
+  -->
   <Identity
       Name="GeckoW10m.W10M"
       Publisher="CN=GeckoW10m"
-      Version="0.2.6.2"
+      Version="155.1.0.3"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity

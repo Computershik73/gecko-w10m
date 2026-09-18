@@ -238,10 +238,10 @@ index 36e7517b4a..9d4ef3bc9f 100644
    mozilla::CreateAndStorePreXULSkeletonUI(GetModuleHandle(nullptr), argc, argv);
  
 diff --git a/browser/components/preferences/config/about-firefox.mjs b/browser/components/preferences/config/about-firefox.mjs
-index 18124ddaa2..5f4755a809 100644
+index 18124ddaa2..a5983ba36b 100644
 --- a/browser/components/preferences/config/about-firefox.mjs
 +++ b/browser/components/preferences/config/about-firefox.mjs
-@@ -1,590 +1,679 @@
+@@ -1,590 +1,693 @@
 -/* This Source Code Form is subject to the terms of the Mozilla Public
 - * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 - * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1118,6 +1118,15 @@ index 18124ddaa2..5f4755a809 100644
 +Preferences.addSetting({ id: "geckoW10mPortDonate" });
 +Preferences.addSetting({ id: "geckoW10mPortDonateAbroad" });
 +Preferences.addSetting({ id: "geckoW10mDefaultBrowser" });
++Preferences.addSetting({
++  id: "geckoW10mPortVersion",
++  getControlConfig(config) {
++    config.l10nArgs = {
++      version: Services.prefs.getStringPref("gecko_w10m.port.version", "?"),
++    };
++    return config;
++  },
++});
 +
 +Preferences.addSetting({
 +  id: "disableShowUpdateHistory",
@@ -1436,6 +1445,11 @@ index 18124ddaa2..5f4755a809 100644
 +        id: "geckoW10mPortGroup",
 +        control: "moz-box-group",
 +        items: [
++          {
++            id: "geckoW10mPortVersion",
++            l10nId: "gecko-w10m-port-version",
++            control: "moz-box-item",
++          },
 +          {
 +            id: "geckoW10mDefaultBrowser",
 +            l10nId: "gecko-w10m-default-browser",
@@ -3880,10 +3894,10 @@ index 9a3da29023..5318768c58 100644
  #include "nsWindowsShellServiceInternal.h"
  #include "WindowsShellServiceRust.h"
 diff --git a/browser/locales/en-US/browser/preferences/preferences.ftl b/browser/locales/en-US/browser/preferences/preferences.ftl
-index 8227dc4b84..0bccd9c84c 100644
+index 8227dc4b84..414848c741 100644
 --- a/browser/locales/en-US/browser/preferences/preferences.ftl
 +++ b/browser/locales/en-US/browser/preferences/preferences.ftl
-@@ -1,2792 +1,2819 @@
+@@ -1,2792 +1,2824 @@
 -# This Source Code Form is subject to the terms of the Mozilla Public
 -# License, v. 2.0. If a copy of the MPL was not distributed with this
 -# file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -7496,6 +7510,11 @@ index 8227dc4b84..0bccd9c84c 100644
 +gecko-w10m-port-heading =
 +    .label = О порте на Windows 10 Mobile
 +    .description = GeckoW10m — это Firefox (движок Gecko { -brand-short-name }), перенесённый на Windows 10 Mobile.
++
++# $version (string) - the port's own version, e.g. 155.1.0.42
++gecko-w10m-port-version =
++    .label = Версия порта: { $version }
++    .description = Первое число — версия движка Gecko, последнее — номер сборки.
 +
 +gecko-w10m-default-browser =
 +    .label = Сделать браузером по умолчанию

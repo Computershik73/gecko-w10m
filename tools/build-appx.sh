@@ -31,7 +31,29 @@ export LIB="$VS/lib/arm/store;$VS/lib/arm;$SDK/Lib/$SDKV/ucrt/arm;$SDK/Lib/$SDKV
 export PATH="$VS/bin/Hostx64/x64:$PATH"
 export MSYS2_ARG_CONV_EXCL="*"
 
-VERSION="$(grep -oE 'Version="[0-9.]+"' "$APP/Package.appxmanifest" | head -1 | grep -oE '[0-9.]+')"
+# The build number is the fourth field of the version and belongs to the build,
+# not to the author: it goes up on every build, is never reset and never
+# reused. That is what makes "shell starting, version ..." in a device log name
+# one package, and what makes installing over the previous one always work --
+# Windows accepts only a strictly higher version.
+COUNTER="$APP/build-number.txt"
+[ -f "$COUNTER" ] || echo 0 > "$COUNTER"
+BUILD="$(( $(tr -cd '0-9' < "$COUNTER") + 1 ))"
+echo "$BUILD" > "$COUNTER"
+
+BASE="$(grep -oE 'Version="[0-9]+\.[0-9]+\.[0-9]+' "$APP/Package.appxmanifest" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+VERSION="$BASE.$BUILD"
+# Write it back, so the tree records the package it produced.
+python - "$(cygpath -w "$APP/Package.appxmanifest")" "$VERSION" <<'PY'
+import re, sys
+path, version = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+text = re.sub(r'(<Identity[^>]*?Version=")[0-9.]+(")',
+              lambda m: m.group(1) + version + m.group(2), text, count=1,
+              flags=re.S)
+open(path, "w", encoding="utf-8").write(text)
+PY
+echo "=== version $VERSION (build $BUILD) ==="
 PKG="$OUT/GeckoW10m_${VERSION}_ARM.appx"
 
 rm -rf "$STAGE"; mkdir -p "$STAGE" "$OUT/obj"
@@ -212,6 +234,10 @@ pref("browser.tabs.closeWindowWithLastTab", false);
 // The start page. A default, so Settings > Home can change it and the change
 // sticks in the profile.
 pref("browser.startup.homepage", "https://google.com");
+
+// The port's own version, for Settings > About. The engine's version is
+// Firefox's and is displayed beside it.
+pref("gecko_w10m.port.version", "$VERSION");
 pref("browser.startup.page", 1);
 
 // Nothing else opens a tab of its own on a first run: no privacy-notice tab

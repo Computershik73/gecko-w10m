@@ -57,9 +57,37 @@ MainPage::MainPage() {
   Log::Init(std::wstring(localState));
   {
     auto v = winrt::Windows::ApplicationModel::Package::Current().Id().Version();
-    Log::Write(L"shell starting, version " + std::to_wstring(v.Major) + L"." +
-               std::to_wstring(v.Minor) + L"." + std::to_wstring(v.Build) + L"." +
-               std::to_wstring(v.Revision));
+    std::wstring line = L"shell starting, version " + std::to_wstring(v.Major) +
+                        L"." + std::to_wstring(v.Minor) + L"." +
+                        std::to_wstring(v.Build) + L"." +
+                        std::to_wstring(v.Revision);
+    // The engine's own version, read where it is written down: the
+    // application.ini the shell hands to XRE_main.
+    try {
+      const std::wstring ini =
+          std::wstring(winrt::Windows::ApplicationModel::Package::Current()
+                           .InstalledLocation()
+                           .Path()) +
+          L"\\browser\\application.ini";
+      if (FILE* f = _wfopen(ini.c_str(), L"r")) {
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), f)) {
+          if (strncmp(buffer, "Version=", 8) == 0) {
+            std::string value(buffer + 8);
+            while (!value.empty() &&
+                   (value.back() == '\n' || value.back() == '\r')) {
+              value.pop_back();
+            }
+            line += L", Gecko " +
+                    std::wstring(value.begin(), value.end());
+            break;
+          }
+        }
+        fclose(f);
+      }
+    } catch (...) {
+    }
+    Log::Write(line);
   }
   Log::Write(L"LocalState", std::wstring(localState));
 
