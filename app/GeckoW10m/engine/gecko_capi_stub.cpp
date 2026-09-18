@@ -362,7 +362,9 @@ void gecko_session_load_uri(gecko_session* s, const char* uri) {
     // Surface the JIT probe result the first time, so the shell can show it.
     std::string title = s->url;
     if (!s->announced && s->rt) {
-      title = s->rt->jit_detail + "  |  " + s->url;
+      // The JIT and xul probes go to the log, not to the screen: they were
+      // the first thing anyone saw on starting the browser.
+      title = s->url;
       s->announced = true;
     }
     s->delegate.on_title_change(s->delegate.user_data, title.c_str());

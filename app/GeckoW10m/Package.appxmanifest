@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  GeckoW10m for Windows 10 Mobile.
+  Gecko for Windows 10 Mobile.
 
   The two things that make the Gecko port possible are declared here:
 
@@ -33,9 +33,9 @@
     app/GeckoW10m/build-number.txt.
   -->
   <Identity
-      Name="GeckoW10m.W10M"
-      Publisher="CN=GeckoW10m"
-      Version="155.1.0.4"
+      Name="Gecko"
+      Publisher="CN=Computershik"
+      Version="155.2.0.5"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -43,8 +43,8 @@
       PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 
   <Properties>
-    <DisplayName>GeckoW10m</DisplayName>
-    <PublisherDisplayName>GeckoW10m</PublisherDisplayName>
+    <DisplayName>Gecko</DisplayName>
+    <PublisherDisplayName>Computershik</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 
@@ -68,18 +68,28 @@
                  Executable="GeckoW10m.exe"
                  EntryPoint="GeckoW10m.App">
       <uap:VisualElements
-          DisplayName="GeckoW10m"
-          Description="Gecko-based web browser for Windows 10 Mobile"
-          BackgroundColor="transparent"
+          DisplayName="Gecko"
+          Description="Gecko web browser for Windows 10 Mobile"
+          BackgroundColor="#1C1B22"
           Square150x150Logo="Assets\Square150x150Logo.png"
           Square44x44Logo="Assets\Square44x44Logo.png">
-        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
-        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+        <uap:DefaultTile
+            ShortName="Gecko"
+            Square71x71Logo="Assets\Square71x71Logo.png"
+            Square310x310Logo="Assets\Square310x310Logo.png"
+            Wide310x150Logo="Assets\Wide310x150Logo.png">
+          <uap:ShowNameOnTiles>
+            <uap:ShowOn Tile="square150x150Logo" />
+            <uap:ShowOn Tile="wide310x150Logo" />
+            <uap:ShowOn Tile="square310x310Logo" />
+          </uap:ShowNameOnTiles>
+        </uap:DefaultTile>
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#1C1B22" />
       </uap:VisualElements>
 
       <Extensions>
         <!--
-          What makes the phone offer GeckoW10m under Settings > System >
+          What makes the phone offer Gecko under Settings > System >
           Default apps > Web browser: an app registered for both http and
           https, with a name and an icon to show there. The app is then
           activated with the URL, which App::OnActivated passes to the engine.
@@ -87,25 +97,25 @@
         <uap:Extension Category="windows.protocol">
           <uap:Protocol Name="http">
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
-            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+            <uap:DisplayName>Gecko</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
         <uap:Extension Category="windows.protocol">
           <uap:Protocol Name="https">
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
-            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+            <uap:DisplayName>Gecko</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
         <uap:Extension Category="windows.protocol">
-          <uap:Protocol Name="gecko_w10m">
+          <uap:Protocol Name="gecko">
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
-            <uap:DisplayName>GeckoW10m</uap:DisplayName>
+            <uap:DisplayName>Gecko</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
 
         <!-- Local pages, so "open with" offers the browser for them too. -->
         <uap:Extension Category="windows.fileTypeAssociation">
-          <uap:FileTypeAssociation Name="geckow10mweb">
+          <uap:FileTypeAssociation Name="geckoweb">
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
             <uap:DisplayName>Web page</uap:DisplayName>
             <uap:SupportedFileTypes>

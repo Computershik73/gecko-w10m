@@ -54,7 +54,7 @@ text = re.sub(r'(<Identity[^>]*?Version=")[0-9.]+(")',
 open(path, "w", encoding="utf-8").write(text)
 PY
 echo "=== version $VERSION (build $BUILD) ==="
-PKG="$OUT/GeckoW10m_${VERSION}_ARM.appx"
+PKG="$OUT/Gecko_${VERSION}_ARM.appx"
 
 rm -rf "$STAGE"; mkdir -p "$STAGE" "$OUT/obj"
 cd "$APP"
@@ -340,7 +340,10 @@ echo "=== sign ==="
 # Signing runs through PowerShell because msys2 leaves TEMP and TMP empty in
 # the environment it hands to children, and signtool needs a temp directory to
 # repack an appx. See tools/sign-appx.ps1.
-CERT="$APP/GeckoW10m.pfx"
+# Signed as CN=Computershik, which is what the manifest's Publisher says;
+# the two must match exactly or the package will not install. Gecko.cer beside
+# it is the certificate to trust on the phone.
+CERT="$APP/Gecko.pfx"
 powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -File "$(cygpath -w "$ROOT/tools/sign-appx.ps1")" \
   -Package "$(cygpath -w "$PKG")" \

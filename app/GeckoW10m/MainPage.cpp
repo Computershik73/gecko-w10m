@@ -313,7 +313,7 @@ void MainPage::BuildUi() {
   contentHost_ = Border();
   contentHost_.Background(Brush(ContentBg()));
   statusText_ = TextBlock();
-  statusText_.Text(L"GeckoW10m for Windows 10 Mobile");
+  statusText_.Text(L"Gecko");
   statusText_.HorizontalAlignment(HorizontalAlignment::Center);
   statusText_.VerticalAlignment(VerticalAlignment::Center);
   statusText_.TextWrapping(TextWrapping::Wrap);
