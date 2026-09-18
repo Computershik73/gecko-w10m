@@ -59,7 +59,7 @@ void Log::Init(std::wstring_view localStatePath) {
   }
   ::SetFilePointer(g_file, 0, nullptr, FILE_END);
 
-  const char* banner = "\r\n==== GeckoW10m session start ====\r\n";
+  const char* banner = "\r\n==== Gecko session start ====\r\n";
   DWORD written = 0;
   ::WriteFile(g_file, banner, (DWORD)strlen(banner), &written, nullptr);
 }

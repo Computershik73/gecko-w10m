@@ -88,7 +88,7 @@ function delete_old_mcf_files() {
 // Distributions install it below /usr/lib, but that path is not visible
 // inside the sandbox of a flatpak'd Firefox, where the files are shipped as
 // an extension mounted into /app/etc/firefox instead.
-// GeckoW10m: the files ship inside the app package, next to the engine.
+// Port: the files ship inside the app package, next to the engine.
 function find_chrome_manifest() {
     const f = Services.dirsvc.get("GreD", Ci.nsIFile);
     f.append("mobile-config-firefox");
@@ -102,13 +102,13 @@ function find_chrome_manifest() {
 chrome_dir_init();
 log_init();
 
-// GeckoW10m: older builds pinned the home page to about:home through an
+// Port: older builds pinned the home page to about:home through an
 // enterprise policy. The policy is gone, but a profile made under it can still
 // carry that value, and then the default (google.com) never shows. Clear it
 // once, and only when it is the page the policy set -- a page the user chose
 // is left alone.
-function gecko_w10m_fix_homepage() {
-    const MARKER = "gecko_w10m.homepage.migrated";
+function gecko_fix_homepage() {
+    const MARKER = "gecko.homepage.migrated";
     if (Services.prefs.getBoolPref(MARKER, false)) {
         return;
     }
@@ -125,18 +125,18 @@ function gecko_w10m_fix_homepage() {
 
 // And a line in the log saying what the browser will actually open, so a
 // start page that is not what was asked for can be read off a device log.
-function gecko_w10m_note_startup() {
+function gecko_note_startup() {
     const homepage = Services.prefs.getStringPref("browser.startup.homepage", "?");
     const page = Services.prefs.getIntPref("browser.startup.page", -1);
     const resume = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash", true);
     Services.console.logStringMessage(
-        "gecko_w10m: start page " + homepage + ", browser.startup.page " + page +
+        "gecko: start page " + homepage + ", browser.startup.page " + page +
         ", resume_from_crash " + resume);
 }
 
 try {
-    gecko_w10m_fix_homepage();
-    gecko_w10m_note_startup();
+    gecko_fix_homepage();
+    gecko_note_startup();
     delete_old_mcf_files();
 
     // Firefox is caching some files to make the startup time faster. We need to

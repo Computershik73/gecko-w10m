@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and package the GeckoW10m UWP shell for Windows 10 Mobile (ARM32).
+# Build and package the Gecko UWP shell for Windows 10 Mobile (ARM32).
 #
 # The shell is a code-only C++/WinRT XAML app, compiled with MSVC cl.exe: clang
 # implements no SEH on 32-bit ARM Windows and C++/WinRT needs C++ exceptions.
@@ -114,16 +114,16 @@ for stub in ktmw32; do
   echo "    $stub.dll ($(stat -c%s "$STAGE/$stub.dll") bytes)"
 done
 
-echo "=== link GeckoW10m.exe ==="
+echo "=== link Gecko.exe ==="
 # mozglue.lib supplies moz_xmalloc and the rest of Gecko's allocator, which the
 # bootstrap unit reaches through the mfbt headers. mozglue.dll already ships in
 # the package, so this adds an import and no new payload.
-"$LLVM/lld-link.exe" $OBJS "/OUT:$STAGE_W\\GeckoW10m.exe" /APPCONTAINER \
+"$LLVM/lld-link.exe" $OBJS "/OUT:$STAGE_W\\Gecko.exe" /APPCONTAINER \
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
-  "/MAP:$OBJDIR_W\\GeckoW10m.map" \
+  "/MAP:$OBJDIR_W\\Gecko.map" \
   "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
   WindowsApp.lib
-echo "    $(stat -c%s "$STAGE/GeckoW10m.exe") bytes"
+echo "    $(stat -c%s "$STAGE/Gecko.exe") bytes"
 
 echo "=== stage the package ==="
 cp "$APP/Package.appxmanifest" "$STAGE/AppxManifest.xml"
@@ -204,7 +204,7 @@ if [ -d "$DIST" ]; then
     # close-window-with-last-tab were all set here and none of them counted.
     # A leading "00-" puts this last in the queue and first in authority.
     cat > "$STAGE/browser/defaults/preferences/00-gecko.js" <<PREFS
-// GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
+// Gecko, Windows 10 Mobile. See tools/build-appx.sh.
 // Back on. The control experiment answered: with the GPU path switched off
 // entirely the window was still hidden, so nothing about the swap chain hides
 // it -- but the software build died of its own separate fault on the way, in
@@ -245,7 +245,7 @@ pref("browser.startup.homepage", "https://google.com");
 
 // The port's own version, for Settings > About. The engine's version is
 // Firefox's and is displayed beside it.
-pref("gecko_w10m.port.version", "$VERSION");
+pref("gecko.port.version", "$VERSION");
 pref("browser.startup.page", 1);
 // On a brand new profile Firefox skips the home page on purpose, because it
 // normally shows its onboarding tour instead -- and that is off here, so the
@@ -283,7 +283,7 @@ pref("network.http.http3.enable", false);
 
 // mobile-config-firefox (postmarketOS): a phone-shaped chrome for desktop
 // Firefox. Autoconfig loads its modules from mobile-config-firefox/ under the
-// engine directory; see vendor/mobile-config-firefox/README-GECKO-W10M.md.
+// engine directory; see vendor/mobile-config-firefox/README-PORT.md.
 pref("general.config.filename", "mobile-config-autoconfig.js");
 pref("general.config.obscure_value", 0);
 pref("general.config.sandbox_enabled", false);

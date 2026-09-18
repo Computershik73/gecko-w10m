@@ -35,7 +35,7 @@
   <Identity
       Name="Gecko"
       Publisher="CN=Computershik"
-      Version="155.3.6.15"
+      Version="155.3.7.16"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -65,8 +65,8 @@
 
   <Applications>
     <Application Id="App"
-                 Executable="GeckoW10m.exe"
-                 EntryPoint="GeckoW10m.App">
+                 Executable="Gecko.exe"
+                 EntryPoint="Gecko.App">
       <uap:VisualElements
           DisplayName="Gecko"
           Description="Gecko web browser for Windows 10 Mobile"

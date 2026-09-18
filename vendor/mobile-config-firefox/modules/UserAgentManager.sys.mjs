@@ -18,7 +18,7 @@ export class UserAgentManager {
     const UA_CHROME_CHROMEOS =
           "Mozilla/5.0 (X11; CrOS aarch64 16640.57.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.250 Safari/537.36";
     // Set default user agent.
-    // GeckoW10m: the phone asks for the phone layout, so the default is Firefox
+    // Port: the phone asks for the phone layout, so the default is Firefox
     // for Android of the same version as the engine. The per-site rules below
     // still hand out the desktop string where a site needs it.
     PrefManager.defaultPref('general.useragent.override', UA_FIREFOX_ANDROID);

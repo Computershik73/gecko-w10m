@@ -82,7 +82,7 @@ void RedirectStdErrTo(const std::wstring& path) {
 // getenv, and gfxPlatform::IsHeadless asks it directly -- and ucrtbase copies
 // the Win32 environment block once at process start and never looks again.
 // SetEnvironmentVariableW updates the block, not the copy, so nothing set that
-// way is visible to the engine. GeckoW10m.exe cannot fix that with its own
+// way is visible to the engine. Gecko.exe cannot fix that with its own
 // putenv either: it links the static runtime, so its environment is a third
 // one that xul.dll never reads.
 //
@@ -262,7 +262,7 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // argv[0] must be the executable; XRE_main derives the install directory
   // from it. -profile keeps the profile inside LocalState, the only place a
   // packaged app may write.
-  const std::string exe = Narrow(install + L"\\GeckoW10m.exe");
+  const std::string exe = Narrow(install + L"\\Gecko.exe");
   const std::string profileArg = Narrow(profile);
   std::vector<char*> argv;
   std::string a0 = exe;

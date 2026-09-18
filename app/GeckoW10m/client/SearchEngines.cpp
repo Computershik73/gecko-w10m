@@ -89,7 +89,7 @@ bool SearchEngines::LooksLikeUrl(std::wstring_view s) {
   if (s.find(L"://") != std::wstring::npos) return true;
   bool hasSpace = s.find(L' ') != std::wstring::npos;
   bool hasDot = s.find(L'.') != std::wstring::npos;
-  if (s.rfind(L"about:", 0) == 0 || s.rfind(L"gecko_w10m:", 0) == 0) return true;
+  if (s.rfind(L"about:", 0) == 0 || s.rfind(L"gecko:", 0) == 0) return true;
   return hasDot && !hasSpace;
 }
 
@@ -103,7 +103,7 @@ std::wstring SearchEngines::ResolveEntry(std::wstring_view entry) {
 
   if (!LooksLikeUrl(trimmed)) return Destination(trimmed);
   if (trimmed.find(L"://") == std::wstring::npos &&
-      trimmed.rfind(L"about:", 0) != 0 && trimmed.rfind(L"gecko_w10m:", 0) != 0) {
+      trimmed.rfind(L"about:", 0) != 0 && trimmed.rfind(L"gecko:", 0) != 0) {
     return L"https://" + trimmed;
   }
   return trimmed;
