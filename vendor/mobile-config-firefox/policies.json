@@ -8,11 +8,7 @@
         "OverrideFirstRunPage": "",
         "OverridePostUpdatePage": "",
 
-        "Homepage": {
-            "URL": "about:home",
-            "Locked": false,
-            "StartPage": "homepage"
-        },
+        "//": "GeckoW10m: the Homepage policy is dropped; the start page is the default pref browser.startup.homepage, which Settings can change.",
 
         "FirefoxHome": {
             "Search": true,

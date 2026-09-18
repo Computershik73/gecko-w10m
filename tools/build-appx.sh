@@ -208,6 +208,21 @@ pref("gfx.webrender.software.d3d11", false);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
+
+// The start page. A default, so Settings > Home can change it and the change
+// sticks in the profile.
+pref("browser.startup.homepage", "https://google.com");
+pref("browser.startup.page", 1);
+
+// Nothing else opens a tab of its own on a first run: no privacy-notice tab
+// (that is the second tab that used to appear), no onboarding, no what's-new
+// page after an update.
+pref("datareporting.policy.firstRunURL", "");
+pref("startup.homepage_welcome_url", "");
+pref("startup.homepage_welcome_url.additional", "");
+pref("startup.homepage_override_url", "");
+pref("browser.aboutwelcome.enabled", false);
+pref("browser.startup.upgradeDialog.enabled", false);
 // No HTTP/3: QUIC over UDP on this phone's stack is an unknown, and a stuck
 // QUIC attempt looks exactly like a page that never loads.
 pref("network.http.http3.enable", false);
