@@ -586,40 +586,23 @@ void EngineView::FullscreenChanged(int32_t on) {
   const bool wanted = on != 0;
   gUiDispatcher.RunAsync(
       winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [wanted]() {
-        // Two separate things on a phone, and both have to go: the status bar
-        // at the top, and the back/start/search bar at the bottom. Hiding them
-        // grows the view's visible bounds, which is what the room and the
-        // screen are both measured from, so the engine hears about the new
-        // size the ordinary way.
-        try {
-          if (ApiInformation::IsTypePresent(
-                  L"Windows.UI.ViewManagement.StatusBar")) {
-            auto status = StatusBar::GetForCurrentView();
-            if (wanted) {
-              status.HideAsync();
-            } else {
-              status.ShowAsync();
-            }
-          }
-        } catch (winrt::hresult_error const& error) {
-          Log::Write(L"fullscreen: the status bar would not move",
-                     std::wstring(error.message()));
-        }
-        try {
-          auto view = winrt::Windows::UI::ViewManagement::ApplicationView::
-              GetForCurrentView();
-          if (wanted) {
-            const bool took = view.TryEnterFullScreenMode();
-            Log::Write(took ? L"fullscreen: on, the whole screen is ours"
-                            : L"fullscreen: on, but the view kept its bars");
-          } else {
-            view.ExitFullScreenMode();
-            Log::Write(L"fullscreen: off");
-          }
-        } catch (winrt::hresult_error const& error) {
-          Log::Write(L"fullscreen: the view refused",
-                     std::wstring(error.message()));
-        }
+        // And the shell does not move a thing. Hiding the status bar and the
+        // navigation bar grows the visible bounds, the room grows with it, and
+        // the page is handed a resize in the middle of its own fullscreen
+        // transition -- which vkvideo's player answers by rebuilding the
+        // player, removing the element that asked for fullscreen, so Gecko
+        // drops straight back out. Three attempts in the log, three times the
+        // viewport went 2238x1440 -> 2560x1440, and three times
+        //
+        //   Exited fullscreen because fullscreen element was removed from
+        //   document.
+        //
+        // followed a fraction of a second later. The two bars are worth about
+        // a tenth of the screen and fullscreen that stays is worth more, so
+        // the window keeps the size it had and the chrome simply collapses
+        // inside it.
+        Log::Write(wanted ? L"fullscreen: on -- the window keeps its size"
+                          : L"fullscreen: off");
       });
 }
 

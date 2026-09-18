@@ -6,7 +6,7 @@
         min-width: 300px !important;
     }
 
-    @media (max-width: 700px) {
+    @media (max-width: 1200px) {
         body {
             --sidebar-width: 200px !important;
             grid-template-columns: var(--sidebar-width) 1fr !important;

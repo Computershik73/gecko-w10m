@@ -340,6 +340,36 @@ pref("media.wmf.dxva.max-videos", 1);
 pref("gfx.direct3d11.reuse-decoder-device", true);
 pref("gfx.direct3d11.reuse-decoder-device.force-enabled", true);
 
+// The URL classifier's local database. The browser went silent for 79 seconds
+// shortly after a cold start -- render thread included, taps queuing up and
+// arriving all at once when it came back -- and the last thing in the engine
+// log before the silence was "Classifier Update #1", writing and SHA-hashing
+// several hundred files in a row. That is Safe Browsing keeping a multi-
+// megabyte blocklist up to date, which a desktop does not notice and this
+// phone's storage plainly does.
+//
+// It costs the warning page for known phishing and malware sites. Nothing
+// else: certificates, mixed content, tracking protection and the permission
+// prompts are all untouched.
+pref("browser.safebrowsing.malware.enabled", false);
+pref("browser.safebrowsing.phishing.enabled", false);
+pref("browser.safebrowsing.downloads.enabled", false);
+pref("browser.safebrowsing.provider.google4.updateURL", "");
+pref("browser.safebrowsing.provider.google4.gethashURL", "");
+pref("browser.safebrowsing.provider.mozilla.updateURL", "");
+pref("browser.safebrowsing.provider.mozilla.gethashURL", "");
+pref("urlclassifier.trackingTable", "");
+
+// And the rest of what a fresh profile does over the network while the person
+// is waiting for their first page: studies, experiments, telemetry pings.
+pref("app.normandy.enabled", false);
+pref("app.normandy.api_url", "");
+pref("app.shield.optoutstudies.enabled", false);
+pref("datareporting.healthreport.uploadEnabled", false);
+pref("datareporting.policy.dataSubmissionEnabled", false);
+pref("toolkit.telemetry.unified", false);
+pref("toolkit.telemetry.archive.enabled", false);
+
 // Canvas 2D was drawing on the CPU for a reason that does not apply here:
 // upstream only accelerates it in the GPU process, and there is none, so the
 // feature reported "Disabled by GPU Process disabled". allow-in-parent is the

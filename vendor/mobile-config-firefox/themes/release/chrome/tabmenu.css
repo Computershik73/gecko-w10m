@@ -1,7 +1,7 @@
 /* Copyright 2025 Peter Mack, Oliver Smith
  * SPDX-License-Identifier: MPL-2.0 */
 
-@media (max-width: 700px) {
+@media (max-width: 1200px) {
     /* Increase tab width, to have more space for displaying the title of the
      * website.
      * The following values are for FF 144+ */

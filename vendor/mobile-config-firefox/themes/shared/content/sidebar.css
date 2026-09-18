@@ -6,7 +6,7 @@
         user-select: none !important;
     }
 
-    @media (max-width: 700px) {
+    @media (max-width: 1200px) {
         /* avoid that sidebar is too wide */
         :root, :host(.anonymous-content-host) {
             --in-content-sidebar-width: 50px !important;

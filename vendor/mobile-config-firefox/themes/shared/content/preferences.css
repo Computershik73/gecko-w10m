@@ -16,7 +16,7 @@
         display: none;
     }
 
-    @media (max-width: 700px) {
+    @media (max-width: 1200px) {
         :root, :host(.anonymous-content-host) {
             --page-main-content-width: calc(100vw - 60px);
             /* fix empty space at the top */
