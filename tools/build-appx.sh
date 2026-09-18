@@ -195,7 +195,15 @@ if [ -d "$DIST" ]; then
   # software one -- which paints into a buffer the shell reads back -- is the
   # only one that reaches the screen here.
   if [ -d "$STAGE/browser/defaults/preferences" ]; then
-    cat > "$STAGE/browser/defaults/preferences/gecko_w10m.js" <<PREFS
+    # THE NAME MATTERS. Gecko sorts this directory REVERSE-alphabetically and
+    # applies the files in that order, so the alphabetically FIRST name is
+    # applied LAST and wins (modules/libpref/Preferences.cpp,
+    # pref_CompareFileNames). As "gecko_w10m.js" this file was applied before
+    # firefox.js, which then quietly put its own defaults back: the home page,
+    # the start page, first-run behaviour, resume-from-crash and
+    # close-window-with-last-tab were all set here and none of them counted.
+    # A leading "00-" puts this last in the queue and first in authority.
+    cat > "$STAGE/browser/defaults/preferences/00-gecko.js" <<PREFS
 // GeckoW10m, Windows 10 Mobile. See tools/build-appx.sh.
 // Back on. The control experiment answered: with the GPU path switched off
 // entirely the window was still hidden, so nothing about the swap chain hides
