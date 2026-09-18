@@ -23,3 +23,25 @@
         display: none;
     }
 }
+
+/* Fullscreen video, with the browser's own chrome out of the way.
+ *
+ * Firefox's rule for this is `:root[inDOMFullscreen] #navigator-toolbox`, and
+ * that attribute is put there by chrome JS -- FullScreen.enterDomFullscreen,
+ * reached through the DOMFullscreen actors and a MozDOMFullscreen:Entered
+ * event. On this port it never arrives, so the toolbar stayed put and a page
+ * that had asked for the whole window got a letterboxed strip with an address
+ * bar under it. The players that notice go back to windowed on their own.
+ *
+ * The element state does get set, though, and by the engine rather than by
+ * chrome JS: Document::ApplyFullscreen walks up the document tree and makes
+ * each embedder element the fullscreen element of its parent document, which
+ * for content in a tab is the <browser>. So ask about that instead. No width
+ * condition -- fullscreen is fullscreen whichever way up the phone is. */
+:root:has(browser:fullscreen) #navigator-toolbox,
+:root:has(browser:fullscreen) #sidebar-container,
+:root:has(browser:fullscreen) #sidebar-box,
+:root:has(browser:fullscreen) #sidebar-splitter,
+:root:has(browser:fullscreen) #fullscr-toggler {
+    visibility: collapse !important;
+}

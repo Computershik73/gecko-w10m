@@ -134,9 +134,58 @@ function gecko_note_startup() {
         ", resume_from_crash " + resume);
 }
 
+// Every fullscreen transition, written down. Which of these arrive says where
+// the chain breaks: MozDOMFullscreen:Entered is the chrome event the actors
+// listen for, inDOMFullscreen is the attribute whose absence leaves the
+// toolbar on screen, and the toolbox height says whether it actually went.
+function gecko_watch_fullscreen() {
+    const EVENTS = ["MozDOMFullscreen:Entered", "MozDOMFullscreen:Exited",
+                    "fullscreenchange", "fullscreenerror"];
+    function watch(win) {
+        const doc = win.document;
+        if (doc.location.href !== "chrome://browser/content/browser.xhtml") {
+            return;
+        }
+        for (const name of EVENTS) {
+            win.addEventListener(name, () => {
+                const toolbox = doc.getElementById("navigator-toolbox");
+                Services.console.logStringMessage(
+                    "gecko: fullscreen " + name +
+                    " -- chrome element " +
+                    (doc.fullscreenElement ? doc.fullscreenElement.localName
+                                           : "none") +
+                    ", inDOMFullscreen " +
+                    doc.documentElement.hasAttribute("inDOMFullscreen") +
+                    ", window.fullScreen " + win.fullScreen +
+                    ", toolbox " +
+                    (toolbox ? Math.round(
+                         toolbox.getBoundingClientRect().height) : "?") +
+                    "px, window " + win.innerWidth + "x" + win.innerHeight);
+            }, true);
+        }
+    }
+    Services.obs.addObserver({
+        observe(subject, topic) {
+            if (topic !== "domwindowopened") {
+                return;
+            }
+            const win = subject;
+            win.addEventListener("load", () => {
+                try {
+                    watch(win);
+                } catch (e) {
+                    Services.console.logStringMessage(
+                        "gecko: fullscreen watch failed: " + e);
+                }
+            }, { once: true });
+        }
+    }, "domwindowopened");
+}
+
 try {
     gecko_fix_homepage();
     gecko_note_startup();
+    gecko_watch_fullscreen();
     delete_old_mcf_files();
 
     // Firefox is caching some files to make the startup time faster. We need to
