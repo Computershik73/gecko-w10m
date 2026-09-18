@@ -586,23 +586,51 @@ void EngineView::FullscreenChanged(int32_t on) {
   const bool wanted = on != 0;
   gUiDispatcher.RunAsync(
       winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [wanted]() {
-        // And the shell does not move a thing. Hiding the status bar and the
-        // navigation bar grows the visible bounds, the room grows with it, and
-        // the page is handed a resize in the middle of its own fullscreen
-        // transition -- which vkvideo's player answers by rebuilding the
-        // player, removing the element that asked for fullscreen, so Gecko
-        // drops straight back out. Three attempts in the log, three times the
-        // viewport went 2238x1440 -> 2560x1440, and three times
-        //
-        //   Exited fullscreen because fullscreen element was removed from
-        //   document.
-        //
-        // followed a fraction of a second later. The two bars are worth about
-        // a tenth of the screen and fullscreen that stays is worth more, so
-        // the window keeps the size it had and the chrome simply collapses
-        // inside it.
-        Log::Write(wanted ? L"fullscreen: on -- the window keeps its size"
-                          : L"fullscreen: off");
+        // Both bars go. The engine has already resized its window to the whole
+        // display by the time this runs -- that is the point of doing it in
+        // this order -- so what happens here only catches the screen up with a
+        // window that is already the right size, and the page is never handed
+        // a resize it has to answer.
+        try {
+          if (ApiInformation::IsTypePresent(
+                  L"Windows.UI.ViewManagement.StatusBar")) {
+            auto status = StatusBar::GetForCurrentView();
+            if (wanted) {
+              status.HideAsync();
+            } else {
+              status.ShowAsync();
+            }
+          }
+        } catch (winrt::hresult_error const& error) {
+          Log::Write(L"fullscreen: the status bar would not move",
+                     std::wstring(error.message()));
+        }
+        try {
+          auto view = winrt::Windows::UI::ViewManagement::ApplicationView::
+              GetForCurrentView();
+          if (wanted) {
+            // Standard overlay mode is what makes the navigation bar hide
+            // itself and come back on a swipe -- as an overlay, over the
+            // picture, without the window changing size underneath it. That is
+            // what keeps a fullscreen player fullscreen while someone reaches
+            // for the back button.
+            try {
+              view.FullScreenSystemOverlayMode(
+                  winrt::Windows::UI::ViewManagement::
+                      FullScreenSystemOverlayMode::Standard);
+            } catch (winrt::hresult_error const&) {
+            }
+            const bool took = view.TryEnterFullScreenMode();
+            Log::Write(took ? L"fullscreen: on, the whole screen is ours"
+                            : L"fullscreen: on, but the view kept its bars");
+          } else {
+            view.ExitFullScreenMode();
+            Log::Write(L"fullscreen: off");
+          }
+        } catch (winrt::hresult_error const& error) {
+          Log::Write(L"fullscreen: the view refused",
+                     std::wstring(error.message()));
+        }
       });
 }
 

@@ -375,6 +375,22 @@ pref("toolkit.telemetry.archive.enabled", false);
 // feature reported "Disabled by GPU Process disabled". allow-in-parent is the
 // switch upstream added for exactly this case; force-enabled is again for the
 // blocklist, which does not know this GPU.
+// Partial present: WebRender redraws only what changed and trusts the swap
+// chain to have kept the rest. On this ANGLE-on-D3D11 chain what comes back is
+// not always what was left there -- the log shows frames rendered with one
+// dirty rect, and the leftovers show up as specks of an older frame, white
+// dots scattered over a dark photograph. Redrawing the whole frame costs fill
+// rate this GPU can spare more easily than it can spare being wrong.
+pref("gfx.webrender.max-partial-present-rects", 0);
+pref("gfx.webrender.allow-partial-present-buffer-age", false);
+
+// The sidebar's launcher strip is off. It is the vertical bar down the left
+// edge with the tab list and the settings cog, and on a phone it is a column
+// of chrome in front of the page.
+pref("sidebar.revamp", false);
+pref("sidebar.visibility", "hide-on-close");
+pref("sidebar.verticalTabs", false);
+
 pref("gfx.canvas.accelerated", true);
 pref("gfx.canvas.accelerated.allow-in-parent", true);
 pref("gfx.canvas.accelerated.force-enabled", true);

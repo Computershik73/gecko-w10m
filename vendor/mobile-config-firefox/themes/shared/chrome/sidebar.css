@@ -8,8 +8,13 @@
     }
 }
 
-/* Apply this customization only on smaller screens in portrait mode */
-@media (orientation: portrait) and (max-width: 720px) {
+/* Upstream applies this in portrait only, and under 720px. Turn this phone on
+ * its side and the window is 839 CSS pixels wide and no longer portrait, so
+ * the rule switched off and the launcher strip appeared down the left edge of
+ * every landscape page -- a column of chrome across the part of the screen
+ * landscape exists to give you. There is no width here at which a tab strip
+ * pinned open is what this browser wants. */
+@media all {
     /* Hide the vertical tab strip unless it's expanded */
     #sidebar-main:not([sidebar-launcher-expanded]),      /* FF 152 and earlier */
     #sidebar-container:not([sidebar-launcher-expanded]), /* FF 153+ */

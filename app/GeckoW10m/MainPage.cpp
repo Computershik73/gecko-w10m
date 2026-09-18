@@ -278,15 +278,27 @@ void MainPage::ApplyVisibleBounds() {
   auto visible = view.VisibleBounds();
   auto window = Window::Current().Bounds();
 
-  // The screen, as far as the engine is concerned, is the part of the display
-  // this app may draw on -- not the display. Reporting the display instead is
-  // what made fullscreen resize the engine's window to 1440x2560 while the
-  // panel showing it was 1440x2308: a window taller than its own surface, with
-  // the chrome back in view and the video stuck. In fullscreen the two bars
-  // are gone, so this grows to the whole display exactly when the whole
-  // display is ours.
+  // The screen is the whole display. It is what the engine resizes its window
+  // to when a page asks for fullscreen, and by then the two bars are gone, so
+  // the whole display is exactly what the window gets.
   if (engineView_) {
-    engineView_->SetScreen(visible.Width, visible.Height);
+    engineView_->SetScreen(window.Width, window.Height);
+  }
+
+  // In fullscreen, nothing is padded. The navigation bar is an overlay there:
+  // it comes back on a swipe, sits over the picture and goes away again, and
+  // the visible bounds move under it every time. Padding for that would resize
+  // the browser window twice per swipe, and a page that is handed a resize
+  // while it is playing fullscreen video rebuilds its player and falls out of
+  // fullscreen -- which is the whole reason this is here.
+  bool fullscreen = false;
+  try {
+    fullscreen = view.IsFullScreenMode();
+  } catch (winrt::hresult_error const&) {
+  }
+  if (fullscreen) {
+    root_.Padding(ThicknessHelper::FromUniformLength(0));
+    return;
   }
 
   double left = visible.X - window.X;
@@ -510,9 +522,10 @@ void MainPage::BuildUi() {
       client::Log::Write(L"size: CoreWindow.ResizeCompleted");
       client::Log::FlushFromFault();
     });
-    Window::Current().SizeChanged([](auto const&, auto const& e) {
-      // The screen follows the visible bounds, not this: the window includes
-      // the two bars the app cannot draw on.
+    Window::Current().SizeChanged([this](auto const&, auto const& e) {
+      if (engineView_) {
+        engineView_->SetScreen(e.Size().Width, e.Size().Height);
+      }
       auto size = e.Size();
       client::Log::Write(L"size: Window.SizeChanged " +
                          std::to_wstring(static_cast<int>(size.Width)) + L"x" +
