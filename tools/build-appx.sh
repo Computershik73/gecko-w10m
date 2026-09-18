@@ -325,6 +325,21 @@ pref("media.sanity-test.disabled", true);
 pref("media.mediasource.vp9.enabled", false);
 pref("media.av1.enabled", false);
 
+// One hardware-decoded video at a time. The pre-roll ad on vkvideo.ru is a
+// second <video> with a decoder of its own, and 16 ms after the second DXVA
+// session was configured the Adreno's D3D11 driver went into an endless
+// recursion and blew its stack -- 0xc00000fd, qcdx11um8996.dll+0x73503
+// calling +0x71b73 calling +0x73503, all the way down. Upstream allows eight
+// at once; this phone manages one. The ad is 360p and the CPU has never had
+// trouble with 360p, so the one that gets the GPU is the one that needs it.
+pref("media.wmf.dxva.max-videos", 1);
+
+// And whatever decoders there are share a single D3D11 device instead of
+// making one each. Firefox does this on Windows already; the blocklist is
+// what kept it off here, and the blocklist has never heard of this GPU.
+pref("gfx.direct3d11.reuse-decoder-device", true);
+pref("gfx.direct3d11.reuse-decoder-device.force-enabled", true);
+
 // Canvas 2D was drawing on the CPU for a reason that does not apply here:
 // upstream only accelerates it in the GPU process, and there is none, so the
 // feature reported "Disabled by GPU Process disabled". allow-in-parent is the
