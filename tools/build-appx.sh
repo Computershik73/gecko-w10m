@@ -320,10 +320,17 @@ pref("media.sanity-test.disabled", true);
 // The Adreno in this phone decodes H.264 and nothing else: Windows 10 Mobile
 // ships no VP9 or AV1 decoder, so those codecs land on the CPU, where four
 // ARM32 cores manage about 360p. Sites that offer a choice -- YouTube offers
-// VP9 first -- must be told we cannot take it, and they then serve H.264,
-// which the GPU decodes up to 1080p.
-pref("media.mediasource.vp9.enabled", false);
-pref("media.av1.enabled", false);
+// VP9 first -- have to be told we cannot take it.
+//
+// Not with these prefs, though. Switching the codecs off browser-wide takes
+// them from every site, including ones with nothing else to fall back to, and
+// a site with no H.264 ladder has nothing left to play. h264ify has done this
+// for years without that: it answers "no" to VP8, VP9 and AV1 inside the page,
+// on YouTube only, and YouTube picks H.264 out of the ladder it was going to
+// offer anyway. That is in the vendored config now; the hosts it does it on
+// are gecko.h264ify.hosts, and everywhere else the browser keeps every codec
+// Firefox ships with.
+pref("gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
 
 // One hardware-decoded video at a time. The pre-roll ad on vkvideo.ru is a
 // second <video> with a decoder of its own, and 16 ms after the second DXVA

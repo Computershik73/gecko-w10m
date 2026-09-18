@@ -134,6 +134,100 @@ function gecko_note_startup() {
         ", resume_from_crash " + resume);
 }
 
+// h264ify, without the extension.
+//
+// The extension does not touch the browser's codec support at all -- it hooks
+// MediaSource.isTypeSupported, HTMLMediaElement.canPlayType and
+// mediaCapabilities.decodingInfo inside the page and answers "no" for VP8, VP9
+// and AV1. YouTube then picks H.264 from a ladder it was going to offer
+// anyway, which is why h264ify users get ordinary videos and not an error.
+//
+// Turning the codecs off with prefs looks like the same thing from the page's
+// side, but it is browser-wide: every other site loses them too, with nothing
+// to fall back to. So the prefs are back to what Firefox ships and this does
+// the refusing, on the hosts named by gecko.h264ify.hosts and nowhere else.
+const H264IFY_SOURCE = `
+(function () {
+  var BAD = ["vp8", "vp9", "vp08", "vp09", "av01", "av1"];
+  function blocked(type) {
+    if (typeof type !== "string") { return false; }
+    var t = type.toLowerCase();
+    for (var i = 0; i < BAD.length; i++) {
+      if (t.indexOf(BAD[i]) !== -1) { return true; }
+    }
+    return false;
+  }
+  if (window.MediaSource && MediaSource.isTypeSupported) {
+    var wasTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
+    MediaSource.isTypeSupported = function (type) {
+      return blocked(type) ? false : wasTypeSupported(type);
+    };
+  }
+  var proto = window.HTMLMediaElement && HTMLMediaElement.prototype;
+  if (proto && proto.canPlayType) {
+    var wasCanPlayType = proto.canPlayType;
+    proto.canPlayType = function (type) {
+      return blocked(type) ? "" : wasCanPlayType.call(this, type);
+    };
+  }
+  var caps = navigator.mediaCapabilities;
+  if (caps && caps.decodingInfo) {
+    var wasDecodingInfo = caps.decodingInfo.bind(caps);
+    caps.decodingInfo = function (config) {
+      var type = config && config.video && config.video.contentType;
+      if (blocked(type)) {
+        return Promise.resolve({
+          supported: false, smooth: false, powerEfficient: false,
+          configuration: config,
+        });
+      }
+      return wasDecodingInfo(config);
+    };
+  }
+})();
+`;
+
+function gecko_h264ify() {
+    const setting = Services.prefs.getStringPref(
+        "gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
+    const hosts = setting.split(",").map(h => h.trim().toLowerCase())
+                         .filter(h => h.length);
+    if (!hosts.length) {
+        return;
+    }
+    const matches = host =>
+        hosts.some(h => host === h || host.endsWith("." + h));
+
+    Services.obs.addObserver({
+        observe(subject) {
+            let win = subject;
+            let host;
+            try {
+                host = win.location.hostname.toLowerCase();
+            } catch (e) {
+                return;
+            }
+            if (!matches(host)) {
+                return;
+            }
+            try {
+                // A sandbox whose prototype is the window, with no Xrays, is
+                // the page's own scope: what it assigns lands on the objects
+                // the page's scripts will look at. "content-document-global-
+                // created" is early enough that they have not run yet.
+                const sandbox = Cu.Sandbox(win, {
+                    sandboxPrototype: win,
+                    wantXrays: false,
+                });
+                Cu.evalInSandbox(H264IFY_SOURCE, sandbox);
+            } catch (e) {
+                Services.console.logStringMessage(
+                    "gecko: h264ify failed on " + host + ": " + e);
+            }
+        }
+    }, "content-document-global-created");
+}
+
 // Every fullscreen transition, written down. Which of these arrive says where
 // the chain breaks: MozDOMFullscreen:Entered is the chrome event the actors
 // listen for, inDOMFullscreen is the attribute whose absence leaves the
@@ -186,6 +280,7 @@ try {
     gecko_fix_homepage();
     gecko_note_startup();
     gecko_watch_fullscreen();
+    gecko_h264ify();
     delete_old_mcf_files();
 
     // Firefox is caching some files to make the startup time faster. We need to
