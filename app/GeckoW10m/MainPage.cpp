@@ -210,6 +210,28 @@ MainPage::MainPage() {
                             cssScale);
 }
 
+void MainPage::PushDpi() {
+  if (!engineView_) {
+    return;
+  }
+  try {
+    auto display =
+        winrt::Windows::Graphics::Display::DisplayInformation::GetForCurrentView();
+    // RawDpiX is the panel's own density and is what a finger is measured
+    // against; it reads zero on displays that never reported one, and then the
+    // logical DPI -- 96 times the shell's scale -- is the closest thing there
+    // is.
+    double dpi = display.RawDpiX();
+    if (!(dpi > 0)) {
+      dpi = display.LogicalDpi();
+    }
+    engineView_->SetDpi(dpi);
+  } catch (winrt::hresult_error const& error) {
+    client::Log::Write(L"size: the display would not say how dense it is",
+                       std::wstring(error.message()));
+  }
+}
+
 void MainPage::ApplyVisibleBounds() {
   // The compositor's own state machine, read out of CoreUIComponents itself,
   // turns out to be about activation: state 5 is activated, 6 deactivated, and
@@ -535,10 +557,12 @@ void MainPage::BuildUi() {
     display.OrientationChanged([](auto const&, auto const&) {
       client::Log::Write(L"size: DisplayInformation.OrientationChanged");
     });
-    display.DpiChanged([](auto const&, auto const&) {
+    display.DpiChanged([this](auto const&, auto const&) {
       client::Log::Write(L"size: DisplayInformation.DpiChanged");
+      PushDpi();
     });
   }
+  PushDpi();
 
   // On a phone an unhandled Back is a navigation away from the app: the shell
   // hides the view and suspends it a few seconds later -- which is, step for

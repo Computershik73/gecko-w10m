@@ -321,6 +321,7 @@ bool EngineView::Resolve() {
   touch_ = reinterpret_cast<TouchFn>(::GetProcAddress(xul, "gecko_w10m_input_touch"));
   screen_fn_ =
       reinterpret_cast<ScreenFn>(::GetProcAddress(xul, "gecko_w10m_set_screen"));
+  dpi_fn_ = reinterpret_cast<DpiFn>(::GetProcAddress(xul, "gecko_w10m_set_dpi"));
   open_url_ =
       reinterpret_cast<OpenUrlFn>(::GetProcAddress(xul, "gecko_w10m_open_url"));
   if (!set_launcher_) {
@@ -341,6 +342,9 @@ bool EngineView::Resolve() {
   }
   if (screen_fn_ && screenWidth_ > 0) {
     screen_fn_(screenWidth_, screenHeight_);
+  }
+  if (dpi_fn_ && dpi_ > 0) {
+    dpi_fn_(dpi_);
   }
   Log::Write(std::wstring(L"view: touch entry point ") +
              (touch_ ? L"found -- fingers go to APZ" : L"MISSING -- taps and wheel"));
@@ -895,6 +899,19 @@ void EngineView::SetScreen(double viewWidth, double viewHeight) {
   screenHeight_ = height;
   if (screen_fn_) {
     screen_fn_(width, height);
+  }
+}
+
+void EngineView::SetDpi(double dpi) {
+  const float value = static_cast<float>(dpi);
+  if (!(value > 0) || value == dpi_) {
+    return;
+  }
+  dpi_ = value;
+  Log::Write(L"view: the display is " + std::to_wstring(static_cast<int>(value)) +
+             L" dpi");
+  if (dpi_fn_) {
+    dpi_fn_(dpi_);
   }
 }
 

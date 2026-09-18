@@ -30,6 +30,9 @@ class MainPage {
   // Windows 10 Mobile draws the status bar and the (retractable) navigation
   // bar over the app window. Keep the chrome inside the visible area.
   void ApplyVisibleBounds();
+  // Tells the engine how dense the display is, so APZ measures a finger
+  // against this screen rather than a 96 dpi monitor.
+  void PushDpi();
 
   void Navigate(std::wstring_view entry);
   void RefreshChrome();

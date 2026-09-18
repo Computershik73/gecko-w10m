@@ -44,6 +44,11 @@ class EngineView {
   // The display in view pixels, as the window sees it; sent on to the engine
   // in device pixels so the headless screen turns with the phone.
   void SetScreen(double viewWidth, double viewHeight);
+  // The display's density. APZ measures how far a finger may wander and still
+  // count as a tap against this; left to itself it assumes a 96 dpi monitor
+  // and lets a tap move nine pixels, which on this screen is a fifth of a
+  // millimetre -- so ordinary taps became tiny pans and never arrived.
+  void SetDpi(double dpi);
   // Makes the room match the keyboard as it actually is. The pane's Hiding
   // event is not delivered when the keyboard goes away with the app -- a
   // suspend with it open, a focus change the shell never sees -- and the
@@ -126,6 +131,7 @@ class EngineView {
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using TouchFn = void (*)(int32_t pointerId, int32_t state, int32_t x, int32_t y);
   using ScreenFn = void (*)(int32_t width, int32_t height);
+  using DpiFn = void (*)(float dpi);
   using OpenUrlFn = int32_t (*)(const char* url);
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
@@ -145,6 +151,8 @@ class EngineView {
   ResizeFn resize_ = nullptr;
   TouchFn touch_ = nullptr;
   ScreenFn screen_fn_ = nullptr;
+  DpiFn dpi_fn_ = nullptr;
+  float dpi_ = 0;
   OpenUrlFn open_url_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
