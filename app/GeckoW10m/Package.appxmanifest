@@ -35,7 +35,7 @@
   <Identity
       Name="Gecko"
       Publisher="CN=Computershik"
-      Version="155.4.2.21"
+      Version="155.4.3.22"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity

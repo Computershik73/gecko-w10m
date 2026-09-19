@@ -187,6 +187,77 @@ const H264IFY_SOURCE = `
 })();
 `;
 
+// What the tabs actually are, a few seconds after a window opens. The first
+// tab after a crash loads forever and comes right the moment it is closed, and
+// which of these fields is wrong says why: a tab left pending by session
+// restore, a browser with no docShell, a load that was started and never
+// finished, or a remoteness the frame loader could not honour.
+function gecko_watch_tabs() {
+    function dump(win) {
+        const gb = win.gBrowser;
+        if (!gb) {
+            return;
+        }
+        const say = m => Services.console.logStringMessage("gecko: " + m);
+        say("tabs: " + gb.tabs.length + " open, selected index " +
+            gb.tabs.indexOf(gb.selectedTab));
+        for (let i = 0; i < gb.tabs.length; i++) {
+            const tab = gb.tabs[i];
+            const b = tab.linkedBrowser;
+            let uri = "?";
+            try {
+                uri = b.currentURI ? b.currentURI.spec : "none";
+            } catch (e) {
+                uri = "threw: " + e;
+            }
+            let loading = "?";
+            try {
+                loading = String(b.webProgress &&
+                                 b.webProgress.isLoadingDocument);
+            } catch (e) {
+                loading = "threw";
+            }
+            say("tab " + i + ": " + uri.slice(0, 90) +
+                " | pending " + !!tab.getAttribute("pending") +
+                " | remote attr " + b.hasAttribute("remote") +
+                " | isRemoteBrowser " + b.isRemoteBrowser +
+                " | docShell " + !!b.docShell +
+                " | contentWindow " + !!b.contentWindow +
+                " | currentWindowGlobal " +
+                !!(b.browsingContext && b.browsingContext.currentWindowGlobal) +
+                " | loading " + loading +
+                " | userTypedValue " + (b.userTypedValue || "none"));
+        }
+    }
+
+    Services.obs.addObserver({
+        observe(subject, topic) {
+            if (topic !== "domwindowopened") {
+                return;
+            }
+            const win = subject;
+            win.addEventListener("load", () => {
+                if (win.document.location.href !==
+                    "chrome://browser/content/browser.xhtml") {
+                    return;
+                }
+                // Twice: once when the window has settled, once after the load
+                // it started has had time to finish or to hang.
+                for (const delay of [4000, 15000]) {
+                    win.setTimeout(() => {
+                        try {
+                            dump(win);
+                        } catch (e) {
+                            Services.console.logStringMessage(
+                                "gecko: tabs: " + e);
+                        }
+                    }, delay);
+                }
+            }, { once: true });
+        }
+    }, "domwindowopened");
+}
+
 function gecko_h264ify() {
     const setting = Services.prefs.getStringPref(
         "gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
@@ -281,6 +352,7 @@ try {
     gecko_note_startup();
     gecko_watch_fullscreen();
     gecko_h264ify();
+    gecko_watch_tabs();
     delete_old_mcf_files();
 
     // Firefox is caching some files to make the startup time faster. We need to
