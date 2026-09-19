@@ -207,7 +207,13 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
       // Video: which decoder was asked, what it answered, and where the
       // pipeline gave up.
       L"MediaDecoder:4,MediaFormatReader:4,PlatformDecoderModule:5,"
-      L"WMFDecoderModule:5,MediaDemuxer:4,MediaSource:4,HTMLMediaElement:4");
+      L"WMFDecoderModule:5,MediaDemuxer:4,MediaSource:4,HTMLMediaElement:4,"
+      // The start page after a crash opens a channel and never hears back:
+      // the TLS handshake is reported, then "waiting for google.com", and
+      // nsDocumentOpenInfo::OnStartRequest never arrives. These say where it
+      // is standing -- the connection, the cache entry it waits for, or the
+      // response that never comes.
+      L"nsHttp:4,cache2:3,nsSocketTransport:3,nsHostResolver:3");
   SetEngineEnvironment(L"MOZ_LOG_FILE", geckoLog.c_str());
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 

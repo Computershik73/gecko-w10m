@@ -131,7 +131,7 @@ class EngineView {
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using TouchFn = void (*)(int32_t pointerId, int32_t state, int32_t x, int32_t y);
   using ScreenFn = void (*)(int32_t width, int32_t height);
-  using DpiFn = void (*)(float dpi);
+  using DpiFn = void (*)(int32_t dpi);
   using OpenUrlFn = int32_t (*)(const char* url);
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
@@ -152,7 +152,7 @@ class EngineView {
   TouchFn touch_ = nullptr;
   ScreenFn screen_fn_ = nullptr;
   DpiFn dpi_fn_ = nullptr;
-  float dpi_ = 0;
+  int32_t dpi_ = 0;
   OpenUrlFn open_url_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;

@@ -325,7 +325,15 @@ function gecko_watch_fullscreen() {
                     ", toolbox " +
                     (toolbox ? Math.round(
                          toolbox.getBoundingClientRect().height) : "?") +
-                    "px, window " + win.innerWidth + "x" + win.innerHeight);
+                    "px, window " + win.innerWidth + "x" + win.innerHeight +
+                    // enterDomFullscreen gives up without a word if either of
+                    // these is wrong, and inDOMFullscreen stays unset -- which
+                    // is what the last log showed.
+                    ", focus.activeWindow is us " +
+                    (Services.focus.activeWindow === win) +
+                    ", selectedBrowser matches " +
+                    (win.gBrowser &&
+                     win.gBrowser.selectedBrowser === doc.fullscreenElement));
             }, true);
         }
     }

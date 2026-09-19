@@ -903,13 +903,14 @@ void EngineView::SetScreen(double viewWidth, double viewHeight) {
 }
 
 void EngineView::SetDpi(double dpi) {
-  const float value = static_cast<float>(dpi);
-  if (!(value > 0) || value == dpi_) {
+  const int32_t value = static_cast<int32_t>(dpi + 0.5);
+  if (value <= 0 || value == dpi_) {
     return;
   }
   dpi_ = value;
-  Log::Write(L"view: the display is " + std::to_wstring(static_cast<int>(value)) +
-             L" dpi");
+  Log::Write(L"view: the display is " + std::to_wstring(value) + L" dpi" +
+             (dpi_fn_ ? L", telling the engine now"
+                      : L", the engine is not up yet"));
   if (dpi_fn_) {
     dpi_fn_(dpi_);
   }
