@@ -830,6 +830,8 @@ void EngineView::OnPressed(winrt::Windows::Foundation::Point const& point) {
   travelled_ = 0;
   lastX_ = point.X;
   lastY_ = point.Y;
+  lastSentTouchX_ = x;
+  lastSentTouchY_ = y;
   if (touch_) {
     touch_(0, 0, x, y);
   }
@@ -853,6 +855,22 @@ void EngineView::OnMoved(winrt::Windows::Foundation::Point const& point) {
 
   if (touch_) {
     // The finger itself; APZ turns its path into a pan, a fling or a pinch.
+    //
+    // Only when it has actually gone somewhere. A digitizer reports a finger
+    // resting on the glass over and over, and every one of those reports was
+    // becoming a touchmove: the log shows six to nine of them for a tap that
+    // moved nothing at all. A real touchscreen sends none, and a player that
+    // reads the touch stream itself -- YouTube's does, in fullscreen, which is
+    // why swipes work there and taps do not -- takes any touchmove as "this is
+    // a drag, not a tap". Three device pixels is a little over one CSS pixel
+    // here, far below anything a person means as a movement.
+    const int32_t movedX = x - lastSentTouchX_;
+    const int32_t movedY = y - lastSentTouchY_;
+    if (std::abs(movedX) + std::abs(movedY) < 3) {
+      return;
+    }
+    lastSentTouchX_ = x;
+    lastSentTouchY_ = y;
     touch_(0, 1, x, y);
     return;
   }

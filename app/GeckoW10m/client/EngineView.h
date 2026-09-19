@@ -161,6 +161,10 @@ class EngineView {
   // window to put it in.
   std::string pendingUrl_;
   unsigned long long lastOpenAttempt_ = 0;
+  // Where the last touch move we actually sent was, so a finger resting on the
+  // glass stops producing them.
+  int32_t lastSentTouchX_ = 0;
+  int32_t lastSentTouchY_ = 0;
   int32_t screenWidth_ = 0;
   int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;
