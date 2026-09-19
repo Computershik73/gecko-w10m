@@ -334,6 +334,34 @@ function gecko_watch_fullscreen() {
                     ", selectedBrowser matches " +
                     (win.gBrowser &&
                      win.gBrowser.selectedBrowser === doc.fullscreenElement));
+                // And what the page itself believes, which is the only thing
+                // that decides where the video sits and where a tap lands.
+                try {
+                    const cw = win.gBrowser.selectedBrowser.contentWindow;
+                    const cd = cw.document;
+                    const fs = cd.fullscreenElement;
+                    const r = fs ? fs.getBoundingClientRect() : null;
+                    const vv = cw.visualViewport;
+                    Services.console.logStringMessage(
+                        "gecko: page viewport " + cw.innerWidth + "x" +
+                        cw.innerHeight + " at dpr " + cw.devicePixelRatio +
+                        ", visual " + (vv ? Math.round(vv.width) + "x" +
+                                            Math.round(vv.height) + " offset " +
+                                            Math.round(vv.offsetLeft) + "," +
+                                            Math.round(vv.offsetTop) +
+                                            " scale " + vv.scale
+                                          : "none") +
+                        ", document " + cd.documentElement.clientWidth + "x" +
+                        cd.documentElement.clientHeight +
+                        ", fullscreen element " +
+                        (fs ? fs.localName + " " + Math.round(r.left) + "," +
+                              Math.round(r.top) + " " + Math.round(r.width) +
+                              "x" + Math.round(r.height)
+                            : "none"));
+                } catch (e) {
+                    Services.console.logStringMessage(
+                        "gecko: page viewport unavailable: " + e);
+                }
             }, true);
         }
     }
