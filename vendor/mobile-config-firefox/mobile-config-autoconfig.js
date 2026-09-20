@@ -328,37 +328,66 @@ function gecko_watch_clicks(cw) {
         }
         return out;
     };
-    // Anything that looks like a menu, a sheet or a dialog, and whether it is
-    // inside the fullscreen element -- outside it nothing is painted or hit
-    // tested, which is what a dead button looks like from the outside.
+    // Anything menu-, sheet-, scrim- or dialog-shaped, listed whether or not
+    // it can be seen -- an element under an ancestor with display:none has no
+    // box at all, and the first version of this dropped exactly those.
     const MENUISH =
-        "[role=menu],[role=dialog],dialog,[class*=menu i],[class*=sheet i]," +
-        "[class*=popup i],[class*=dialog i]";
-    const surveyMenus = doc => {
+        "[role=menu],[role=dialog],dialog,ytw-scrim,ytm-bottom-sheet-renderer," +
+        "[class*=menu i],[class*=sheet i],[class*=scrim i],[class*=popup i]," +
+        "[class*=dialog i]";
+
+    const hiddenBy = el => {
+        const win = el.ownerDocument.defaultView;
+        for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+            const st = win.getComputedStyle(n);
+            if (st.display === "none") {
+                return describe(n) + " has display:none";
+            }
+            if (st.visibility === "hidden" || st.visibility === "collapse") {
+                return describe(n) + " has visibility:" + st.visibility;
+            }
+            if (st.opacity === "0") {
+                return describe(n) + " has opacity:0";
+            }
+        }
+        return "no ancestor hides it";
+    };
+
+    const snapshot = doc => {
+        const seen = new Set();
+        for (const el of doc.querySelectorAll(MENUISH)) {
+            seen.add(el);
+        }
+        return seen;
+    };
+
+    const surveyMenus = (doc, before) => {
         const fs = doc.fullscreenElement;
-        let found = 0;
+        let listed = 0;
         for (const el of doc.querySelectorAll(MENUISH)) {
             const r = el.getBoundingClientRect();
-            if (!r.width || !r.height) {
+            const isNew = !before.has(el);
+            // Everything that is new, and anything old that now has a box
+            // bigger than a control -- the sheet we are looking for is one or
+            // the other.
+            if (!isNew && !(r.width > 120 && r.height > 120)) {
                 continue;
             }
-            const style = doc.defaultView.getComputedStyle(el);
-            if (style.visibility === "hidden" || style.display === "none") {
-                continue;
-            }
-            if (++found > 5) {
+            if (++listed > 8) {
                 break;
             }
             Services.console.logStringMessage(
-                "gecko: after click, visible " + describe(el) + " at " +
-                Math.round(r.left) + "," + Math.round(r.top) + " " +
-                Math.round(r.width) + "x" + Math.round(r.height) +
-                ", inside the fullscreen element " +
-                (fs ? fs.contains(el) : "no fullscreen"));
+                "gecko: menu " + (isNew ? "APPEARED " : "present ") +
+                describe(el) + " box " + Math.round(r.left) + "," +
+                Math.round(r.top) + " " + Math.round(r.width) + "x" +
+                Math.round(r.height) +
+                ", inside fullscreen element " +
+                (fs ? fs.contains(el) : "no fullscreen") +
+                (r.width && r.height ? "" : ", " + hiddenBy(el)));
         }
-        if (!found) {
+        if (!listed) {
             Services.console.logStringMessage(
-                "gecko: after click, nothing menu-shaped is visible");
+                "gecko: menu -- the page added nothing and nothing grew");
         }
     };
 
@@ -374,14 +403,15 @@ function gecko_watch_clicks(cw) {
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
             if (inFullscreen) {
+                const before = snapshot(doc);
                 cw.setTimeout(() => {
                     try {
-                        surveyMenus(doc);
+                        surveyMenus(doc, before);
                     } catch (e2) {
                         Services.console.logStringMessage(
                             "gecko: menu survey: " + e2);
                     }
-                }, 500);
+                }, 600);
             }
         } catch (e) {
             Services.console.logStringMessage("gecko: click watch: " + e);
