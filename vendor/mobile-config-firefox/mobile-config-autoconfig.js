@@ -200,12 +200,33 @@ function gecko_note_phases() {
     const mods = () => Cu.loadedESModules.length + " modules";
     Services.console.logStringMessage(
         "gecko: phase autoconfig -- " + mods());
+    // Between final-ui-startup and browser-delayed-startup-finished the
+    // window is built and two hundred modules load, three and a half
+    // seconds on the fastest phone. Their names, once, say which features
+    // those are -- and which a phone could do without.
+    let atUiStartup = null;
     const mark = topic => {
         Services.obs.addObserver({
             observe() {
                 Services.obs.removeObserver(this, topic);
                 Services.console.logStringMessage(
                     "gecko: phase " + topic + " -- " + since() + ", " + mods());
+                if (topic === "final-ui-startup") {
+                    atUiStartup = new Set(Cu.loadedESModules);
+                } else if (topic === "browser-delayed-startup-finished" &&
+                           atUiStartup) {
+                    const fresh = Cu.loadedESModules
+                        .filter(m => !atUiStartup.has(m))
+                        .map(m => m.replace(/^resource:\/\/gre\/modules\//, "gre:")
+                                   .replace(/^resource:\/\/\/modules\//, "app:")
+                                   .replace(/^moz-src:\/\/\//, "src:")
+                                   .replace(/\.sys\.mjs$/, ""));
+                    for (let i = 0; i < fresh.length; i += 8) {
+                        Services.console.logStringMessage(
+                            "gecko: loaded while building the window: " +
+                            fresh.slice(i, i + 8).join(" "));
+                    }
+                }
             }
         }, topic);
     };
@@ -487,72 +508,6 @@ const H264IFY_SOURCE = `
 // which of these fields is wrong says why: a tab left pending by session
 // restore, a browser with no docShell, a load that was started and never
 // finished, or a remoteness the frame loader could not honour.
-function gecko_watch_tabs() {
-    function dump(win) {
-        const gb = win.gBrowser;
-        if (!gb) {
-            return;
-        }
-        const say = m => Services.console.logStringMessage("gecko: " + m);
-        say("tabs: " + gb.tabs.length + " open, selected index " +
-            gb.tabs.indexOf(gb.selectedTab));
-        for (let i = 0; i < gb.tabs.length; i++) {
-            const tab = gb.tabs[i];
-            const b = tab.linkedBrowser;
-            let uri = "?";
-            try {
-                uri = b.currentURI ? b.currentURI.spec : "none";
-            } catch (e) {
-                uri = "threw: " + e;
-            }
-            let loading = "?";
-            try {
-                loading = String(b.webProgress &&
-                                 b.webProgress.isLoadingDocument);
-            } catch (e) {
-                loading = "threw";
-            }
-            say("tab " + i + ": " + uri.slice(0, 90) +
-                " | pending " + !!tab.getAttribute("pending") +
-                " | remote attr " + b.hasAttribute("remote") +
-                " | isRemoteBrowser " + b.isRemoteBrowser +
-                " | docShell " + !!b.docShell +
-                " | contentWindow " + !!b.contentWindow +
-                " | currentWindowGlobal " +
-                !!(b.browsingContext && b.browsingContext.currentWindowGlobal) +
-                " | loading " + loading +
-                " | userTypedValue " + (b.userTypedValue || "none"));
-        }
-    }
-
-    Services.obs.addObserver({
-        observe(subject, topic) {
-            if (topic !== "domwindowopened") {
-                return;
-            }
-            const win = subject;
-            win.addEventListener("load", () => {
-                if (win.document.location.href !==
-                    "chrome://browser/content/browser.xhtml") {
-                    return;
-                }
-                // Twice: once when the window has settled, once after the load
-                // it started has had time to finish or to hang.
-                for (const delay of [4000, 15000]) {
-                    win.setTimeout(() => {
-                        try {
-                            dump(win);
-                        } catch (e) {
-                            Services.console.logStringMessage(
-                                "gecko: tabs: " + e);
-                        }
-                    }, delay);
-                }
-            }, { once: true });
-        }
-    }, "domwindowopened");
-}
-
 function gecko_h264ify() {
     const setting = Services.prefs.getStringPref(
         "gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
@@ -615,265 +570,9 @@ function gecko_h264ify() {
     Services.obs.addObserver(observer, "document-element-inserted");
 }
 
-// What a tap actually lands on. Every control in the fullscreen player answers
-// now except the settings gear, and the only way to tell "the tap missed it"
-// from "the page did nothing with it" is to name the element it reached.
-const GECKO_CLICK_WATCHED = new WeakSet();
-const GECKO_PROBE_WATCHED = new WeakSet();
-
-function gecko_watch_clicks(cw) {
-    if (GECKO_CLICK_WATCHED.has(cw)) {
-        return;
-    }
-    GECKO_CLICK_WATCHED.add(cw);
-    const describe = el => {
-        if (!el) {
-            return "nothing";
-        }
-        let out = el.localName || "?";
-        if (el.id) {
-            out += "#" + el.id;
-        }
-        const cls = typeof el.className === "string" ? el.className : "";
-        if (cls) {
-            out += "." + cls.trim().split(/\s+/).slice(0, 3).join(".");
-        }
-        const label = el.getAttribute && (el.getAttribute("aria-label") ||
-                                          el.getAttribute("title"));
-        if (label) {
-            out += " [" + label.slice(0, 40) + "]";
-        }
-        return out;
-    };
-    // Anything menu-, sheet-, scrim- or dialog-shaped, listed whether or not
-    // it can be seen -- an element under an ancestor with display:none has no
-    // box at all, and the first version of this dropped exactly those.
-    const MENUISH =
-        "[role=menu],[role=dialog],dialog,ytw-scrim,ytm-bottom-sheet-renderer," +
-        "[class*=menu i],[class*=sheet i],[class*=scrim i],[class*=popup i]," +
-        "[class*=dialog i]";
-
-    const hiddenBy = el => {
-        const win = el.ownerDocument.defaultView;
-        for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
-            const st = win.getComputedStyle(n);
-            if (st.display === "none") {
-                return describe(n) + " has display:none";
-            }
-            if (st.visibility === "hidden" || st.visibility === "collapse") {
-                return describe(n) + " has visibility:" + st.visibility;
-            }
-            if (st.opacity === "0") {
-                return describe(n) + " has opacity:0";
-            }
-        }
-        return "no ancestor hides it";
-    };
-
-    // querySelectorAll stops at a shadow boundary, and these components are
-    // made of them, so walk the roots as well.
-    const collect = root => {
-        const out = [];
-        const visit = r => {
-            let all;
-            try {
-                all = r.querySelectorAll("*");
-            } catch (e) {
-                return;
-            }
-            for (const el of all) {
-                if (el.matches && el.matches(MENUISH)) {
-                    out.push(el);
-                }
-                if (el.shadowRoot) {
-                    visit(el.shadowRoot);
-                }
-            }
-        };
-        visit(root);
-        return out;
-    };
-
-    const snapshot = doc => new Set(collect(doc));
-
-    const surveyMenus = (doc, before) => {
-        const fs = doc.fullscreenElement;
-        let listed = 0;
-        for (const el of collect(doc)) {
-            const r = el.getBoundingClientRect();
-            const isNew = !before.has(el);
-            // Everything that is new, and anything old that now has a box
-            // bigger than a control -- the sheet we are looking for is one or
-            // the other.
-            if (!isNew && !(r.width > 120 && r.height > 120)) {
-                continue;
-            }
-            if (++listed > 8) {
-                break;
-            }
-            Services.console.logStringMessage(
-                "gecko: menu " + (isNew ? "APPEARED " : "present ") +
-                describe(el) + " box " + Math.round(r.left) + "," +
-                Math.round(r.top) + " " + Math.round(r.width) + "x" +
-                Math.round(r.height) +
-                ", inside fullscreen element " +
-                (fs ? fs.contains(el) : "no fullscreen") +
-                (r.width && r.height ? "" : ", " + hiddenBy(el)));
-        }
-        if (!listed) {
-            Services.console.logStringMessage(
-                "gecko: menu -- the page added nothing and nothing grew " +
-                "(shadow roots included)");
-        }
-    };
-
-    cw.addEventListener("click", ev => {
-        try {
-            const doc = ev.target && ev.target.ownerDocument;
-            const inFullscreen = !!(doc && doc.fullscreenElement);
-            Services.console.logStringMessage(
-                "gecko: click at " + Math.round(ev.clientX) + "," +
-                Math.round(ev.clientY) + " on " + describe(ev.target) +
-                ", fullscreen " + (inFullscreen ? "yes" : "no") +
-                (inFullscreen
-                     ? ", fullscreen element " + describe(doc.fullscreenElement)
-                     : ""));
-            try {
-                const said =
-                    doc.documentElement.getAttribute("data-gecko-probe");
-                if (said) {
-                    Services.console.logStringMessage(
-                        "gecko: the page reported " + said.slice(0, 300));
-                    doc.documentElement.removeAttribute("data-gecko-probe");
-                }
-            } catch (e8) {
-                Services.console.logStringMessage("gecko: report read: " + e8);
-            }
-
-            if (inFullscreen) {
-                // Everything at that point, topmost first. If a control does
-                // nothing, what sits over it is the first thing to know.
-                try {
-                    const stack = doc.elementsFromPoint(ev.clientX, ev.clientY);
-                    const win = doc.defaultView;
-                    const parts = [];
-                    for (const el of stack.slice(0, 6)) {
-                        const st = win.getComputedStyle(el);
-                        parts.push(describe(el) + " (" + st.position + ", z=" +
-                                   st.zIndex + ", pointer-events=" +
-                                   st.pointerEvents + ")");
-                    }
-                    Services.console.logStringMessage(
-                        "gecko: stack at " + Math.round(ev.clientX) + "," +
-                        Math.round(ev.clientY) + ", topmost first: " +
-                        parts.join(" | "));
-                } catch (e6) {
-                    Services.console.logStringMessage(
-                        "gecko: stack: " + e6);
-                }
-
-                // Which listeners the engine sees on the thing under the
-                // finger, and on the few elements above it -- a click reaching
-                // an element nobody is listening on goes nowhere, and that
-                // cannot be seen from inside the page.
-                try {
-                    const els = Cc["@mozilla.org/eventlistenerservice;1"]
-                        .getService(Ci.nsIEventListenerService);
-                    const parts = [];
-                    let el = ev.target;
-                    for (let depth = 0; el && depth < 4; depth++) {
-                        const types = [];
-                        for (const info of els.getListenerInfoFor(el)) {
-                            if (!info.inSystemEventGroup) {
-                                types.push(info.type);
-                            }
-                        }
-                        parts.push(describe(el) + " <" +
-                                   (types.length ? types.join(",") : "none") +
-                                   ">");
-                        el = el.parentElement;
-                    }
-                    Services.console.logStringMessage(
-                        "gecko: listeners " + parts.join(" << "));
-                } catch (e7) {
-                    Services.console.logStringMessage(
-                        "gecko: listeners: " + e7);
-                }
-
-                const before = snapshot(doc);
-
-                // Does the handler run at all? The button carries no aria
-                // state to read, so watch the document instead: if anything
-                // the press set in motion touches the page, it shows up here.
-                let changes = 0;
-                const samples = [];
-                let observer = null;
-                try {
-                    observer = new cw.MutationObserver(records => {
-                        for (const rec of records) {
-                            changes++;
-                            if (samples.length < 6) {
-                                samples.push(
-                                    rec.type === "attributes"
-                                        ? describe(rec.target) + " @" +
-                                          rec.attributeName
-                                        : describe(rec.target) + " +" +
-                                          rec.addedNodes.length + "/-" +
-                                          rec.removedNodes.length);
-                            }
-                        }
-                    });
-                    observer.observe(doc, {
-                        childList: true,
-                        subtree: true,
-                        attributes: true,
-                        characterData: false,
-                    });
-                } catch (e4) {
-                    Services.console.logStringMessage(
-                        "gecko: mutation watch: " + e4);
-                }
-                cw.setTimeout(() => {
-                    try {
-                        if (observer) {
-                            observer.disconnect();
-                        }
-                        Services.console.logStringMessage(
-                            "gecko: page made " + changes +
-                            " changes after the click" +
-                            (samples.length ? ": " + samples.join("; ") : ""));
-                        const said =
-                            doc.documentElement.getAttribute("data-gecko-probe");
-                        if (said) {
-                            Services.console.logStringMessage(
-                                "gecko: the page reported " + said.slice(0, 300));
-                            doc.documentElement.removeAttribute(
-                                "data-gecko-probe");
-                        }
-                    } catch (e5) {
-                        Services.console.logStringMessage(
-                            "gecko: mutation report: " + e5);
-                    }
-                }, 1000);
-                cw.setTimeout(() => {
-                    try {
-                        surveyMenus(doc, before);
-                    } catch (e2) {
-                        Services.console.logStringMessage(
-                            "gecko: menu survey: " + e2);
-                    }
-                }, 600);
-            }
-        } catch (e) {
-            Services.console.logStringMessage("gecko: click watch: " + e);
-        }
-    }, true);
-}
-
-// Every fullscreen transition, written down. Which of these arrive says where
-// the chain breaks: MozDOMFullscreen:Entered is the chrome event the actors
-// listen for, inDOMFullscreen is the attribute whose absence leaves the
-// toolbar on screen, and the toolbox height says whether it actually went.
+// DOM fullscreen without content processes: the chrome half that the actor
+// chain never reaches is run here, and the page is nudged to re-measure once
+// the window has settled. One line per transition.
 function gecko_watch_fullscreen() {
     const EVENTS = ["MozDOMFullscreen:Entered", "MozDOMFullscreen:Exited",
                     "fullscreenchange", "fullscreenerror"];
@@ -920,79 +619,22 @@ function gecko_watch_fullscreen() {
                 } else if (name === "MozDOMFullscreen:Exited") {
                     runChromeHalf(false);
                 }
-                const toolbox = doc.getElementById("navigator-toolbox");
                 Services.console.logStringMessage(
-                    "gecko: fullscreen " + name +
-                    " -- chrome element " +
-                    (doc.fullscreenElement ? doc.fullscreenElement.localName
-                                           : "none") +
-                    ", inDOMFullscreen " +
-                    doc.documentElement.hasAttribute("inDOMFullscreen") +
-                    ", window.fullScreen " + win.fullScreen +
-                    ", toolbox " +
-                    (toolbox ? Math.round(
-                         toolbox.getBoundingClientRect().height) : "?") +
-                    "px, window " + win.innerWidth + "x" + win.innerHeight +
-                    // enterDomFullscreen gives up without a word if either of
-                    // these is wrong, and inDOMFullscreen stays unset -- which
-                    // is what the last log showed.
-                    ", focus.activeWindow is us " +
-                    (Services.focus.activeWindow === win) +
-                    ", selectedBrowser matches " +
-                    (win.gBrowser &&
-                     win.gBrowser.selectedBrowser === doc.fullscreenElement));
-                // And what the page itself believes, which is the only thing
-                // that decides where the video sits and where a tap lands.
+                    "gecko: fullscreen " + name + ", inDOMFullscreen " +
+                    doc.documentElement.hasAttribute("inDOMFullscreen"));
+                // The page laid itself out while the window was changing
+                // size and will not measure again on its own. Two nudges,
+                // once the transition has settled.
                 try {
                     const cw = win.gBrowser.selectedBrowser.contentWindow;
-                    const cd = cw.document;
-                    const fs = cd.fullscreenElement;
-                    const r = fs ? fs.getBoundingClientRect() : null;
-                    const vv = cw.visualViewport;
-                    Services.console.logStringMessage(
-                        "gecko: page viewport " + cw.innerWidth + "x" +
-                        cw.innerHeight + " at dpr " + cw.devicePixelRatio +
-                        ", visual " + (vv ? Math.round(vv.width) + "x" +
-                                            Math.round(vv.height) + " offset " +
-                                            Math.round(vv.offsetLeft) + "," +
-                                            Math.round(vv.offsetTop) +
-                                            " scale " + vv.scale
-                                          : "none") +
-                        ", document " + cd.documentElement.clientWidth + "x" +
-                        cd.documentElement.clientHeight +
-                        ", fullscreen element " +
-                        (fs ? fs.localName + " " + Math.round(r.left) + "," +
-                              Math.round(r.top) + " " + Math.round(r.width) +
-                              "x" + Math.round(r.height)
-                            : "none"));
-                    // The page laid itself out while the window was
-                    // changing size and will not measure again on its own.
-                    // Two nudges, once the transition has settled.
                     for (const delay of [300, 1200]) {
                         win.setTimeout(() => {
                             try {
                                 cw.dispatchEvent(new cw.Event("resize"));
-                            } catch (e2) {
-                                Services.console.logStringMessage(
-                                    "gecko: resize nudge failed: " + e2);
-                            }
+                            } catch (e2) {}
                         }, delay);
                     }
-                    gecko_watch_clicks(cw);
-                    if (!GECKO_PROBE_WATCHED.has(cw)) {
-                        GECKO_PROBE_WATCHED.add(cw);
-                        // The fourth argument is the point: an event a page
-                        // dispatches is untrusted, and chrome does not hear
-                        // those unless it says so.
-                        cw.addEventListener("gecko-probe", pe => {
-                            Services.console.logStringMessage(
-                                "gecko: " + String(pe.detail).slice(0, 200));
-                        }, true, true);
-                    }
-                } catch (e) {
-                    Services.console.logStringMessage(
-                        "gecko: page viewport unavailable: " + e);
-                }
+                } catch (e) {}
             }, true);
         }
     }
@@ -1023,7 +665,6 @@ try {
     gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_h264ify();
-    gecko_watch_tabs();
     delete_old_mcf_files();
 
     // Upstream clears the startup cache on every launch, so that edits to
