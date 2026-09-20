@@ -146,67 +146,60 @@ function gecko_note_startup() {
 // side, but it is browser-wide: every other site loses them too, with nothing
 // to fall back to. So the prefs are back to what Firefox ships and this does
 // the refusing, on the hosts named by gecko.h264ify.hosts and nowhere else.
-const GECKO_HANDLER_PROBE = `
+// The settings gear in the fullscreen player.
+//
+// Measured, not guessed: the tap reaches
+// button.icon-button.player-settings-icon with its own click and touch
+// listeners, the page hook is confirmed installed at the moment of the click,
+// and the page answers with more mutations than an ordinary control tap
+// makes. The handler runs. It just builds no sheet -- not in the document,
+// not in any shadow root.
+//
+// Which is reasonable of it. The fullscreen element is
+// div#player-container-id, and YouTube's settings sheet belongs to the app
+// shell outside it, where fullscreen painting could never show it. Declining
+// to open a sheet nobody could see is the right call for the site to make.
+//
+// So give it somewhere to be seen. The gear steps out of fullscreen first --
+// the state where the sheet already opens -- and the player is one tap from
+// going back in. Narrow on purpose: only the gear, only while fullscreen.
+const GECKO_FULLSCREEN_MENU = `
 (function () {
-  var say = function (m) {
+  var GEAR = ".player-settings-icon";
+  var replaying = false;
+  document.addEventListener("click", function (ev) {
+    if (replaying || !document.fullscreenElement) {
+      return;
+    }
+    var gear;
     try {
-      window.dispatchEvent(new CustomEvent("gecko-probe", { detail: m }));
-    } catch (e) {}
-    // And on the document, where nothing can be lost in translation.
+      gear = ev.target && ev.target.closest && ev.target.closest(GEAR);
+    } catch (e) {
+      return;
+    }
+    if (!gear) {
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var reopen = function () {
+      replaying = true;
+      try {
+        gear.click();
+      } catch (e2) {}
+      setTimeout(function () { replaying = false; }, 0);
+    };
     try {
-      var root = document.documentElement;
-      var kept = (root.getAttribute("data-gecko-probe") || "").split(" || ");
-      kept.push(m);
-      while (kept.length > 6) { kept.shift(); }
-      root.setAttribute("data-gecko-probe", kept.join(" || "));
-    } catch (e2) {}
-  };
-  var WATCHED = ["player-settings-icon", "player-control-play-pause-icon"];
-  var nameOf = function (t) {
-    try {
-      if (!t || !t.classList) { return null; }
-      for (var i = 0; i < WATCHED.length; i++) {
-        if (t.classList.contains(WATCHED[i])) { return WATCHED[i]; }
+      var left = document.exitFullscreen();
+      if (left && left.then) {
+        left.then(function () { setTimeout(reopen, 120); }, reopen);
+      } else {
+        setTimeout(reopen, 120);
       }
-    } catch (e) {}
-    return null;
-  };
-  // The map keeps removeEventListener working: it is handed the original
-  // function and has to find the wrapper that was actually registered.
-  var wrappers = new WeakMap();
-  var add = EventTarget.prototype.addEventListener;
-  var remove = EventTarget.prototype.removeEventListener;
-  say("installed, addEventListener is " +
-      (typeof add === "function" ? "wrappable" : "missing"));
-
-  EventTarget.prototype.addEventListener = function (type, fn, opts) {
-    if (typeof fn !== "function" || (type !== "click" && type !== "touchend")) {
-      return add.call(this, type, fn, opts);
+    } catch (e3) {
+      reopen();
     }
-    var wrapped = wrappers.get(fn);
-    if (!wrapped) {
-      wrapped = function (ev) {
-        var which = nameOf(this);
-        if (!which) { return fn.apply(this, arguments); }
-        say("handler " + ev.type + " on " + which + " entered");
-        try {
-          var r = fn.apply(this, arguments);
-          say("handler " + ev.type + " on " + which + " returned normally");
-          return r;
-        } catch (err) {
-          say("handler " + ev.type + " on " + which + " THREW " + err);
-          throw err;
-        }
-      };
-      wrappers.set(fn, wrapped);
-    }
-    return add.call(this, type, wrapped, opts);
-  };
-
-  EventTarget.prototype.removeEventListener = function (type, fn, opts) {
-    var wrapped = typeof fn === "function" ? wrappers.get(fn) : null;
-    return remove.call(this, type, wrapped || fn, opts);
-  };
+  }, true);
 })();
 `;
 
@@ -370,7 +363,7 @@ function gecko_h264ify() {
                     sandboxPrototype: win,
                     wantXrays: false,
                 });
-                Cu.evalInSandbox(GECKO_HANDLER_PROBE, sandbox);
+                Cu.evalInSandbox(GECKO_FULLSCREEN_MENU, sandbox);
                 Cu.evalInSandbox(H264IFY_SOURCE, sandbox);
                 Services.console.logStringMessage(
                     "gecko: page hooks injected into " + host);
