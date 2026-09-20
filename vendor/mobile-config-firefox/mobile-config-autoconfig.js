@@ -176,6 +176,8 @@ const GECKO_HANDLER_PROBE = `
   var wrappers = new WeakMap();
   var add = EventTarget.prototype.addEventListener;
   var remove = EventTarget.prototype.removeEventListener;
+  say("installed, addEventListener is " +
+      (typeof add === "function" ? "wrappable" : "missing"));
 
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
     if (typeof fn !== "function" || (type !== "click" && type !== "touchend")) {
@@ -354,6 +356,8 @@ function gecko_h264ify() {
                 });
                 Cu.evalInSandbox(GECKO_HANDLER_PROBE, sandbox);
                 Cu.evalInSandbox(H264IFY_SOURCE, sandbox);
+                Services.console.logStringMessage(
+                    "gecko: page hooks injected into " + host);
             } catch (e) {
                 Services.console.logStringMessage(
                     "gecko: h264ify failed on " + host + ": " + e);
@@ -485,6 +489,18 @@ function gecko_watch_clicks(cw) {
                 (inFullscreen
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
+            try {
+                const said =
+                    doc.documentElement.getAttribute("data-gecko-probe");
+                if (said) {
+                    Services.console.logStringMessage(
+                        "gecko: the page reported " + said.slice(0, 300));
+                    doc.documentElement.removeAttribute("data-gecko-probe");
+                }
+            } catch (e8) {
+                Services.console.logStringMessage("gecko: report read: " + e8);
+            }
+
             if (inFullscreen) {
                 // Everything at that point, topmost first. If a control does
                 // nothing, what sits over it is the first thing to know.
