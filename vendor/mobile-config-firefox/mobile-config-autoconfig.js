@@ -328,14 +328,61 @@ function gecko_watch_clicks(cw) {
         }
         return out;
     };
+    // Anything that looks like a menu, a sheet or a dialog, and whether it is
+    // inside the fullscreen element -- outside it nothing is painted or hit
+    // tested, which is what a dead button looks like from the outside.
+    const MENUISH =
+        "[role=menu],[role=dialog],dialog,[class*=menu i],[class*=sheet i]," +
+        "[class*=popup i],[class*=dialog i]";
+    const surveyMenus = doc => {
+        const fs = doc.fullscreenElement;
+        let found = 0;
+        for (const el of doc.querySelectorAll(MENUISH)) {
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height) {
+                continue;
+            }
+            const style = doc.defaultView.getComputedStyle(el);
+            if (style.visibility === "hidden" || style.display === "none") {
+                continue;
+            }
+            if (++found > 5) {
+                break;
+            }
+            Services.console.logStringMessage(
+                "gecko: after click, visible " + describe(el) + " at " +
+                Math.round(r.left) + "," + Math.round(r.top) + " " +
+                Math.round(r.width) + "x" + Math.round(r.height) +
+                ", inside the fullscreen element " +
+                (fs ? fs.contains(el) : "no fullscreen"));
+        }
+        if (!found) {
+            Services.console.logStringMessage(
+                "gecko: after click, nothing menu-shaped is visible");
+        }
+    };
+
     cw.addEventListener("click", ev => {
         try {
             const doc = ev.target && ev.target.ownerDocument;
+            const inFullscreen = !!(doc && doc.fullscreenElement);
             Services.console.logStringMessage(
                 "gecko: click at " + Math.round(ev.clientX) + "," +
                 Math.round(ev.clientY) + " on " + describe(ev.target) +
-                ", fullscreen " +
-                (doc && doc.fullscreenElement ? "yes" : "no"));
+                ", fullscreen " + (inFullscreen ? "yes" : "no") +
+                (inFullscreen
+                     ? ", fullscreen element " + describe(doc.fullscreenElement)
+                     : ""));
+            if (inFullscreen) {
+                cw.setTimeout(() => {
+                    try {
+                        surveyMenus(doc);
+                    } catch (e2) {
+                        Services.console.logStringMessage(
+                            "gecko: menu survey: " + e2);
+                    }
+                }, 500);
+            }
         } catch (e) {
             Services.console.logStringMessage("gecko: click watch: " + e);
         }
