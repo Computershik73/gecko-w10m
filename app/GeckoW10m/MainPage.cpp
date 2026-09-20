@@ -91,6 +91,50 @@ MainPage::MainPage() {
   }
   Log::Write(L"LocalState", std::wstring(localState));
 
+  // The number every memory question on this platform comes down to. A phone
+  // does not give an app its RAM, it gives it a ceiling set by the device's
+  // class, and past it the app is simply gone. Nobody has read the ceiling on
+  // any of these phones yet, so it goes in the log first, then every half
+  // minute with how much of it is in use, and at once whenever the system
+  // says it is moving.
+  try {
+    using winrt::Windows::System::MemoryManager;
+    const auto mb = [](uint64_t bytes) {
+      return std::to_wstring(bytes / (1024 * 1024)) + L" MB";
+    };
+    Log::Write(L"mem: the app may use " + mb(MemoryManager::AppMemoryUsageLimit()) +
+               L", using " + mb(MemoryManager::AppMemoryUsage()) + L", level " +
+               std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())));
+    MemoryManager::AppMemoryUsageLimitChanging([mb](auto&&, auto&& args) {
+      Log::Write(L"mem: the limit is changing from " + mb(args.OldLimit()) +
+                 L" to " + mb(args.NewLimit()));
+    });
+    MemoryManager::AppMemoryUsageIncreased([mb](auto&&, auto&&) {
+      Log::Write(L"mem: the system says usage went UP a level -- now " +
+                 std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())) +
+                 L" at " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
+                 mb(MemoryManager::AppMemoryUsageLimit()));
+    });
+    MemoryManager::AppMemoryUsageDecreased([mb](auto&&, auto&&) {
+      Log::Write(L"mem: usage went down a level -- now " +
+                 std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())) +
+                 L" at " + mb(MemoryManager::AppMemoryUsage()));
+    });
+    std::thread([mb] {
+      while (true) {
+        ::Sleep(30000);
+        try {
+          Log::Write(L"mem: using " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
+                     mb(MemoryManager::AppMemoryUsageLimit()) + L", level " +
+                     std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())));
+        } catch (...) {
+        }
+      }
+    }).detach();
+  } catch (...) {
+    Log::Write(L"mem: MemoryManager is not available here");
+  }
+
   // Before the engine, before the UI: a fault reported only once Gecko is
   // running looks like Gecko's fault, and there was no way to tell that from
   // something this device does on every launch.

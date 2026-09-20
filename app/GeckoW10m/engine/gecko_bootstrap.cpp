@@ -14,6 +14,7 @@
 //
 // Compiled by clang-cl with exceptions off; see gecko_bootstrap.h for why.
 
+#include <cstdlib>
 #include "gecko_bootstrap.h"
 
 #include <windows.h>
@@ -299,6 +300,18 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   }
   const std::string appIni = Narrow(appIniPath);
   config.appDataPath = appIni.c_str();
+
+  // Gecko's driver crash guard writes "starting D3D11" to the profile before
+  // it tries, and "done" after; a launch that ends between the two is read on
+  // the next one as a graphics crash, and hardware compositing is turned off
+  // for good. On a phone a launch ends between the two whenever the user
+  // gives up on a slow start and kills the app -- which one device log shows
+  // happening twice, followed by "hardware compositing is off -- Crashed
+  // during startup in a previous session" on every launch after. There is no
+  // crash reporter here to tell a kill from a crash, so the guard is off. The
+  // variable is read through the CRT, which the shell and xul share.
+  ::_putenv_s("MOZ_DISABLE_CRASH_GUARD", "1");
+  Log("bootstrap: graphics crash guards are off");
 
   Log("bootstrap: XRE_main with " + appIni);
   int rc = bootstrap->XRE_main(static_cast<int>(argv.size()) - 1, argv.data(),

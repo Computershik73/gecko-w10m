@@ -246,7 +246,12 @@ pref("browser.startup.homepage", "https://google.com");
 // The port's own version, for Settings > About. The engine's version is
 // Firefox's and is displayed beside it.
 pref("gecko.port.version", "$VERSION");
-pref("browser.startup.page", 1);
+// 0: the first tab is blank. Every launch used to begin with google.com,
+// and on a network where it does not answer the handshake sat in front of the
+// whole startup with the browser deaf to taps until it gave up. The home
+// button still goes to the home page above; startup just does not wait for
+// the network. (1 to start on the home page again.)
+pref("browser.startup.page", 0);
 // On a brand new profile Firefox skips the home page on purpose, because it
 // normally shows its onboarding tour instead -- and that is off here, so the
 // first launch after installing landed on about:blank. Do not skip it.

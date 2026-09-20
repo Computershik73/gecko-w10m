@@ -123,6 +123,145 @@ function gecko_fix_homepage() {
     }
 }
 
+
+// Where the startup time goes. The device logs give one minute from
+// XRE_main to the start page on the fastest phone and nothing in between;
+// these are the marks Firefox itself keeps, written out as each is reached.
+function gecko_note_phases() {
+    const t0 = Date.now();
+    const since = () => (Date.now() - t0) + " ms after autoconfig";
+    const mods = () => Cu.loadedESModules.length + " modules";
+    Services.console.logStringMessage(
+        "gecko: phase autoconfig -- " + mods());
+    const mark = topic => {
+        Services.obs.addObserver({
+            observe() {
+                Services.obs.removeObserver(this, topic);
+                Services.console.logStringMessage(
+                    "gecko: phase " + topic + " -- " + since() + ", " + mods());
+            }
+        }, topic);
+    };
+    for (const topic of ["final-ui-startup", "sessionstore-windows-restored",
+                         "browser-delayed-startup-finished",
+                         "browser-idle-startup-tasks-finished"]) {
+        mark(topic);
+    }
+    Services.obs.addObserver({
+        observe() {
+            Services.obs.removeObserver(this, "browser-idle-startup-tasks-finished");
+            try {
+                const info = Services.startup.getStartupInfo();
+                const base = info.process;
+                const rel = k => info[k] ? (info[k] - base) + " ms" : "never";
+                Services.console.logStringMessage(
+                    "gecko: startup timeline from process start: main " +
+                    rel("main") + ", profile " + rel("selectProfile") +
+                    ", profile locked " + rel("afterProfileLocked") +
+                    ", first paint " + rel("firstPaint") +
+                    ", session restored " + rel("sessionRestored"));
+            } catch (e) {
+                Services.console.logStringMessage("gecko: startup timeline: " + e);
+            }
+        }
+    }, "browser-idle-startup-tasks-finished");
+}
+
+// The startup cache holds every chrome script already compiled. Whether it
+// was found, whether it is being used and whether it gets written back is
+// exactly the difference between a two-second launch and a forty-five second
+// one, and no log so far has said which of the two this is.
+function gecko_note_startup_cache(when) {
+    try {
+        const info = Cc["@mozilla.org/startupcacheinfo;1"]
+            .getService(Ci.nsIStartupCacheInfo);
+        let onDisk = "no file";
+        try {
+            const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+            f.initWithPath(info.DiskCachePath);
+            if (f.exists()) {
+                onDisk = Math.round(f.fileSize / 1024) + " KB, written " +
+                    new Date(f.lastModifiedTime).toISOString();
+            }
+        } catch (e2) {
+            onDisk = "unreadable: " + e2;
+        }
+        Services.console.logStringMessage(
+            "gecko: startup cache (" + when + "): found on init " +
+            info.FoundDiskCacheOnInit + ", ignored " + info.IgnoreDiskCache +
+            ", written this run " + info.WroteToDiskCache + ", at " +
+            info.DiskCachePath + " -- " + onDisk);
+    } catch (e) {
+        Services.console.logStringMessage("gecko: startup cache: " + e);
+    }
+}
+
+// What the engine is holding, in its own accounting: resident and virtual
+// size, the heap, the JS heap and decoded images. The shell logs the ceiling
+// the phone imposes; this is what is filling it.
+function gecko_note_memory(when) {
+    try {
+        const mgr = Cc["@mozilla.org/memory-reporter-manager;1"]
+            .getService(Ci.nsIMemoryReporterManager);
+        const mb = v => Math.round(v / 1048576) + " MB";
+        const read = (name) => {
+            try { return mb(mgr[name]); } catch (e) { return "n/a"; }
+        };
+        Services.console.logStringMessage(
+            "gecko: memory (" + when + "): resident " + read("resident") +
+            ", virtual " + read("vsize") + ", heap " + read("heapAllocated") +
+            ", js gc heap " + read("JSMainRuntimeGCHeap") +
+            ", images " + read("imagesContentUsedUncompressed") +
+            ", ghost windows " + (mgr.ghostWindows ?? "?"));
+    } catch (e) {
+        Services.console.logStringMessage("gecko: memory: " + e);
+    }
+}
+
+function gecko_watch_memory() {
+    Services.obs.addObserver({
+        observe() {
+            Services.obs.removeObserver(this, "sessionstore-windows-restored");
+            gecko_note_startup_cache("session restored");
+            gecko_note_memory("session restored");
+            // The cache is written a few seconds after the last script lands
+            // in it; one more look says whether it got there.
+            setTimeout(() => gecko_note_startup_cache("30 s later"), 30000);
+            setInterval(() => gecko_note_memory("periodic"), 60000);
+        }
+    }, "sessionstore-windows-restored");
+    Services.obs.addObserver({
+        observe(subject, topic, data) {
+            Services.console.logStringMessage(
+                "gecko: memory-pressure (" + data + ")");
+            gecko_note_memory("under pressure");
+        }
+    }, "memory-pressure");
+}
+
+// The guard that turned one phone's hardware compositing off for good after
+// its user killed a slow launch. The shell now switches the guards off
+// through the environment; the verdicts they left behind are cleared here so
+// that phone gets its hardware back, and both facts are written down.
+function gecko_reset_crash_guards() {
+    try {
+        const env = Services.env.get("MOZ_DISABLE_CRASH_GUARD");
+        const branch = "gfx.crash-guard.";
+        const left = Services.prefs.getChildList(branch)
+            .filter(p => Services.prefs.prefHasUserValue(p))
+            .map(p => p + "=" + Services.prefs.getIntPref(p, -1));
+        Services.console.logStringMessage(
+            "gecko: crash guards: MOZ_DISABLE_CRASH_GUARD=" +
+            JSON.stringify(env) + ", verdicts on record: " +
+            (left.length ? left.join(" ") : "none"));
+        for (const p of Services.prefs.getChildList(branch)) {
+            Services.prefs.clearUserPref(p);
+        }
+    } catch (e) {
+        Services.console.logStringMessage("gecko: crash guards: " + e);
+    }
+}
+
 // And a line in the log saying what the browser will actually open, so a
 // start page that is not what was asked for can be read off a device log.
 function gecko_note_startup() {
@@ -791,20 +930,34 @@ function gecko_watch_fullscreen() {
 }
 
 try {
+    gecko_note_phases();
     gecko_fix_homepage();
     gecko_note_startup();
+    gecko_reset_crash_guards();
+    gecko_watch_memory();
     gecko_watch_fullscreen();
     gecko_h264ify();
     gecko_watch_tabs();
     delete_old_mcf_files();
 
-    // Firefox is caching some files to make the startup time faster. We need to
-    // clear the startup cache for the changes in boot.sys.mjs to take effect.
-    //
-    // TODO:
-    // - Find a solution to only trigger a cache clearing when the source files
-    //   have changed.
-    Services.appinfo.invalidateCachesOnRestart();
+    // Upstream clears the startup cache on every launch, so that edits to
+    // boot.sys.mjs take effect on a development machine. Here nothing under
+    // the package can change between launches -- only a new package can
+    // change it -- so the cache is cleared once per package version and kept
+    // otherwise. Cleared every time, every launch recompiled every chrome
+    // script from source.
+    const built = Services.prefs.getStringPref("gecko.port.version", "?");
+    const cached = Services.prefs.getStringPref("gecko.cache.builtFor", "");
+    if (cached !== built) {
+        Services.appinfo.invalidateCachesOnRestart();
+        Services.prefs.setStringPref("gecko.cache.builtFor", built);
+        Services.console.logStringMessage(
+            "gecko: startup cache will be rebuilt: package " + built +
+            ", cache was for " + (cached || "nothing"));
+    } else {
+        Services.console.logStringMessage(
+            "gecko: startup cache kept for package " + built);
+    }
 
     // nsIFile of chrome.manifest, so it can be consumed by autoRegister below.
     const chromeManifest = find_chrome_manifest();
