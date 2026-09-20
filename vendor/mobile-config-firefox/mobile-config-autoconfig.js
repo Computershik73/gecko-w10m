@@ -296,8 +296,11 @@ function gecko_note_memory_top(when) {
         const rows = [];
         const handle = {
             callback(process, path, kind, units, amount) {
+                // The explicit tree is what is allocated on purpose; the
+                // address-space and vsize reports beside it only said how
+                // much, never of what.
                 if (units === Ci.nsIMemoryReporter.UNITS_BYTES &&
-                    amount >= 2 * 1048576 && !path.startsWith("resident")) {
+                    amount >= 2 * 1048576 && path.startsWith("explicit/")) {
                     rows.push([path, amount]);
                 }
             }
@@ -305,10 +308,17 @@ function gecko_note_memory_top(when) {
         const finish = {
             callback() {
                 rows.sort((a, b) => b[1] - a[1]);
-                const lines = rows.slice(0, 30).map(
-                    r => Math.round(r[1] / 1048576) + " MB  " + r[0]);
+                // One line each: the device log keeps a line to about a
+                // kilobyte, and a single message with thirty of them was cut
+                // off after ten.
                 Services.console.logStringMessage(
-                    "gecko: memory top (" + when + "):\n" + lines.join("\n"));
+                    "gecko: memory top (" + when + "), " + rows.length +
+                    " explicit entries over 2 MB:");
+                for (const r of rows.slice(0, 30)) {
+                    Services.console.logStringMessage(
+                        "gecko: memory top: " + Math.round(r[1] / 1048576) +
+                        " MB  " + r[0]);
+                }
             }
         };
         mgr.getReports(handle, null, finish, null, false);

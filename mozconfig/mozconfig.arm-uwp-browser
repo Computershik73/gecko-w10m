@@ -136,6 +136,14 @@ ac_add_options --disable-updater
 # such a port exists.)
 ac_add_options --disable-ctypes
 
+# No printing: there is no spooler in the app container (WINSPOOL.DRV is
+# "absent entirely" in the delay-load log) and no printer on a phone. No
+# Web Speech: neither synthesis nor recognition has a backend here.
+# WebRTC stays -- Discord Web needs it, and the camera and microphone are
+# coming.
+ac_add_options --disable-printing
+ac_add_options --disable-webspeech
+
 # The crash reporter is a separate GUI process that the app container cannot
 # spawn, its WER runtime-exception module is a desktop-only facility, and its
 # Rust client cannot even build (the manifest-embedding crate does not know

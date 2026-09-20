@@ -323,6 +323,17 @@ pref("layout.css.report_errors", false);
 // the app being ended, which is how every session ends here.
 pref("browser.sessionstore.interval", 10000);
 
+// Local ML models -- translation, alt text, the chat sidebar -- are not
+// something this phone will run, and the inference runtime is not shipped.
+pref("browser.ml.enable", false);
+pref("browser.ml.chat.enabled", false);
+pref("browser.ml.linkPreview.enabled", false);
+// Breach alerts and the trust panel that shows them: the Rust store behind
+// them fails to open its file in the container on every start ("Access is
+// denied" from RustBreachAlerts) and nothing here needs them.
+pref("signon.management.page.breach-alerts.enabled", false);
+pref("browser.urlbar.trustPanel.featureGate", false);
+
 // No HTTP/3: QUIC over UDP on this phone's stack is an unknown, and a stuck
 // QUIC attempt looks exactly like a page that never loads.
 pref("network.http.http3.enable", false);
