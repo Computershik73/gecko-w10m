@@ -13,7 +13,32 @@ export VC_PATH='C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tool
 export PATH="/c/Users/User/.cargo/bin:/c/Program Files/nodejs:/c/Program Files/LLVM/bin:/c/mozilla-build/python3:/c/mozilla-build/python3/Scripts:/c/mozilla-build/bin:/c/mozilla-build/msys2/usr/bin:$PATH"
 cd /c/Users/User/Documents/GitHub/gecko-w10m/engine/firefox
 export MOZCONFIG=/c/Users/User/Documents/GitHub/gecko-w10m/mozconfig/mozconfig.arm-uwp-browser
-echo "=== browser BUILD start $(date) ==="
+# The build id is the clock at build time unless MOZ_BUILD_DATE says
+# otherwise, and it goes into compatibility.ini in the profile: a new id
+# purges every cache the previous version built. So a package that changed
+# only the shell threw away the caches too, and a startup cache captured
+# on one package could never ship in the next. The id is now the newest
+# modification time among the engine's changed and untracked sources, so
+# it moves when the engine moves and stays when it does not.
+export MOZ_BUILD_DATE="$(python - <<'PY'
+import os, subprocess, datetime
+root = r"C:\Users\User\Documents\GitHub\gecko-w10m\engine\firefox"
+out = subprocess.run(["git", "-C", root, "ls-files", "-m", "-o", "--exclude-standard", "-z"],
+                     capture_output=True).stdout.decode("utf-8", "replace")
+latest = 0.0
+for rel in out.split("\0"):
+    if not rel:
+        continue
+    try:
+        latest = max(latest, os.stat(os.path.join(root, rel)).st_mtime)
+    except OSError:
+        pass
+if not latest:
+    latest = os.stat(os.path.join(root, "configure.py")).st_mtime
+print(datetime.datetime.fromtimestamp(latest).strftime("%Y%m%d%H%M%S"))
+PY
+)"
+echo "=== browser BUILD start $(date), MOZ_BUILD_DATE=$MOZ_BUILD_DATE ==="
 # 16 logical CPUs / 31 GB RAM: use most of the machine but leave headroom
 # so it stays usable and the build does not page itself to death.
 export CARGO_BUILD_JOBS=8

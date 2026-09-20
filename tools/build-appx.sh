@@ -328,6 +328,10 @@ pref("browser.sessionstore.interval", 10000);
 pref("browser.ml.enable", false);
 pref("browser.ml.chat.enabled", false);
 pref("browser.ml.linkPreview.enabled", false);
+// Quarter-size shared texture-cache pages: 4 MB each instead of 16. See the
+// pref's entry in StaticPrefList.yaml.
+pref("gfx.webrender.texture-cache.small", true);
+
 // The intermediate-certificate preload and CRLite revocation filters: a
 // 15 MB store loaded at every start (explicit/cert-storage/storage) and
 // refreshed from Remote Settings, which this build does not reach anyway.
@@ -482,6 +486,28 @@ pref("gfx.canvas.accelerated.force-enabled", true);
 PREFS
     echo "    app default preferences staged"
   fi
+  # A startup cache captured on a device (app/GeckoW10m/seed/, untracked):
+  # scriptCache.bin, urlCache.bin, startupCache.4.little and the profile's
+  # compatibility.ini from the run that made them. The shell copies them
+  # into a brand-new profile, so the first launch after installing starts
+  # the way a second launch does. Compiled chrome is only valid for the
+  # engine build that compiled it, so the seed ships only when its build id
+  # is this package's; otherwise it is left out and said so.
+  SEED="$APP/seed"
+  if [ -f "$SEED/compatibility.ini" ]; then
+    seed_id=$(grep -o "LastVersion=[^/]*" "$SEED/compatibility.ini" | sed 's/.*_//')
+    our_id=$(grep -o "^BuildID=.*" "$STAGE/browser/application.ini" | cut -d= -f2 | tr -d '\r')
+    if [ -n "$seed_id" ] && [ "$seed_id" = "$our_id" ]; then
+      mkdir -p "$STAGE/seed"
+      for f in compatibility.ini scriptCache.bin urlCache.bin startupCache.4.little; do
+        [ -f "$SEED/$f" ] && cp "$SEED/$f" "$STAGE/seed/$f"
+      done
+      echo "    startup cache seed staged (build $our_id): $(ls "$STAGE/seed" | tr '\n' ' ')"
+    else
+      echo "    startup cache seed NOT staged: it is for build ${seed_id:-?}, this is $our_id" >&2
+    fi
+  fi
+
   # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
   # guard dispatcher reaches its target with bx, and an entry recorded without
   # the Thumb bit lands there in ARM state, where the first honest Thumb

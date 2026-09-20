@@ -5,6 +5,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Display.h>
+#include <winrt/Windows.System.Diagnostics.h>
 
 #include <thread>
 
@@ -132,13 +133,45 @@ MainPage::MainPage() {
                  std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())) +
                  L" at " + mb(MemoryManager::AppMemoryUsage()));
     });
+    // Every ten seconds for the first two minutes, then every thirty: the
+    // app's own usage, and beside it what the whole phone is doing -- CPU
+    // busy since the last sample, memory free. A launch that took seventy
+    // seconds with the engine thread barely using any CPU was waiting on
+    // something outside the process, and this is the only view of outside
+    // an app gets.
     std::thread([mb] {
+      using namespace winrt::Windows::System::Diagnostics;
+      const ULONGLONG started = ::GetTickCount64();
+      long long lastBusy = 0, lastIdle = 0;
       while (true) {
-        ::Sleep(30000);
+        ::Sleep(::GetTickCount64() - started < 120000 ? 10000 : 30000);
         try {
-          Log::Write(L"mem: using " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
-                     mb(MemoryManager::AppMemoryUsageLimit()) + L", level " +
-                     std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())));
+          std::wstring line = L"mem: using " + mb(MemoryManager::AppMemoryUsage()) +
+                              L" of " + mb(MemoryManager::AppMemoryUsageLimit()) +
+                              L", level " +
+                              std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel()));
+          try {
+            auto sys = SystemDiagnosticInfo::GetForCurrentSystem();
+            auto cpu = sys.CpuUsage().GetReport();
+            const long long busy = cpu.KernelTime().count() + cpu.UserTime().count();
+            const long long idle = cpu.IdleTime().count();
+            if (lastBusy || lastIdle) {
+              const long long dBusy = busy - lastBusy, dIdle = idle - lastIdle;
+              if (dBusy + dIdle > 0) {
+                line += L"; phone cpu " + std::to_wstring(dBusy * 100 / (dBusy + dIdle)) +
+                        L"% busy";
+              }
+            }
+            lastBusy = busy;
+            lastIdle = idle;
+            auto m = sys.MemoryUsage().GetReport();
+            line += L", phone memory " + mb(m.AvailableSizeInBytes()) + L" free of " +
+                    mb(m.TotalPhysicalSizeInBytes()) + L", committed " +
+                    mb(m.CommittedSizeInBytes());
+          } catch (...) {
+            line += L"; phone stats unavailable";
+          }
+          Log::Write(line);
         } catch (...) {
         }
       }

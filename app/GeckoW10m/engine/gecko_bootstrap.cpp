@@ -133,6 +133,82 @@ void WriteProfileFile(const std::wstring& path, const std::string& body) {
   ::CloseHandle(file);
 }
 
+// A brand-new profile gets the caches a previous run captured, if the
+// package carries them (seed/ next to the engine; see tools/build-appx.sh).
+// Gecko keeps the caches only while the profile's compatibility.ini names
+// this exact build and install directory, so the shipped file is rewritten
+// with the directories this phone actually installed to. Anything wrong
+// with the seed -- a different build, a corrupt file -- makes Gecko purge
+// and rebuild it, which is where a new profile started anyway.
+void SeedProfileCaches(const std::wstring& install,
+                       const std::wstring& profile) {
+  const std::wstring compat = profile + L"\\compatibility.ini";
+  if (::GetFileAttributesW(compat.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    return;  // not a new profile
+  }
+  const std::wstring seed = install + L"\\seed";
+  const std::wstring seedCompat = seed + L"\\compatibility.ini";
+  if (::GetFileAttributesW(seedCompat.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    Log("seed: the package carries no startup cache");
+    return;
+  }
+  std::string body;
+  {
+    CREATEFILE2_EXTENDED_PARAMETERS params{};
+    params.dwSize = sizeof(params);
+    params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    HANDLE f = ::CreateFile2(seedCompat.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                             OPEN_EXISTING, &params);
+    if (f == INVALID_HANDLE_VALUE) {
+      Log("seed: could not read the seed's compatibility.ini");
+      return;
+    }
+    char buf[4096];
+    DWORD got = 0;
+    while (::ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) {
+      body.append(buf, got);
+    }
+    ::CloseHandle(f);
+  }
+  // Rewrite the two directory lines for this installation.
+  std::string out;
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos) end = body.size();
+    std::string line = body.substr(pos, end - pos);
+    while (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("LastPlatformDir=", 0) == 0) {
+      line = "LastPlatformDir=" + Narrow(install);
+    } else if (line.rfind("LastAppDir=", 0) == 0) {
+      line = "LastAppDir=" + Narrow(install + L"\\browser");
+    }
+    out += line + "\r\n";
+    pos = end + 1;
+  }
+  const std::wstring cacheDir = profile + L"\\startupCache";
+  ::CreateDirectoryW(cacheDir.c_str(), nullptr);
+  int copied = 0;
+  for (const wchar_t* name :
+       {L"scriptCache.bin", L"urlCache.bin", L"startupCache.4.little"}) {
+    const std::wstring from = seed + L"\\" + name;
+    const std::wstring to = cacheDir + L"\\" + name;
+    if (::GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      continue;
+    }
+    COPYFILE2_EXTENDED_PARAMETERS cp{};
+    cp.dwSize = sizeof(cp);
+    if (SUCCEEDED(::CopyFile2(from.c_str(), to.c_str(), &cp))) {
+      ++copied;
+    } else {
+      Log(std::string("seed: could not copy ") + Narrow(name));
+    }
+  }
+  WriteProfileFile(compat, out);
+  Log("seed: a new profile, seeded with " + std::to_string(copied) +
+      " cache files and a compatibility.ini for " + Narrow(install));
+}
+
 void PrepareProfile(const std::wstring& profile, int width, int height,
                     double scale) {
   if (width <= 0 || height <= 0) {
@@ -231,6 +307,7 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   const mozilla::TimeStamp startedAt = mozilla::TimeStamp::Now();
 
   PrepareProfile(profile, width, height, scale);
+  SeedProfileCaches(install, profile);
 
   Log("bootstrap: loading xul.dll");
   HMODULE xul = ::LoadPackagedLibrary(L"xul.dll", 0);
