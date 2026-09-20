@@ -422,6 +422,27 @@ function gecko_watch_clicks(cw) {
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
             if (inFullscreen) {
+                // Everything at that point, topmost first. If a control does
+                // nothing, what sits over it is the first thing to know.
+                try {
+                    const stack = doc.elementsFromPoint(ev.clientX, ev.clientY);
+                    const win = doc.defaultView;
+                    const parts = [];
+                    for (const el of stack.slice(0, 6)) {
+                        const st = win.getComputedStyle(el);
+                        parts.push(describe(el) + " (" + st.position + ", z=" +
+                                   st.zIndex + ", pointer-events=" +
+                                   st.pointerEvents + ")");
+                    }
+                    Services.console.logStringMessage(
+                        "gecko: stack at " + Math.round(ev.clientX) + "," +
+                        Math.round(ev.clientY) + ", topmost first: " +
+                        parts.join(" | "));
+                } catch (e6) {
+                    Services.console.logStringMessage(
+                        "gecko: stack: " + e6);
+                }
+
                 const before = snapshot(doc);
 
                 // Does the handler run at all? The button carries no aria
