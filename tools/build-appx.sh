@@ -332,6 +332,19 @@ pref("media.sanity-test.disabled", true);
 // Firefox ships with.
 pref("gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
 
+// Fingerprinting protection, minus the part that lies about the screen.
+//
+// The console says it plainly on every YouTube load: "Fingerprinting
+// Protection is altering screen.availWidth and screen.availHeight". A video
+// player works out which controls to build by comparing the window it has
+// against the screen it thinks exists, and in fullscreen the settings menu is
+// the one piece of that decision that comes out wrong here -- the click lands
+// on the gear and the page builds nothing at all. ScreenRect, ScreenAvailRect
+// and WindowOuterSize are the three it alters; the rest of the protection
+// stays on.
+pref("privacy.fingerprintingProtection.overrides",
+     "-ScreenRect,-ScreenAvailRect,-WindowOuterSize");
+
 // One hardware-decoded video at a time. The pre-roll ad on vkvideo.ru is a
 // second <video> with a decoder of its own, and 16 ms after the second DXVA
 // session was configured the Adreno's D3D11 driver went into an endless
