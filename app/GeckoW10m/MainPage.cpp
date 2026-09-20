@@ -56,6 +56,7 @@ MainPage::MainPage() {
 
   auto localState = ApplicationData::Current().LocalFolder().Path();
   Log::Init(std::wstring(localState));
+  Log::Write(L"boot: MainPage constructor entered");
   {
     auto v = winrt::Windows::ApplicationModel::Package::Current().Id().Version();
     std::wstring line = L"shell starting, version " + std::to_wstring(v.Major) +

@@ -25,6 +25,18 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
   std::shared_ptr<MainPage> page_;
 
   App() {
+    // The log first, before anything that could throw. On Windows 10 Mobile
+    // 1511 the app closed at once and left no trace: the constructor below
+    // asked for an event this OS does not have, the exception had nobody to
+    // catch it, and the first log line was still a page away in MainPage.
+    // Every step of the constructor is a line now, and each optional API is
+    // its own try.
+    try {
+      client::Log::Init(std::wstring(
+          winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
+      client::Log::Write(L"boot: App constructor entered");
+    } catch (...) {
+    }
     // Warm the disk cache with the engine before the loader asks for it.
     // A cold launch on a phone was sixty seconds before the first chrome
     // manifest was even read, against two seconds warm: the loader brings a
@@ -73,11 +85,16 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     // the only place that is visible, and neither leaves a trace in the Win32
     // handlers -- which is why an entire crash could look like a fault in
     // CoreUIComponents that the process then happily survived.
+    try {
     UnhandledException([](auto const&, UnhandledExceptionEventArgs const& e) {
       client::Log::Write(L"FATAL: XAML unhandled exception",
                          std::wstring(e.Message()));
     });
 
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: UnhandledException unavailable", std::wstring(e.message()));
+    }
+    try {
     CoreApplication::UnhandledErrorDetected(
         [](auto const&, UnhandledErrorDetectedEventArgs const& e) {
           // Propagating it is what turns the error back into an exception this
@@ -98,6 +115,11 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     // are used: the engine is told, chrome script flushes what Firefox
     // normally saves on the shutdown that never comes here, and the deferral
     // is held for as long as the system allows before it is completed.
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: UnhandledErrorDetected unavailable", std::wstring(e.message()));
+    }
+    client::Log::Write(L"boot: error handlers installed");
+    try {
     Suspending([](auto const&, SuspendingEventArgs const& args) {
       client::Log::Write(L"app: suspending -- telling the engine, holding "
                          L"the deferral");
@@ -127,10 +149,18 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     // again. When the system says the app is going, the process goes with it
     // rather than lingering with the engine still painting into a window
     // nobody will ever see.
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: Suspending unavailable", std::wstring(e.message()));
+    }
+    try {
     CoreApplication::Exiting([](auto const&, auto const&) {
       client::Log::Write(L"app: exiting");
       ::TerminateProcess(::GetCurrentProcess(), 0);
     });
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: Exiting unavailable", std::wstring(e.message()));
+    }
+    try {
     Resuming([](auto const&, auto const&) {
       client::Log::Write(L"app: resuming");
       if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
@@ -146,14 +176,28 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     // client -- the thing the shell talks to when it switches what is in
     // front. So the shell is switching away from us, and these are the ways an
     // app is told that. None has been on the record.
-    CoreApplication::EnteredBackground([](auto const&, auto const&) {
-      client::Log::Write(L"app: ENTERED the background -- the shell put "
-                         L"something else in front");
-      client::Log::FlushFromFault();
-    });
-    CoreApplication::LeavingBackground([](auto const&, auto const&) {
-      client::Log::Write(L"app: leaving the background");
-    });
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: Resuming unavailable", std::wstring(e.message()));
+    }
+    client::Log::Write(L"boot: lifecycle handlers installed");
+    // EnteredBackground and LeavingBackground arrived with Windows 10 1607
+    // (ICoreApplication2). On 1511 asking for them throws E_NOINTERFACE,
+    // which is what closed the app on the Lumia 650 before it drew anything.
+    try {
+      CoreApplication::EnteredBackground([](auto const&, auto const&) {
+        client::Log::Write(L"app: ENTERED the background -- the shell put "
+                           L"something else in front");
+        client::Log::FlushFromFault();
+      });
+      CoreApplication::LeavingBackground([](auto const&, auto const&) {
+        client::Log::Write(L"app: leaving the background");
+      });
+    } catch (winrt::hresult_error const& e) {
+      client::Log::Write(L"boot: no background events on this OS",
+                         std::wstring(e.message()));
+    }
+    client::Log::Write(L"boot: App constructor done");
+    client::Log::FlushFromFault();
   }
 
   void OnLaunched(LaunchActivatedEventArgs const& args) {
