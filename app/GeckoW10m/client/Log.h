@@ -48,6 +48,13 @@ class Log {
 
   // Full path of the log file, or empty if Init has not run.
   static std::wstring Path();
+  // Copies the logs into Pictures\Gecko logs. LocalState cannot be reached
+  // from outside on a phone whose Device Portal has no file explorer
+  // (Windows 10 Mobile 1511), but the Pictures library is what every phone
+  // shows over USB. Called at launch -- so the previous run's ending is
+  // there even if this one dies at once -- and on suspend. Blocking; call
+  // it off the UI thread.
+  static void Mirror();
 };
 
 }  // namespace gecko_w10m::client

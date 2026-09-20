@@ -114,7 +114,8 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
         // Time for prefs, the session file and the startup cache to reach
         // the disk. The system's deadline on a phone is about five seconds;
         // half is spent, the rest is margin.
-        ::Sleep(2500);
+        ::Sleep(2000);
+        client::Log::Mirror();
         client::Log::Write(L"app: suspend deferral completed");
         client::Log::FlushFromFault();
         deferral.Complete();

@@ -1,4 +1,7 @@
 // Log.cpp
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.h>
 #include "pch.h"
 #include "Log.h"
 
@@ -37,6 +40,45 @@ std::string ToUtf8(std::wstring_view s) {
 }
 
 }  // namespace
+
+void Log::Mirror() {
+  try {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+  } catch (...) {
+  }
+  try {
+    using namespace winrt::Windows::Storage;
+    FlushFromFault();
+    auto folder = KnownFolders::PicturesLibrary()
+                      .CreateFolderAsync(L"Gecko logs",
+                                         CreationCollisionOption::OpenIfExists)
+                      .get();
+    const std::wstring dir = g_path.substr(0, g_path.rfind(L'\\') + 1);
+    const wchar_t* names[] = {L"gecko.log",
+                              L"profile\\gecko-notes.log",
+                              L"profile\\delay-load-used.log",
+                              L"profile\\gecko-stderr.log",
+                              L"profile\\gecko-moz.log"};
+    int copied = 0;
+    for (const wchar_t* name : names) {
+      const std::wstring full = dir + name;
+      if (::GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        continue;
+      }
+      std::wstring leaf(name);
+      leaf = leaf.substr(leaf.rfind(L'\\') + 1);
+      auto file = StorageFile::GetFileFromPathAsync(full).get();
+      file.CopyAsync(folder, leaf, NameCollisionOption::ReplaceExisting).get();
+      ++copied;
+    }
+    Write(L"mirror: " + std::to_wstring(copied) +
+          L" logs copied to Pictures\\Gecko logs");
+  } catch (winrt::hresult_error const& e) {
+    Write(L"mirror: failed", std::wstring(e.message()));
+  } catch (...) {
+    Write(L"mirror: failed");
+  }
+}
 
 void Log::Init(std::wstring_view localStatePath) {
   std::lock_guard<std::mutex> lock(g_mutex);

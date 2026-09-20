@@ -35,7 +35,7 @@
   <Identity
       Name="Gecko"
       Publisher="CN=Computershik"
-      Version="155.13.1.53"
+      Version="155.13.2.54"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -135,6 +135,7 @@
     <Capability Name="internetClientServer" />
     <Capability Name="privateNetworkClientServer" />
     <uap:Capability Name="removableStorage" />
+    <uap:Capability Name="picturesLibrary" />
 
     <!-- JIT. The whole reason a real Gecko engine can run here. -->
     <rescap:Capability Name="codeGeneration" />

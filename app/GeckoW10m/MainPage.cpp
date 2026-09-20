@@ -91,6 +91,7 @@ MainPage::MainPage() {
     Log::Write(line);
   }
   Log::Write(L"LocalState", std::wstring(localState));
+  std::thread([] { Log::Mirror(); }).detach();
 
   // The number every memory question on this platform comes down to. A phone
   // does not give an app its RAM, it gives it a ceiling set by the device's
