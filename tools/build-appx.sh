@@ -302,6 +302,9 @@ pref("browser.startup.upgradeDialog.enabled", false);
 //
 // Decoded images kept around: 128 MB, not two gigabytes.
 pref("image.mem.surfacecache.max_size_kb", 131072);
+// Pages kept alive for back/forward: two, not a count worked out from the
+// RAM present. Each one is a whole document held in memory.
+pref("browser.sessionhistory.max_total_viewers", 2);
 // The in-memory network cache: 16 MB, not sized from the RAM present.
 pref("browser.cache.memory.capacity", 16384);
 // The JS nursery: 16 MB, not 64.

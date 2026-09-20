@@ -178,6 +178,10 @@ function gecko_watch_app_state() {
                 "gecko: background -- flushed " + done.join(", ") + " in " +
                 (Date.now() - t0) + " ms");
             gecko_note_memory("going to the background");
+            if (!gecko_watch_app_state.dumped) {
+                gecko_watch_app_state.dumped = true;
+                gecko_note_memory_top("first time in the background");
+            }
         }
     }, "application-background");
     Services.obs.addObserver({
@@ -281,6 +285,38 @@ function gecko_note_memory(when) {
     }
 }
 
+// The largest things in memory, by the engine's own reports -- the same
+// tree about:memory shows, reduced to the thirty entries that matter. The
+// totals said 350 MB with a blank tab and 850 MB on YouTube; this says of
+// what.
+function gecko_note_memory_top(when) {
+    try {
+        const mgr = Cc["@mozilla.org/memory-reporter-manager;1"]
+            .getService(Ci.nsIMemoryReporterManager);
+        const rows = [];
+        const handle = {
+            callback(process, path, kind, units, amount) {
+                if (units === Ci.nsIMemoryReporter.UNITS_BYTES &&
+                    amount >= 2 * 1048576 && !path.startsWith("resident")) {
+                    rows.push([path, amount]);
+                }
+            }
+        };
+        const finish = {
+            callback() {
+                rows.sort((a, b) => b[1] - a[1]);
+                const lines = rows.slice(0, 30).map(
+                    r => Math.round(r[1] / 1048576) + " MB  " + r[0]);
+                Services.console.logStringMessage(
+                    "gecko: memory top (" + when + "):\n" + lines.join("\n"));
+            }
+        };
+        mgr.getReports(handle, null, finish, null, false);
+    } catch (e) {
+        Services.console.logStringMessage("gecko: memory top: " + e);
+    }
+}
+
 function gecko_watch_memory() {
     Services.obs.addObserver({
         observe() {
@@ -291,6 +327,7 @@ function gecko_watch_memory() {
             // in it; one more look says whether it got there.
             gecko_after(30000, () => gecko_note_startup_cache("30 s later"));
             gecko_after(60000, () => gecko_note_memory("periodic"), true);
+            gecko_after(45000, () => gecko_note_memory_top("45 s after start"));
         }
     }, "sessionstore-windows-restored");
     Services.obs.addObserver({
