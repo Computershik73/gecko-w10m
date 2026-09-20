@@ -422,29 +422,53 @@ function gecko_watch_clicks(cw) {
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
             if (inFullscreen) {
-                const btn = ev.target && ev.target.closest
-                    ? ev.target.closest("button,[role=button]")
-                    : null;
-                const stateOf = el => !el ? "none" :
-                    "expanded=" + el.getAttribute("aria-expanded") +
-                    " pressed=" + el.getAttribute("aria-pressed") +
-                    " class=" + (typeof el.className === "string"
-                                     ? el.className.slice(0, 60) : "?");
-                const wasState = stateOf(btn);
                 const before = snapshot(doc);
+
+                // Does the handler run at all? The button carries no aria
+                // state to read, so watch the document instead: if anything
+                // the press set in motion touches the page, it shows up here.
+                let changes = 0;
+                const samples = [];
+                let observer = null;
+                try {
+                    observer = new cw.MutationObserver(records => {
+                        for (const rec of records) {
+                            changes++;
+                            if (samples.length < 6) {
+                                samples.push(
+                                    rec.type === "attributes"
+                                        ? describe(rec.target) + " @" +
+                                          rec.attributeName
+                                        : describe(rec.target) + " +" +
+                                          rec.addedNodes.length + "/-" +
+                                          rec.removedNodes.length);
+                            }
+                        }
+                    });
+                    observer.observe(doc, {
+                        childList: true,
+                        subtree: true,
+                        attributes: true,
+                        characterData: false,
+                    });
+                } catch (e4) {
+                    Services.console.logStringMessage(
+                        "gecko: mutation watch: " + e4);
+                }
                 cw.setTimeout(() => {
                     try {
-                        const now = stateOf(btn);
+                        if (observer) {
+                            observer.disconnect();
+                        }
                         Services.console.logStringMessage(
-                            "gecko: button " + describe(btn) +
-                            (now === wasState
-                                 ? " unchanged (" + now + ")"
-                                 : " changed: " + wasState + " -> " + now));
-                    } catch (e3) {
+                            "gecko: page made " + changes +
+                            " changes after the click" +
+                            (samples.length ? ": " + samples.join("; ") : ""));
+                    } catch (e5) {
                         Services.console.logStringMessage(
-                            "gecko: button state: " + e3);
+                            "gecko: mutation report: " + e5);
                     }
-                }, 600);
+                }, 1000);
                 cw.setTimeout(() => {
                     try {
                         surveyMenus(doc, before);
