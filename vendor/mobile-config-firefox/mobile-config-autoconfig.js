@@ -1027,23 +1027,13 @@ try {
     delete_old_mcf_files();
 
     // Upstream clears the startup cache on every launch, so that edits to
-    // boot.sys.mjs take effect on a development machine. Here nothing under
-    // the package can change between launches -- only a new package can
-    // change it -- so the cache is cleared once per package version and kept
-    // otherwise. Cleared every time, every launch recompiled every chrome
-    // script from source.
-    const built = Services.prefs.getStringPref("gecko.port.version", "?");
-    const cached = Services.prefs.getStringPref("gecko.cache.builtFor", "");
-    if (cached !== built) {
-        Services.appinfo.invalidateCachesOnRestart();
-        Services.prefs.setStringPref("gecko.cache.builtFor", built);
-        Services.console.logStringMessage(
-            "gecko: startup cache will be rebuilt: package " + built +
-            ", cache was for " + (cached || "nothing"));
-    } else {
-        Services.console.logStringMessage(
-            "gecko: startup cache kept for package " + built);
-    }
+    // boot.sys.mjs take effect on a development machine. Nothing is cleared
+    // here at all: Gecko compares the platform and app directories recorded
+    // in compatibility.ini with the current ones, and a new package has a
+    // new directory, so it purges on its own the first time a version runs.
+    // Asking for a purge "on restart" as well threw away the cache the
+    // first launch had just built -- the second launch of every version
+    // reported "version same, caches PURGED" and compiled everything again.
 
     // nsIFile of chrome.manifest, so it can be consumed by autoRegister below.
     const chromeManifest = find_chrome_manifest();

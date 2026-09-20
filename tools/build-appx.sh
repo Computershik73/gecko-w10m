@@ -328,6 +328,14 @@ pref("browser.sessionstore.interval", 10000);
 pref("browser.ml.enable", false);
 pref("browser.ml.chat.enabled", false);
 pref("browser.ml.linkPreview.enabled", false);
+// The intermediate-certificate preload and CRLite revocation filters: a
+// 15 MB store loaded at every start (explicit/cert-storage/storage) and
+// refreshed from Remote Settings, which this build does not reach anyway.
+// Certificates are still verified; the chain is fetched from the site (AIA)
+// and revocation falls back to OCSP as it did before CRLite.
+pref("security.remote_settings.intermediates.enabled", false);
+pref("security.remote_settings.crlite_filters.enabled", false);
+pref("security.pki.crlite_mode", 0);
 // Breach alerts and the trust panel that shows them: the Rust store behind
 // them fails to open its file in the container on every start ("Access is
 // denied" from RustBreachAlerts) and nothing here needs them.
