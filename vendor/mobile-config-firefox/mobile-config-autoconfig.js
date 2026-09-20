@@ -333,9 +333,20 @@ function gecko_h264ify() {
     const matches = host =>
         hosts.some(h => host === h || host.endsWith("." + h));
 
-    Services.obs.addObserver({
-        observe(subject) {
-            let win = subject;
+    const INJECTED = new WeakSet();
+
+    const observer = {
+        observe(subject, topic) {
+            // document-element-inserted hands over the document, the other
+            // hands over the window. Both land before any script in the page
+            // runs; the difference is that by the first one there is a root
+            // element, so anything the injected code wants to say about
+            // itself has somewhere to go.
+            let win = topic === "document-element-inserted"
+                ? (subject && subject.defaultView) : subject;
+            if (!win || INJECTED.has(win)) {
+                return;
+            }
             let host;
             try {
                 host = win.location.hostname.toLowerCase();
@@ -345,11 +356,16 @@ function gecko_h264ify() {
             if (!matches(host)) {
                 return;
             }
+            if (!win.document || !win.document.documentElement) {
+                // The other notification will come with a root element.
+                return;
+            }
+            INJECTED.add(win);
             try {
                 // A sandbox whose prototype is the window, with no Xrays, is
                 // the page's own scope: what it assigns lands on the objects
-                // the page's scripts will look at. "content-document-global-
-                // created" is early enough that they have not run yet.
+                // the page's scripts will look at, and both notifications
+                // are early enough that none of them have run.
                 const sandbox = Cu.Sandbox(win, {
                     sandboxPrototype: win,
                     wantXrays: false,
@@ -363,7 +379,9 @@ function gecko_h264ify() {
                     "gecko: h264ify failed on " + host + ": " + e);
             }
         }
-    }, "content-document-global-created");
+    };
+    Services.obs.addObserver(observer, "content-document-global-created");
+    Services.obs.addObserver(observer, "document-element-inserted");
 }
 
 // What a tap actually lands on. Every control in the fullscreen player answers
@@ -489,6 +507,20 @@ function gecko_watch_clicks(cw) {
                 (inFullscreen
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
+            try {
+                const page = Cu.waiveXrays(doc.defaultView);
+                const fn = page.EventTarget.prototype.addEventListener;
+                Services.console.logStringMessage(
+                    "gecko: the page's addEventListener is " +
+                    (fn && fn.name ? fn.name : "unnamed") +
+                    (String(fn).includes("[native code]")
+                        ? " (native, our patch is not there)"
+                        : " (patched)"));
+            } catch (e9) {
+                Services.console.logStringMessage(
+                    "gecko: could not look at addEventListener: " + e9);
+            }
+
             try {
                 const said =
                     doc.documentElement.getAttribute("data-gecko-probe");
