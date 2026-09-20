@@ -22,6 +22,10 @@ if [ -z "$GECKO_W10M_DIST" ] && [ -f C:/rw-obj/dist/firefox/omni.ja ]; then
   GECKO_W10M_DIST=C:/rw-obj/dist/firefox
 fi
 DIST="${GECKO_W10M_DIST:-C:/rw-obj/dist/bin}"
+# The object directory, for the linker maps the binary patches below need.
+# It used to be derived from DIST by stripping /dist/bin, which the packaged
+# tree does not end in -- and the thunk patch then silently found no map.
+OBJ="${GECKO_W10M_OBJ:-C:/rw-obj}"
 OUT="$ROOT/app/GeckoW10m/AppPackages"
 STAGE="$OUT/stage"
 
@@ -479,13 +483,13 @@ PREFS
   # them: clang allocates registers differently from one thunk to the next, so
   # their bytes vary while the map names every one. See
   # tools/patch-vcall-thunks.py.
-  python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")"     "$(cygpath -w "$STAGE/xul.dll")"     "$(cygpath -w "${DIST%/dist/bin}/toolkit/library/build/xul.map")"     | sed 's/^/    /'
+  python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")"     "$(cygpath -w "$STAGE/xul.dll")"     "$(cygpath -w "$OBJ/toolkit/library/build/xul.map")"     | sed 's/^/    /'
   # ANGLE's two DLLs have the same thunks and, until 0.2.4.6, no map -- so they
   # went unpatched, and every glUniform* reached the D3D backend with the
   # location replaced by the thunk's address (a fast fail under the hardened
   # STL, and the reason hardware WebRender never survived its first frame).
   for angle in libGLESv2 libEGL; do
-    map="${DIST%/dist/bin}/third_party/angle/${angle}_gn/${angle}.map"
+    map="$OBJ/third_party/angle/${angle}_gn/${angle}.map"
     if [ -f "$map" ]; then
       python "$(cygpath -w "$ROOT/tools/patch-vcall-thunks.py")"         "$(cygpath -w "$STAGE/${angle}.dll")"         "$(cygpath -w "$map")"         | sed 's/^/    /'
     else
