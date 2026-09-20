@@ -299,6 +299,49 @@ function gecko_h264ify() {
     }, "content-document-global-created");
 }
 
+// What a tap actually lands on. Every control in the fullscreen player answers
+// now except the settings gear, and the only way to tell "the tap missed it"
+// from "the page did nothing with it" is to name the element it reached.
+const GECKO_CLICK_WATCHED = new WeakSet();
+
+function gecko_watch_clicks(cw) {
+    if (GECKO_CLICK_WATCHED.has(cw)) {
+        return;
+    }
+    GECKO_CLICK_WATCHED.add(cw);
+    const describe = el => {
+        if (!el) {
+            return "nothing";
+        }
+        let out = el.localName || "?";
+        if (el.id) {
+            out += "#" + el.id;
+        }
+        const cls = typeof el.className === "string" ? el.className : "";
+        if (cls) {
+            out += "." + cls.trim().split(/\s+/).slice(0, 3).join(".");
+        }
+        const label = el.getAttribute && (el.getAttribute("aria-label") ||
+                                          el.getAttribute("title"));
+        if (label) {
+            out += " [" + label.slice(0, 40) + "]";
+        }
+        return out;
+    };
+    cw.addEventListener("click", ev => {
+        try {
+            const doc = ev.target && ev.target.ownerDocument;
+            Services.console.logStringMessage(
+                "gecko: click at " + Math.round(ev.clientX) + "," +
+                Math.round(ev.clientY) + " on " + describe(ev.target) +
+                ", fullscreen " +
+                (doc && doc.fullscreenElement ? "yes" : "no"));
+        } catch (e) {
+            Services.console.logStringMessage("gecko: click watch: " + e);
+        }
+    }, true);
+}
+
 // Every fullscreen transition, written down. Which of these arrive says where
 // the chain breaks: MozDOMFullscreen:Entered is the chrome event the actors
 // listen for, inDOMFullscreen is the attribute whose absence leaves the
@@ -358,6 +401,20 @@ function gecko_watch_fullscreen() {
                               Math.round(r.top) + " " + Math.round(r.width) +
                               "x" + Math.round(r.height)
                             : "none"));
+                    // The page laid itself out while the window was
+                    // changing size and will not measure again on its own.
+                    // Two nudges, once the transition has settled.
+                    for (const delay of [300, 1200]) {
+                        win.setTimeout(() => {
+                            try {
+                                cw.dispatchEvent(new cw.Event("resize"));
+                            } catch (e2) {
+                                Services.console.logStringMessage(
+                                    "gecko: resize nudge failed: " + e2);
+                            }
+                        }, delay);
+                    }
+                    gecko_watch_clicks(cw);
                 } catch (e) {
                     Services.console.logStringMessage(
                         "gecko: page viewport unavailable: " + e);
