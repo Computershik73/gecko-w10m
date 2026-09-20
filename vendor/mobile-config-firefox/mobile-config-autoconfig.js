@@ -517,8 +517,44 @@ function gecko_watch_fullscreen() {
         if (doc.location.href !== "chrome://browser/content/browser.xhtml") {
             return;
         }
+        // The browser's own half of DOM fullscreen, which the actor chain does
+        // not reach without content processes. Harmless when it already ran:
+        // both calls are the ones Firefox makes itself.
+        const runChromeHalf = entering => {
+            try {
+                const root = doc.documentElement;
+                if (entering === root.hasAttribute("inDOMFullscreen")) {
+                    return;
+                }
+                const browser = win.gBrowser && win.gBrowser.selectedBrowser;
+                const global = browser && browser.browsingContext &&
+                               browser.browsingContext.currentWindowGlobal;
+                const actor = global && global.getActor("DOMFullscreen");
+                if (!browser || !actor) {
+                    return;
+                }
+                if (entering) {
+                    win.FullScreen.enterDomFullscreen(browser, actor);
+                } else {
+                    win.FullScreen.cleanupDomFullscreen(actor);
+                }
+                Services.console.logStringMessage(
+                    "gecko: ran the chrome half of fullscreen (" +
+                    (entering ? "enter" : "exit") + "), inDOMFullscreen now " +
+                    root.hasAttribute("inDOMFullscreen"));
+            } catch (e) {
+                Services.console.logStringMessage(
+                    "gecko: chrome half of fullscreen failed: " + e);
+            }
+        };
+
         for (const name of EVENTS) {
             win.addEventListener(name, () => {
+                if (name === "MozDOMFullscreen:Entered") {
+                    runChromeHalf(true);
+                } else if (name === "MozDOMFullscreen:Exited") {
+                    runChromeHalf(false);
+                }
                 const toolbox = doc.getElementById("navigator-toolbox");
                 Services.console.logStringMessage(
                     "gecko: fullscreen " + name +
