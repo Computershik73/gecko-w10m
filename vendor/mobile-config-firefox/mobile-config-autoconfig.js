@@ -146,6 +146,45 @@ function gecko_note_startup() {
 // side, but it is browser-wide: every other site loses them too, with nothing
 // to fall back to. So the prefs are back to what Firefox ships and this does
 // the refusing, on the hosts named by gecko.h264ify.hosts and nowhere else.
+const GECKO_HANDLER_PROBE = `
+(function () {
+  var say = function (m) {
+    try {
+      window.dispatchEvent(new CustomEvent("gecko-probe", { detail: m }));
+    } catch (e) {}
+  };
+  var interesting = function (t) {
+    try {
+      return t && t.classList &&
+             (t.classList.contains("player-settings-icon") ||
+              t.classList.contains("player-control-play-pause-icon"));
+    } catch (e) {
+      return false;
+    }
+  };
+  var original = EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener = function (type, fn, opts) {
+    if (typeof fn === "function" && interesting(this) &&
+        (type === "click" || type === "touchend")) {
+      var name = this.className;
+      var wrapped = function (ev) {
+        say("handler " + type + " on " + name + " entered");
+        try {
+          var r = fn.apply(this, arguments);
+          say("handler " + type + " on " + name + " returned normally");
+          return r;
+        } catch (err) {
+          say("handler " + type + " on " + name + " THREW " + err);
+          throw err;
+        }
+      };
+      return original.call(this, type, wrapped, opts);
+    }
+    return original.call(this, type, fn, opts);
+  };
+})();
+`;
+
 const H264IFY_SOURCE = `
 (function () {
   var BAD = ["vp8", "vp9", "vp08", "vp09", "av01", "av1"];
@@ -290,6 +329,7 @@ function gecko_h264ify() {
                     sandboxPrototype: win,
                     wantXrays: false,
                 });
+                Cu.evalInSandbox(GECKO_HANDLER_PROBE, sandbox);
                 Cu.evalInSandbox(H264IFY_SOURCE, sandbox);
             } catch (e) {
                 Services.console.logStringMessage(
@@ -303,6 +343,7 @@ function gecko_h264ify() {
 // now except the settings gear, and the only way to tell "the tap missed it"
 // from "the page did nothing with it" is to name the element it reached.
 const GECKO_CLICK_WATCHED = new WeakSet();
+const GECKO_PROBE_WATCHED = new WeakSet();
 
 function gecko_watch_clicks(cw) {
     if (GECKO_CLICK_WATCHED.has(cw)) {
@@ -642,6 +683,13 @@ function gecko_watch_fullscreen() {
                         }, delay);
                     }
                     gecko_watch_clicks(cw);
+                    if (!GECKO_PROBE_WATCHED.has(cw)) {
+                        GECKO_PROBE_WATCHED.add(cw);
+                        cw.addEventListener("gecko-probe", pe => {
+                            Services.console.logStringMessage(
+                                "gecko: " + String(pe.detail).slice(0, 200));
+                        }, true);
+                    }
                 } catch (e) {
                     Services.console.logStringMessage(
                         "gecko: page viewport unavailable: " + e);
