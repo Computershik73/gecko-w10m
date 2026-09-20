@@ -353,18 +353,36 @@ function gecko_watch_clicks(cw) {
         return "no ancestor hides it";
     };
 
-    const snapshot = doc => {
-        const seen = new Set();
-        for (const el of doc.querySelectorAll(MENUISH)) {
-            seen.add(el);
-        }
-        return seen;
+    // querySelectorAll stops at a shadow boundary, and these components are
+    // made of them, so walk the roots as well.
+    const collect = root => {
+        const out = [];
+        const visit = r => {
+            let all;
+            try {
+                all = r.querySelectorAll("*");
+            } catch (e) {
+                return;
+            }
+            for (const el of all) {
+                if (el.matches && el.matches(MENUISH)) {
+                    out.push(el);
+                }
+                if (el.shadowRoot) {
+                    visit(el.shadowRoot);
+                }
+            }
+        };
+        visit(root);
+        return out;
     };
+
+    const snapshot = doc => new Set(collect(doc));
 
     const surveyMenus = (doc, before) => {
         const fs = doc.fullscreenElement;
         let listed = 0;
-        for (const el of doc.querySelectorAll(MENUISH)) {
+        for (const el of collect(doc)) {
             const r = el.getBoundingClientRect();
             const isNew = !before.has(el);
             // Everything that is new, and anything old that now has a box
@@ -387,7 +405,8 @@ function gecko_watch_clicks(cw) {
         }
         if (!listed) {
             Services.console.logStringMessage(
-                "gecko: menu -- the page added nothing and nothing grew");
+                "gecko: menu -- the page added nothing and nothing grew " +
+                "(shadow roots included)");
         }
     };
 
@@ -403,7 +422,29 @@ function gecko_watch_clicks(cw) {
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
             if (inFullscreen) {
+                const btn = ev.target && ev.target.closest
+                    ? ev.target.closest("button,[role=button]")
+                    : null;
+                const stateOf = el => !el ? "none" :
+                    "expanded=" + el.getAttribute("aria-expanded") +
+                    " pressed=" + el.getAttribute("aria-pressed") +
+                    " class=" + (typeof el.className === "string"
+                                     ? el.className.slice(0, 60) : "?");
+                const wasState = stateOf(btn);
                 const before = snapshot(doc);
+                cw.setTimeout(() => {
+                    try {
+                        const now = stateOf(btn);
+                        Services.console.logStringMessage(
+                            "gecko: button " + describe(btn) +
+                            (now === wasState
+                                 ? " unchanged (" + now + ")"
+                                 : " changed: " + wasState + " -> " + now));
+                    } catch (e3) {
+                        Services.console.logStringMessage(
+                            "gecko: button state: " + e3);
+                    }
+                }, 600);
                 cw.setTimeout(() => {
                     try {
                         surveyMenus(doc, before);
