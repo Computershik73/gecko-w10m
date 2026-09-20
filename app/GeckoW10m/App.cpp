@@ -5,6 +5,8 @@
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.Storage.h>
 
+#include <thread>
+#include <vector>
 #include "MainPage.h"
 #include "client/Log.h"
 
@@ -23,6 +25,49 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
   std::shared_ptr<MainPage> page_;
 
   App() {
+    // Warm the disk cache with the engine before the loader asks for it.
+    // A cold launch on a phone was sixty seconds before the first chrome
+    // manifest was even read, against two seconds warm: the loader brings a
+    // hundred and forty megabytes of xul.dll in one page fault at a time,
+    // and on eMMC a random four-kilobyte read costs what a sequential
+    // megabyte does. Streaming the file once, in order, while the splash is
+    // up puts it in the standby cache, and the faults then cost nothing.
+    std::thread([] {
+      try {
+        const std::wstring root(Package::Current().InstalledLocation().Path());
+        const wchar_t* names[] = {L"/xul.dll", L"/omni.ja",
+                                  L"/browser/omni.ja", L"/gkcodecs.dll",
+                                  L"/nss3.dll", L"/libGLESv2.dll"};
+        const ULONGLONG started = ::GetTickCount64();
+        unsigned long long total = 0;
+        std::vector<char> buffer(1 << 20);
+        for (const wchar_t* name : names) {
+          CREATEFILE2_EXTENDED_PARAMETERS params{};
+          params.dwSize = sizeof(params);
+          params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+          params.dwFileFlags = FILE_FLAG_SEQUENTIAL_SCAN;
+          HANDLE file = ::CreateFile2((root + name).c_str(), GENERIC_READ,
+                                      FILE_SHARE_READ, OPEN_EXISTING, &params);
+          if (file == INVALID_HANDLE_VALUE) {
+            continue;
+          }
+          DWORD got = 0;
+          while (::ReadFile(file, buffer.data(),
+                            static_cast<DWORD>(buffer.size()), &got, nullptr) &&
+                 got) {
+            total += got;
+          }
+          ::CloseHandle(file);
+        }
+        client::Log::Write(L"prefetch: streamed " +
+                           std::to_wstring(total / (1024 * 1024)) +
+                           L" MB of the engine in " +
+                           std::to_wstring(::GetTickCount64() - started) +
+                           L" ms");
+      } catch (...) {
+        client::Log::Write(L"prefetch: could not read the package");
+      }
+    }).detach();
     // A XAML app does not die of a Win32 exception; it dies when an error
     // reaches the framework with nobody to answer for it. Those two events are
     // the only place that is visible, and neither leaves a trace in the Win32
@@ -47,9 +92,33 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
           }
         });
 
-    Suspending([](auto const&, auto const&) {
-      client::Log::Write(L"app: suspending");
+    // The system gives a suspending app a few seconds before it is parked,
+    // and on this platform parked is as far as most apps get before they are
+    // ended -- there is no orderly shutdown after this, ever. So the seconds
+    // are used: the engine is told, chrome script flushes what Firefox
+    // normally saves on the shutdown that never comes here, and the deferral
+    // is held for as long as the system allows before it is completed.
+    Suspending([](auto const&, SuspendingEventArgs const& args) {
+      client::Log::Write(L"app: suspending -- telling the engine, holding "
+                         L"the deferral");
       client::Log::FlushFromFault();
+      auto deferral = args.SuspendingOperation().GetDeferral();
+      std::thread([deferral] {
+        if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+          using AppStateFn = void(__cdecl*)(int32_t);
+          if (auto fn = reinterpret_cast<AppStateFn>(
+                  ::GetProcAddress(xul, "gecko_w10m_app_state"))) {
+            fn(0);
+          }
+        }
+        // Time for prefs, the session file and the startup cache to reach
+        // the disk. The system's deadline on a phone is about five seconds;
+        // half is spent, the rest is margin.
+        ::Sleep(2500);
+        client::Log::Write(L"app: suspend deferral completed");
+        client::Log::FlushFromFault();
+        deferral.Complete();
+      }).detach();
     });
 
     // Gecko runs a dozen threads of its own and shuts itself down by calling
@@ -63,6 +132,13 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     });
     Resuming([](auto const&, auto const&) {
       client::Log::Write(L"app: resuming");
+      if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+        using AppStateFn = void(__cdecl*)(int32_t);
+        if (auto fn = reinterpret_cast<AppStateFn>(
+                ::GetProcAddress(xul, "gecko_w10m_app_state"))) {
+          fn(1);
+        }
+      }
     });
 
     // The module that hides the window turned out to be the phone's navigation

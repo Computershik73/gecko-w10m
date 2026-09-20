@@ -15,6 +15,12 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/app/GeckoW10m"
+# The packaged tree (mach package): two omni.ja archives instead of eight
+# thousand loose files, and a preload list ordered by startup use. The raw
+# dist/bin is the fallback when it has not been made.
+if [ -z "$GECKO_W10M_DIST" ] && [ -f C:/rw-obj/dist/firefox/omni.ja ]; then
+  GECKO_W10M_DIST=C:/rw-obj/dist/firefox
+fi
 DIST="${GECKO_W10M_DIST:-C:/rw-obj/dist/bin}"
 OUT="$ROOT/app/GeckoW10m/AppPackages"
 STAGE="$OUT/stage"
@@ -194,6 +200,9 @@ if [ -d "$DIST" ]; then
   # compositors present to a surface, and a headless widget has none, so the
   # software one -- which paints into a buffer the shell reads back -- is the
   # only one that reaches the screen here.
+  # In the packaged tree the defaults live inside browser/omni.ja; the loose
+  # directory is still read, and is ours to fill.
+  mkdir -p "$STAGE/browser/defaults/preferences"
   if [ -d "$STAGE/browser/defaults/preferences" ]; then
     # THE NAME MATTERS. Gecko sorts this directory REVERSE-alphabetically and
     # applies the files in that order, so the alphabetically FIRST name is
@@ -282,6 +291,31 @@ pref("startup.homepage_welcome_url.additional", "");
 pref("startup.homepage_override_url", "");
 pref("browser.aboutwelcome.enabled", false);
 pref("browser.startup.upgradeDialog.enabled", false);
+// Memory. The engine's defaults are a desktop's; these are the values Firefox
+// for Android ships for phones of this class, where the cache sizes below
+// were sized for a machine with a swap file. The phone gives an app a fixed
+// ceiling and ends it past that.
+//
+// Decoded images kept around: 128 MB, not two gigabytes.
+pref("image.mem.surfacecache.max_size_kb", 131072);
+// The in-memory network cache: 16 MB, not sized from the RAM present.
+pref("browser.cache.memory.capacity", 16384);
+// The JS nursery: 16 MB, not 64.
+pref("javascript.options.mem.nursery.max_kb", 16384);
+// Tabs in the background are unloaded when memory is tight, and the phone
+// says when that is (gecko_w10m_memory_pressure).
+pref("browser.tabs.unloadOnLowMemory", true);
+// Connection pool sized as on Android.
+pref("network.http.max-connections", 128);
+// Twenty seconds before a script is called slow, as on Android: the CPU is a
+// phone's, and the dialog offering to stop it cannot be answered here yet.
+pref("dom.max_script_run_time", 20);
+// CSS error reporting is work done for a console nobody opens.
+pref("layout.css.report_errors", false);
+// The session file every ten seconds rather than fifteen: it is what survives
+// the app being ended, which is how every session ends here.
+pref("browser.sessionstore.interval", 10000);
+
 // No HTTP/3: QUIC over UDP on this phone's stack is an unknown, and a stuck
 // QUIC attempt looks exactly like a page that never loads.
 pref("network.http.http3.enable", false);

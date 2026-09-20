@@ -124,6 +124,69 @@ function gecko_fix_homepage() {
 }
 
 
+// The autoconfig scope has no setTimeout; this is the same thing on an
+// nsITimer, and it keeps the timer alive for as long as it is needed.
+const GECKO_TIMERS = new Set();
+function gecko_after(ms, fn, repeat) {
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    GECKO_TIMERS.add(timer);
+    timer.initWithCallback({
+        notify() {
+            if (!repeat) {
+                GECKO_TIMERS.delete(timer);
+            }
+            try {
+                fn();
+            } catch (e) {
+                Services.console.logStringMessage("gecko: timer: " + e);
+            }
+        }
+    }, ms, repeat ? Ci.nsITimer.TYPE_REPEATING_SLACK : Ci.nsITimer.TYPE_ONE_SHOT);
+    return timer;
+}
+
+// What Firefox saves at shutdown, saved when the phone says the app is
+// going to the background -- which here is also the only warning it gets
+// before being ended. The shell holds the suspend for a couple of seconds
+// after telling the engine; this is what those seconds are for.
+function gecko_watch_app_state() {
+    Services.obs.addObserver({
+        observe() {
+            const t0 = Date.now();
+            const done = [];
+            try {
+                Services.prefs.savePrefFile(null);
+                done.push("prefs");
+            } catch (e) {
+                done.push("prefs failed: " + e);
+            }
+            try {
+                const { SessionSaver } = ChromeUtils.importESModule(
+                    "resource:///modules/sessionstore/SessionSaver.sys.mjs");
+                SessionSaver.run();
+                done.push("session");
+            } catch (e) {
+                done.push("session failed: " + e);
+            }
+            try {
+                Services.obs.notifyObservers(null, "memory-pressure", "heap-minimize");
+                done.push("heap minimised");
+            } catch (e) {
+                done.push("heap-minimize failed: " + e);
+            }
+            Services.console.logStringMessage(
+                "gecko: background -- flushed " + done.join(", ") + " in " +
+                (Date.now() - t0) + " ms");
+            gecko_note_memory("going to the background");
+        }
+    }, "application-background");
+    Services.obs.addObserver({
+        observe() {
+            Services.console.logStringMessage("gecko: foreground again");
+        }
+    }, "application-foreground");
+}
+
 // Where the startup time goes. The device logs give one minute from
 // XRE_main to the start page on the fastest phone and nothing in between;
 // these are the marks Firefox itself keeps, written out as each is reached.
@@ -226,8 +289,8 @@ function gecko_watch_memory() {
             gecko_note_memory("session restored");
             // The cache is written a few seconds after the last script lands
             // in it; one more look says whether it got there.
-            setTimeout(() => gecko_note_startup_cache("30 s later"), 30000);
-            setInterval(() => gecko_note_memory("periodic"), 60000);
+            gecko_after(30000, () => gecko_note_startup_cache("30 s later"));
+            gecko_after(60000, () => gecko_note_memory("periodic"), true);
         }
     }, "sessionstore-windows-restored");
     Services.obs.addObserver({
@@ -305,9 +368,8 @@ function gecko_note_startup() {
 const GECKO_FULLSCREEN_MENU = `
 (function () {
   var GEAR = ".player-settings-icon";
-  var replaying = false;
   document.addEventListener("click", function (ev) {
-    if (replaying || !document.fullscreenElement) {
+    if (!document.fullscreenElement) {
       return;
     }
     var gear;
@@ -319,25 +381,15 @@ const GECKO_FULLSCREEN_MENU = `
     if (!gear) {
       return;
     }
+    // Replaying the tap after leaving fullscreen sent the player into a
+    // storm -- thirty-eight thousand DOM changes and a script the browser
+    // wanted to stop -- while the user's own next tap opened the sheet at
+    // once. So: leave fullscreen, and let the next tap be theirs.
     ev.preventDefault();
     ev.stopImmediatePropagation();
-    var reopen = function () {
-      replaying = true;
-      try {
-        gear.click();
-      } catch (e2) {}
-      setTimeout(function () { replaying = false; }, 0);
-    };
     try {
-      var left = document.exitFullscreen();
-      if (left && left.then) {
-        left.then(function () { setTimeout(reopen, 120); }, reopen);
-      } else {
-        setTimeout(reopen, 120);
-      }
-    } catch (e3) {
-      reopen();
-    }
+      document.exitFullscreen();
+    } catch (e3) {}
   }, true);
 })();
 `;
@@ -640,20 +692,6 @@ function gecko_watch_clicks(cw) {
                      ? ", fullscreen element " + describe(doc.fullscreenElement)
                      : ""));
             try {
-                const page = Cu.waiveXrays(doc.defaultView);
-                const fn = page.EventTarget.prototype.addEventListener;
-                Services.console.logStringMessage(
-                    "gecko: the page's addEventListener is " +
-                    (fn && fn.name ? fn.name : "unnamed") +
-                    (String(fn).includes("[native code]")
-                        ? " (native, our patch is not there)"
-                        : " (patched)"));
-            } catch (e9) {
-                Services.console.logStringMessage(
-                    "gecko: could not look at addEventListener: " + e9);
-            }
-
-            try {
                 const said =
                     doc.documentElement.getAttribute("data-gecko-probe");
                 if (said) {
@@ -935,6 +973,7 @@ try {
     gecko_note_startup();
     gecko_reset_crash_guards();
     gecko_watch_memory();
+    gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_h264ify();
     gecko_watch_tabs();

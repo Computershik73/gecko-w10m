@@ -110,10 +110,22 @@ MainPage::MainPage() {
                  L" to " + mb(args.NewLimit()));
     });
     MemoryManager::AppMemoryUsageIncreased([mb](auto&&, auto&&) {
+      const auto level = MemoryManager::AppMemoryUsageLevel();
       Log::Write(L"mem: the system says usage went UP a level -- now " +
-                 std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())) +
+                 std::to_wstring(static_cast<int>(level)) +
                  L" at " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
                  mb(MemoryManager::AppMemoryUsageLimit()));
+      // Low is 0, Medium 1, High 2, OverLimit 3. From Medium on, the engine
+      // is told to let go of what it can.
+      if (static_cast<int>(level) >= 1) {
+        if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+          using PressureFn = void(__cdecl*)(int32_t);
+          if (auto fn = reinterpret_cast<PressureFn>(
+                  ::GetProcAddress(xul, "gecko_w10m_memory_pressure"))) {
+            fn(static_cast<int32_t>(level));
+          }
+        }
+      }
     });
     MemoryManager::AppMemoryUsageDecreased([mb](auto&&, auto&&) {
       Log::Write(L"mem: usage went down a level -- now " +
