@@ -152,6 +152,14 @@ const GECKO_HANDLER_PROBE = `
     try {
       window.dispatchEvent(new CustomEvent("gecko-probe", { detail: m }));
     } catch (e) {}
+    // And on the document, where nothing can be lost in translation.
+    try {
+      var root = document.documentElement;
+      var kept = (root.getAttribute("data-gecko-probe") || "").split(" || ");
+      kept.push(m);
+      while (kept.length > 6) { kept.shift(); }
+      root.setAttribute("data-gecko-probe", kept.join(" || "));
+    } catch (e2) {}
   };
   var WATCHED = ["player-settings-icon", "player-control-play-pause-icon"];
   var nameOf = function (t) {
@@ -569,6 +577,14 @@ function gecko_watch_clicks(cw) {
                             "gecko: page made " + changes +
                             " changes after the click" +
                             (samples.length ? ": " + samples.join("; ") : ""));
+                        const said =
+                            doc.documentElement.getAttribute("data-gecko-probe");
+                        if (said) {
+                            Services.console.logStringMessage(
+                                "gecko: the page reported " + said.slice(0, 300));
+                            doc.documentElement.removeAttribute(
+                                "data-gecko-probe");
+                        }
                     } catch (e5) {
                         Services.console.logStringMessage(
                             "gecko: mutation report: " + e5);
@@ -700,10 +716,13 @@ function gecko_watch_fullscreen() {
                     gecko_watch_clicks(cw);
                     if (!GECKO_PROBE_WATCHED.has(cw)) {
                         GECKO_PROBE_WATCHED.add(cw);
+                        // The fourth argument is the point: an event a page
+                        // dispatches is untrusted, and chrome does not hear
+                        // those unless it says so.
                         cw.addEventListener("gecko-probe", pe => {
                             Services.console.logStringMessage(
                                 "gecko: " + String(pe.detail).slice(0, 200));
-                        }, true);
+                        }, true, true);
                     }
                 } catch (e) {
                     Services.console.logStringMessage(
