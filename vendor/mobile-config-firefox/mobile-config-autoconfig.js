@@ -443,6 +443,34 @@ function gecko_watch_clicks(cw) {
                         "gecko: stack: " + e6);
                 }
 
+                // Which listeners the engine sees on the thing under the
+                // finger, and on the few elements above it -- a click reaching
+                // an element nobody is listening on goes nowhere, and that
+                // cannot be seen from inside the page.
+                try {
+                    const els = Cc["@mozilla.org/eventlistenerservice;1"]
+                        .getService(Ci.nsIEventListenerService);
+                    const parts = [];
+                    let el = ev.target;
+                    for (let depth = 0; el && depth < 4; depth++) {
+                        const types = [];
+                        for (const info of els.getListenerInfoFor(el)) {
+                            if (!info.inSystemEventGroup) {
+                                types.push(info.type);
+                            }
+                        }
+                        parts.push(describe(el) + " <" +
+                                   (types.length ? types.join(",") : "none") +
+                                   ">");
+                        el = el.parentElement;
+                    }
+                    Services.console.logStringMessage(
+                        "gecko: listeners " + parts.join(" << "));
+                } catch (e7) {
+                    Services.console.logStringMessage(
+                        "gecko: listeners: " + e7);
+                }
+
                 const before = snapshot(doc);
 
                 // Does the handler run at all? The button carries no aria
