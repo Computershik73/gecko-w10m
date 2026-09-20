@@ -153,34 +153,49 @@ const GECKO_HANDLER_PROBE = `
       window.dispatchEvent(new CustomEvent("gecko-probe", { detail: m }));
     } catch (e) {}
   };
-  var interesting = function (t) {
+  var WATCHED = ["player-settings-icon", "player-control-play-pause-icon"];
+  var nameOf = function (t) {
     try {
-      return t && t.classList &&
-             (t.classList.contains("player-settings-icon") ||
-              t.classList.contains("player-control-play-pause-icon"));
-    } catch (e) {
-      return false;
-    }
+      if (!t || !t.classList) { return null; }
+      for (var i = 0; i < WATCHED.length; i++) {
+        if (t.classList.contains(WATCHED[i])) { return WATCHED[i]; }
+      }
+    } catch (e) {}
+    return null;
   };
-  var original = EventTarget.prototype.addEventListener;
+  // The map keeps removeEventListener working: it is handed the original
+  // function and has to find the wrapper that was actually registered.
+  var wrappers = new WeakMap();
+  var add = EventTarget.prototype.addEventListener;
+  var remove = EventTarget.prototype.removeEventListener;
+
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
-    if (typeof fn === "function" && interesting(this) &&
-        (type === "click" || type === "touchend")) {
-      var name = this.className;
-      var wrapped = function (ev) {
-        say("handler " + type + " on " + name + " entered");
+    if (typeof fn !== "function" || (type !== "click" && type !== "touchend")) {
+      return add.call(this, type, fn, opts);
+    }
+    var wrapped = wrappers.get(fn);
+    if (!wrapped) {
+      wrapped = function (ev) {
+        var which = nameOf(this);
+        if (!which) { return fn.apply(this, arguments); }
+        say("handler " + ev.type + " on " + which + " entered");
         try {
           var r = fn.apply(this, arguments);
-          say("handler " + type + " on " + name + " returned normally");
+          say("handler " + ev.type + " on " + which + " returned normally");
           return r;
         } catch (err) {
-          say("handler " + type + " on " + name + " THREW " + err);
+          say("handler " + ev.type + " on " + which + " THREW " + err);
           throw err;
         }
       };
-      return original.call(this, type, wrapped, opts);
+      wrappers.set(fn, wrapped);
     }
-    return original.call(this, type, fn, opts);
+    return add.call(this, type, wrapped, opts);
+  };
+
+  EventTarget.prototype.removeEventListener = function (type, fn, opts) {
+    var wrapped = typeof fn === "function" ? wrappers.get(fn) : null;
+    return remove.call(this, type, wrapped || fn, opts);
   };
 })();
 `;
