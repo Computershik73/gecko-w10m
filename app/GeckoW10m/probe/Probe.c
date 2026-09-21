@@ -1,29 +1,58 @@
-// A second application in the package, for phones with no debugger and no
-// crash dumps: Win32 only, static CRT, no XAML, no WinRT. It asks the loader
-// for each DLL the browser needs, one at a time, and writes the answer with
-// the error code into TempState\gecko-probe.txt -- which the Device Portal's
-// App File Explorer shows -- and then exits.
+// Gecko Probe: its own tiny package, for phones with no debugger and no
+// crash dumps. Win32 only, static CRT, no XAML, no WinRT. It asks the loader
+// for each DLL the browser's start-up chain needs and reports every answer
+// with its error code.
 //
 // A Lumia 650 on 1607 maps msvcp140.dll and then never maps the
 // vcruntime140.dll it imports, and the kernel's image events say only that,
 // not why. GetLastError after LoadPackagedLibrary says why: 126 is "not
 // found", 193 "not a valid image", 577 "invalid image hash", 127 "a function
 // it imports is missing", 1114 "its DllMain failed".
+//
+// The answers go out three ways at once, because on that phone no file has
+// yet been seen to arrive: as ETW events under the provider below, which the
+// Device Portal records like any other; into LocalState, built from
+// %LOCALAPPDATA% and the package family name; and into the container's temp
+// directory. The process then stays up five seconds, so a run is visible as
+// a run and not mistaken for a crash.
 #include <windows.h>
 #include <appmodel.h>
+#include <TraceLoggingProvider.h>
 #include <stdio.h>
 #include <wchar.h>
 
-static HANDLE g_out = INVALID_HANDLE_VALUE;
+// {5f3c2e1a-7b8d-4c9e-9a1b-2c3d4e5f6a7b}: enter this GUID as a custom
+// provider on the Device Portal's ETW page, level 5.
+TRACELOGGING_DEFINE_PROVIDER(g_provider, "GeckoProbe",
+    (0x5f3c2e1a, 0x7b8d, 0x4c9e, 0x9a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b));
+
+static HANDLE g_files[2] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
 
 static void say(const wchar_t* text) {
   DWORD written = 0;
-  if (g_out != INVALID_HANDLE_VALUE) {
-    ::WriteFile(g_out, text, (DWORD)(wcslen(text) * sizeof(wchar_t)),
-                &written, NULL);
-    ::WriteFile(g_out, L"\r\n", 2 * sizeof(wchar_t), &written, NULL);
-    ::FlushFileBuffers(g_out);
+  int i;
+  TraceLoggingWrite(g_provider, "Line", TraceLoggingLevel(4),
+                    TraceLoggingWideString(text, "text"));
+  for (i = 0; i < 2; ++i) {
+    if (g_files[i] != INVALID_HANDLE_VALUE) {
+      ::WriteFile(g_files[i], text, (DWORD)(wcslen(text) * sizeof(wchar_t)),
+                  &written, NULL);
+      ::WriteFile(g_files[i], L"\r\n", 2 * sizeof(wchar_t), &written, NULL);
+      ::FlushFileBuffers(g_files[i]);
+    }
   }
+}
+
+static HANDLE open_out(const wchar_t* path) {
+  CREATEFILE2_EXTENDED_PARAMETERS params;
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+  params.dwFileFlags = 0;
+  params.dwSecurityQosFlags = 0;
+  params.lpSecurityAttributes = NULL;
+  params.hTemplateFile = NULL;
+  return ::CreateFile2(path, GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS,
+                       &params);
 }
 
 static void probe(const wchar_t* name, int packaged) {
@@ -35,47 +64,52 @@ static void probe(const wchar_t* name, int packaged) {
                : ::LoadLibraryExW(name, NULL, 0);
   err = ::GetLastError();
   if (m) {
-    swprintf_s(line, 512, L"%s  (%s)  -> loaded at %p", name,
-              packaged ? L"package" : L"system", (void*)m);
+    swprintf_s(line, 512, L"%s (%s) -> loaded at %p", name,
+               packaged ? L"package" : L"system", (void*)m);
   } else {
-    swprintf_s(line, 512, L"%s  (%s)  -> FAILED, error %lu (0x%lx)", name,
-              packaged ? L"package" : L"system", err, err);
+    swprintf_s(line, 512, L"%s (%s) -> FAILED, error %lu (0x%lx)", name,
+               packaged ? L"package" : L"system", err, err);
   }
   say(line);
 }
 
 int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
+  wchar_t local[MAX_PATH] = {0};
+  wchar_t family[128] = {0};
   wchar_t path[MAX_PATH];
-  CREATEFILE2_EXTENDED_PARAMETERS params;
+  wchar_t line[600];
+  UINT32 familyLen = 128;
+  DWORD localLen, familyRc;
   OSVERSIONINFOW ver;
-  wchar_t line[256];
   (void)h; (void)p; (void)cmd; (void)show;
 
-  // Not GetTempPath: inside the container that is AC\Temp, which the
-  // Device Portal never shows. LocalState is
-  // %LOCALAPPDATA%\Packages\<family>\LocalState, and both halves come
-  // from Win32 alone.
-  {
-    wchar_t local[MAX_PATH] = {0};
-    wchar_t family[128] = {0};
-    UINT32 familyLen = 128;
-    ::GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    ::GetCurrentPackageFamilyName(&familyLen, family);
-    swprintf_s(path, MAX_PATH,
-               L"%s\\Packages\\%s\\LocalState\\gecko-probe.txt", local,
-               family);
+  TraceLoggingRegister(g_provider);
+
+  // LocalState, without WinRT: %LOCALAPPDATA%\Packages\<family>\LocalState.
+  localLen = ::GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+  familyRc = ::GetCurrentPackageFamilyName(&familyLen, family);
+  if (localLen && familyRc == ERROR_SUCCESS) {
+    swprintf_s(path, MAX_PATH, L"%s\\Packages\\%s\\LocalState\\gecko-probe.txt",
+               local, family);
+    g_files[0] = open_out(path);
   }
-  {
-    params.dwSize = sizeof(params);
-    params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-    params.dwFileFlags = 0;
-    params.dwSecurityQosFlags = 0;
-    params.lpSecurityAttributes = NULL;
-    params.hTemplateFile = NULL;
-    g_out = ::CreateFile2(path, GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS,
-                          &params);
+  // And the container's own temp directory, whatever it is.
+  if (::GetTempPathW(MAX_PATH, path)) {
+    wcscat_s(path, MAX_PATH, L"gecko-probe.txt");
+    g_files[1] = open_out(path);
   }
+
   say(L"Gecko loader probe");
+  swprintf_s(line, 600, L"LOCALAPPDATA=\"%s\" (len %lu), family=\"%s\" (rc %lu), "
+             L"LocalState file %s, temp file %s",
+             local, localLen, family, familyRc,
+             g_files[0] != INVALID_HANDLE_VALUE ? L"open" : L"NOT open",
+             g_files[1] != INVALID_HANDLE_VALUE ? L"open" : L"NOT open");
+  say(line);
+  if (::GetTempPathW(MAX_PATH, path)) {
+    swprintf_s(line, 600, L"temp path: %s", path);
+    say(line);
+  }
 
   // What the loader itself is: RtlGetVersion is not lied to by manifests.
   {
@@ -84,8 +118,8 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
     RtlGetVersionFn fn = ntdll ? (RtlGetVersionFn)::GetProcAddress(ntdll, "RtlGetVersion") : NULL;
     ver.dwOSVersionInfoSize = sizeof(ver);
     if (fn && fn(&ver) == 0) {
-      swprintf_s(line, 256, L"OS build %lu.%lu.%lu", ver.dwMajorVersion,
-                ver.dwMinorVersion, ver.dwBuildNumber);
+      swprintf_s(line, 600, L"OS build %lu.%lu.%lu", ver.dwMajorVersion,
+                 ver.dwMinorVersion, ver.dwBuildNumber);
       say(line);
     }
   }
@@ -124,8 +158,9 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   probe(L"dxgi.dll", 0);
 
   say(L"done");
-  if (g_out != INVALID_HANDLE_VALUE) {
-    ::CloseHandle(g_out);
-  }
+  if (g_files[0] != INVALID_HANDLE_VALUE) ::CloseHandle(g_files[0]);
+  if (g_files[1] != INVALID_HANDLE_VALUE) ::CloseHandle(g_files[1]);
+  TraceLoggingUnregister(g_provider);
+  ::Sleep(5000);
   return 0;
 }
