@@ -35,7 +35,7 @@
   <Identity
       Name="Gecko"
       Publisher="CN=Computershik"
-      Version="155.14.6.73"
+      Version="155.14.7.74"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -127,25 +127,6 @@
           </uap:FileTypeAssociation>
         </uap:Extension>
       </Extensions>
-    </Application>
-
-    <!--
-      Loader probe: a second tile, "Gecko Probe". Win32 only, no XAML; it
-      asks the loader for each DLL the browser needs and writes the error
-      codes into TempState\gecko-probe.txt for the Device Portal's file
-      explorer. For phones with no debugger and no crash dumps.
-    -->
-    <Application Id="Probe"
-                 Executable="Probe.exe"
-                 EntryPoint="Gecko.Probe">
-      <uap:VisualElements
-          DisplayName="Gecko Probe"
-          Description="Loader probe for the Gecko browser"
-          BackgroundColor="#1C1B22"
-          Square150x150Logo="Assets\Square150x150Logo.png"
-          Square44x44Logo="Assets\Square44x44Logo.png">
-        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#1C1B22" />
-      </uap:VisualElements>
     </Application>
   </Applications>
 
