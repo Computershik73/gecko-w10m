@@ -300,11 +300,45 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
 
 }  // namespace gecko_w10m
 
+// The earliest possible mark, with nothing but Win32: a file in the app's
+// TempState (what GetTempPath names inside the container), visible in the
+// Device Portal's file explorer. A phone that has this file but no
+// LocalState log died between here and the App constructor -- in XAML. A
+// phone with neither died before wWinMain: the loader, the CRT, or a DLL's
+// DllMain.
+static void BootMark(const wchar_t* what) {
+  wchar_t path[MAX_PATH] = {};
+  if (!::GetTempPathW(MAX_PATH, path)) {
+    return;
+  }
+  std::wstring file = std::wstring(path) + L"gecko-boot.txt";
+  CREATEFILE2_EXTENDED_PARAMETERS params{};
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+  HANDLE h = ::CreateFile2(file.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           OPEN_ALWAYS, &params);
+  if (h == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  std::wstring line = std::wstring(what) + L"\r\n";
+  DWORD written = 0;
+  ::WriteFile(h, line.c_str(), static_cast<DWORD>(line.size() * sizeof(wchar_t)),
+              &written, nullptr);
+  ::FlushFileBuffers(h);
+  ::CloseHandle(h);
+}
+
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  BootMark(L"wWinMain reached");
   // Entry thread must be MTA (cf. C++/CX's [Platform::MTAThread] main).
   // Application::Start creates the ASTA UI thread itself; an uninitialized or
   // STA/ASTA entry thread makes CoreApplication throw RPC_E_WRONG_THREAD.
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
-  Application::Start([](auto&&) { winrt::make<gecko_w10m::App>(); });
+  BootMark(L"apartment initialised");
+  Application::Start([](auto&&) {
+    BootMark(L"XAML started, making the App");
+    winrt::make<gecko_w10m::App>();
+    BootMark(L"App made");
+  });
   return 0;
 }

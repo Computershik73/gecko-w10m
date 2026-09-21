@@ -139,7 +139,12 @@ echo "=== link Gecko.exe ==="
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
   "/MAP:$OBJDIR_W\\Gecko.map" \
   "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
-  WindowsApp.lib OneCoreUap.lib   /DELAYLOAD:oleaut32.dll delayimp.lib
+  WindowsApp.lib OneCoreUap.lib   /DELAYLOAD:oleaut32.dll /DELAYLOAD:mozglue.dll delayimp.lib
+# mozglue.dll delay-loaded as well: it was the shell's only remaining static
+# import, and with it gone the executable starts with nothing but system
+# DLLs -- so a launch that still dies before the first log line dies in the
+# executable, the CRT or XAML, and one that reaches the log and dies at the
+# first allocator call dies in mozglue's own dependencies.
 # oleaut32.dll is the one static import of the shell that is neither ours nor
 # OneCore: C++/WinRT reaches SysAllocString/SysFreeString/SysStringLen and
 # Get/SetErrorInfo through it, on error paths only. A phone whose OS does
