@@ -319,8 +319,16 @@ static void BootMark(const wchar_t* what) {
       ::GetCurrentPackageFamilyName(&familyLen, family) != ERROR_SUCCESS) {
     return;
   }
-  std::wstring file = std::wstring(local) + L"\\Packages\\" + family +
-                      L"\\LocalState\\gecko-boot.txt";
+  // Inside the container LOCALAPPDATA is the package's own ...\AC
+  // directory; LocalState is its sibling.
+  std::wstring base(local);
+  if (base.size() > 3 && _wcsicmp(base.c_str() + base.size() - 3, L"\\AC") == 0) {
+    base.resize(base.size() - 3);
+  } else {
+    base += L"\\Packages\\";
+    base += family;
+  }
+  std::wstring file = base + L"\\LocalState\\gecko-boot.txt";
   CREATEFILE2_EXTENDED_PARAMETERS params{};
   params.dwSize = sizeof(params);
   params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;

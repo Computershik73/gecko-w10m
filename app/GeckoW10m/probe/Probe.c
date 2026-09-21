@@ -67,7 +67,7 @@ static void probe(const wchar_t* name, int packaged) {
     swprintf_s(line, 512, L"%s (%s) -> loaded at %p", name,
                packaged ? L"package" : L"system", (void*)m);
   } else {
-    swprintf_s(line, 512, L"%s (%s) -> FAILED, error %lu (0x%lx)", name,
+    swprintf_s(line, 512, L"%s (%s) -> FAILED; error %lu (0x%lx)", name,
                packaged ? L"package" : L"system", err, err);
   }
   say(line);
@@ -86,11 +86,20 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   TraceLoggingRegister(g_provider);
 
   // LocalState, without WinRT: %LOCALAPPDATA%\Packages\<family>\LocalState.
+  // Inside the container LOCALAPPDATA is already the package's own
+  // ...\Packages\<family>\AC directory (the probe on the 650 said so);
+  // LocalState is its sibling.
   localLen = ::GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
   familyRc = ::GetCurrentPackageFamilyName(&familyLen, family);
-  if (localLen && familyRc == ERROR_SUCCESS) {
-    swprintf_s(path, MAX_PATH, L"%s\\Packages\\%s\\LocalState\\gecko-probe.txt",
-               local, family);
+  if (localLen) {
+    size_t n = wcslen(local);
+    if (n > 3 && _wcsicmp(local + n - 3, L"\\AC") == 0) {
+      local[n - 3] = 0;
+      swprintf_s(path, MAX_PATH, L"%s\\LocalState\\gecko-probe.txt", local);
+    } else {
+      swprintf_s(path, MAX_PATH, L"%s\\Packages\\%s\\LocalState\\gecko-probe.txt",
+                 local, family);
+    }
     g_files[0] = open_out(path);
   }
   // And the container's own temp directory, whatever it is.
@@ -100,8 +109,8 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   }
 
   say(L"Gecko loader probe");
-  swprintf_s(line, 600, L"LOCALAPPDATA=\"%s\" (len %lu), family=\"%s\" (rc %lu), "
-             L"LocalState file %s, temp file %s",
+  swprintf_s(line, 600, L"LOCALAPPDATA=\"%s\" (len %lu); family=\"%s\" (rc %lu); "
+             L"LocalState file %s; temp file %s",
              local, localLen, family, familyRc,
              g_files[0] != INVALID_HANDLE_VALUE ? L"open" : L"NOT open",
              g_files[1] != INVALID_HANDLE_VALUE ? L"open" : L"NOT open");
@@ -170,6 +179,35 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   probe(L"version.dll", 0);
   probe(L"d3d11.dll", 0);
   probe(L"dxgi.dll", 0);
+
+  // The functions the 1607 umbrella libraries cannot map to an api-set:
+  // which DLL on this phone actually exports them.
+  {
+    const wchar_t* carriers[] = {L"kernel32legacy.dll", L"kernelbase.dll",
+                                 L"combase.dll", L"ntdll.dll"};
+    const char* names[] = {
+        "CreateFileMappingA", "GetComputerNameW", "GetNamedPipeServerProcessId",
+        "GetProcessAffinityMask", "GetSystemPowerStatus", "GlobalLock",
+        "GlobalMemoryStatus", "GlobalSize", "GlobalUnlock", "MoveFileW",
+        "OpenFileMappingA", "PowerClearRequest", "PowerCreateRequest",
+        "PowerSetRequest", "RegisterApplicationRestart", "RegRenameKey",
+        "RegisterEventSourceW", "ReportEventW", "LogonUserW",
+        "LsaNtStatusToWinError", "RtlNtStatusToDosError", "SymFromAddr", NULL};
+    int i, j;
+    for (i = 0; names[i]; ++i) {
+      wchar_t found[256] = L"";
+      for (j = 0; j < 4; ++j) {
+        HMODULE m = ::LoadLibraryExW(carriers[j], NULL, 0);
+        if (m && ::GetProcAddress(m, names[i])) {
+          wcscat_s(found, 256, carriers[j]);
+          wcscat_s(found, 256, L" ");
+        }
+      }
+      swprintf_s(line, 600, L"export %S: %s", names[i],
+                 found[0] ? found : L"NOWHERE");
+      say(line);
+    }
+  }
 
   say(L"done");
   if (g_files[0] != INVALID_HANDLE_VALUE) ::CloseHandle(g_files[0]);
