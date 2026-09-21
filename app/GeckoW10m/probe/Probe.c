@@ -144,7 +144,21 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   probe(L"api-ms-win-crt-locale-l1-1-0.dll", 0);
   probe(L"api-ms-win-crt-time-l1-1-0.dll", 0);
 
-  // System DLLs the engine names directly.
+  // Every DLL the package names outside the api-sets. The trace from the
+  // 650 shows kernel32legacy.dll where kernel32.dll would be; which of the
+  // others exist there at all is what this list answers.
+  probe(L"kernel32.dll", 0);
+  probe(L"kernel32legacy.dll", 0);
+  probe(L"advapi32.dll", 0);
+  probe(L"ntdll.dll", 0);
+  probe(L"rpcrt4.dll", 0);
+  probe(L"bcrypt.dll", 0);
+  probe(L"bcryptprimitives.dll", 0);
+  probe(L"ole32.dll", 0);
+  probe(L"combase.dll", 0);
+  probe(L"shcore.dll", 0);
+  probe(L"wsock32.dll", 0);
+  probe(L"d3dcompiler_47.dll", 0);
   probe(L"oleaut32.dll", 0);
   probe(L"uiautomationcore.dll", 0);
   probe(L"dbghelp.dll", 0);

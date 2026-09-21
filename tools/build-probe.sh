@@ -45,7 +45,13 @@ echo "=== compile Probe.exe (cl.exe, ARM, static CRT, SDK $SDKV_LIB libraries) =
       /TP /EHs-c- /GR- /MT /O1 /D_ARM_ /DWIN32 /D_WIN32 /DUNICODE /D_UNICODE \
       /DWINAPI_FAMILY=WINAPI_FAMILY_APP
 "$LLVM/lld-link.exe" "$OBJ_W\\Probe.obj" "/OUT:$STAGE_W\\Probe.exe" /APPCONTAINER \
-  /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM WindowsApp.lib
+  /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM   /NODEFAULTLIB:kernel32.lib WindowsApp.lib OneCoreUap.lib
+# No kernel32.lib: the static CRT names it as a default library, and every
+# symbol taken from it becomes an import of kernel32.dll -- a file Windows 10
+# Mobile 1607 does not have (the loader ended Probe.exe with
+# STATUS_DLL_NOT_FOUND after mapping only ntdll and KernelBase). Resolved
+# from the umbrella libraries instead, the same functions are api-set
+# imports, which that OS does have.
 echo "    Probe.exe ($(stat -c%s "$STAGE/Probe.exe") bytes)"
 
 echo "=== stage ==="
