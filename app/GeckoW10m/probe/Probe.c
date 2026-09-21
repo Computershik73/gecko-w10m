@@ -10,6 +10,7 @@
 // found", 193 "not a valid image", 577 "invalid image hash", 127 "a function
 // it imports is missing", 1114 "its DllMain failed".
 #include <windows.h>
+#include <appmodel.h>
 #include <stdio.h>
 #include <wchar.h>
 
@@ -50,8 +51,21 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   wchar_t line[256];
   (void)h; (void)p; (void)cmd; (void)show;
 
-  if (::GetTempPathW(MAX_PATH, path)) {
-    wcscat_s(path, MAX_PATH, L"gecko-probe.txt");
+  // Not GetTempPath: inside the container that is AC\Temp, which the
+  // Device Portal never shows. LocalState is
+  // %LOCALAPPDATA%\Packages\<family>\LocalState, and both halves come
+  // from Win32 alone.
+  {
+    wchar_t local[MAX_PATH] = {0};
+    wchar_t family[128] = {0};
+    UINT32 familyLen = 128;
+    ::GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    ::GetCurrentPackageFamilyName(&familyLen, family);
+    swprintf_s(path, MAX_PATH,
+               L"%s\\Packages\\%s\\LocalState\\gecko-probe.txt", local,
+               family);
+  }
+  {
     params.dwSize = sizeof(params);
     params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
     params.dwFileFlags = 0;

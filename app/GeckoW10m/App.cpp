@@ -4,6 +4,7 @@
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.Storage.h>
+#include <appmodel.h>
 
 #include <thread>
 #include <vector>
@@ -307,11 +308,19 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
 // phone with neither died before wWinMain: the loader, the CRT, or a DLL's
 // DllMain.
 static void BootMark(const wchar_t* what) {
-  wchar_t path[MAX_PATH] = {};
-  if (!::GetTempPathW(MAX_PATH, path)) {
+  // Not GetTempPath: inside the container that is AC\Temp, which the
+  // Device Portal never shows. LocalState is
+  // %LOCALAPPDATA%\Packages\<family>\LocalState, and both halves come
+  // from Win32 alone.
+  wchar_t local[MAX_PATH] = {};
+  wchar_t family[128] = {};
+  UINT32 familyLen = 128;
+  if (!::GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) ||
+      ::GetCurrentPackageFamilyName(&familyLen, family) != ERROR_SUCCESS) {
     return;
   }
-  std::wstring file = std::wstring(path) + L"gecko-boot.txt";
+  std::wstring file = std::wstring(local) + L"\\Packages\\" + family +
+                      L"\\LocalState\\gecko-boot.txt";
   CREATEFILE2_EXTENDED_PARAMETERS params{};
   params.dwSize = sizeof(params);
   params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
