@@ -131,6 +131,11 @@ for stub in ktmw32; do
   echo "    $stub.dll ($(stat -c%s "$STAGE/$stub.dll") bytes)"
 done
 
+echo "=== build the loader probe (Probe.exe) ==="
+"$CL" /nologo /c "$(cygpath -w "$APP/probe/Probe.c")" "/Fo:$OBJDIR_W\Probe.obj"       /TP /EHs-c- /GR- /MT /O1 /D_ARM_ /DWIN32 /D_WIN32 /DUNICODE /D_UNICODE       /DWINAPI_FAMILY=WINAPI_FAMILY_APP
+"$LLVM/lld-link.exe" "$OBJDIR_W\Probe.obj" "/OUT:$STAGE_W\Probe.exe" /APPCONTAINER   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM WindowsApp.lib
+echo "    Probe.exe ($(stat -c%s "$STAGE/Probe.exe") bytes)"
+
 echo "=== link Gecko.exe ==="
 # mozglue.lib supplies moz_xmalloc and the rest of Gecko's allocator, which the
 # bootstrap unit reaches through the mfbt headers. mozglue.dll already ships in
