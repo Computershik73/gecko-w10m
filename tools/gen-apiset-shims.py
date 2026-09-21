@@ -261,6 +261,18 @@ def main():
         if os.path.exists(p):
             os.remove(p)
 
+    # The legacy-name layer is for Windows 10 Mobile 1607 and is parked:
+    # twenty of the functions the engine imports exist in no DLL on that
+    # build, and everything past the loader is untested there. Off by
+    # default, because the alias rewrite would route every OS build through
+    # these forwarders, and 1709 -- the one build the port is proven on --
+    # has the real DLLs. GECKO_W10M_LEGACY_SHIMS=1 turns it back on.
+    if os.environ.get('GECKO_W10M_LEGACY_SHIMS') != '1':
+        with open(os.path.join(work, 'probe-forwards.h'), 'w') as h:
+            h.write('static const struct { const wchar_t* host; const char* name; } kForwards[] = {{0, 0}};\n')
+        print('    legacy-name forwarders: off (GECKO_W10M_LEGACY_SHIMS=1 to build them)')
+        return
+
     probe_pairs = []   # (host dll, function) for the probe to verify
     for dll in sorted(wanted_legacy):
         alias, fallback = LEGACY[dll]
