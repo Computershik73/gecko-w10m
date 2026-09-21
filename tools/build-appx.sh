@@ -139,7 +139,13 @@ echo "=== link Gecko.exe ==="
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
   "/MAP:$OBJDIR_W\\Gecko.map" \
   "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
-  WindowsApp.lib OneCoreUap.lib
+  WindowsApp.lib OneCoreUap.lib   /DELAYLOAD:oleaut32.dll delayimp.lib
+# oleaut32.dll is the one static import of the shell that is neither ours nor
+# OneCore: C++/WinRT reaches SysAllocString/SysFreeString/SysStringLen and
+# Get/SetErrorInfo through it, on error paths only. A phone whose OS does
+# not carry oleaut32 refuses the whole executable before wWinMain -- which is
+# what a Lumia 650 does on 1511 and 1607 while the Elite X3 on 1709 runs.
+# Delay-loaded, it is resolved on first use, not at launch.
 # OneCoreUap.lib after WindowsApp.lib: the 1607 SDK's WindowsApp.lib lacks
 # SetErrorInfo/GetErrorInfo, which C++/WinRT's hresult_error needs; the
 # OneCore umbrella of the same SDK has them. WindowsApp.lib still resolves
@@ -518,6 +524,20 @@ PREFS
       echo "    startup cache seed NOT staged: it is for build ${seed_id:-?}, this is $our_id" >&2
     fi
   fi
+
+  # resources.pri: every packaged XAML app carries one and this one did not.
+  # The XAML runtime on 1709 tolerated its absence; older ones are not known
+  # to. Built from the manifest and the Assets alone, in a scratch tree, so
+  # makepri does not index the 250 MB of engine files.
+  PRITMP="$OUT/pri"
+  rm -rf "$PRITMP" && mkdir -p "$PRITMP/Assets"
+  cp "$STAGE/AppxManifest.xml" "$PRITMP/" && cp "$STAGE/Assets/"* "$PRITMP/Assets/"
+  if "$SDK/bin/$SDKV/x64/makepri.exe" createconfig /cf "$(cygpath -w "$PRITMP/priconfig.xml")" /dq en-US /pv 10.0.0 /o >/dev/null 2>&1      && "$SDK/bin/$SDKV/x64/makepri.exe" new /pr "$(cygpath -w "$PRITMP")" /cf "$(cygpath -w "$PRITMP/priconfig.xml")"           /mn "$(cygpath -w "$PRITMP/AppxManifest.xml")" /of "$(cygpath -w "$STAGE/resources.pri")" /o >/dev/null 2>&1; then
+    echo "    resources.pri built ($(stat -c %s "$STAGE/resources.pri") bytes)"
+  else
+    echo "    WARNING: makepri failed, no resources.pri" >&2
+  fi
+  rm -rf "$PRITMP"
 
   # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
   # guard dispatcher reaches its target with bx, and an entry recorded without
