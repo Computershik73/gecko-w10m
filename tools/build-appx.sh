@@ -182,16 +182,34 @@ if [ -f "$VCLIBS" ]; then
       [System.IO.Compression.ZipFileExtensions]::ExtractToFile(\$_,
         (Join-Path '$(cygpath -w "$CRTTMP")' \$_.Name), \$true) };
     \$zip.Dispose()" >/dev/null
-  for f in "$CRTTMP"/*.dll; do
-    b=$(basename "$f")
-    cp "$f" "$STAGE/$b"
-    # Same bytes under the name the engine imports: vcruntime140_app.dll also
-    # answers to vcruntime140.dll.
-    plain=$(echo "$b" | sed 's/_app\.dll$/.dll/')
-    [ "$plain" != "$b" ] && cp "$f" "$STAGE/$plain"
-  done
+  # Only the two DLLs anything of ours imports, and only under the plain
+  # names. The _app names are gone from the package altogether: a Lumia 650
+  # on 1607 mapped msvcp140.dll (these same bytes) and then never mapped the
+  # vcruntime140_app.dll it imports, though the file, flagged APPCONTAINER,
+  # lay beside it -- the plain-named copy was never even tried. The _app
+  # runtime names appear to be resolved through the VCLibs framework package
+  # on that OS, which this package neither declares nor carries. So the copy
+  # of msvcp140 has its import rewritten to vcruntime140.dll, in place, same
+  # length, and nothing in the package names an _app DLL any more.
+  cp "$CRTTMP/vcruntime140_app.dll" "$STAGE/vcruntime140.dll"
+  cp "$CRTTMP/msvcp140_app.dll" "$STAGE/msvcp140.dll"
+  python - "$(cygpath -w "$STAGE/msvcp140.dll")" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+d = open(p, 'rb').read()
+# The name is stored as VCRUNTIME140_APP.dll; match it in any case and keep
+# the field the same length, NUL-padded. No backslashes here on purpose:
+# they do not survive the shells this passes through.
+pat = re.compile(rb'vcruntime140_app[.]dll', re.IGNORECASE)
+n = len(pat.findall(d))
+assert n >= 1, 'import name not found'
+out = pat.sub(lambda m: b'vcruntime140.dll' + bytes(4), d)
+assert len(out) == len(d)
+open(p, 'wb').write(out)
+print('    msvcp140.dll: %d import name(s) rewritten to vcruntime140.dll' % n)
+PYEOF
   rm -rf "$CRTTMP"
-  echo "    CRT from VCLibs 14.00 ARM (UWP, appcontainer)"
+  echo "    CRT from VCLibs 14.00 ARM (UWP, appcontainer), plain names only"
 else
   echo "    WARNING: VCLibs ARM package not found, no CRT staged" >&2
 fi
