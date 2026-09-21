@@ -63,7 +63,7 @@ done
 cp "$BROWSER_STAGE"/api-ms-win-*.dll "$BROWSER_STAGE"/ext-ms-win-*.dll "$STAGE/" 2>/dev/null || true
 # The forwarders for the legacy names the phone lacks, so the probe's load of
 # mozglue, nss3 and xul is a dry run of the browser's fix.
-for f in kernel32.dll advapi32.dll ole32.dll version.dll dbghelp.dll; do
+for f in kernl32.dll advap32.dll ole3x.dll vers1on.dll dbghlp.dll; do
   [ -f "$BROWSER_STAGE/$f" ] && cp "$BROWSER_STAGE/$f" "$STAGE/$f"
 done
 echo "    $(ls "$STAGE" | grep -c '^api-ms\|^ext-ms') shims, $(du -sm "$STAGE" | cut -f1) MB"

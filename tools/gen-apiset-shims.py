@@ -12,30 +12,41 @@ exports forward to where the functions really live stands in for it.
 2. Legacy names. Windows 10 Mobile 1607 has no kernel32.dll, advapi32.dll,
    ole32.dll, version.dll or dbghelp.dll -- the loader probe on a Lumia 650
    asked for each and was refused -- while nineteen files in the package
-   import kernel32.dll by name, the engine's DLLs among them. For each such
-   name a DLL forwarding every imported function to the api-set the 1607
-   SDK's umbrella libraries map it to; what the umbrella does not map goes to
-   kernel32legacy.dll, which that phone has, and the handful of functions
-   that exist nowhere on the phone (the event log, LogonUser, dbghelp's
-   symbol lookup) are stubs that fail cleanly. On a phone that has the real
-   DLL, kernel32 is a KnownDLL and the system's copy wins; the others resolve
-   through the same api-sets the system's copies would.
+   import kernel32.dll by name, the engine's DLLs among them.
+
+   These forwarders are NOT shipped under the real names. The api-set schema
+   on that phone names kernel32.dll as the host of the core api-sets and
+   falls back to kernelbase only while no kernel32.dll can be found; the
+   moment the package carried one, the loader bound every module's api-set
+   imports -- the probe's own included -- to it, and ended the process with
+   STATUS_ENTRYPOINT_NOT_FOUND on the first function the forwarder did not
+   have. So each legacy name gets an alias of the same length or shorter,
+   the forwarder is shipped under the alias, and the import-name strings in
+   every binary of the package are rewritten in place to the alias. Nothing
+   named kernel32.dll exists in the package, the schema keeps its fallback,
+   and our binaries reach the same functions through the alias: each goes to
+   the api-set the 1607 SDK's umbrella libraries map it to, what they do not
+   map goes to kernel32legacy.dll, and the handful that exist nowhere on the
+   phone (the event log, LogonUser, RegRenameKey, dbghelp's symbol lookup)
+   are stubs that fail cleanly. On a phone that has the real DLLs the
+   aliases resolve through the same api-sets the real ones would.
 
 Usage: gen-apiset-shims.py <stage dir> <work dir> <cl.exe> <lld-link.exe> <sdk lib dir>
 """
 import glob
 import os
+import re
 import struct
 import subprocess
 import sys
 
+# legacy name -> (alias of no greater length, fallback DLL for unmapped functions)
 LEGACY = {
-    # name the phone lacks: where an unmapped function is forwarded
-    'kernel32.dll': 'kernel32legacy.dll',
-    'advapi32.dll': 'kernelbase.dll',
-    'ole32.dll': 'combase.dll',
-    'version.dll': 'kernelbase.dll',
-    'dbghelp.dll': None,
+    'kernel32.dll': ('kernl32.dll', 'kernel32legacy.dll'),
+    'advapi32.dll': ('advap32.dll', 'kernelbase.dll'),
+    'ole32.dll': ('ole3x.dll', 'combase.dll'),
+    'version.dll': ('vers1on.dll', 'kernelbase.dll'),
+    'dbghelp.dll': ('dbghlp.dll', None),
 }
 
 # Functions no DLL on the phone provides: a stub that fails, and the value
@@ -106,6 +117,24 @@ def imports(path):
     return out
 
 
+def rewrite_import_names(path, renames):
+    """Rewrite import DLL name strings in place: same length, NUL-padded."""
+    d = open(path, 'rb').read()
+    out = d
+    changed = 0
+    for old, new in renames.items():
+        assert len(new) <= len(old)
+        pat = re.compile(re.escape(old.encode()) + b'\0', re.IGNORECASE)
+        n = len(pat.findall(out))
+        if n:
+            out = pat.sub(new.encode() + b'\0' * (len(old) - len(new) + 1), out)
+            changed += n
+    if changed:
+        assert len(out) == len(d)
+        open(path, 'wb').write(out)
+    return changed
+
+
 def umbrella_map(libdir):
     """function name -> dll name, from the SDK's umbrella import libraries."""
     m = {}
@@ -156,18 +185,25 @@ def main():
     stage, work, cl, lld, libdir = sys.argv[1:6]
     os.makedirs(work, exist_ok=True)
     umbrella = umbrella_map(libdir)
+    aliases = {k: v[0] for k, v in LEGACY.items()}
+    alias_names = set(aliases.values())
+
+    binaries = [f for f in glob.glob(os.path.join(stage, '*.dll')) + glob.glob(os.path.join(stage, '*.exe'))
+                if not os.path.basename(f).lower().startswith(('api-ms-win-', 'ext-ms-win-'))
+                and os.path.basename(f).lower() not in alias_names]
 
     wanted_apisets = {}
     wanted_legacy = {}
-    for f in glob.glob(os.path.join(stage, '*.dll')) + glob.glob(os.path.join(stage, '*.exe')):
-        base = os.path.basename(f).lower()
-        if base.startswith(('api-ms-win-', 'ext-ms-win-')) or base in LEGACY:
-            continue
+    for f in binaries:
         for dll, names in imports(f).items():
             if dll.startswith(('api-ms-win-', 'ext-ms-win-')):
                 wanted_apisets.setdefault(dll[:-4], set()).update(names)
             elif dll in LEGACY:
                 wanted_legacy.setdefault(dll, set()).update(names)
+            elif dll in alias_names:
+                # already rewritten on an earlier run
+                legacy = [k for k, v in aliases.items() if v == dll][0]
+                wanted_legacy.setdefault(legacy, set()).update(names)
 
     src = os.path.join(work, 'empty.c')
     obj = os.path.join(work, 'empty.obj')
@@ -191,10 +227,16 @@ def main():
     print('    %d api-set forwarder shims staged (%d names imported by the package)'
           % (made, len(wanted_apisets)))
 
+    # Nothing under a real legacy name may remain in the stage.
+    for legacy in LEGACY:
+        p = os.path.join(stage, legacy)
+        if os.path.exists(p):
+            os.remove(p)
+
     for dll in sorted(wanted_legacy):
-        base = dll[:-4]
+        alias, fallback = LEGACY[dll]
+        base = alias[:-4]
         names = sorted(n for n in wanted_legacy[dll] if n)
-        fallback = LEGACY[dll]
         forwards, stubs, dropped = [], [], []
         for n in names:
             if n in STUBS:
@@ -225,10 +267,18 @@ def main():
                 d.write('  ' + line + '\n')
             for n in stubs:
                 d.write('  ' + n + '\n')
-        ok = link(lld, objs, deffile, os.path.join(stage, dll), work, base)
-        print('    %s: %s -- %d forwarded, %d stubbed%s'
-              % (dll, 'staged' if ok else 'FAILED', len(forwards), len(stubs),
+        ok = link(lld, objs, deffile, os.path.join(stage, alias), work, base)
+        print('    %s as %s: %s -- %d forwarded, %d stubbed%s'
+              % (dll, alias, 'staged' if ok else 'FAILED', len(forwards), len(stubs),
                  (', %d DROPPED: %s' % (len(dropped), ' '.join(dropped))) if dropped else ''))
+
+    # And every binary that named a legacy DLL now names its alias instead.
+    patched = 0
+    for f in binaries:
+        n = rewrite_import_names(f, aliases)
+        if n:
+            patched += 1
+    print('    import names rewritten to the aliases in %d binaries' % patched)
 
 
 if __name__ == '__main__':
