@@ -404,6 +404,290 @@ function gecko_note_startup() {
         ", resume_from_crash " + resume);
 }
 
+
+// PlayReady for one site, through the phone.
+//
+// Stage one: license acquisition only. The page sees a working
+// com.microsoft.playready key system -- requestMediaKeySystemAccess,
+// MediaKeys, MediaKeySession with generateRequest/update -- whose challenge
+// comes from the phone's own PlayReady and whose license response goes back
+// into it. Nothing here decrypts or plays; that is stage two, and it is only
+// worth building if this stage shows the site issuing a license to this
+// phone at all. Everything the page does with the key system is written to
+// the device log.
+const SPOTIFY_EME_SOURCE = `
+(function () {
+  var KS = "com.microsoft.playready";
+  var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0";
+  var nextId = 1, pending = {};
+  var say = function (m) {
+    try { window.dispatchEvent(new CustomEvent("gecko-drm", { detail: JSON.stringify({ log: String(m).slice(0, 600) }) })); } catch (e) {}
+  };
+  var send = function (msg) {
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      msg.id = id;
+      pending[id] = { resolve: resolve, reject: reject };
+      window.dispatchEvent(new CustomEvent("gecko-drm", { detail: JSON.stringify(msg) }));
+    });
+  };
+  window.addEventListener("gecko-drm-reply", function (ev) {
+    var r;
+    try { r = JSON.parse(ev.detail); } catch (e) { return; }
+    var p = pending[r.id];
+    if (!p) { return; }
+    delete pending[r.id];
+    if (r.ok) { p.resolve(r); } else { p.reject(new DOMException(r.error || "PlayReady failure", "InvalidStateError")); }
+  });
+  var toB64 = function (data) {
+    var u8 = data instanceof ArrayBuffer ? new Uint8Array(data)
+           : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+           : new Uint8Array(0);
+    var s = "";
+    for (var i = 0; i < u8.length; i += 8192) { s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); }
+    return btoa(s);
+  };
+  var fromB64 = function (b64) {
+    var s = atob(b64), u8 = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) { u8[i] = s.charCodeAt(i); }
+    return u8.buffer;
+  };
+  var fire = function (target, type, props) {
+    var ev = new Event(type);
+    for (var k in props) { try { Object.defineProperty(ev, k, { value: props[k], enumerable: true }); } catch (e) {} }
+    var handler = target["on" + type];
+    if (typeof handler === "function") { try { handler.call(target, ev); } catch (e) { say("on" + type + " threw: " + e); } }
+    target.dispatchEvent(ev);
+  };
+  var makeStatusMap = function () {
+    var m = new Map();
+    return {
+      _map: m,
+      get size() { return m.size; },
+      get: function (k) { return m.get(String(k)); },
+      has: function (k) { return m.has(String(k)); },
+      keys: function () { return m.keys(); },
+      values: function () { return m.values(); },
+      entries: function () { return m.entries(); },
+      forEach: function (fn, thisArg) { m.forEach(function (v, k) { fn.call(thisArg, v, k, this); }, this); },
+      [Symbol.iterator]: function () { return m.entries(); }
+    };
+  };
+
+  class Session extends EventTarget {
+    constructor(type) {
+      super();
+      this.sessionId = "pr-" + Math.random().toString(36).slice(2);
+      this.expiration = NaN;
+      this.keyStatuses = makeStatusMap();
+      this.onmessage = null;
+      this.onkeystatuseschange = null;
+      var self = this;
+      this.closed = new Promise(function (res) { self._resolveClosed = res; });
+      say("createSession(" + type + ") -> " + this.sessionId);
+    }
+    generateRequest(initDataType, initData) {
+      var self = this;
+      var bytes = initData instanceof ArrayBuffer ? initData.byteLength : (initData && initData.byteLength) || 0;
+      say("generateRequest(" + initDataType + ", " + bytes + " bytes) on " + self.sessionId);
+      return send({ op: "drm.challenge", session: self.sessionId, initDataType: initDataType, initData: toB64(initData) })
+        .then(function (r) {
+          var buf = fromB64(r.challenge);
+          say("the phone made a " + buf.byteLength + "-byte challenge; its license URI " + (r.uri || "(none)"));
+          fire(self, "message", { messageType: "license-request", message: buf });
+        }, function (e) { say("challenge FAILED: " + e.message); throw e; });
+    }
+    update(response) {
+      var self = this;
+      var bytes = response instanceof ArrayBuffer ? response.byteLength : (response && response.byteLength) || 0;
+      say("update(" + bytes + " bytes) on " + self.sessionId);
+      return send({ op: "drm.response", session: self.sessionId, license: toB64(response) })
+        .then(function () {
+          say("the phone ACCEPTED the license for " + self.sessionId);
+          self.keyStatuses._map.set("gecko-key", "usable");
+          fire(self, "keystatuseschange", {});
+        }, function (e) { say("the phone REJECTED the license: " + e.message); throw e; });
+    }
+    load() { say("load on " + this.sessionId); return Promise.resolve(false); }
+    close() { say("close " + this.sessionId); this._resolveClosed(); return Promise.resolve(); }
+    remove() { say("remove " + this.sessionId); return Promise.resolve(); }
+  }
+
+  class Keys {
+    createSession(type) { return new Session(type || "temporary"); }
+    setServerCertificate(cert) { say("setServerCertificate(" + ((cert && cert.byteLength) || 0) + " bytes)"); return Promise.resolve(true); }
+    getStatusForPolicy() { return Promise.resolve("usable"); }
+  }
+
+  var makeAccess = function (keySystem, config) {
+    return {
+      keySystem: keySystem,
+      getConfiguration: function () { return config; },
+      createMediaKeys: function () { say("createMediaKeys"); return Promise.resolve(new Keys()); }
+    };
+  };
+  var pickConfig = function (configs) {
+    var c = (configs && configs[0]) ? JSON.parse(JSON.stringify(configs[0])) : {};
+    c.label = c.label || "";
+    c.initDataTypes = c.initDataTypes && c.initDataTypes.length ? c.initDataTypes : ["cenc", "keyids"];
+    c.audioCapabilities = c.audioCapabilities || [];
+    c.videoCapabilities = c.videoCapabilities || [];
+    c.distinctiveIdentifier = "not-allowed";
+    c.persistentState = c.persistentState === "required" ? "required" : "not-allowed";
+    c.sessionTypes = c.sessionTypes && c.sessionTypes.length ? c.sessionTypes : ["temporary"];
+    return c;
+  };
+
+  navigator.requestMediaKeySystemAccess = function (keySystem, configs) {
+    say("requestMediaKeySystemAccess(" + keySystem + ", " + JSON.stringify(configs).slice(0, 400) + ")");
+    if (/playready/i.test(keySystem)) {
+      return Promise.resolve(makeAccess(keySystem, pickConfig(configs)));
+    }
+    return Promise.reject(new DOMException("Unsupported keySystem or supportedConfigurations.", "NotSupportedError"));
+  };
+  if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
+    var realDecodingInfo = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+    navigator.mediaCapabilities.decodingInfo = function (config) {
+      var ksc = config && config.keySystemConfiguration;
+      if (ksc) {
+        say("decodingInfo with keySystem " + ksc.keySystem);
+        if (/playready/i.test(ksc.keySystem)) {
+          return Promise.resolve({ supported: true, smooth: true, powerEfficient: true,
+                                   keySystemAccess: makeAccess(ksc.keySystem, pickConfig([{}])) });
+        }
+        return Promise.resolve({ supported: false, smooth: false, powerEfficient: false });
+      }
+      return realDecodingInfo(config);
+    };
+  }
+  var mediaProto = HTMLMediaElement.prototype;
+  mediaProto.setMediaKeys = function (keys) {
+    say("setMediaKeys(" + (keys ? "keys" : "null") + ") on <" + this.tagName.toLowerCase() + ">");
+    this._geckoMediaKeys = keys || null;
+    return Promise.resolve();
+  };
+  Object.defineProperty(mediaProto, "mediaKeys", { get: function () { return this._geckoMediaKeys || null; }, configurable: true });
+  Object.defineProperty(navigator, "userAgent", { get: function () { return UA; }, configurable: true });
+  Object.defineProperty(navigator, "appVersion", { get: function () { return UA.slice(8); }, configurable: true });
+  Object.defineProperty(navigator, "vendor", { get: function () { return "Google Inc."; }, configurable: true });
+  say("PlayReady key system offered to the page");
+})();
+`;
+
+function gecko_spotify() {
+    const setting = Services.prefs.getStringPref("gecko.spotify.hosts", "open.spotify.com");
+    const hosts = setting.split(",").map(h => h.trim().toLowerCase()).filter(h => h.length);
+    if (!hosts.length) {
+        return;
+    }
+    const matches = host => hosts.some(h => host === h || host.endsWith("." + h));
+    // The header the site sees, for every request to it and its CDN: the
+    // page-side navigator.userAgent says the same, so the two agree.
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0";
+    const uaHosts = host => host.endsWith("spotify.com") || host.endsWith("scdn.co") ||
+                            host.endsWith("spotifycdn.com");
+    const log = m => Services.console.logStringMessage("gecko: drm: " + m);
+
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const channel = subject.QueryInterface(Ci.nsIHttpChannel);
+                if (uaHosts(channel.URI.host.toLowerCase())) {
+                    channel.setRequestHeader("User-Agent", UA, false);
+                }
+            } catch (e) {}
+        }
+    }, "http-on-modify-request");
+    // The decisive line of stage one: what the site's license server answers.
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const channel = subject.QueryInterface(Ci.nsIHttpChannel);
+                const spec = channel.URI.spec;
+                if (uaHosts(channel.URI.host.toLowerCase()) &&
+                    /licen[cs]e|playready|widevine|drm/i.test(spec)) {
+                    log("license server " + channel.requestMethod + " " + spec.slice(0, 200) +
+                        " -> HTTP " + channel.responseStatus);
+                }
+            } catch (e) {}
+        }
+    }, "http-on-examine-response");
+
+    // The bridge: page -> chrome -> shell, and back, with chrome-side ids so
+    // several windows cannot collide.
+    let nextId = 1;
+    const inflight = new Map();
+    Services.obs.addObserver({
+        observe(subject, topic, data) {
+            let reply;
+            try { reply = JSON.parse(data); } catch (e) { return; }
+            const entry = inflight.get(reply.id);
+            if (!entry) {
+                if (reply.securityVersion !== undefined) {
+                    log("the phone's PlayReady: security version " + reply.securityVersion +
+                        ", hardware DRM " + reply.hardwareSupported);
+                } else if (reply.error) {
+                    log("shell: " + reply.error);
+                }
+                return;
+            }
+            inflight.delete(reply.id);
+            reply.id = entry.pageId;
+            try {
+                const win = entry.win;
+                win.dispatchEvent(new win.CustomEvent("gecko-drm-reply", { detail: JSON.stringify(reply) }));
+            } catch (e) {
+                log("could not deliver a reply to the page: " + e);
+            }
+        }
+    }, "gecko-w10m-bridge-reply");
+
+    const INJECTED = new WeakSet();
+    const observer = {
+        observe(subject, topic) {
+            let win = topic === "document-element-inserted" ? (subject && subject.defaultView) : subject;
+            if (!win || INJECTED.has(win)) {
+                return;
+            }
+            let host;
+            try {
+                host = win.location.hostname.toLowerCase();
+            } catch (e) {
+                return;
+            }
+            if (!matches(host) || !win.document || !win.document.documentElement) {
+                return;
+            }
+            INJECTED.add(win);
+            try {
+                const sandbox = Cu.Sandbox(win, { sandboxPrototype: win, wantXrays: false });
+                Cu.evalInSandbox(SPOTIFY_EME_SOURCE, sandbox);
+                // The fourth argument: the page's events are untrusted, and
+                // chrome does not hear those unless it asks.
+                win.addEventListener("gecko-drm", ev => {
+                    let msg;
+                    try { msg = JSON.parse(ev.detail); } catch (e) { return; }
+                    if (msg.log !== undefined) {
+                        log("page: " + msg.log);
+                        return;
+                    }
+                    const id = nextId++;
+                    inflight.set(id, { win, pageId: msg.id });
+                    msg.id = id;
+                    Services.obs.notifyObservers(null, "gecko-w10m-bridge", JSON.stringify(msg));
+                }, true, true);
+                Services.obs.notifyObservers(null, "gecko-w10m-bridge", JSON.stringify({ id: 0, op: "drm.info" }));
+                log("PlayReady offered on " + host);
+            } catch (e) {
+                log("hook failed on " + host + ": " + e);
+            }
+        }
+    };
+    Services.obs.addObserver(observer, "content-document-global-created");
+    Services.obs.addObserver(observer, "document-element-inserted");
+}
+
 // h264ify, without the extension.
 //
 // The extension does not touch the browser's codec support at all -- it hooks
@@ -665,6 +949,7 @@ try {
     gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_h264ify();
+    gecko_spotify();
     delete_old_mcf_files();
 
     // Upstream clears the startup cache on every launch, so that edits to

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 
+#include "client/DrmBridge.h"
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
 #include <winrt/Windows.Foundation.Metadata.h>
@@ -284,7 +285,37 @@ void EngineView::WireKeyboard() {
   });
 }
 
+void EngineView::ArmBridge() {
+  if (bridgeArmed_) {
+    return;
+  }
+  const ULONGLONG now = ::GetTickCount64();
+  if (lastBridgeAttempt_ && now - lastBridgeAttempt_ < 1000) {
+    return;
+  }
+  lastBridgeAttempt_ = now;
+  HMODULE xul = ::GetModuleHandleW(L"xul.dll");
+  if (!xul) {
+    return;
+  }
+  if (!set_bridge_) {
+    set_bridge_ = reinterpret_cast<SetBridgeSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_bridge_sink"));
+    bridge_reply_ = reinterpret_cast<BridgeReplyFn>(
+        ::GetProcAddress(xul, "gecko_w10m_bridge_reply"));
+  }
+  if (!set_bridge_ || !bridge_reply_) {
+    return;
+  }
+  DrmBridge::SetReply(bridge_reply_);
+  if (set_bridge_(&DrmBridge::OnMessage) == 1) {
+    bridgeArmed_ = true;
+    Log::Write(L"bridge: the shell is listening for chrome");
+  }
+}
+
 bool EngineView::Resolve() {
+  ArmBridge();
   if (copy_) {
     return true;
   }

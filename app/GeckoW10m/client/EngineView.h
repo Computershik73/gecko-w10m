@@ -135,6 +135,8 @@ class EngineView {
   using OpenUrlFn = int32_t (*)(const char* url);
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
+  using SetBridgeSinkFn = int32_t (*)(void (*)(const char*));
+  using BridgeReplyFn = void (*)(const char*);
   using PanelFn = void (*)(void* panel);
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
   using PanelScaleFn = void (*)(float x, float y);
@@ -156,6 +158,13 @@ class EngineView {
   OpenUrlFn open_url_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
+  // The chrome-to-shell message bridge (client/DrmBridge). Armed once the
+  // engine's main thread is up, which is later than the exports resolve.
+  SetBridgeSinkFn set_bridge_ = nullptr;
+  BridgeReplyFn bridge_reply_ = nullptr;
+  bool bridgeArmed_ = false;
+  unsigned long long lastBridgeAttempt_ = 0;
+  void ArmBridge();
   // A URL the phone handed us -- from a tap on a link in another app, or from
   // this being the browser it opens links with. Kept until the engine has a
   // window to put it in.
