@@ -124,6 +124,7 @@ def main():
         out = os.path.join(stage, apiset + '.dll')
         r = subprocess.run([lld, obj, '/DLL', '/NOENTRY', '/APPCONTAINER',
                             '/MACHINE:ARM', '/NODEFAULTLIB', '/DEF:' + deffile,
+                            '/IMPLIB:' + os.path.join(work, apiset + '.lib'),
                             '/OUT:' + out], capture_output=True, text=True)
         if r.returncode != 0:
             print('    shim %s FAILED: %s' % (apiset, r.stderr.strip()[:200]))
