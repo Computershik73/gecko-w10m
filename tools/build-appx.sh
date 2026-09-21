@@ -544,6 +544,11 @@ PREFS
   fi
   rm -rf "$PRITMP"
 
+  # Api-set forwarder shims for phones whose OS lacks an api-set name (a
+  # Lumia 650 on 1607 lacks api-ms-win-core-fibers-l1-1-0, and the loader
+  # refused vcruntime140_app.dll for it). See tools/gen-apiset-shims.py.
+  python "$(cygpath -w "$ROOT/tools/gen-apiset-shims.py")" "$(cygpath -w "$STAGE")"       "$(cygpath -w "$OUT/shims")" "$CL" "$(cygpath -w "$LLVM/lld-link.exe")"
+
   # Control Flow Guard, as lld-link emits it for 32-bit ARM, is wrong: the
   # guard dispatcher reaches its target with bx, and an entry recorded without
   # the Thumb bit lands there in ARM state, where the first honest Thumb
