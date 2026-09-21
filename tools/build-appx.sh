@@ -37,7 +37,14 @@ LLVM="/c/Program Files/LLVM/bin"
 BIN="$SDK/bin/$SDKV/x64"
 
 export INCLUDE="$VS/include;$SDK/Include/$SDKV/ucrt;$SDK/Include/$SDKV/shared;$SDK/Include/$SDKV/um;$SDK/Include/$SDKV/winrt;$SDK/Include/$SDKV/cppwinrt"
-export LIB="$VS/lib/arm/store;$VS/lib/arm;$SDK/Lib/$SDKV/ucrt/arm;$SDK/Lib/$SDKV/um/arm"
+# The umbrella library decides which api-set DLLs the shell imports, and an
+# api-set that a newer SDK maps a function to may not exist on an older
+# phone: the loader then refuses the whole executable before a line of ours
+# runs. Headers stay at the newest SDK (cppwinrt lives only there); the
+# libraries can be pinned to the oldest OS the package should start on.
+SDKV_LIB="${GECKO_W10M_SDK_LIB:-$SDKV}"
+export LIB="$VS/lib/arm/store;$VS/lib/arm;$SDK/Lib/$SDKV_LIB/ucrt/arm;$SDK/Lib/$SDKV_LIB/um/arm"
+echo "    shell links against SDK $SDKV_LIB libraries"
 export PATH="$VS/bin/Hostx64/x64:$PATH"
 export MSYS2_ARG_CONV_EXCL="*"
 
@@ -132,7 +139,11 @@ echo "=== link Gecko.exe ==="
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM \
   "/MAP:$OBJDIR_W\\Gecko.map" \
   "/LIBPATH:$(cygpath -w "$DIST/../lib")" mozglue.lib \
-  WindowsApp.lib
+  WindowsApp.lib OneCoreUap.lib
+# OneCoreUap.lib after WindowsApp.lib: the 1607 SDK's WindowsApp.lib lacks
+# SetErrorInfo/GetErrorInfo, which C++/WinRT's hresult_error needs; the
+# OneCore umbrella of the same SDK has them. WindowsApp.lib still resolves
+# first, so nothing else changes.
 echo "    $(stat -c%s "$STAGE/Gecko.exe") bytes"
 
 echo "=== stage the package ==="
