@@ -20,6 +20,7 @@
 #include <TraceLoggingProvider.h>
 #include <stdio.h>
 #include <wchar.h>
+#include "probe-forwards.h"
 
 // {5f3c2e1a-7b8d-4c9e-9a1b-2c3d4e5f6a7b}: enter this GUID as a custom
 // provider on the Device Portal's ETW page, level 5.
@@ -180,33 +181,29 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE p, PWSTR cmd, int show) {
   probe(L"d3d11.dll", 0);
   probe(L"dxgi.dll", 0);
 
-  // The functions the 1607 umbrella libraries cannot map to an api-set:
-  // which DLL on this phone actually exports them.
+  // Every legacy forward that names a host DLL rather than a proven api-set
+  // (kForwards, generated with the shims): does that host export that
+  // function on this phone? A forward to a missing export fails the load of
+  // whatever imports it with "procedure not found", and the loader does not
+  // say which one.
   {
-    const wchar_t* carriers[] = {L"kernel32legacy.dll", L"kernelbase.dll",
-                                 L"combase.dll", L"ntdll.dll"};
-    const char* names[] = {
-        "CreateFileMappingA", "GetComputerNameW", "GetNamedPipeServerProcessId",
-        "GetProcessAffinityMask", "GetSystemPowerStatus", "GlobalLock",
-        "GlobalMemoryStatus", "GlobalSize", "GlobalUnlock", "MoveFileW",
-        "OpenFileMappingA", "PowerClearRequest", "PowerCreateRequest",
-        "PowerSetRequest", "RegisterApplicationRestart", "RegRenameKey",
-        "RegisterEventSourceW", "ReportEventW", "LogonUserW",
-        "LsaNtStatusToWinError", "RtlNtStatusToDosError", "SymFromAddr", NULL};
-    int i, j;
-    for (i = 0; names[i]; ++i) {
-      wchar_t found[256] = L"";
-      for (j = 0; j < 4; ++j) {
-        HMODULE m = ::LoadLibraryExW(carriers[j], NULL, 0);
-        if (m && ::GetProcAddress(m, names[i])) {
-          wcscat_s(found, 256, carriers[j]);
-          wcscat_s(found, 256, L" ");
-        }
+    int i, missing = 0;
+    for (i = 0; kForwards[i].host; ++i) {
+      HMODULE m = ::LoadLibraryExW(kForwards[i].host, NULL, 0);
+      if (!m) {
+        swprintf_s(line, 600, L"forward host %s: NOT LOADABLE (%S)",
+                   kForwards[i].host, kForwards[i].name);
+        say(line);
+        ++missing;
+      } else if (!::GetProcAddress(m, kForwards[i].name)) {
+        swprintf_s(line, 600, L"forward MISSING: %s has no %S",
+                   kForwards[i].host, kForwards[i].name);
+        say(line);
+        ++missing;
       }
-      swprintf_s(line, 600, L"export %S: %s", names[i],
-                 found[0] ? found : L"NOWHERE");
-      say(line);
     }
+    swprintf_s(line, 600, L"forwards checked: %d; missing: %d", i, missing);
+    say(line);
   }
 
   say(L"done");

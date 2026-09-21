@@ -43,7 +43,7 @@ OBJ_W="$(cygpath -w "$OBJ")"
 echo "=== compile Probe.exe (cl.exe, ARM, static CRT, SDK $SDKV_LIB libraries) ==="
 "$CL" /nologo /c "$(cygpath -w "$APP/probe/Probe.c")" "/Fo:$OBJ_W\\Probe.obj" \
       /TP /EHs-c- /GR- /MT /O1 /D_ARM_ /DWIN32 /D_WIN32 /DUNICODE /D_UNICODE \
-      /DWINAPI_FAMILY=WINAPI_FAMILY_APP
+      /DWINAPI_FAMILY=WINAPI_FAMILY_APP "/I$(cygpath -w "$OUT/shims")"
 "$LLVM/lld-link.exe" "$OBJ_W\\Probe.obj" "/OUT:$STAGE_W\\Probe.exe" /APPCONTAINER \
   /SUBSYSTEM:WINDOWS,10.0 /ENTRY:wWinMainCRTStartup /MACHINE:ARM   /NODEFAULTLIB:kernel32.lib WindowsApp.lib OneCoreUap.lib
 # No kernel32.lib: the static CRT names it as a default library, and every

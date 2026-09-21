@@ -18,18 +18,21 @@ exports forward to where the functions really live stands in for it.
    on that phone names kernel32.dll as the host of the core api-sets and
    falls back to kernelbase only while no kernel32.dll can be found; the
    moment the package carried one, the loader bound every module's api-set
-   imports -- the probe's own included -- to it, and ended the process with
-   STATUS_ENTRYPOINT_NOT_FOUND on the first function the forwarder did not
-   have. So each legacy name gets an alias of the same length or shorter,
-   the forwarder is shipped under the alias, and the import-name strings in
-   every binary of the package are rewritten in place to the alias. Nothing
-   named kernel32.dll exists in the package, the schema keeps its fallback,
-   and our binaries reach the same functions through the alias: each goes to
-   the api-set the 1607 SDK's umbrella libraries map it to, what they do not
-   map goes to kernel32legacy.dll, and the handful that exist nowhere on the
-   phone (the event log, LogonUser, RegRenameKey, dbghelp's symbol lookup)
-   are stubs that fail cleanly. On a phone that has the real DLLs the
-   aliases resolve through the same api-sets the real ones would.
+   imports to it and ended the process on the first function the forwarder
+   did not have. So each legacy name gets an alias of the same length or
+   shorter, the forwarder ships under the alias, and the import-name strings
+   in every binary of the package are rewritten in place to the alias.
+
+   And the forwarders do not point at api-set names the phone might lack.
+   The 1607 SDK's umbrella libraries are the desktop's; the phone's schema
+   is a subset, and a forward to a name outside it fails the whole load with
+   "module not found" -- which is what mozglue's load came back with once
+   kernl32.dll was mapped. A forward goes to an api-set name only if that
+   name has been seen to resolve on the phone (PROVEN below); otherwise it
+   goes to the DLL that hosts the family on Windows 10 Mobile, by name.
+   Every forward of that second kind is written into probe-forwards.h, so
+   the loader probe can ask each host for each function and name any that
+   are missing.
 
 Usage: gen-apiset-shims.py <stage dir> <work dir> <cl.exe> <lld-link.exe> <sdk lib dir>
 """
@@ -65,6 +68,47 @@ STUBS = {
 RENAMES = {
     'LsaNtStatusToWinError': 'ntdll.RtlNtStatusToDosError',
 }
+
+# Api-set names seen to resolve on a Lumia 650 running 10.0.14393: the
+# imports of Gecko.exe and Probe.exe, both of which ran there, and the names
+# the probe loaded by hand.
+PROVEN = set('''
+api-ms-win-core-handle-l1-1-0 api-ms-win-core-file-l1-2-1 api-ms-win-core-file-l2-1-1
+api-ms-win-eventing-provider-l1-1-0 api-ms-win-core-errorhandling-l1-1-1
+api-ms-win-core-libraryloader-l1-2-0 api-ms-win-core-libraryloader-l1-2-2
+api-ms-win-core-libraryloader-l2-1-0 api-ms-win-core-synch-l1-2-0
+api-ms-win-appmodel-runtime-l1-1-1 api-ms-win-core-processenvironment-l1-2-0
+api-ms-win-core-profile-l1-1-0 api-ms-win-core-processthreads-l1-1-2
+api-ms-win-core-sysinfo-l1-2-1 api-ms-win-core-sysinfo-l1-2-0
+api-ms-win-core-interlocked-l1-2-0 api-ms-win-core-rtlsupport-l1-2-0
+api-ms-win-core-string-l1-1-0 api-ms-win-core-localization-l1-2-1
+api-ms-win-core-fibers-l1-1-1 api-ms-win-core-fibers-l1-1-0
+api-ms-win-core-heap-l1-2-0 api-ms-win-core-console-l1-1-0
+api-ms-win-core-memory-l1-1-2 api-ms-win-core-memory-l1-1-4
+api-ms-win-core-com-l1-1-1 api-ms-win-core-com-l1-1-0 api-ms-win-core-debug-l1-1-1
+api-ms-win-core-util-l1-1-0 api-ms-win-core-winrt-l1-1-0 api-ms-win-core-winrt-string-l1-1-0
+api-ms-win-core-winrt-error-l1-1-1 api-ms-win-core-threadpool-l1-2-0
+api-ms-win-core-file-l2-1-0 api-ms-win-crt-locale-l1-1-0 api-ms-win-crt-time-l1-1-0
+'''.split())
+
+
+def host_for(apiset):
+    """The DLL that hosts an api-set family on Windows 10 Mobile."""
+    if apiset.startswith('api-ms-win-crt-'):
+        return 'ucrtbase.dll'
+    if apiset.startswith(('api-ms-win-core-com-', 'api-ms-win-core-winrt')):
+        return 'combase.dll'
+    if apiset.startswith('api-ms-win-core-rpc'):
+        return 'rpcrt4.dll'
+    if apiset.startswith('api-ms-win-shcore-'):
+        return 'shcore.dll'
+    if apiset.startswith('ext-ms-win-uiacore-'):
+        return 'uiautomationcore.dll'
+    if apiset.startswith(('api-ms-win-service-', 'api-ms-win-security-lsalookup-')):
+        return 'sechost.dll'
+    if apiset.startswith('api-ms-win-security-cryptoapi-'):
+        return 'cryptsp.dll'
+    return 'kernelbase.dll'
 
 
 def imports(path):
@@ -156,20 +200,6 @@ def umbrella_map(libdir):
     return m
 
 
-def target_for_apiset(apiset):
-    if apiset.startswith('api-ms-win-crt-'):
-        return 'ucrtbase'
-    if apiset.startswith(('api-ms-win-core-com-', 'api-ms-win-core-winrt')):
-        return 'combase'
-    if apiset.startswith('api-ms-win-core-rpc'):
-        return 'rpcrt4'
-    if apiset.startswith('api-ms-win-shcore-'):
-        return 'shcore'
-    if apiset.startswith('ext-ms-win-uiacore-'):
-        return 'uiautomationcore'
-    return 'kernelbase'
-
-
 def link(lld, objs, deffile, out, work, name):
     r = subprocess.run([lld] + objs + ['/DLL', '/NOENTRY', '/APPCONTAINER',
                         '/MACHINE:ARM', '/NODEFAULTLIB', '/DEF:' + deffile,
@@ -201,7 +231,6 @@ def main():
             elif dll in LEGACY:
                 wanted_legacy.setdefault(dll, set()).update(names)
             elif dll in alias_names:
-                # already rewritten on an earlier run
                 legacy = [k for k, v in aliases.items() if v == dll][0]
                 wanted_legacy.setdefault(legacy, set()).update(names)
 
@@ -216,7 +245,7 @@ def main():
         names = sorted(n for n in wanted_apisets[apiset] if n)
         if not names:
             continue
-        target = target_for_apiset(apiset)
+        target = host_for(apiset)[:-4]
         deffile = os.path.join(work, apiset + '.def')
         with open(deffile, 'w') as d:
             d.write('LIBRARY ' + apiset + '\nEXPORTS\n')
@@ -227,26 +256,36 @@ def main():
     print('    %d api-set forwarder shims staged (%d names imported by the package)'
           % (made, len(wanted_apisets)))
 
-    # Nothing under a real legacy name may remain in the stage.
     for legacy in LEGACY:
         p = os.path.join(stage, legacy)
         if os.path.exists(p):
             os.remove(p)
 
+    probe_pairs = []   # (host dll, function) for the probe to verify
     for dll in sorted(wanted_legacy):
         alias, fallback = LEGACY[dll]
         base = alias[:-4]
         names = sorted(n for n in wanted_legacy[dll] if n)
-        forwards, stubs, dropped = [], [], []
+        forwards, stubs, dropped, by_host = [], [], [], 0
         for n in names:
             if n in STUBS:
                 stubs.append(n)
             elif n in RENAMES:
                 forwards.append('%s=%s' % (n, RENAMES[n]))
+                probe_pairs.append(tuple(RENAMES[n].split('.')))
             elif n in umbrella:
-                forwards.append('%s=%s.%s' % (n, umbrella[n][:-4], n))
+                apiset = umbrella[n][:-4]
+                if apiset in PROVEN:
+                    forwards.append('%s=%s.%s' % (n, apiset, n))
+                else:
+                    host = host_for(apiset)
+                    forwards.append('%s=%s.%s' % (n, host[:-4], n))
+                    probe_pairs.append((host[:-4], n))
+                    by_host += 1
             elif fallback:
                 forwards.append('%s=%s.%s' % (n, fallback[:-4], n))
+                probe_pairs.append((fallback[:-4], n))
+                by_host += 1
             else:
                 dropped.append(n)
         objs = [obj]
@@ -268,15 +307,21 @@ def main():
             for n in stubs:
                 d.write('  ' + n + '\n')
         ok = link(lld, objs, deffile, os.path.join(stage, alias), work, base)
-        print('    %s as %s: %s -- %d forwarded, %d stubbed%s'
-              % (dll, alias, 'staged' if ok else 'FAILED', len(forwards), len(stubs),
+        print('    %s as %s: %s -- %d forwarded (%d by host name), %d stubbed%s'
+              % (dll, alias, 'staged' if ok else 'FAILED', len(forwards), by_host, len(stubs),
                  (', %d DROPPED: %s' % (len(dropped), ' '.join(dropped))) if dropped else ''))
 
-    # And every binary that named a legacy DLL now names its alias instead.
+    with open(os.path.join(work, 'probe-forwards.h'), 'w') as h:
+        h.write('/* generated by gen-apiset-shims.py: every legacy forward that names a host DLL */\n')
+        h.write('static const struct { const wchar_t* host; const char* name; } kForwards[] = {\n')
+        for host, n in sorted(set(probe_pairs)):
+            h.write('  {L"%s.dll", "%s"},\n' % (host, n))
+        h.write('  {0, 0}};\n')
+    print('    %d host-name forwards listed for the probe' % len(set(probe_pairs)))
+
     patched = 0
     for f in binaries:
-        n = rewrite_import_names(f, aliases)
-        if n:
+        if rewrite_import_names(f, aliases):
             patched += 1
     print('    import names rewritten to the aliases in %d binaries' % patched)
 
