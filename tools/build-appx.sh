@@ -444,7 +444,7 @@ pref("gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
 // script sees a com.microsoft.playready key system whose license exchange
 // runs on the phone's own PlayReady (see gecko_spotify in the autoconfig and
 // client/DrmBridge.cpp in the shell). Stage one, license acquisition only.
-pref("gecko.spotify.hosts", "open.spotify.com");
+pref("gecko.spotify.hosts", "open.spotify.com,spotify.com,spotifycdn.com");
 
 // Fingerprinting protection, minus the part that lies about the screen.
 //

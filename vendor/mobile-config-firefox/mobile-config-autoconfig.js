@@ -523,7 +523,7 @@ const SPOTIFY_EME_SOURCE = `
     return {
       keySystem: keySystem,
       getConfiguration: function () { return config; },
-      createMediaKeys: function () { say("createMediaKeys"); return Promise.resolve(new Keys()); }
+      createMediaKeys: function () { say("createMediaKeys for " + keySystem); return Promise.resolve(new Keys()); }
     };
   };
   var pickConfig = function (configs) {
@@ -560,6 +560,14 @@ const SPOTIFY_EME_SOURCE = `
       return realDecodingInfo(config);
     };
   }
+  if (window.MediaSource && MediaSource.isTypeSupported) {
+    var realIsTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
+    MediaSource.isTypeSupported = function (type) {
+      var r = realIsTypeSupported(type);
+      say("MediaSource.isTypeSupported(" + type + ") -> " + r);
+      return r;
+    };
+  }
   var mediaProto = HTMLMediaElement.prototype;
   mediaProto.setMediaKeys = function (keys) {
     say("setMediaKeys(" + (keys ? "keys" : "null") + ") on <" + this.tagName.toLowerCase() + ">");
@@ -581,6 +589,19 @@ function gecko_spotify() {
         return;
     }
     const matches = host => hosts.some(h => host === h || host.endsWith("." + h));
+    // The player does its EME from a frame on another host: the first run
+    // logged seven real requestMediaKeySystemAccess calls, all refused, from a
+    // window the hook never saw, and then "No such device". So every frame
+    // whose top document is on a Spotify host is hooked, whatever its own.
+    const underSpotify = win => {
+        try {
+            if (matches(win.location.hostname.toLowerCase())) return true;
+            const top = win.top;
+            return top && top !== win && matches(top.location.hostname.toLowerCase());
+        } catch (e) {
+            return false;
+        }
+    };
     // The header the site sees, for every request to it and its CDN: the
     // page-side navigator.userAgent says the same, so the two agree.
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -656,13 +677,14 @@ function gecko_spotify() {
             } catch (e) {
                 return;
             }
-            if (!matches(host) || !win.document || !win.document.documentElement) {
+            if (!underSpotify(win) || !win.document || !win.document.documentElement) {
                 return;
             }
             INJECTED.add(win);
             try {
                 const sandbox = Cu.Sandbox(win, { sandboxPrototype: win, wantXrays: false });
                 Cu.evalInSandbox(SPOTIFY_EME_SOURCE, sandbox);
+                log("frame " + host + (win.top === win ? " (top)" : " (in " + win.top.location.hostname + ")"));
                 // The fourth argument: the page's events are untrusted, and
                 // chrome does not hear those unless it asks.
                 win.addEventListener("gecko-drm", ev => {

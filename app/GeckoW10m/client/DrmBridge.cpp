@@ -115,9 +115,31 @@ std::vector<uint8_t> UnwrapPssh(std::vector<uint8_t> const& in,
   return in;
 }
 
+// MSPR_E_NEEDS_INDIVIDUALIZATION: this phone has never done PlayReady. One
+// network round trip to Microsoft, once per device, and then every PlayReady
+// call works. On the Elite X3 even asking the security version threw it.
+bool IndividualizeIfNeeded(hresult_error const& e, JsonObject& o) {
+  if (static_cast<uint32_t>(e.code()) != 0x8004B822u) {
+    return false;
+  }
+  try {
+    Log::Write(L"drm: the phone needs individualization -- doing it now");
+    PlayReadyIndividualizationServiceRequest indiv;
+    indiv.BeginServiceRequest().get();
+    Log::Write(L"drm: individualized");
+    o.SetNamedValue(L"individualized", JsonValue::CreateBooleanValue(true));
+    return true;
+  } catch (hresult_error const& e2) {
+    Log::Write(L"drm: individualization FAILED: " + std::wstring(e2.message()) +
+               L" (" + std::to_wstring(static_cast<uint32_t>(e2.code())) + L")");
+    return false;
+  }
+}
+
 void HandleInfo(double id) {
   JsonObject o;
   o.SetNamedValue(L"id", JsonValue::CreateNumberValue(id));
+  for (int attempt = 0; attempt < 2; ++attempt) {
   try {
     o.SetNamedValue(L"ok", JsonValue::CreateBooleanValue(true));
     o.SetNamedValue(L"securityVersion",
@@ -127,8 +149,14 @@ void HandleInfo(double id) {
                         PlayReadyHardwareDRMFeatures::HardwareDRM)));
     Log::Write(L"drm: PlayReady security version " +
                std::to_wstring(PlayReadyStatics::PlayReadySecurityVersion()));
+    break;
   } catch (hresult_error const& e) {
+    if (attempt == 0 && IndividualizeIfNeeded(e, o)) {
+      continue;
+    }
     o = Failure(id, L"PlayReady is not available: " + std::wstring(e.message()), e.code());
+    break;
+  }
   }
   Send(o);
 }
@@ -150,13 +178,8 @@ void HandleChallenge(double id, JsonObject const& msg) {
     try {
       soap = request.GenerateManualEnablingChallenge();
     } catch (hresult_error const& e) {
-      // MSPR_E_NEEDS_INDIVIDUALIZATION: the phone has never done PlayReady.
-      // Individualise once (network), then try again.
-      if (static_cast<uint32_t>(e.code()) == 0x8004B822u) {
-        Log::Write(L"drm: the phone needs individualization first");
-        PlayReadyIndividualizationServiceRequest indiv;
-        indiv.BeginServiceRequest().get();
-        Log::Write(L"drm: individualized");
+      JsonObject scratch;
+      if (IndividualizeIfNeeded(e, scratch)) {
         soap = request.GenerateManualEnablingChallenge();
       } else {
         throw;
