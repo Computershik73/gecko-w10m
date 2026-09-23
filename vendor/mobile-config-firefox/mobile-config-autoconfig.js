@@ -664,11 +664,15 @@ function gecko_spotify() {
         }
     }, "gecko-w10m-bridge-reply");
 
+    // Keyed by document, not by window: a tab that navigates keeps its
+    // WindowProxy, so a window-keyed set skipped every page after the first
+    // one in that tab -- Spotify after the sign-in redirect, and a YouTube
+    // page reached by a full navigation, never got their hooks.
     const INJECTED = new WeakSet();
     const observer = {
         observe(subject, topic) {
             let win = topic === "document-element-inserted" ? (subject && subject.defaultView) : subject;
-            if (!win || INJECTED.has(win)) {
+            if (!win || !win.document || INJECTED.has(win.document)) {
                 return;
             }
             let host;
@@ -680,7 +684,7 @@ function gecko_spotify() {
             if (!underSpotify(win) || !win.document || !win.document.documentElement) {
                 return;
             }
-            INJECTED.add(win);
+            INJECTED.add(win.document);
             try {
                 const sandbox = Cu.Sandbox(win, { sandboxPrototype: win, wantXrays: false });
                 Cu.evalInSandbox(SPOTIFY_EME_SOURCE, sandbox);
@@ -825,6 +829,10 @@ function gecko_h264ify() {
     const matches = host =>
         hosts.some(h => host === h || host.endsWith("." + h));
 
+    // Keyed by document, not by window: a tab that navigates keeps its
+    // WindowProxy, so a window-keyed set skipped every page after the first
+    // one in that tab -- Spotify after the sign-in redirect, and a YouTube
+    // page reached by a full navigation, never got their hooks.
     const INJECTED = new WeakSet();
 
     const observer = {
@@ -836,7 +844,7 @@ function gecko_h264ify() {
             // itself has somewhere to go.
             let win = topic === "document-element-inserted"
                 ? (subject && subject.defaultView) : subject;
-            if (!win || INJECTED.has(win)) {
+            if (!win || !win.document || INJECTED.has(win.document)) {
                 return;
             }
             let host;
@@ -852,7 +860,7 @@ function gecko_h264ify() {
                 // The other notification will come with a root element.
                 return;
             }
-            INJECTED.add(win);
+            INJECTED.add(win.document);
             try {
                 // A sandbox whose prototype is the window, with no Xrays, is
                 // the page's own scope: what it assigns lands on the objects
