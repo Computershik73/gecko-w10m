@@ -7,6 +7,7 @@
 #include <winrt/Windows.Graphics.Display.h>
 #include <winrt/Windows.System.Diagnostics.h>
 
+#include <atomic>
 #include <thread>
 
 #include "client/Log.h"
@@ -119,8 +120,19 @@ MainPage::MainPage() {
                  L" at " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
                  mb(MemoryManager::AppMemoryUsageLimit()));
       // Low is 0, Medium 1, High 2, OverLimit 3. From Medium on, the engine
-      // is told to let go of what it can.
-      if (static_cast<int>(level) >= 1) {
+      // is told to let go of what it can -- but not every time. On a 1 GB
+      // phone Medium is half the limit, the system repeats it several times a
+      // second, and each one is a full GC, a cycle collection and a cache
+      // purge on a CPU that is already 90% busy: the cure was the illness.
+      // Medium goes through once in thirty seconds, High and over once in
+      // five.
+      static std::atomic<unsigned long long> lastSent{0};
+      const unsigned long long now = ::GetTickCount64();
+      const unsigned long long gap =
+          static_cast<int>(level) >= 2 ? 5000ull : 30000ull;
+      const unsigned long long last = lastSent.load();
+      if (static_cast<int>(level) >= 1 && (!last || now - last >= gap)) {
+        lastSent.store(now);
         if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
           using PressureFn = void(__cdecl*)(int32_t);
           if (auto fn = reinterpret_cast<PressureFn>(

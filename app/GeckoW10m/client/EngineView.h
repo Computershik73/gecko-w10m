@@ -138,6 +138,7 @@ class EngineView {
   using SetBridgeSinkFn = int32_t (*)(void (*)(const char*));
   using BridgeReplyFn = void (*)(const char*);
   using PanelFn = void (*)(void* panel);
+  using PanelPresentingFn = int32_t (*)();
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
   using PanelScaleFn = void (*)(float x, float y);
   using AngleLogFn = void (*)(void (*)(const char*));
@@ -177,6 +178,7 @@ class EngineView {
   int32_t screenWidth_ = 0;
   int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;
+  PanelPresentingFn panel_presenting_fn_ = nullptr;
   PanelSizeFn panel_size_fn_ = nullptr;
   PanelScaleFn panel_scale_fn_ = nullptr;
 

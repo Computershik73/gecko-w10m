@@ -381,6 +381,11 @@ bool EngineView::Resolve() {
              (touch_ ? L"found -- fingers go to APZ" : L"MISSING -- taps and wheel"));
   panel_fn_ =
       reinterpret_cast<PanelFn>(::GetProcAddress(xul, "gecko_w10m_set_panel"));
+  // The other road to the panel: phones whose GPU stops at feature level 9_3
+  // run software WebRender and composite it with D3D11, which presents to the
+  // panel from xul rather than from ANGLE -- so ANGLE's note never comes.
+  panel_presenting_fn_ = reinterpret_cast<PanelPresentingFn>(
+      ::GetProcAddress(xul, "gecko_w10m_panel_presenting"));
   // The size goes to ANGLE rather than to the engine: ANGLE needs it on its
   // render thread, where XAML cannot be asked for anything, and xul cannot
   // pass it on because xul does not link against ANGLE -- EGL loads it at run
@@ -716,6 +721,12 @@ void EngineView::Tick() {
   // own. A count that stops while the pulse goes on says the UI thread died
   // without the process.
   engine::NoteUiFrame();
+
+  if (!g_panelPresenting.load() && panel_presenting_fn_ &&
+      panel_presenting_fn_()) {
+    Log::Write(L"view: the D3D11 compositor has the panel");
+    g_panelPresenting.store(true);
+  }
 
   // The hardware path presents on its own and never fills the buffer the
   // splash is waiting for, so the splash has to be told separately.

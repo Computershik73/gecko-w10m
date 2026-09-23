@@ -275,19 +275,20 @@ if [ -d "$DIST" ]; then
 // file to fix. If it is hidden anyway, it is the gfx configuration itself.
 pref("gfx.webrender.software", false);
 
-// Never the D3D11 software compositor, whichever way the pref above goes.
+// Software WebRender composited by D3D11, for phones whose GPU stops at
+// feature level 9_3 (Lumia 550/650/950): hardware WebRender needs GLES3 and
+// ANGLE there offers only GLES2, so the tiles are drawn on the CPU -- but they
+// are put together and presented on the GPU, into the same XAML
+// SwapChainPanel ANGLE uses on the bigger phones, instead of being copied out
+// through main memory into an Image every frame.
 //
-// RenderCompositorD3D11SWGL::Create builds a CompositorD3D11, and
-// CompositorD3D11::Initialize reaches through the widget for an HWND. This
-// widget is headless and has none, so it reads 0x1c out of a null pointer and
-// the engine dies -- which is exactly what the software control did, on an
-// NSPR thread, thirteen instructions into Initialize. It only became reachable
-// when headless stopped force-disabling hardware compositing for the sake of
-// the GPU path, so it is my regression, and this is the pref that closes it:
-// CompositorOptions::AllowSoftwareWebRenderD3D11 gates that whole branch, and
-// with it false the software path falls through to RenderCompositorSWGL, which
-// wants no window at all.
-pref("gfx.webrender.software.d3d11", false);
+// This was false because CompositorD3D11::Initialize reached through the
+// widget for an HWND the headless widget does not have and read 0x1c out of
+// a null pointer. It no longer asks: with no HWND it makes a composition swap
+// chain and hands it to the panel (gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp).
+// Phones that run hardware WebRender never reach it; if it cannot start, the
+// software branch falls through to RenderCompositorSWGL as before.
+pref("gfx.webrender.software.d3d11", true);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
