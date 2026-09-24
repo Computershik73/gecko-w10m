@@ -969,7 +969,9 @@ function gecko_h264ify() {
         hosts.some(h => host === h || host.endsWith("." + h));
 
     // The video ceiling: gecko.video.max-height and -framerate, or when they
-    // are 0, 480p at 30 frames on a phone with a gigabyte and a half or less.
+    // are 0, 720p at 30 frames on a phone with a gigabyte and a half or less
+    // (DXVA decodes it; 60 frames are more than the rest of the chain keeps
+    // up with).
     let maxHeight = Services.prefs.getIntPref("gecko.video.max-height", 0);
     let maxFps = Services.prefs.getIntPref("gecko.video.max-framerate", 0);
     if (!maxHeight || !maxFps) {
@@ -979,7 +981,7 @@ function gecko_h264ify() {
         } catch (e) {}
         const small = memory > 0 && memory <= 1536 * 1024 * 1024;
         if (!maxHeight) {
-            maxHeight = small ? 480 : -1;
+            maxHeight = small ? 720 : -1;
         }
         if (!maxFps) {
             maxFps = small ? 30 : -1;
