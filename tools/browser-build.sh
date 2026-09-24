@@ -23,8 +23,14 @@ export MOZCONFIG=/c/Users/User/Documents/GitHub/gecko-w10m/mozconfig/mozconfig.a
 export MOZ_BUILD_DATE="$(python - <<'PY'
 import os, subprocess, datetime
 root = r"C:\Users\User\Documents\GitHub\gecko-w10m\engine\firefox"
-out = subprocess.run(["git", "-C", root, "ls-files", "-m", "-o", "--exclude-standard", "-z"],
+# Against the upstream commit the port started from, not HEAD: the port's
+# changes are committed on a local branch (w10m-port), so "modified" alone
+# would be empty and the id would stop following the engine.
+base = "fb95137a04eb8fe1196cb12f26b100c1e060295c"
+out = subprocess.run(["git", "-C", root, "diff", "--name-only", "-z", base],
                      capture_output=True).stdout.decode("utf-8", "replace")
+out += subprocess.run(["git", "-C", root, "ls-files", "-o", "--exclude-standard", "-z"],
+                      capture_output=True).stdout.decode("utf-8", "replace")
 latest = 0.0
 for rel in out.split("\0"):
     if not rel:
