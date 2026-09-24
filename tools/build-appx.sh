@@ -289,6 +289,15 @@ pref("gfx.webrender.software", false);
 // Phones that run hardware WebRender never reach it; if it cannot start, the
 // software branch falls through to RenderCompositorSWGL as before.
 pref("gfx.webrender.software.d3d11", true);
+// ...and the pixels of that software WebRender shaded on the GPU as well.
+// SWGL keeps running WebRender's vertex shaders on the CPU -- a 9_3 GPU has
+// no vertex texture fetch, which is why hardware WebRender cannot run there
+// -- but the quads go to the compositor's Direct3D 11 device, which shades
+// them straight into the compositor's tiles with pixel shaders built for
+// ps_4_0_level_9_3 (gfx/wr/swgl/src/gpu_d3d11.h). Programs and blend modes
+// that do not fit stay on the CPU; text is greyscale-antialiased, since
+// subpixel text needs dual-source blending.
+pref("gfx.webrender.software.d3d11.gpu-shading", true);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
