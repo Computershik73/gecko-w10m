@@ -775,13 +775,30 @@ const GECKO_FULLSCREEN_MENU = `
 const H264IFY_SOURCE = `
 (function () {
   var BAD = ["vp8", "vp9", "vp08", "vp09", "av01", "av1"];
+  // The video ceiling, set by gecko_h264ify before this runs (0: none). A
+  // phone with a gigabyte decodes 1080p60 in software no better than 480p,
+  // and the frames and buffers alone push it over its memory limit.
+  var MAX_H = typeof GECKO_VIDEO_MAX_HEIGHT === "number" ? GECKO_VIDEO_MAX_HEIGHT : 0;
+  var MAX_FPS = typeof GECKO_VIDEO_MAX_FPS === "number" ? GECKO_VIDEO_MAX_FPS : 0;
+  function tooBig(w, h, fps) {
+    var side = Math.min(w || Infinity, h || Infinity);
+    return (MAX_H > 0 && side !== Infinity && side > MAX_H) ||
+           (MAX_FPS > 0 && fps > MAX_FPS);
+  }
+  // YouTube asks with the size in the type: "...; width=1920; height=1080;
+  // framerate=60".
+  function typeTooBig(t) {
+    var w = /width=(\\d+)/.exec(t), h = /height=(\\d+)/.exec(t),
+        f = /framerate=(\\d+)/.exec(t);
+    return tooBig(w ? +w[1] : 0, h ? +h[1] : 0, f ? +f[1] : 0);
+  }
   function blocked(type) {
     if (typeof type !== "string") { return false; }
     var t = type.toLowerCase();
     for (var i = 0; i < BAD.length; i++) {
       if (t.indexOf(BAD[i]) !== -1) { return true; }
     }
-    return false;
+    return typeTooBig(t);
   }
   if (window.MediaSource && MediaSource.isTypeSupported) {
     var wasTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
@@ -800,8 +817,10 @@ const H264IFY_SOURCE = `
   if (caps && caps.decodingInfo) {
     var wasDecodingInfo = caps.decodingInfo.bind(caps);
     caps.decodingInfo = function (config) {
-      var type = config && config.video && config.video.contentType;
-      if (blocked(type)) {
+      var video = config && config.video;
+      var type = video && video.contentType;
+      if (blocked(type) ||
+          (video && tooBig(video.width, video.height, video.framerate))) {
         return Promise.resolve({
           supported: false, smooth: false, powerEfficient: false,
           configuration: config,
@@ -828,6 +847,30 @@ function gecko_h264ify() {
     }
     const matches = host =>
         hosts.some(h => host === h || host.endsWith("." + h));
+
+    // The video ceiling: gecko.video.max-height and -framerate, or when they
+    // are 0, 480p at 30 frames on a phone with a gigabyte and a half or less.
+    let maxHeight = Services.prefs.getIntPref("gecko.video.max-height", 0);
+    let maxFps = Services.prefs.getIntPref("gecko.video.max-framerate", 0);
+    if (!maxHeight || !maxFps) {
+        let memory = 0;
+        try {
+            memory = Services.sysinfo.getProperty("memsize");
+        } catch (e) {}
+        const small = memory > 0 && memory <= 1536 * 1024 * 1024;
+        if (!maxHeight) {
+            maxHeight = small ? 480 : -1;
+        }
+        if (!maxFps) {
+            maxFps = small ? 30 : -1;
+        }
+    }
+    const ceiling = "var GECKO_VIDEO_MAX_HEIGHT = " + Math.max(maxHeight, 0) +
+        ", GECKO_VIDEO_MAX_FPS = " + Math.max(maxFps, 0) + ";";
+    const ceilingNote = maxHeight > 0 || maxFps > 0
+        ? " (video up to " + (maxHeight > 0 ? maxHeight + "p" : "any size") +
+          (maxFps > 0 ? " at " + maxFps + " fps" : "") + ")"
+        : "";
 
     // Keyed by document, not by window: a tab that navigates keeps its
     // WindowProxy, so a window-keyed set skipped every page after the first
@@ -871,9 +914,10 @@ function gecko_h264ify() {
                     wantXrays: false,
                 });
                 Cu.evalInSandbox(GECKO_FULLSCREEN_MENU, sandbox);
+                Cu.evalInSandbox(ceiling, sandbox);
                 Cu.evalInSandbox(H264IFY_SOURCE, sandbox);
                 Services.console.logStringMessage(
-                    "gecko: page hooks injected into " + host);
+                    "gecko: page hooks injected into " + host + ceilingNote);
             } catch (e) {
                 Services.console.logStringMessage(
                     "gecko: h264ify failed on " + host + ": " + e);
