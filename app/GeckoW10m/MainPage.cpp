@@ -128,8 +128,11 @@ MainPage::MainPage() {
       // five.
       static std::atomic<unsigned long long> lastSent{0};
       const unsigned long long now = ::GetTickCount64();
-      const unsigned long long gap =
-          static_cast<int>(level) >= 2 ? 5000ull : 30000ull;
+      // Past the limit (OverLimit, 3) the app is about to be ended, so that
+      // one always goes through.
+      const unsigned long long gap = static_cast<int>(level) >= 3   ? 0ull
+                                     : static_cast<int>(level) >= 2 ? 5000ull
+                                                                    : 30000ull;
       const unsigned long long last = lastSent.load();
       if (static_cast<int>(level) >= 1 && (!last || now - last >= gap)) {
         lastSent.store(now);

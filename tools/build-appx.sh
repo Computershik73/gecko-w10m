@@ -350,6 +350,18 @@ pref("browser.sessionhistory.max_total_viewers", 2);
 pref("browser.cache.memory.capacity", 16384);
 // The JS nursery: 16 MB, not 64.
 pref("javascript.options.mem.nursery.max_kb", 16384);
+// Video a page has handed to Media Source Extensions -- every HLS and DASH
+// player, rutube's included -- is kept until a source buffer holds 150 MB of
+// it, and 20 MB of audio beside that. On a 390 MB ceiling that is the whole
+// app: the Lumia 650 was ended on rutube.ru at 475 MB with the heap doubling
+// in the last minute. 24 MB of video is still half a minute of 720p ahead of
+// the playhead; the player simply asks for the next segment sooner.
+pref("media.mediasource.eviction_threshold.video", 25165824);
+pref("media.mediasource.eviction_threshold.audio", 4194304);
+// The in-memory media cache for plain <video src>: 4 MB per stream instead of
+// 8, and all of them together no more than 24 MB.
+pref("media.memory_cache_max_size", 4096);
+pref("media.memory_caches_combined_limit_kb", 24576);
 // Tabs in the background are unloaded when memory is tight, and the phone
 // says when that is (gecko_w10m_memory_pressure).
 pref("browser.tabs.unloadOnLowMemory", true);
