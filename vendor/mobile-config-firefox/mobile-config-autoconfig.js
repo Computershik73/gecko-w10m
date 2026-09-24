@@ -832,6 +832,126 @@ const H264IFY_SOURCE = `
 })();
 `;
 
+// A phone with a gigabyte gives the app 390 MB, and the desktop browser with
+// YouTube open went past that and was killed. On such a phone (1.5 GB or
+// less; gecko.lowmem.enabled = false turns it off) the defaults below take
+// the values Firefox uses on Android -- and on low-memory Android devices go
+// further -- trading some speed and caching for memory. They are defaults,
+// so about:config can still change any of them.
+function gecko_low_memory_prefs() {
+    if (!Services.prefs.getBoolPref("gecko.lowmem.enabled", true)) {
+        return;
+    }
+    let memory = 0;
+    try {
+        memory = Services.sysinfo.getProperty("memsize");
+    } catch (e) {}
+    if (!(memory > 0 && memory <= 1536 * 1024 * 1024)) {
+        return;
+    }
+    const defaults = Services.prefs.getDefaultBranch("");
+    const PREFS = {
+        // JavaScript heap: collect sooner and let the heap grow less between
+        // collections; fewer helper threads, a smaller nursery, no parallel
+        // marking (off on Android: each marker thread has its own stacks).
+        "javascript.options.mem.gc_parallel_marking": false,
+        "javascript.options.mem.gc_high_frequency_small_heap_growth": 150,
+        "javascript.options.mem.gc_high_frequency_large_heap_growth": 120,
+        "javascript.options.mem.gc_low_frequency_heap_growth": 120,
+        "javascript.options.mem.gc_small_heap_size_max_mb": 50,
+        "javascript.options.mem.gc_large_heap_size_min_mb": 200,
+        "javascript.options.mem.gc_allocation_threshold_mb": 16,
+        "javascript.options.mem.gc_malloc_threshold_base_mb": 20,
+        "javascript.options.mem.gc_max_helper_threads": 2,
+        "javascript.options.mem.nursery.max_kb": 8192,
+
+        // Back/forward cache: no previous pages kept alive, and short
+        // histories (Android keeps viewers 360 s; here none at all).
+        "browser.sessionhistory.max_total_viewers": 0,
+        "browser.sessionhistory.contentViewerTimeout": 360,
+        "browser.sessionhistory.max_entries": 25,
+        "browser.sessionstore.max_tabs_undo": 3,
+        "browser.sessionstore.max_windows_undo": 0,
+
+        // Network: Android's buffer and HTTP/2 table sizes, a small memory
+        // cache, and no speculative connections or prefetching.
+        "network.buffer.cache.size": 16384,
+        "network.http.http2.default-hpack-buffer": 4096,
+        "network.http.http2.push-allowance": 32768,
+        "network.http.largeKeepaliveFactor": 10,
+        "browser.cache.memory.capacity": 4096,
+        "network.http.speculative-parallel-limit": 0,
+        "network.dns.disablePrefetch": true,
+        "network.prefetch-next": false,
+        "browser.places.speculativeConnect.enabled": false,
+        "browser.urlbar.speculativeConnect.enabled": false,
+
+        // Media: Android's frame queues and decoder reuse; less buffered
+        // video (480p needs little).
+        "media.video-queue.default-size": 5,
+        "media.video-queue.send-to-compositor-size": 1,
+        "media.decoder.recycle.enabled": true,
+        "media.mediasource.eviction_threshold.video": 12 * 1024 * 1024,
+        "media.mediasource.eviction_threshold.audio": 3 * 1024 * 1024,
+
+        // Painting: Android's display port (less painted off screen), no
+        // subpixel text, cheaper pinch zoom, fewer render threads, smaller
+        // and quicker-to-expire decoded image cache, a smaller word cache.
+        "apz.y_skate_size_multiplier": "1.5",
+        "apz.y_stationary_size_multiplier": "1.5",
+        "gfx.webrender.enable-subpixel-aa": false,
+        "gfx.webrender.low-quality-pinch-zoom": true,
+        "gfx.webrender.enable-low-priority-pool": false,
+        "image.mem.surfacecache.max_size_kb": 32768,
+        "image.mem.surfacecache.min_expiration_ms": 20000,
+        "gfx.font_rendering.wordcache.maxentries": 3000,
+        "dom.suspend_inactive.enabled": true,
+
+        // Desktop features a phone does not use, whose modules, data and
+        // background work all cost memory: backups, profiles, taskbar tabs,
+        // translations, accounts, the new-tab page and its hidden preload,
+        // Nimbus rollouts, page-interaction tracking, Reader View parsing
+        // every page, and the network-fed address-bar suggestions.
+        "browser.backup.enabled": false,
+        "browser.backup.archive.enabled": false,
+        "browser.backup.restore.enabled": false,
+        "browser.profiles.enabled": false,
+        "browser.taskbarTabs.enabled": false,
+        "browser.translations.enable": false,
+        "identity.fxaccounts.enabled": false,
+        "browser.newtabpage.enabled": false,
+        "browser.newtab.preload": false,
+        "nimbus.rollouts.enabled": false,
+        "browser.places.interactions.enabled": false,
+        "reader.parse-on-load.enabled": false,
+        "browser.urlbar.trending.featureGate": false,
+        "browser.urlbar.suggest.trending": false,
+        "browser.urlbar.suggest.weather": false,
+        "browser.urlbar.suggest.quickactions": false,
+        "browser.urlbar.suggest.recentsearches": false,
+    };
+    let set = 0;
+    for (const [name, value] of Object.entries(PREFS)) {
+        try {
+            if (typeof value === "boolean") {
+                defaults.setBoolPref(name, value);
+            } else if (typeof value === "number") {
+                defaults.setIntPref(name, value);
+            } else {
+                defaults.setStringPref(name, value);
+            }
+            set++;
+        } catch (e) {
+            // A pref of another type (float prefs take strings) -- skip it.
+            log("lowmem: " + name + " not set: " + e);
+        }
+    }
+    Services.console.logStringMessage(
+        "gecko: low-memory defaults for a " +
+        Math.round(memory / (1024 * 1024)) + " MB phone -- " + set + " of " +
+        Object.keys(PREFS).length + " set");
+}
+
 // What the tabs actually are, a few seconds after a window opens. The first
 // tab after a crash loads forever and comes right the moment it is closed, and
 // which of these fields is wrong says why: a tab left pending by session
@@ -1017,6 +1137,7 @@ function gecko_watch_fullscreen() {
 try {
     gecko_note_phases();
     gecko_fix_homepage();
+    gecko_low_memory_prefs();
     gecko_note_startup();
     gecko_reset_crash_guards();
     gecko_watch_memory();
