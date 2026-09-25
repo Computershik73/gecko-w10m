@@ -886,13 +886,23 @@ function gecko_low_memory_prefs() {
         "browser.places.speculativeConnect.enabled": false,
         "browser.urlbar.speculativeConnect.enabled": false,
 
-        // Media: Android's frame queues and decoder reuse; less buffered
-        // video (480p needs little).
+        // Media: decoder reuse and less buffered video. The compositor still
+        // gets every queued frame with its time (Android sends one at a
+        // time only because its SurfaceTexture holds one picture), and
+        // hardware-decoded frames get a longer queue than the desktop's 3:
+        // on this phone a page or the pagefile holds the decoder up for a
+        // tenth of a second at times, and 3 frames ran dry -- late frames,
+        // a skip to the next key frame, sound ahead of the picture.
         "media.video-queue.default-size": 5,
-        "media.video-queue.send-to-compositor-size": 1,
+        "media.video-queue.hw-accel-size": 6,
         "media.decoder.recycle.enabled": true,
         "media.mediasource.eviction_threshold.video": 12 * 1024 * 1024,
         "media.mediasource.eviction_threshold.audio": 3 * 1024 * 1024,
+
+        // A long script on a phone that pages is slow, not stuck: YouTube's
+        // player script took more than the 20 s the slow-script dialog
+        // allows. The dialog still comes, after a minute.
+        "dom.max_script_run_time": 60,
 
         // Painting: Android's display port (less painted off screen), no
         // subpixel text, cheaper pinch zoom, fewer render threads, smaller
