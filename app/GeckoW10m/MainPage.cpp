@@ -160,6 +160,7 @@ MainPage::MainPage() {
       using namespace winrt::Windows::System::Diagnostics;
       const ULONGLONG started = ::GetTickCount64();
       long long lastBusy = 0, lastIdle = 0;
+      unsigned samples = 0;
       while (true) {
         ::Sleep(::GetTickCount64() - started < 120000 ? 10000 : 30000);
         try {
@@ -189,6 +190,11 @@ MainPage::MainPage() {
             line += L"; phone stats unavailable";
           }
           Log::Write(line);
+          // Every other sample -- every minute once past the first two --
+          // what that memory is made of.
+          if (++samples % 2 == 0) {
+            gecko_w10m::engine::LogMemoryMap();
+          }
         } catch (...) {
         }
       }

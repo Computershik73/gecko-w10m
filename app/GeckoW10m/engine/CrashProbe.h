@@ -86,4 +86,10 @@ void MakeSecondD3DDevice();
 // the screen.
 void SetProbeSurfaceSize(int width, int height);
 
+// Writes to the log what the process's memory is made of: xul.dll's pages in
+// memory section by section, shared (the system can drop them and read them
+// back from flash) or private (the app's own), the rest of the working set by
+// kind, and the commit charge.
+void LogMemoryMap();
+
 }  // namespace gecko_w10m::engine

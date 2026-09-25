@@ -13,7 +13,9 @@
 #include <setjmp.h>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "../client/Log.h"
 
@@ -2093,6 +2095,221 @@ void InstallEngineProbes() {
   WORD characteristics = nt->OptionalHeader.DllCharacteristics;
   Log::Write(L"probe crash: xul.dll CFG",
              (characteristics & 0x4000) ? L"ENFORCED" : L"off");
+}
+
+// ---------------------------------------------------------------------------
+// What the process's memory is made of, page by page.
+//
+// xul.dll is linked for 0x10000000 and the phone loads it wherever ASLR says;
+// on ARM32 nearly every code page holds an absolute address (movw/movt pairs),
+// so 98% of its 87 MB of code needs fixing up on load. A code page that still
+// matches the file is free memory to the system -- dropped when memory is
+// short and read back from flash when touched. A fixed-up page is not, and if
+// the fix-up happened in the process, copy on write, it is the app's own
+// memory: in the commit charge, in the ceiling, written to the pagefile
+// instead of dropped. Which of the two this phone does decides whether loading
+// the engine at a fixed address is worth anything, and the working set says
+// it: every resident page carries a "shared" bit.
+namespace {
+
+// psapi.h is desktop-partition only; kernelbase exports the calls to apps
+// all the same.
+struct GeckoW10mProcessMemoryCounters {
+  DWORD cb;
+  DWORD PageFaultCount;
+  SIZE_T PeakWorkingSetSize;
+  SIZE_T WorkingSetSize;
+  SIZE_T QuotaPeakPagedPoolUsage;
+  SIZE_T QuotaPagedPoolUsage;
+  SIZE_T QuotaPeakNonPagedPoolUsage;
+  SIZE_T QuotaNonPagedPoolUsage;
+  SIZE_T PagefileUsage;
+  SIZE_T PeakPagefileUsage;
+  SIZE_T PrivateUsage;
+};
+using QueryWorkingSetFn = BOOL(WINAPI*)(HANDLE, PVOID, DWORD);
+using GetProcessMemoryInfoFn = BOOL(WINAPI*)(HANDLE, void*, DWORD);
+
+FARPROC FindPsapi(const char* name) {
+  for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
+    if (HMODULE module = ::GetModuleHandleW(dll)) {
+      if (FARPROC fn = ::GetProcAddress(module, name)) return fn;
+    }
+  }
+  return nullptr;
+}
+
+std::wstring MB(uint64_t pages) {
+  wchar_t buf[32];
+  ::swprintf_s(buf, L"%.1f", pages * 4096.0 / (1024 * 1024));
+  return buf;
+}
+
+struct PageCount {
+  uint64_t shared = 0;
+  uint64_t priv = 0;
+  uint64_t total() const { return shared + priv; }
+  void add(bool isShared) { (isShared ? shared : priv)++; }
+};
+
+}  // namespace
+
+void LogMemoryMap() {
+  static const auto queryWorkingSet =
+      reinterpret_cast<QueryWorkingSetFn>(FindPsapi("K32QueryWorkingSet"));
+  static const auto getMemoryInfo = reinterpret_cast<GetProcessMemoryInfoFn>(
+      FindPsapi("K32GetProcessMemoryInfo"));
+  if (!queryWorkingSet) {
+    Log::Write(L"memmap: QueryWorkingSet is not available");
+    return;
+  }
+
+  // The working set: a count, then one word per resident page -- the page
+  // number in the top 20 bits, bit 8 set if the page is shareable.
+  static std::vector<ULONG_PTR> buffer(64 * 1024);
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    if (queryWorkingSet(::GetCurrentProcess(), buffer.data(),
+                        static_cast<DWORD>(buffer.size() * sizeof(ULONG_PTR)))) {
+      break;
+    }
+    if (::GetLastError() != ERROR_BAD_LENGTH) {
+      Log::WriteNum(L"memmap: QueryWorkingSet failed", ::GetLastError());
+      return;
+    }
+    buffer.resize(static_cast<size_t>(buffer[0]) + 8192);
+    if (attempt == 3) return;
+  }
+  const size_t count = static_cast<size_t>(buffer[0]);
+  std::vector<ULONG_PTR> pages(buffer.begin() + 1, buffer.begin() + 1 + count);
+  std::sort(pages.begin(), pages.end());
+
+  // xul.dll's sections, from its own headers.
+  struct Section {
+    wchar_t name[9];
+    uintptr_t start, end;
+    PageCount resident;
+  };
+  std::vector<Section> sections;
+  uintptr_t xulStart = 0, xulEnd = 0, xulPreferred = 0;
+  if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+    auto* base = reinterpret_cast<unsigned char*>(xul);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(
+        base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    xulStart = reinterpret_cast<uintptr_t>(base);
+    xulEnd = xulStart + nt->OptionalHeader.SizeOfImage;
+    xulPreferred = nt->OptionalHeader.ImageBase;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+      Section s{};
+      for (int c = 0; c < 8 && sec->Name[c]; ++c) s.name[c] = sec->Name[c];
+      s.start = xulStart + sec->VirtualAddress;
+      s.end = s.start + ((sec->Misc.VirtualSize + 4095) & ~4095u);
+      sections.push_back(s);
+    }
+  }
+
+  PageCount xulOther, images, mapped, privateMem;
+  MEMORY_BASIC_INFORMATION region{};
+  uintptr_t regionEnd = 0;
+  for (ULONG_PTR entry : pages) {
+    const uintptr_t addr = entry & ~uintptr_t(4095);
+    const bool isShared = (entry & 0x100) != 0;
+    if (addr >= xulStart && addr < xulEnd) {
+      bool found = false;
+      for (Section& s : sections) {
+        if (addr >= s.start && addr < s.end) {
+          s.resident.add(isShared);
+          found = true;
+          break;
+        }
+      }
+      if (!found) xulOther.add(isShared);
+      continue;
+    }
+    if (addr >= regionEnd || addr < reinterpret_cast<uintptr_t>(region.BaseAddress)) {
+      if (::VirtualQuery(reinterpret_cast<void*>(addr), &region,
+                         sizeof(region)) != sizeof(region)) {
+        region = {};
+        regionEnd = 0;
+        privateMem.add(isShared);
+        continue;
+      }
+      regionEnd = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize;
+    }
+    if (region.Type == MEM_IMAGE) {
+      images.add(isShared);
+    } else if (region.Type == MEM_MAPPED) {
+      mapped.add(isShared);
+    } else {
+      privateMem.add(isShared);
+    }
+  }
+
+  // How the loader left xul.dll's pages: execute-read as linked, or
+  // write-copy -- the mark of a fix-up done in the process.
+  uint64_t protBytes[5] = {};  // RX, R, RW/WC, XWC/XRW, other
+  for (uintptr_t at = xulStart; at && at < xulEnd;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (::VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) !=
+        sizeof(info)) {
+      break;
+    }
+    const uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    const uint64_t bytes = (std::min(next, xulEnd) - at);
+    if (info.State == MEM_COMMIT) {
+      switch (info.Protect & 0xff) {
+        case PAGE_EXECUTE_READ: protBytes[0] += bytes; break;
+        case PAGE_READONLY: protBytes[1] += bytes; break;
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY: protBytes[2] += bytes; break;
+        case PAGE_EXECUTE_WRITECOPY:
+        case PAGE_EXECUTE_READWRITE: protBytes[3] += bytes; break;
+        default: protBytes[4] += bytes; break;
+      }
+    }
+    if (next <= at) break;
+    at = next;
+  }
+
+  if (xulStart) {
+    std::wstring line = L"memmap: xul.dll at " + Hex(xulStart) + L", linked for " +
+                        Hex(xulPreferred) +
+                        (xulStart == xulPreferred ? L" (in place)" : L" (moved)") +
+                        L"; in memory, shared+private MB:";
+    for (const Section& s : sections) {
+      if (!s.resident.total()) continue;
+      line += std::wstring(L" ") + s.name + L" " + MB(s.resident.shared) + L"+" +
+              MB(s.resident.priv) + L" of " + MB((s.end - s.start) / 4096);
+    }
+    if (xulOther.total()) {
+      line += L", headers " + MB(xulOther.shared) + L"+" + MB(xulOther.priv);
+    }
+    Log::Write(line);
+    Log::Write(L"memmap: xul.dll mapped as execute-read " + MB(protBytes[0] / 4096) +
+               L" MB, read-only " + MB(protBytes[1] / 4096) + L" MB, read-write " +
+               MB(protBytes[2] / 4096) + L" MB, execute-write " +
+               MB(protBytes[3] / 4096) + L" MB, other " + MB(protBytes[4] / 4096) +
+               L" MB");
+  }
+
+  uint64_t xulShared = xulOther.shared, xulPriv = xulOther.priv;
+  for (const Section& s : sections) {
+    xulShared += s.resident.shared;
+    xulPriv += s.resident.priv;
+  }
+  std::wstring line = L"memmap: working set " + MB(count) +
+                      L" MB, shared+private MB: xul.dll " + MB(xulShared) + L"+" +
+                      MB(xulPriv) + L", other images " + MB(images.shared) + L"+" +
+                      MB(images.priv) + L", mapped " + MB(mapped.shared) + L"+" +
+                      MB(mapped.priv) + L", allocated " + MB(privateMem.shared) +
+                      L"+" + MB(privateMem.priv);
+  GeckoW10mProcessMemoryCounters counters{};
+  counters.cb = sizeof(counters);
+  if (getMemoryInfo &&
+      getMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters))) {
+    line += L"; commit charge " + MB(counters.PrivateUsage / 4096) + L" MB";
+  }
+  Log::Write(line);
 }
 
 }  // namespace gecko_w10m::engine
