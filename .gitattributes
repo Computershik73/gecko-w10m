@@ -1,3 +1,4 @@
 # Engine patches carry CRLF and LF lines byte for byte; any line-ending
 # conversion breaks them.
 patches/**/*.patch -text
+*.sh text eol=lf
