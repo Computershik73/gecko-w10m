@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 08:37:14 +0400
+Subject: [PATCH 09/30] SWGL: blend functions without a CPU key are fine when a
+ GPU blends
+
+Hiding the KHR advanced equations sends WebRender's mix-blend-mode down
+its shader path, whose blend functions the CPU rasterizer's key table does
+not list; the assertion took wrench down on blend/large.yaml. With a
+device attached the GPU blends them, and the CPU key falls back to none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/swgl/src/gl.cc | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index d2d4fcce19..084e5b6673 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -1448,7 +1448,11 @@ static void hash_blend_key() {
+     default:
+       debugf("blendfunc: %x, %x, separate: %x, %x, equation: %x\n", srgb, drgb,
+              sa, da, equation);
+-      assert(false);
++      // With a GPU shading the pixels, WebRender may pick blend functions the
++      // CPU rasterizer has no key for (mix-blend-mode without the advanced
++      // equations); the GPU blends whatever GL can express.
++      assert(ctx->gpu);
++      ctx->blend_key = BLEND_KEY_NONE;
+       break;
+   }
+ }

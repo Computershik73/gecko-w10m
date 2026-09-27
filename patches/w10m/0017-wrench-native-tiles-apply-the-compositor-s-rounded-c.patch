@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 12:10:58 +0400
+Subject: [PATCH 17/30] wrench native tiles: apply the compositor's rounded
+ clip
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/wrench/src/native_tiles.rs | 39 +++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/gfx/wr/wrench/src/native_tiles.rs b/gfx/wr/wrench/src/native_tiles.rs
+index 39a2e7255c..4d6447d19d 100644
+--- a/gfx/wr/wrench/src/native_tiles.rs
++++ b/gfx/wr/wrench/src/native_tiles.rs
+@@ -47,7 +47,7 @@ struct Surface {
+ pub struct NativeTiles {
+     gl: swgl::Context,
+     surfaces: HashMap<NativeSurfaceId, Surface>,
+-    frame: Vec<(NativeSurfaceId, CompositorSurfaceTransform, DeviceIntRect)>,
++    frame: Vec<(NativeSurfaceId, CompositorSurfaceTransform, DeviceIntRect, DeviceIntRect, ClipRadius)>,
+     clear: [u8; 4],
+ }
+ 
+@@ -81,7 +81,7 @@ impl NativeTiles {
+                 pixels[i .. i + 4].copy_from_slice(&self.clear);
+             }
+         }
+-        for &(id, transform, clip) in &self.frame {
++        for &(id, transform, clip, rrect, radii) in &self.frame {
+             let surface = match self.surfaces.get(&id) {
+                 Some(s) => s,
+                 None => continue,
+@@ -124,6 +124,9 @@ impl NativeTiles {
+                     let v = ((((y as f32 + 0.5) - oy) / sy - r0y).floor() as i32).clamp(0, h - 1);
+                     for x in x0 .. x1 {
+                         let u = ((((x as f32 + 0.5) - ox) / sx - r0x).floor() as i32).clamp(0, w - 1);
++                        if !inside_rounded(x, y, &rrect, &radii) {
++                            continue;
++                        }
+                         let s = ((v * w + u) * 4) as usize;
+                         let d = at(x, y);
+                         if surface.is_opaque {
+@@ -142,6 +145,32 @@ impl NativeTiles {
+     }
+ }
+ 
++// Whether the centre of pixel (x, y) is inside the rounded clip (no
++// antialiasing: edge pixels may differ from a render that has it).
++fn inside_rounded(x: i32, y: i32, r: &DeviceIntRect, radii: &ClipRadius) -> bool {
++    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
++    let corners = [
++        (radii.top_left, r.min.x, r.min.y, 1.0, 1.0),
++        (radii.top_right, r.max.x, r.min.y, -1.0, 1.0),
++        (radii.bottom_right, r.max.x, r.max.y, -1.0, -1.0),
++        (radii.bottom_left, r.min.x, r.max.y, 1.0, -1.0),
++    ];
++    for &(rad, cx, cy, dx, dy) in &corners {
++        if rad <= 0 {
++            continue;
++        }
++        let rad = rad as f32;
++        let (ox, oy) = (cx as f32 + dx * rad, cy as f32 + dy * rad);
++        if (px - ox) * dx < 0.0 && (py - oy) * dy < 0.0 {
++            let (ex, ey) = (px - ox, py - oy);
++            if ex * ex + ey * ey > rad * rad {
++                return false;
++            }
++        }
++    }
++    true
++}
++
+ impl Compositor for NativeTiles {
+     fn create_surface(
+         &mut self,
+@@ -216,10 +245,10 @@ impl Compositor for NativeTiles {
+         transform: CompositorSurfaceTransform,
+         clip_rect: DeviceIntRect,
+         _image_rendering: ImageRendering,
+-        _rounded_clip_rect: DeviceIntRect,
+-        _rounded_clip_radii: ClipRadius,
++        rounded_clip_rect: DeviceIntRect,
++        rounded_clip_radii: ClipRadius,
+     ) {
+-        self.frame.push((id, transform, clip_rect));
++        self.frame.push((id, transform, clip_rect, rounded_clip_rect, rounded_clip_radii));
+     }
+ 
+     fn start_compositing(&mut self, _device: &mut Device, clear_color: ColorF, _dirty: &[DeviceIntRect], _opaque: &[DeviceIntRect]) {

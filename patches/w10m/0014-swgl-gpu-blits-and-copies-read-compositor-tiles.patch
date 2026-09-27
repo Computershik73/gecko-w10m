@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 11:52:07 +0400
+Subject: [PATCH 14/30] swgl gpu: blits and copies read compositor tiles
+
+A tile that lives only in the compositor's texture has no CPU buffer, and
+BlitFramebuffer/CopyImageSubData returned early on it, so mix-blend
+backdrops were never copied. The GPU copy now takes the tile's offset in
+its texture; the CPU fallback brings the tile back first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/swgl/src/composite.h | 6 ++++--
+ gfx/wr/swgl/src/gl.cc       | 6 ++++--
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/gfx/wr/swgl/src/composite.h b/gfx/wr/swgl/src/composite.h
+index 3d9a473ae1..70083e8ca1 100644
+--- a/gfx/wr/swgl/src/composite.h
++++ b/gfx/wr/swgl/src/composite.h
+@@ -475,9 +475,9 @@ void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+   Framebuffer* dstfb = get_framebuffer(GL_DRAW_FRAMEBUFFER);
+   if (!dstfb) return;
+   Texture& srctex = ctx->textures[srcfb->color_attachment];
+-  if (!srctex.buf) return;
++  if (!srctex.buf && !gpu_resolve_external_pending(srctex)) return;
+   Texture& dsttex = ctx->textures[dstfb->color_attachment];
+-  if (!dsttex.buf) return;
++  if (!dsttex.buf && !gpu_resolve_external_pending(dsttex)) return;
+   assert(!dsttex.locked);
+   if (srctex.internal_format != dsttex.internal_format &&
+       (!is_renderable_format(srctex.internal_format) ||
+@@ -509,6 +509,8 @@ void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+   }
+   prepare_texture(srctex);
+   prepare_texture(dsttex, &dstReq);
++  // A compositor tile gets a CPU buffer only once something brings it back.
++  if (!srctex.buf || !dsttex.buf) return;
+   if (!srcReq.same_size(dstReq) && srctex.width >= 2 && filter == GL_LINEAR &&
+       srctex.internal_format == dsttex.internal_format &&
+       is_renderable_format(srctex.internal_format)) {
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index 52a8fcb174..3e8428a609 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -3042,9 +3042,9 @@ void CopyImageSubData(GLuint srcName, GLenum srcTarget, UNUSED GLint srcLevel,
+     dstName = rb.texture;
+   }
+   Texture& srctex = ctx->textures[srcName];
+-  if (!srctex.buf) return;
++  if (!srctex.buf && !gpu_resolve_external_pending(srctex)) return;
+   Texture& dsttex = ctx->textures[dstName];
+-  if (!dsttex.buf) return;
++  if (!dsttex.buf && !gpu_resolve_external_pending(dsttex)) return;
+   assert(!dsttex.locked);
+   if (gpu_copy(srctex, IntRect{srcX, srcY, srcX + srcWidth, srcY + srcHeight},
+                dsttex, IntRect{dstX, dstY, dstX + srcWidth, dstY + srcHeight})) {
+@@ -3053,6 +3053,8 @@ void CopyImageSubData(GLuint srcName, GLenum srcTarget, UNUSED GLint srcLevel,
+   prepare_texture(srctex);
+   IntRect skip = {dstX, dstY, dstX + srcWidth, dstY + srcHeight};
+   prepare_texture(dsttex, &skip);
++  // A compositor tile gets a CPU buffer only once something brings it back.
++  if (!srctex.buf || !dsttex.buf) return;
+   assert(srctex.internal_format == dsttex.internal_format);
+   assert(srcWidth >= 0);
+   assert(srcHeight >= 0);

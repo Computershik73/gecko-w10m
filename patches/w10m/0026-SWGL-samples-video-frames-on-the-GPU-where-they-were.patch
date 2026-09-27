@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 25 Sep 2026 07:38:31 +0400
+Subject: [PATCH 26/30] SWGL samples video frames on the GPU where they were
+ decoded
+
+With frames staying on the GPU, the Lumia 650 decoded 30 frames a second
+but showed about 10: the frames were not promoted to compositor surfaces
+(RGB images only ever try an overlay), so SWGL drew them from
+RenderDXGITextureHost::MapPlane, which made a staging texture, copied the
+frame into it and waited on the GPU for every frame, and then uploaded the
+pixels again. SwglGpuSetTextureSource now makes a SWGL texture a BGRA
+Direct3D texture on its own device, which GPU draws sample in place (CPU
+draws read it back if they must); RenderTextureHostSWGL uses it for DXGI
+frames on the compositor's device before falling back to mapping. The log
+says once which way video frames are drawn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorD3D11SWGL.cpp             |  9 +++
+ .../RenderD3D11TextureHost.cpp                | 11 +++
+ .../RenderD3D11TextureHost.h                  |  1 +
+ .../RenderTextureHostSWGL.cpp                 | 40 ++++++++++
+ .../RenderTextureHostSWGL.h                   |  7 ++
+ gfx/wr/swgl/src/gpu_d3d11.h                   | 80 ++++++++++++++++++-
+ 6 files changed, 147 insertions(+), 1 deletion(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+index dca3ce43b6..baf93c86cc 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+@@ -298,6 +298,15 @@ void RenderCompositorD3D11SWGL::HandleExternalImage(
+ 
+   gfx::Rect drawRect(0, 0, size.width, size.height);
+ 
++#if defined(GECKO_W10M)
++  static bool sNoted = false;
++  if (!sNoted && texturedEffect) {
++    sNoted = true;
++    GeckoW10mNote("gfx: a video frame drawn by the D3D11 compositor as a surface "
++                "of its own");
++  }
++#endif
++
+   EffectChain effect;
+   effect.mPrimaryEffect = texturedEffect;
+   mCompositor->DrawQuad(drawRect, aFrameSurface.mClipRect, effect, 1.0,
+diff --git a/gfx/webrender_bindings/RenderD3D11TextureHost.cpp b/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
+index 11adeeecdf..2a2fe121e1 100644
+--- a/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
++++ b/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
+@@ -268,6 +268,17 @@ static bool MapTexture(T* aHost, RenderCompositor* aCompositor,
+   return SUCCEEDED(hr);
+ }
+ 
++void* RenderDXGITextureHost::GetD3D11TextureForSWGL(
++    RenderCompositor* aCompositor) {
++  RenderCompositorD3D11SWGL* compositor =
++      aCompositor ? aCompositor->AsRenderCompositorD3D11SWGL() : nullptr;
++  if (!compositor || mArrayIndex != 0 || mKeyedMutex ||
++      !EnsureD3D11Texture2D(compositor->GetDevice())) {
++    return nullptr;
++  }
++  return mTexture.get();
++}
++
+ bool RenderDXGITextureHost::MapPlane(RenderCompositor* aCompositor,
+                                      uint8_t aChannelIndex,
+                                      PlaneInfo& aPlaneInfo) {
+diff --git a/gfx/webrender_bindings/RenderD3D11TextureHost.h b/gfx/webrender_bindings/RenderD3D11TextureHost.h
+index b02446d430..8620eb1a53 100644
+--- a/gfx/webrender_bindings/RenderD3D11TextureHost.h
++++ b/gfx/webrender_bindings/RenderD3D11TextureHost.h
+@@ -70,6 +70,7 @@ class RenderDXGITextureHost final : public RenderTextureHostSWGL {
+   bool MapPlane(RenderCompositor* aCompositor, uint8_t aChannelIndex,
+                 PlaneInfo& aPlaneInfo) override;
+   void UnmapPlanes() override;
++  void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor) override;
+   gfx::YUVRangedColorSpace GetYUVColorSpace() const override {
+     return ToYUVRangedColorSpace(ToYUVColorSpace(mColorSpace), mColorRange,
+                                  mTransferFunction);
+diff --git a/gfx/webrender_bindings/RenderTextureHostSWGL.cpp b/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
+index 4501eee2c0..d03f919a61 100644
+--- a/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
++++ b/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
+@@ -8,6 +8,13 @@
+ #include "mozilla/gfx/Logging.h"
+ #include "mozilla/layers/TextureHost.h"
+ 
++#if defined(GECKO_W10M)
++// swgl (gpu_d3d11.h): a Direct3D texture as a texture's pixels.
++extern "C" bool SwglGpuSetTextureSource(uint32_t aTexture, void* aD3DTexture,
++                                        int32_t aWidth, int32_t aHeight);
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace wr {
+ 
+@@ -24,6 +31,39 @@ bool RenderTextureHostSWGL::UpdatePlanes(RenderCompositor* aCompositor) {
+   }
+   gfx::SurfaceFormat format = GetFormat();
+   gfx::ColorDepth colorDepth = GetColorDepth();
++#if defined(GECKO_W10M)
++  // A decoded video frame on the device SWGL shades with: SWGL samples it
++  // where it is, rather than it being read back and uploaded again for
++  // every frame (MapPlane).
++  if (planeCount == 1 && (format == gfx::SurfaceFormat::B8G8R8A8 ||
++                          format == gfx::SurfaceFormat::B8G8R8X8)) {
++    if (void* texture = GetD3D11TextureForSWGL(aCompositor)) {
++      gfx::IntSize size = GetSize(0);
++      if (SwglGpuSetTextureSource(mPlanes[0].mTexture, texture, size.width,
++                                  size.height)) {
++        mPlanes[0].mSize = size;
++        mPlanes[0].mData = nullptr;
++        mPlanes[0].mStride = 0;
++        static bool sNoted = false;
++        if (!sNoted) {
++          sNoted = true;
++          GeckoW10mNote(
++              "gfx: a video frame drawn in the page by SWGL, sampled on the "
++              "GPU where it was decoded");
++        }
++        if (texInit) {
++          wr_swgl_set_texture_parameter(mContext, mPlanes[0].mTexture,
++                                        LOCAL_GL_TEXTURE_MIN_FILTER,
++                                        LOCAL_GL_LINEAR);
++          wr_swgl_set_texture_parameter(mContext, mPlanes[0].mTexture,
++                                        LOCAL_GL_TEXTURE_MAG_FILTER,
++                                        LOCAL_GL_LINEAR);
++        }
++        return true;
++      }
++    }
++  }
++#endif
+   for (size_t i = 0; i < planeCount; i++) {
+     PlaneInfo& plane = mPlanes[i];
+     if (!MapPlane(aCompositor, i, plane)) {
+diff --git a/gfx/webrender_bindings/RenderTextureHostSWGL.h b/gfx/webrender_bindings/RenderTextureHostSWGL.h
+index e2804b3157..fb50bbfbda 100644
+--- a/gfx/webrender_bindings/RenderTextureHostSWGL.h
++++ b/gfx/webrender_bindings/RenderTextureHostSWGL.h
+@@ -46,6 +46,13 @@ class RenderTextureHostSWGL : public RenderTextureHost {
+ 
+   virtual void UnmapPlanes() = 0;
+ 
++  // A Direct3D 11 texture holding the whole image, on the compositor's
++  // device, that SWGL shading on that device can sample directly instead of
++  // mapping planes (Windows 10 Mobile). Null when there is none.
++  virtual void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor) {
++    return nullptr;
++  }
++
+   // Lock this texture host as an attached external image for a SWGL compositor
+   // surface. See swgl_bindings.rs for a description of the resulting
+   // WrSWGLCompositeSurfaceInfo. This is paired with a call to UnlockSWGL when
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 100dadae70..f5abbdeb4d 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -103,6 +103,9 @@ struct GpuTex {
+   // this SWGL texture is the rectangle at (ox, oy). It is never recreated,
+   // and SWGL keeps no CPU buffer for it unless a CPU draw needs one.
+   bool external = false;
++  // ... and one that is only read, never drawn into: a video frame decoded
++  // on this device (SwglGpuSetTextureSource). Draws may sample it.
++  bool source = false;
+   int ox = 0;
+   int oy = 0;
+   // A colour texture whose CPU buffer was freed once the GPU copy was
+@@ -135,6 +138,7 @@ struct GpuTex {
+     tex_w = tex_h = 0;
+     format = DXGI_FORMAT_UNKNOWN;
+     external = false;
++    source = false;
+     resident = false;
+     ox = oy = 0;
+   }
+@@ -1132,6 +1136,10 @@ static void gpu_cpu_wrote_rect(Texture& t, int x0, int y0, int x1, int y1) {
+ 
+ // Storage was (re)specified: whatever the GPU had no longer applies.
+ static void gpu_storage_changed(Texture& t) {
++  if (t.gpu && t.gpu->external) {
++    // It held someone else's Direct3D texture; that is over now.
++    t.gpu->release();
++  }
+   if (t.gpu) {
+     t.gpu->gpu_newer = false;
+     t.gpu->cpu_newer = true;
+@@ -1392,7 +1400,7 @@ static bool gpu_check(Texture& colortex, Texture** sampled,
+     if ((!st.buf && !(st.gpu && st.gpu->resident)) ||
+         !gl_format_on_gpu(g, st.internal_format, &f, &e) ||
+         st.internal_format == GL_DEPTH_COMPONENT24 ||
+-        (st.gpu && st.gpu->external)) {
++        (st.gpu && st.gpu->external && !st.gpu->source)) {
+       return refuse(g, false, "sampled texture");
+     }
+     sampled[i] = &st;
+@@ -1973,6 +1981,73 @@ bool SwglGpuSetTextureTarget(GLuint texid, void* d3d_texture, GLsizei width,
+   return true;
+ }
+ 
++// Makes texture `texid` a Direct3D texture on the attached device that
++// belongs to the caller -- a decoded video frame -- `width` by `height` BGRA,
++// which GPU draws sample where it is: no copy to memory and back. A CPU draw
++// that needs it reads it back. False if it is not on this device or not of
++// that size and format, and the caller hands over memory instead.
++bool SwglGpuSetTextureSource(GLuint texid, void* d3d_texture, GLsizei width,
++                             GLsizei height) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || !d3d_texture || width <= 0 || height <= 0) {
++    return false;
++  }
++  ID3D11Texture2D* tex = (ID3D11Texture2D*)d3d_texture;
++  D3D11_TEXTURE2D_DESC td;
++  tex->GetDesc(&td);
++  if (td.Width != UINT(width) || td.Height != UINT(height) ||
++      td.ArraySize != 1 ||
++      (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
++       td.Format != DXGI_FORMAT_B8G8R8X8_UNORM) ||
++      !(td.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
++    return false;
++  }
++  ID3D11Device* dev = nullptr;
++  tex->GetDevice(&dev);
++  bool same = dev == g->dev;
++  if (dev) dev->Release();
++  if (!same) return false;
++  debug_check(g, "texture source");
++  Texture& t = ctx->textures[texid];
++  if (t.width != width || t.height != height ||
++      t.internal_format != GL_RGBA8 || !t.should_free()) {
++    t.cleanup();
++    t.set_should_free(true);
++    t.internal_format = GL_RGBA8;
++    t.width = width;
++    t.height = height;
++  } else if (t.buf) {
++    t.cleanup();
++  }
++  t.offset = IntPoint(0, 0);
++  t.disable_delayed_clear();
++  if (!t.gpu) t.gpu = new GpuTex;
++  GpuTex& gt = *t.gpu;
++  if (gt.tex != tex || !gt.source) {
++    gt.release();
++    tex->AddRef();
++    gt.tex = tex;
++    if (FAILED(g->dev->CreateShaderResourceView(tex, nullptr, &gt.srv))) {
++      gt.release();
++      return false;
++    }
++    gt.format = td.Format;
++    gt.tex_w = td.Width;
++    gt.tex_h = td.Height;
++  }
++  gt.external = true;
++  gt.source = true;
++  gt.internal_format = GL_RGBA8;
++  gt.width = width;
++  gt.height = height;
++  gt.ox = gt.oy = 0;
++  gt.expanded = false;
++  gt.gpu_newer = true;
++  gt.cpu_newer = false;
++  return true;
++}
++
+ // Attaches a Direct3D 11 device to the current SWGL context; from then on
+ // draws that can run on it do. The device must belong to the thread that
+ // uses the context. Returns false, attaching nothing, if the device cannot
+@@ -2188,6 +2263,9 @@ void SwglGpuDescribe(char* out, size_t size) {
+ bool SwglGpuSetTextureTarget(GLuint, void*, GLsizei, GLsizei, GLint, GLint) {
+   return false;
+ }
++bool SwglGpuSetTextureSource(GLuint, void*, GLsizei, GLsizei) {
++  return false;
++}
+ bool SwglGpuAttachNewDevice(int, bool) { return false; }
+ void* SwglGpuTestCreateTile(int, int) { return nullptr; }
+ void SwglGpuTestReleaseTile(void*) {}

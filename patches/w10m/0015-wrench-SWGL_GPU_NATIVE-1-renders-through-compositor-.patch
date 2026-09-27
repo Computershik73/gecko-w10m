@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 11:52:08 +0400
+Subject: [PATCH 15/30] wrench: SWGL_GPU_NATIVE=1 renders through compositor
+ tiles on the GPU
+
+A native compositor whose tiles are Direct3D textures that SWGL draws into,
+as Gecko's D3D11 SWGL compositor does on the phone; the tiles are read
+back and composited on the CPU so the result compares with a CPU render.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/wrench/Cargo.toml          |   2 +-
+ gfx/wr/wrench/src/main.rs         |   2 +
+ gfx/wr/wrench/src/native_tiles.rs | 277 ++++++++++++++++++++++++++++++
+ gfx/wr/wrench/src/wrench.rs       |  21 ++-
+ 4 files changed, 300 insertions(+), 2 deletions(-)
+ create mode 100644 gfx/wr/wrench/src/native_tiles.rs
+
+diff --git a/gfx/wr/wrench/Cargo.toml b/gfx/wr/wrench/Cargo.toml
+index 90391ec51e..92b7f08a48 100644
+--- a/gfx/wr/wrench/Cargo.toml
++++ b/gfx/wr/wrench/Cargo.toml
+@@ -46,7 +46,7 @@ core-foundation = "0.9"
+ [features]
+ default = [ "env_logger" ]
+ headless = [ "osmesa-sys", "osmesa-src" ]
+-software = [ "swgl" ]
++software = [ "swgl", "webrender/sw_compositor" ]
+ debugger = [ "webrender/debugger" ]
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/gfx/wr/wrench/src/main.rs b/gfx/wr/wrench/src/main.rs
+index f9eefb37bc..e59263b9e9 100644
+--- a/gfx/wr/wrench/src/main.rs
++++ b/gfx/wr/wrench/src/main.rs
+@@ -38,6 +38,8 @@ mod parse_function;
+ mod perf;
+ mod png;
+ mod premultiply;
++#[cfg(feature = "software")]
++mod native_tiles;
+ mod rawtest;
+ mod rawtests;
+ mod reftest;
+diff --git a/gfx/wr/wrench/src/native_tiles.rs b/gfx/wr/wrench/src/native_tiles.rs
+new file mode 100644
+index 0000000000..39a2e7255c
+--- /dev/null
++++ b/gfx/wr/wrench/src/native_tiles.rs
+@@ -0,0 +1,277 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// SWGL_GPU_NATIVE=1 with SWGL_GPU: WebRender composites through a native
++// compositor whose tiles are Direct3D textures that SWGL draws into on the
++// GPU, as Gecko's D3D11 SWGL compositor does on the phone. The tiles are then
++// read back and composited here, on the CPU, into the default framebuffer, so
++// that the result can be compared with a plain software render.
++
++use std::collections::HashMap;
++use std::os::raw::c_void;
++
++use webrender::api::units::*;
++use webrender::api::{ColorF, ExternalImageId, ImageRendering};
++use webrender::{
++    ClipRadius, Compositor, CompositorCapabilities, CompositorSurfaceTransform, Device,
++    MappableCompositor, MappedTileInfo, NativeSurfaceId, NativeSurfaceInfo, NativeTileId,
++    SWGLCompositeSurfaceInfo, WindowVisibility,
++};
++
++extern "C" {
++    fn SwglGpuTestCreateTile(width: i32, height: i32) -> *mut c_void;
++    fn SwglGpuTestReleaseTile(tex: *mut c_void);
++    fn SwglGpuTestReadTile(
++        tex: *mut c_void,
++        x: i32,
++        y: i32,
++        width: i32,
++        height: i32,
++        out: *mut c_void,
++        stride: i32,
++    ) -> bool;
++}
++
++struct Tile {
++    tex: *mut c_void,
++    valid: DeviceIntRect,
++}
++
++struct Surface {
++    tile_size: DeviceIntSize,
++    is_opaque: bool,
++    tiles: HashMap<(i32, i32), Tile>,
++}
++
++pub struct NativeTiles {
++    gl: swgl::Context,
++    surfaces: HashMap<NativeSurfaceId, Surface>,
++    frame: Vec<(NativeSurfaceId, CompositorSurfaceTransform, DeviceIntRect)>,
++    clear: [u8; 4],
++}
++
++impl NativeTiles {
++    pub fn new(gl: swgl::Context) -> Self {
++        NativeTiles {
++            gl,
++            surfaces: HashMap::new(),
++            frame: Vec::new(),
++            clear: [255, 255, 255, 255],
++        }
++    }
++
++    fn composite(&self) {
++        let fb = match self.gl.lock_framebuffer(0) {
++            Some(fb) => fb,
++            None => return,
++        };
++        let (data, fw, fh, stride) = fb.get_buffer();
++        if data.is_null() {
++            return;
++        }
++        let pixels = unsafe {
++            std::slice::from_raw_parts_mut(data as *mut u8, (stride * fh) as usize)
++        };
++        // Memory row 0 is the bottom of the window: flip.
++        let at = |x: i32, y: i32| ((fh - 1 - y) * stride + x * 4) as usize;
++        for y in 0 .. fh {
++            for x in 0 .. fw {
++                let i = at(x, y);
++                pixels[i .. i + 4].copy_from_slice(&self.clear);
++            }
++        }
++        for &(id, transform, clip) in &self.frame {
++            let surface = match self.surfaces.get(&id) {
++                Some(s) => s,
++                None => continue,
++            };
++            let (sx, sy) = (transform.scale.x, transform.scale.y);
++            let (ox, oy) = (transform.offset.x, transform.offset.y);
++            for (&(tx, ty), tile) in &surface.tiles {
++                if tile.valid.is_empty() || tile.tex.is_null() {
++                    continue;
++                }
++                let (w, h) = (tile.valid.width(), tile.valid.height());
++                let mut src = vec![0u8; (w * h * 4) as usize];
++                let ok = unsafe {
++                    SwglGpuTestReadTile(
++                        tile.tex,
++                        tile.valid.min.x,
++                        tile.valid.min.y,
++                        w,
++                        h,
++                        src.as_mut_ptr() as *mut c_void,
++                        w * 4,
++                    )
++                };
++                if !ok {
++                    eprintln!("native: tile readback failed");
++                    continue;
++                }
++                // The tile's valid rectangle in surface space, then on screen.
++                let r0x = (tx * surface.tile_size.width + tile.valid.min.x) as f32;
++                let r0y = (ty * surface.tile_size.height + tile.valid.min.y) as f32;
++                let ax = r0x * sx + ox;
++                let bx = (r0x + w as f32) * sx + ox;
++                let ay = r0y * sy + oy;
++                let by = (r0y + h as f32) * sy + oy;
++                let x0 = (ax.min(bx).round() as i32).max(clip.min.x).max(0);
++                let x1 = (ax.max(bx).round() as i32).min(clip.max.x).min(fw);
++                let y0 = (ay.min(by).round() as i32).max(clip.min.y).max(0);
++                let y1 = (ay.max(by).round() as i32).min(clip.max.y).min(fh);
++                for y in y0 .. y1 {
++                    let v = ((((y as f32 + 0.5) - oy) / sy - r0y).floor() as i32).clamp(0, h - 1);
++                    for x in x0 .. x1 {
++                        let u = ((((x as f32 + 0.5) - ox) / sx - r0x).floor() as i32).clamp(0, w - 1);
++                        let s = ((v * w + u) * 4) as usize;
++                        let d = at(x, y);
++                        if surface.is_opaque {
++                            pixels[d .. d + 4].copy_from_slice(&src[s .. s + 4]);
++                        } else {
++                            let inv = 255 - src[s + 3] as u32;
++                            for c in 0 .. 4 {
++                                let v = src[s + c] as u32 + (pixels[d + c] as u32 * inv + 127) / 255;
++                                pixels[d + c] = v.min(255) as u8;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl Compositor for NativeTiles {
++    fn create_surface(
++        &mut self,
++        _device: &mut Device,
++        id: NativeSurfaceId,
++        _virtual_offset: DeviceIntPoint,
++        tile_size: DeviceIntSize,
++        is_opaque: bool,
++    ) {
++        self.surfaces.insert(id, Surface { tile_size, is_opaque, tiles: HashMap::new() });
++    }
++
++    fn create_external_surface(&mut self, _device: &mut Device, id: NativeSurfaceId, is_opaque: bool) {
++        eprintln!("native: external surfaces are not composited here");
++        self.surfaces.insert(id, Surface {
++            tile_size: DeviceIntSize::new(1, 1),
++            is_opaque,
++            tiles: HashMap::new(),
++        });
++    }
++
++    fn create_backdrop_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _color: ColorF) {
++        unreachable!();
++    }
++
++    fn destroy_surface(&mut self, _device: &mut Device, id: NativeSurfaceId) {
++        if let Some(s) = self.surfaces.remove(&id) {
++            for (_, t) in s.tiles {
++                unsafe { SwglGpuTestReleaseTile(t.tex) };
++            }
++        }
++    }
++
++    fn create_tile(&mut self, _device: &mut Device, id: NativeTileId) {
++        let s = self.surfaces.get_mut(&id.surface_id).unwrap();
++        let tex = unsafe { SwglGpuTestCreateTile(s.tile_size.width, s.tile_size.height) };
++        s.tiles.insert((id.x, id.y), Tile { tex, valid: DeviceIntRect::zero() });
++    }
++
++    fn destroy_tile(&mut self, _device: &mut Device, id: NativeTileId) {
++        if let Some(s) = self.surfaces.get_mut(&id.surface_id) {
++            if let Some(t) = s.tiles.remove(&(id.x, id.y)) {
++                unsafe { SwglGpuTestReleaseTile(t.tex) };
++            }
++        }
++    }
++
++    fn attach_external_image(&mut self, _device: &mut Device, _id: NativeSurfaceId, _image: ExternalImageId) {}
++
++    fn invalidate_tile(&mut self, _device: &mut Device, id: NativeTileId, valid_rect: DeviceIntRect) {
++        if let Some(t) = self.surfaces.get_mut(&id.surface_id).and_then(|s| s.tiles.get_mut(&(id.x, id.y))) {
++            t.valid = valid_rect;
++        }
++    }
++
++    fn bind(&mut self, _device: &mut Device, _id: NativeTileId, _dirty: DeviceIntRect, _valid: DeviceIntRect) -> NativeSurfaceInfo {
++        unreachable!();
++    }
++
++    fn unbind(&mut self, _device: &mut Device) {
++        unreachable!();
++    }
++
++    fn begin_frame(&mut self, _device: &mut Device) {
++        self.frame.clear();
++    }
++
++    fn add_surface(
++        &mut self,
++        _device: &mut Device,
++        id: NativeSurfaceId,
++        transform: CompositorSurfaceTransform,
++        clip_rect: DeviceIntRect,
++        _image_rendering: ImageRendering,
++        _rounded_clip_rect: DeviceIntRect,
++        _rounded_clip_radii: ClipRadius,
++    ) {
++        self.frame.push((id, transform, clip_rect));
++    }
++
++    fn start_compositing(&mut self, _device: &mut Device, clear_color: ColorF, _dirty: &[DeviceIntRect], _opaque: &[DeviceIntRect]) {
++        let c = clear_color.premultiplied();
++        let b = |v: f32| (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
++        self.clear = [b(c.b), b(c.g), b(c.r), b(c.a)];
++    }
++
++    fn end_frame(&mut self, _device: &mut Device) {
++        self.composite();
++    }
++
++    fn enable_native_compositor(&mut self, _device: &mut Device, _enable: bool) {}
++
++    fn deinit(&mut self, _device: &mut Device) {
++        for (_, s) in self.surfaces.drain() {
++            for (_, t) in s.tiles {
++                unsafe { SwglGpuTestReleaseTile(t.tex) };
++            }
++        }
++    }
++
++    fn get_capabilities(&self, _device: &mut Device) -> CompositorCapabilities {
++        CompositorCapabilities::default()
++    }
++
++    fn get_window_visibility(&self, _device: &mut Device) -> WindowVisibility {
++        WindowVisibility::default()
++    }
++}
++
++impl MappableCompositor for NativeTiles {
++    fn map_tile(&mut self, _device: &mut Device, id: NativeTileId, _dirty: DeviceIntRect, valid: DeviceIntRect) -> Option<MappedTileInfo> {
++        let t = self.surfaces.get_mut(&id.surface_id)?.tiles.get_mut(&(id.x, id.y))?;
++        t.valid = valid;
++        if t.tex.is_null() {
++            return None;
++        }
++        Some(MappedTileInfo { data: t.tex, stride: -1 })
++    }
++
++    fn unmap_tile(&mut self, _device: &mut Device) {}
++
++    fn lock_composite_surface(
++        &mut self,
++        _device: &mut Device,
++        _ctx: *mut c_void,
++        _id: ExternalImageId,
++        _info: *mut SWGLCompositeSurfaceInfo,
++    ) -> bool {
++        false
++    }
++
++    fn unlock_composite_surface(&mut self, _device: &mut Device, _ctx: *mut c_void, _id: ExternalImageId) {}
++}
+diff --git a/gfx/wr/wrench/src/wrench.rs b/gfx/wr/wrench/src/wrench.rs
+index 5bea01e69b..5a60836232 100644
+--- a/gfx/wr/wrench/src/wrench.rs
++++ b/gfx/wr/wrench/src/wrench.rs
+@@ -273,7 +273,7 @@ impl Wrench {
+ 
+         let compositor_config = match layer_compositor {
+             Some(compositor) => CompositorConfig::Layer { compositor },
+-            None => CompositorConfig::default(),
++            None => native_tiles_config(window).unwrap_or_default(),
+         };
+ 
+         let opts = webrender::WebRenderOptions {
+@@ -717,3 +717,22 @@ impl Wrench {
+         self.renderer.deinit();
+     }
+ }
++
++// SWGL_GPU_NATIVE=1: compositor tiles are Direct3D textures that SWGL draws
++// into on the GPU, as on the phone (see native_tiles.rs).
++#[cfg(feature = "software")]
++fn native_tiles_config(window: &WindowWrapper) -> Option<CompositorConfig> {
++    std::env::var("SWGL_GPU_NATIVE").ok()?;
++    let gl = *window.software_gl()?;
++    let compositor = webrender::sw_compositor::SwCompositor::new(
++        gl,
++        Box::new(crate::native_tiles::NativeTiles::new(gl)),
++        true,
++    );
++    Some(CompositorConfig::Native { compositor: Box::new(compositor) })
++}
++
++#[cfg(not(feature = "software"))]
++fn native_tiles_config(_window: &WindowWrapper) -> Option<CompositorConfig> {
++    None
++}

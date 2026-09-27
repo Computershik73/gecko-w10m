@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:26:20 +0400
+Subject: [PATCH 03/30] swgl: build the feature level 9_3 pixel shaders and the
+ glue that feeds them
+
+For Windows targets, swgl's build script now translates each program's
+fragment half with glsl-to-cxx's HLSL back end and compiles it with fxc
+(ps_4_0_level_9_3). The bytecode goes into <shader>_gpu.h. glsl-to-cxx
+gives every program class three GPU hooks:
+- gpu_info(): the bytecode and its varying layout, or null;
+- gpu_pack(): after the vertex shader has run a quad, copies its
+  interpolated outputs and the program's flat fields into the packed
+  per-vertex layout and the flat-texture run;
+- gpu_sampler_unit(): the texture unit behind each sampler.
+
+gpu_shaders.h carries the eight pass-through vertex shaders (one per count
+of texture coordinates) and a clear shader. They flip Y so that memory row
+0 stays GL's row 0, as in SWGL's own buffers, and map depth to [0, 1].
+
+Of the 39 programs, 33 get a GPU pixel shader. The rest stay on the CPU:
+the blurs, the gradient and the SVG filter exceed the 512 instructions of
+ps_2_x, and two glyph-transform text variants use gl_ClipDistance. Nothing
+calls the hooks yet. SWGL_FXC overrides where fxc comes from; set it empty
+to leave the GPU path out.
+
+Wrench gets a GeckoW10mNote that prints to stderr, since WebRender on this
+port calls it and wrench has no xul. Wrench builds and links again on
+Windows with clang-cl.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/glsl-to-cxx/src/hlsl.rs |  59 +++++++++++++
+ gfx/wr/glsl-to-cxx/src/lib.rs  |  38 +++++++-
+ gfx/wr/swgl/build.rs           | 155 ++++++++++++++++++++++++++++++++-
+ gfx/wr/swgl/src/program.h      |  28 ++++++
+ gfx/wr/wrench/src/main.rs      |  11 +++
+ 5 files changed, 289 insertions(+), 2 deletions(-)
+
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+index 73d1f4e9f0..ca94f7ffe5 100644
+--- a/gfx/wr/glsl-to-cxx/src/hlsl.rs
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -1483,3 +1483,62 @@ pub fn translate_fragment_file(path: &str) -> Result<(String, Layout), Vec<Strin
+     let (state, hir, _) = crate::parse_shader(path.to_string());
+     translate_fragment(&state, &hir)
+ }
++
++/// The C++ that goes into SWGL's program class so the GPU path can use it:
++/// packing the varyings of the quad the vertex shader just ran into the
++/// layout above, and naming the texture unit behind each sampler.
++///
++/// `interps` points at four InterpOutputs, `stride` bytes apart; `v` receives
++/// 32 floats per vertex; `f` receives the flat values that live in the flat
++/// texture. Flat values are fields of the program, which is where SWGL's
++/// vertex shader leaves them.
++pub fn cxx_glue(layout: &Layout) -> String {
++    let mut s = String::new();
++    s.push_str(
++        "void gpu_pack(const char* interps, size_t stride, float* v, float* f) override {\n",
++    );
++    s.push_str(" (void)interps; (void)stride; (void)v; (void)f;\n");
++    let comps = ["x", "y", "z", "w"];
++    let access = |var: &Varying, k: usize, base: &str| -> String {
++        if var.floats == 1 {
++            format!("float({}{})", base, var.name)
++        } else if var.kind.is_matrix() {
++            // Column-major, as GLSL constructs them and hlsl.rs unpacks them.
++            let n = match var.kind {
++                hir::TypeKind::Mat2 => 2,
++                hir::TypeKind::Mat3 => 3,
++                _ => 4,
++            };
++            format!("float({}{}[{}].{})", base, var.name, k / n, comps[k % n])
++        } else {
++            format!("float({}{}.{})", base, var.name, comps[k])
++        }
++    };
++    s.push_str(" for (int n = 0; n < 4; n++) {\n");
++    s.push_str("  const InterpOutputs& io = *reinterpret_cast<const InterpOutputs*>(interps + n * stride);\n");
++    s.push_str("  (void)io;\n");
++    s.push_str("  float* o = v + n * 32;\n");
++    for var in layout.varyings.iter().filter(|v| !v.in_texture) {
++        for k in 0..var.floats {
++            let base = if var.flat { "" } else { "io." };
++            let _ = writeln!(s, "  o[{}] = {};", var.offset + k, access(var, k, base));
++        }
++    }
++    s.push_str(" }\n");
++    for var in layout.varyings.iter().filter(|v| v.in_texture) {
++        for k in 0..var.floats {
++            let _ = writeln!(s, " f[{}] = {};", var.offset + k, access(var, k, ""));
++        }
++    }
++    s.push_str("}\n");
++    s.push_str("int gpu_sampler_unit(int i) const override {\n switch (i) {\n");
++    for smp in &layout.samplers {
++        let _ = writeln!(
++            s,
++            "  case {}: return samplers.{}_slot;",
++            smp.register, smp.name
++        );
++    }
++    s.push_str("  default: return -1;\n }\n}\n");
++    s
++}
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index 53c72f5296..3add024e10 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -47,6 +47,18 @@ fn build_uniform_indices(indices: &mut UniformIndices, state: &hir::State) {
+ }
+ 
+ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
++    translate_with_gpu(args, false).0
++}
++
++/// As translate(), and when `gpu` is set, also the feature level 9_3 pixel
++/// shader for the fragment half (see hlsl.rs) with its layout, and the
++/// program class then carries the C++ that packs varyings for it. Shaders
++/// whose vertex half writes gl_ClipDistance stay on the CPU: SWGL clips
++/// those quads itself.
++pub fn translate_with_gpu(
++    args: &mut dyn Iterator<Item = String>,
++    gpu: bool,
++) -> (String, Option<(String, hlsl::Layout)>, Vec<String>) {
+     let _cmd_name = args.next();
+     let vertex_file = args.next().unwrap();
+ 
+@@ -67,6 +79,23 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+     let (vs_state, vs_hir, vs_is_frag) = parse_shader(vertex_file);
+     let (fs_state, fs_hir, fs_is_frag) = parse_shader(frag_file);
+ 
++    let mut gpu_errors = Vec::new();
++    let gpu_result = if !gpu {
++        None
++    } else if vs_state.used_clip_dist != 0 {
++        gpu_errors.push("the vertex shader writes gl_ClipDistance".to_string());
++        None
++    } else {
++        match hlsl::translate_fragment(&fs_state, &fs_hir) {
++            Ok(r) => Some(r),
++            Err(e) => {
++                gpu_errors = e.into_iter().filter(|e| !e.starts_with("-- partial")).collect();
++                None
++            }
++        }
++    };
++    let glue = gpu_result.as_ref().map(|(_, layout)| hlsl::cxx_glue(layout));
++
+     // we use a BTree so that iteration is stable
+     let mut uniform_indices = BTreeMap::new();
+     build_uniform_indices(&mut uniform_indices, &vs_state);
+@@ -80,6 +109,7 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+         vs_hir,
+         vs_is_frag,
+         &uniform_indices,
++        None,
+     );
+     result += "\n";
+     result += &translate_shader(
+@@ -88,8 +118,9 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+         fs_hir,
+         fs_is_frag,
+         &uniform_indices,
++        glue.as_deref(),
+     );
+-    result
++    (result, gpu_result, gpu_errors)
+ }
+ 
+ pub(crate) fn parse_shader(file: String) -> (hir::State, hir::TranslationUnit, bool) {
+@@ -122,6 +153,7 @@ fn translate_shader(
+     hir: hir::TranslationUnit,
+     is_frag: bool,
+     uniform_indices: &UniformIndices,
++    gpu_glue: Option<&str>,
+ ) -> String {
+     //println!("{:#?}", state);
+ 
+@@ -247,6 +279,10 @@ fn translate_shader(
+             write!(state, " return this;\n}}\n");
+             write!(state, "const char* get_name() const override {{ return \"{}\"; }}\n", name);
+             write!(state, "static ProgramImpl* loader() {{ return new {}_program; }}\n", name);
++            write!(state, "const GpuProgramInfo* gpu_info() const override {{ return {}_gpu_info(); }}\n", name);
++            if let Some(glue) = gpu_glue {
++                state.write(glue);
++            }
+             write!(state, "}};\n\n");
+         }
+ 
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index 650b09efb5..64c5c12ac6 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -19,6 +19,7 @@ fn shader_file(shader_key: &str) -> String {
+ fn write_load_shader(shader_keys: &[String]) {
+     let mut load_shader = String::new();
+     for s in shader_keys {
++        let _ = writeln!(load_shader, "#include \"{}_gpu.h\"", shader_file(s));
+         let _ = writeln!(load_shader, "#include \"{}.h\"", shader_file(s));
+     }
+     load_shader.push_str("ProgramLoader load_shader(const char* name) {\n");
+@@ -136,8 +137,159 @@ fn translate_shader(
+     std::fs::write(&fs_name, fs).unwrap();
+ 
+     let args = vec!["glsl_to_cxx".to_string(), vs_name, fs_name];
+-    let result = glsl_to_cxx::translate(&mut args.into_iter());
++    let fxc = gpu_compiler();
++    let (result, gpu, gpu_errors) =
++        glsl_to_cxx::translate_with_gpu(&mut args.into_iter(), fxc.is_some());
+     std::fs::write(format!("{out_dir}/{shader}.h"), result).unwrap();
++    write_gpu_header(&out_dir, &shader, fxc.as_deref(), gpu, &gpu_errors);
++}
++
++/// fxc, when building for Windows: the fragment shaders are also compiled for
++/// Direct3D feature level 9_3 so that SWGL can hand pixel shading to GPUs that
++/// cannot run WebRender. SWGL_FXC names it explicitly (empty turns the GPU
++/// path off); otherwise the newest Windows 10 SDK's is used. Without it the
++/// GPU path is simply absent.
++fn gpu_compiler() -> Option<String> {
++    if std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("windows") {
++        return None;
++    }
++    println!("cargo:rerun-if-env-changed=SWGL_FXC");
++    if let Ok(fxc) = std::env::var("SWGL_FXC") {
++        return if fxc.is_empty() { None } else { Some(fxc) };
++    }
++    let root = "C:/Program Files (x86)/Windows Kits/10/bin";
++    let mut versions: Vec<_> = std::fs::read_dir(root)
++        .ok()?
++        .filter_map(|e| e.ok())
++        .map(|e| e.path().join("x64").join("fxc.exe"))
++        .filter(|p| p.exists())
++        .collect();
++    versions.sort();
++    versions.pop().map(|p| p.to_string_lossy().into_owned())
++}
++
++fn fxc_compile(fxc: &str, hlsl: &str, profile: &str, out: &str) -> Result<Vec<u8>, String> {
++    let src = format!("{out}.hlsl");
++    let obj = format!("{out}.cso");
++    std::fs::write(&src, hlsl).unwrap();
++    let _ = std::fs::remove_file(&obj);
++    let output = std::process::Command::new(fxc)
++        .args(["/nologo", "/O3", "/T", profile, "/E", "main", "/Fo", &obj, &src])
++        .output()
++        .map_err(|e| e.to_string())?;
++    match std::fs::read(&obj) {
++        Ok(bytes) => Ok(bytes),
++        Err(_) => Err(String::from_utf8_lossy(&output.stderr)
++            .lines()
++            .filter(|l| l.contains("error"))
++            .take(2)
++            .collect::<Vec<_>>()
++            .join(" ")),
++    }
++}
++
++fn bytes_array(name: &str, bytes: &[u8]) -> String {
++    let mut s = format!("static const unsigned char {name}[{}] = {{", bytes.len());
++    for (i, b) in bytes.iter().enumerate() {
++        if i % 24 == 0 {
++            s.push_str("\n ");
++        }
++        let _ = write!(s, "{},", b);
++    }
++    s.push_str("\n};\n");
++    s
++}
++
++fn write_gpu_header(
++    out_dir: &str,
++    shader: &str,
++    fxc: Option<&str>,
++    gpu: Option<(String, glsl_to_cxx::hlsl::Layout)>,
++    errors: &[String],
++) {
++    let path = format!("{out_dir}/{shader}_gpu.h");
++    let stub = format!("static const GpuProgramInfo* {shader}_gpu_info() {{ return nullptr; }}\n");
++    let (fxc, (hlsl, layout)) = match (fxc, gpu) {
++        (Some(f), Some(g)) => (f, g),
++        (Some(_), None) => {
++            println!("cargo:warning=swgl: {shader} stays on the CPU: {}", errors.join(" | "));
++            std::fs::write(path, stub).unwrap();
++            return;
++        }
++        _ => {
++            std::fs::write(path, stub).unwrap();
++            return;
++        }
++    };
++    match fxc_compile(fxc, &hlsl, "ps_4_0_level_9_3", &format!("{out_dir}/{shader}_ps")) {
++        Ok(bytes) => {
++            let mut h = bytes_array(&format!("{shader}_ps"), &bytes);
++            let _ = writeln!(
++                h,
++                "static const GpuProgramInfo {shader}_gpu_info_data = {{ {shader}_ps, sizeof({shader}_ps), {}, {}, {}, {}, {}, \"{shader}\" }};",
++                layout.slots,
++                layout.texture_floats,
++                layout.flat_coord_offset.map_or(-1, |o| o as i64),
++                layout.fragcoord_offset.map_or(-1, |o| o as i64),
++                layout.samplers.len(),
++            );
++            let _ = writeln!(
++                h,
++                "static const GpuProgramInfo* {shader}_gpu_info() {{ return &{shader}_gpu_info_data; }}"
++            );
++            std::fs::write(path, h).unwrap();
++        }
++        Err(e) => {
++            println!("cargo:warning=swgl: {shader} stays on the CPU: fxc: {e}");
++            std::fs::write(path, stub).unwrap();
++        }
++    }
++}
++
++/// The vertex half on the GPU does nothing but place the quad SWGL already
++/// transformed: flip Y so that row 0 in memory is GL's row 0, as it is in
++/// SWGL's buffers, and move depth from GL's [-1, 1] to Direct3D's [0, 1].
++/// One per number of texture coordinates, plus a clear shader.
++fn write_gpu_common(out_dir: &str) {
++    let path = format!("{out_dir}/gpu_shaders.h");
++    let fxc = match gpu_compiler() {
++        Some(f) => f,
++        None => {
++            std::fs::write(path, "#define SWGL_GPU_SHADERS 0\n").unwrap();
++            return;
++        }
++    };
++    let mut h = String::from("#define SWGL_GPU_SHADERS 1\n");
++    for slots in 1..=8 {
++        let mut src = String::from("struct VIn { float4 pos : POSITION;");
++        for i in 0..slots {
++            let _ = write!(src, " float4 t{i} : TEXCOORD{i};");
++        }
++        src.push_str(" };\nstruct VOut { float4 pos : SV_Position;");
++        for i in 0..slots {
++            let _ = write!(src, " float4 t{i} : TEXCOORD{i};");
++        }
++        src.push_str(
++            " };\nVOut main(VIn i) { VOut o;\n o.pos = float4(i.pos.x, -i.pos.y, (i.pos.z + i.pos.w) * 0.5, i.pos.w);\n",
++        );
++        for i in 0..slots {
++            let _ = write!(src, " o.t{i} = i.t{i};");
++        }
++        src.push_str("\n return o; }\n");
++        let bytes = fxc_compile(&fxc, &src, "vs_4_0_level_9_3", &format!("{out_dir}/gpu_vs{slots}"))
++            .expect("the GPU vertex shader must compile");
++        h.push_str(&bytes_array(&format!("swgl_gpu_vs{slots}"), &bytes));
++    }
++    let clear_vs = "float4 main(float4 pos : POSITION) : SV_Position { return float4(pos.x, -pos.y, (pos.z + pos.w) * 0.5, pos.w); }\n";
++    let bytes = fxc_compile(&fxc, clear_vs, "vs_4_0_level_9_3", &format!("{out_dir}/gpu_clear_vs"))
++        .expect("the GPU clear vertex shader must compile");
++    h.push_str(&bytes_array("swgl_gpu_clear_vs", &bytes));
++    let clear_ps =
++        "cbuffer c : register(b0) { float4 color; };\nfloat4 main() : SV_Target { return color; }\n";
++    let bytes = fxc_compile(&fxc, clear_ps, "ps_4_0_level_9_3", &format!("{out_dir}/gpu_clear_ps"))
++        .expect("the GPU clear pixel shader must compile");
++    h.push_str(&bytes_array("swgl_gpu_clear_ps", &bytes));
++    std::fs::write(path, h).unwrap();
+ }
+ 
+ fn main() {
+@@ -167,6 +319,7 @@ fn main() {
+     drop(suppressed_env_vars); // Restore env. vars. for further compilation.
+ 
+     write_load_shader(&shaders);
++    write_gpu_common(&std::env::var("OUT_DIR").unwrap());
+ 
+     println!("cargo:rerun-if-changed=src/blend.h");
+     println!("cargo:rerun-if-changed=src/composite.h");
+diff --git a/gfx/wr/swgl/src/program.h b/gfx/wr/swgl/src/program.h
+index 9ea7c6dd6e..e47619081f 100644
+--- a/gfx/wr/swgl/src/program.h
++++ b/gfx/wr/swgl/src/program.h
+@@ -21,6 +21,26 @@ static ALWAYS_INLINE Float get_clip_distances(const Interpolants& interp) {
+ struct VertexShaderImpl;
+ struct FragmentShaderImpl;
+ 
++// A program's fragment half compiled for the GPU (Direct3D feature level 9_3,
++// ps_4_0_level_9_3), for GPUs that cannot run WebRender but can shade
++// pixels: SWGL runs the vertex half on the CPU as always, packs the varyings
++// with gpu_pack, and the GPU rasterises and shades. Generated at build time
++// by glsl-to-cxx's hlsl.rs and fxc; absent where the shader did not fit.
++struct GpuProgramInfo {
++  const unsigned char* ps;
++  size_t ps_size;
++  // float4 texture coordinates per vertex.
++  int slots;
++  // Flat floats per primitive kept in the flat texture instead.
++  int texture_floats;
++  // Float offsets of the flat texture coordinate and of gl_FragCoord.xy in
++  // the packed vertex data, or -1.
++  int flat_coord_offset;
++  int fragcoord_offset;
++  int num_samplers;
++  const char* name;
++};
++
+ struct ProgramImpl {
+   virtual ~ProgramImpl() {}
+   virtual int get_uniform(const char* name) const = 0;
+@@ -30,6 +50,14 @@ struct ProgramImpl {
+   virtual VertexShaderImpl* get_vertex_shader() = 0;
+   virtual FragmentShaderImpl* get_fragment_shader() = 0;
+   virtual const char* get_name() const = 0;
++  virtual const GpuProgramInfo* gpu_info() const { return nullptr; }
++  // Packs the varyings of the quad the vertex shader just ran: `interps`
++  // holds its four InterpOutputs, `stride` bytes apart; `v` receives 32
++  // floats per vertex, `f` the flat values that go to the flat texture.
++  virtual void gpu_pack(const char* interps, size_t stride, float* v,
++                        float* f) {}
++  // The texture unit behind the pixel shader's i-th sampler.
++  virtual int gpu_sampler_unit(int i) const { return -1; }
+ };
+ 
+ typedef ProgramImpl* (*ProgramLoader)();
+diff --git a/gfx/wr/wrench/src/main.rs b/gfx/wr/wrench/src/main.rs
+index 0bf6b79776..4857d0096a 100644
+--- a/gfx/wr/wrench/src/main.rs
++++ b/gfx/wr/wrench/src/main.rs
+@@ -18,6 +18,17 @@ extern crate tracy_rs;
+ /// therefore quantized to 1/60 px (bug 2059570).
+ pub const AU_PER_DEV_PX: f32 = 60.0;
+ 
++// WebRender's device reports to the Windows 10 Mobile port's log through
++// GeckoW10mNote, which lives in xul. Wrench has no xul; the notes go to stderr.
++#[cfg(windows)]
++#[no_mangle]
++pub extern "C" fn GeckoW10mNote(text: *const std::os::raw::c_char) {
++    if !text.is_null() {
++        let s = unsafe { std::ffi::CStr::from_ptr(text) };
++        eprintln!("note: {}", s.to_string_lossy());
++    }
++}
++
+ mod angle;
+ mod blob;
+ #[cfg(target_os = "windows")]

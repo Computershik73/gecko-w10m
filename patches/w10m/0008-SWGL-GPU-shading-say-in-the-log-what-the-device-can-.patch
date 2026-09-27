@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 08:35:41 +0400
+Subject: [PATCH 08/30] SWGL GPU shading: say in the log what the device can do
+
+Feature level, whether R8 render targets and float textures are available
+(without float textures the programs needing flat data or the GPU buffer
+stay on the CPU), and the texture size limit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorD3D11SWGL.cpp             |  8 +++++++
+ gfx/wr/swgl/src/gpu_d3d11.h                   | 24 +++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+index 699d2c3604..41290569cc 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+@@ -21,6 +21,7 @@
+ // swgl (gpu_d3d11.h): pixel shading on a Direct3D 11 device.
+ extern "C" bool SwglGpuAttach(void* aDevice);
+ extern "C" void SwglGpuStats(uint32_t* aOut8);
++extern "C" void SwglGpuDescribe(char* aOut, size_t aSize);
+ #if defined(GECKO_W10M)
+ extern "C" void GeckoW10mNote(const char* aText);
+ #endif
+@@ -80,6 +81,13 @@ UniquePtr<RenderCompositor> RenderCompositorD3D11SWGL::Create(
+                       "targets"
+                     : "gfx: SWGL could not take the device -- pixels stay on "
+                       "the CPU");
++    if (result->mGpuShading) {
++      char desc[256];
++      SwglGpuDescribe(desc, sizeof(desc));
++      char note[320];
++      SprintfLiteral(note, "gfx: GPU shading device: %s", desc);
++      GeckoW10mNote(note);
++    }
+ #endif
+     if (result->mGpuShading) {
+       // Tiles are drawn on the GPU; the staging paths never run.
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 89b545e85b..4002d3e734 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -1485,6 +1485,27 @@ bool SwglGpuSetTextureTarget(GLuint texid, void* d3d_texture, GLsizei width,
+ // draws that can run on it do. The device must belong to the thread that
+ // uses the context. Returns false, attaching nothing, if the device cannot
+ // take the shaders.
++// One line about the attached device, for the log: its feature level and
++// what it can do that decides which draws stay on the CPU.
++void SwglGpuDescribe(char* out, size_t size) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) {
++    snprintf(out, size, "no device");
++    return;
++  }
++  int programs = 0;
++  for (auto* p : ctx->programs) {
++    if (p && p->gpu_impl && p->gpu_impl->gpu_info()) programs++;
++  }
++  snprintf(out, size,
++           "feature level %x, R8 targets %s, float textures %s (flat data "
++           "and gradients %s), max texture %d",
++           unsigned(g->level), g->r8_ok ? "yes" : "no (BGRA instead)",
++           g->rgba32f_ok ? "yes" : "NO", g->rgba32f_ok ? "on the GPU" : "on the CPU",
++           gpu_max_texture_size());
++  (void)programs;
++}
++
+ bool SwglGpuAttach(void* device) {
+   if (!ctx) return false;
+   delete ctx->gpu;
+@@ -1584,6 +1605,9 @@ Context::~Context() { delete gpu; }
+ 
+ extern "C" {
+ bool SwglGpuAttach(void*) { return false; }
++void SwglGpuDescribe(char* out, size_t size) {
++  if (size) out[0] = 0;
++}
+ bool SwglGpuSetTextureTarget(GLuint, void*, GLsizei, GLsizei, GLint, GLint) {
+   return false;
+ }

@@ -1,64 +1,49 @@
 #Requires -Version 5.0
 <#
 .SYNOPSIS
-  Apply the Windows 10 Mobile (arm-uwp) patch set to the Gecko tree and drop in
-  the JIT executable-memory wrappers.
+  Put the Windows 10 Mobile port on a plain Firefox tree.
 
 .DESCRIPTION
-  Run after `git submodule update --init --recursive engine/firefox`.
-  Applies every *.patch under patches/w10m/ with `git apply` (3-way, with fuzz),
-  then copies the runtime shim sources into js/src so the engine build picks
-  them up.
+  patches/w10m holds the port as a series of commits (git format-patch) on top
+  of the upstream release tag named in engine/release.txt. This checks out that
+  tag on a new branch and replays the series onto it with `git am`, keeping
+  authors, dates and messages -- the result is the same tree, byte for byte, as
+  the branch the patches were exported from (tools/export-patches-w10m.sh).
+
+  The clone only needs the release tag:
+    git clone --depth 1 --branch FIREFOX_155_0_1_RELEASE `
+        https://github.com/mozilla-firefox/firefox engine/firefox
+
+  The same as tools/apply-patches-w10m.sh, for a shell without bash.
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    [string]$Gecko,
+    [string]$Branch = 'w10m-port'
 )
 
 $ErrorActionPreference = 'Stop'
-$gecko   = Join-Path $RepoRoot 'engine\firefox'
-$patches = Join-Path $RepoRoot 'patches\w10m'
-$runtime = Join-Path $patches   'runtime'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if (-not $Gecko) { $Gecko = Join-Path $root 'engine\firefox' }
+$tag = ((Get-Content (Join-Path $root 'engine\release.txt') -TotalCount 1).Trim() -split '\s+')[0]
 
-if (-not (Test-Path (Join-Path $gecko 'js\src'))) {
-    throw "Gecko tree not found at '$gecko'. Run: git submodule update --init --recursive engine/firefox"
+& git -C $Gecko rev-parse -q --verify "$tag^{commit}" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "$Gecko has no $tag. Fetch it first: git -C `"$Gecko`" fetch --depth 1 origin tag $tag"
+}
+& git -C $Gecko rev-parse -q --verify "refs/heads/$Branch" | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    throw "$Gecko already has a branch $Branch; delete it or pass -Branch."
 }
 
-Write-Host "Applying W10M patch set to $gecko" -ForegroundColor Cyan
+$patches = @(Get-ChildItem -Path (Join-Path $root 'patches\w10m') -Filter *.patch |
+    Sort-Object Name | ForEach-Object { $_.FullName })
+if ($patches.Count -eq 0) { throw "No patches in patches\w10m." }
 
-# 1. Apply diffs (skip the runtime/ folder, which holds drop-in sources).
-Get-ChildItem -Path $patches -Recurse -Filter *.patch | ForEach-Object {
-    Write-Host "  apply $($_.FullName.Substring($patches.Length + 1))"
-    & git -C $gecko apply --3way --whitespace=nowarn --recount $_.FullName
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "  '$($_.Name)' did not apply cleanly; resolve manually or re-cut against $(Get-Content (Join-Path $RepoRoot 'engine\release.txt'))"
-    }
-}
-
-# 2. Drop the JIT wrapper source + compat header into js/src.
-$jsSrc = Join-Path $gecko 'js\src'
-Copy-Item (Join-Path $runtime 'gecko_w10m_winuwp_jit.cpp')   $jsSrc -Force
-Copy-Item (Join-Path $runtime 'gecko_w10m_winuwp_compat.h')  $jsSrc -Force
-Write-Host "  copied gecko_w10m_winuwp_jit.cpp + gecko_w10m_winuwp_compat.h -> js/src"
-
-# 2b. Drop the new UWP configure module into the tree (new file, not a diff).
-$uwpConf = Join-Path $patches 'build\moz.configure\uwp.configure'
-Copy-Item $uwpConf (Join-Path $gecko 'build\moz.configure') -Force
-Write-Host "  copied uwp.configure -> build/moz.configure"
-
-# 3. Register the wrapper in js/src/moz.build (idempotent).
-$mozBuild = Join-Path $jsSrc 'moz.build'
-$marker   = '# GeckoW10m/W10M JIT wrapper'
-if (-not (Select-String -Path $mozBuild -SimpleMatch $marker -Quiet)) {
-    @"
-
-$marker
-if CONFIG.get('OS_TARGET') == 'WINNT' and CONFIG.get('GECKO_W10M'):
-    SOURCES += ['gecko_w10m_winuwp_jit.cpp']
-"@ | Add-Content -Path $mozBuild -Encoding utf8
-    Write-Host "  registered gecko_w10m_winuwp_jit.cpp in js/src/moz.build"
-} else {
-    Write-Host "  moz.build already registers the wrapper"
-}
-
-Write-Host "W10M patch set applied." -ForegroundColor Green
+& git -C $Gecko checkout -q -b $Branch $tag
+if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
+# --keep-cr: the patches carry CRLF lines as they are, and Firefox's
+# .gitattributes (* -text) keeps git from converting them.
+& git -C $Gecko am --keep-cr --3way --whitespace=nowarn @patches
+if ($LASTEXITCODE -ne 0) { throw "git am stopped; see git -C `"$Gecko`" am --show-current-patch" }
+Write-Host "Applied $($patches.Count) patches: $Gecko is on $Branch." -ForegroundColor Green

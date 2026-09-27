@@ -1,0 +1,1632 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:16:53 +0400
+Subject: [PATCH 02/30] glsl-to-cxx: translate WebRender's fragment shaders to
+ HLSL for feature level 9_3
+
+The first step toward drawing pages on GPUs that stop at Direct3D feature
+level 9_3, like the Adreno 3xx in the Lumia 550/650/950. WebRender cannot
+run there: its vertex shaders read every primitive's data from textures,
+and 9_3 has no vertex texture fetch. The plan is to keep SWGL's vertex
+stage on the CPU, where it already runs, and give the per-pixel stage to
+the GPU.
+
+hlsl.rs translates a preprocessed fragment shader from the same HIR that
+SWGL's C++ comes from, into ps_4_0_level_9_3. It emits only what main()
+reaches. Varyings are packed into at most eight float4 texture
+coordinates: interpolated ones first, then flat ones. Flat values that do
+not fit are read from a float texture, one run of texels per primitive.
+Where 9_3 lacks something, the output works around it:
+- bitwise operations are emulated with arithmetic;
+- loops without a constant bound are unrolled to a limit with a break;
+- gl_FragCoord arrives as a varying, because SV_Position cannot be read;
+- texelFetch samples at the texel centre, because SampleLevel is missing;
+- dFdy is negated for a Y-flipped vertex stage;
+- array results travel in structs.
+
+Checked on the PC with fxc /T ps_4_0_level_9_3 against all 39 SWGL
+variants: 35 compile. The four that do not (cs_blur x2, ps_quad_gradient,
+cs_svg_filter_node) exceed the 512-instruction limit of ps_2_x; they stay
+on the CPU for now. `glsl-to-cxx --hlsl <dir> <files>` reproduces the run.
+
+Not used by the build yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/glsl-to-cxx/src/hir.rs  |   13 +
+ gfx/wr/glsl-to-cxx/src/hlsl.rs | 1485 ++++++++++++++++++++++++++++++++
+ gfx/wr/glsl-to-cxx/src/lib.rs  |    3 +-
+ gfx/wr/glsl-to-cxx/src/main.rs |   43 +
+ 4 files changed, 1543 insertions(+), 1 deletion(-)
+ create mode 100644 gfx/wr/glsl-to-cxx/src/hlsl.rs
+
+diff --git a/gfx/wr/glsl-to-cxx/src/hir.rs b/gfx/wr/glsl-to-cxx/src/hir.rs
+index b831becbe8..4796600587 100644
+--- a/gfx/wr/glsl-to-cxx/src/hir.rs
++++ b/gfx/wr/glsl-to-cxx/src/hir.rs
+@@ -242,6 +242,19 @@ pub enum TypeKind {
+ }
+ 
+ impl TypeKind {
++    pub fn is_matrix(&self) -> bool {
++        use TypeKind::*;
++        matches!(
++            self,
++            Mat2 | Mat3 | Mat4 | Mat23 | Mat24 | Mat32 | Mat34 | Mat42 | Mat43
++        )
++    }
++
++    pub fn is_scalar(&self) -> bool {
++        use TypeKind::*;
++        matches!(self, Bool | Int | UInt | Float | Double)
++    }
++
+     pub fn is_sampler(&self) -> bool {
+         use TypeKind::*;
+         match self {
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+new file mode 100644
+index 0000000000..73d1f4e9f0
+--- /dev/null
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -0,0 +1,1485 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++//! A second back end for the fragment half of WebRender's shaders: HLSL for
++//! Direct3D feature level 9_3 (ps_4_0_level_9_3).
++//!
++//! GPUs that stop at feature level 9_3 -- the Adreno 3xx in the Lumia
++//! 550/650/950 and their like -- cannot run WebRender: its vertex shaders read
++//! every primitive's data out of textures, and 9_3 has no vertex texture
++//! fetch at all. Their pixel shaders are another matter. So SWGL keeps doing
++//! what it does now for the vertex half -- it already runs WebRender's vertex
++//! shaders on the CPU, four vertices at a time -- and the per-pixel half,
++//! which is where nearly all of software rendering's time goes, is handed to
++//! the GPU. This file translates the fragment shader for that.
++//!
++//! The varyings arrive packed. SWGL keeps flat varyings as fields of the
++//! program and interpolated ones in InterpOutputs; both are gathered on the
++//! CPU after the vertex shader runs and written into up to eight float4
++//! texture coordinates per vertex, interpolated ones first, then flat ones,
++//! in the order `Layout` records. Flat values are the same at every vertex,
++//! so interpolating them changes nothing.
++//!
++//! What 9_3 lacks is worked around here: no bitwise operations (emulated
++//! with arithmetic), no dynamic loops (unrolled with a limit and a break), no
++//! reading SV_Position (gl_FragCoord arrives as a varying), no SampleLevel
++//! (texelFetch samples at the texel's centre), and GL's bottom-up rows (the
++//! vertex stage flips Y so that memory layout matches SWGL's exactly).
++
++use crate::hir;
++use glsl::syntax;
++use std::collections::{HashMap, HashSet};
++use std::fmt::Write;
++use std::rc::Rc;
++
++/// Where each varying lives in the packed per-vertex data.
++#[derive(Debug, Clone)]
++pub struct Varying {
++    pub name: String,
++    pub kind: hir::TypeKind,
++    /// Number of floats (arrays are not supported as varyings).
++    pub floats: usize,
++    /// Offset in floats from the start of the packed data.
++    pub offset: usize,
++    pub flat: bool,
++    /// Whether the value is integer-typed and must be rounded when unpacked.
++    pub integer: bool,
++    /// Flat values that do not fit in the texture coordinates are read from
++    /// a float texture instead; `offset` then counts floats in that
++    /// primitive's run of texels.
++    pub in_texture: bool,
++}
++
++#[derive(Debug, Clone)]
++pub struct Sampler {
++    pub name: String,
++    pub kind: hir::TypeKind,
++    pub register: usize,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct Layout {
++    pub varyings: Vec<Varying>,
++    pub samplers: Vec<Sampler>,
++    /// Floats of varyings, before any gl_FragCoord slot.
++    pub varying_floats: usize,
++    /// The float offset of gl_FragCoord.xy, when the shader reads it.
++    pub fragcoord_offset: Option<usize>,
++    /// Total float4 texture coordinates the pixel shader takes.
++    pub slots: usize,
++    pub uses_discard: bool,
++    /// Floats of flat values that live in the flat texture, per primitive.
++    pub texture_floats: usize,
++    /// The float offset of the primitive's first flat texel (u, v, at its
++    /// centre), when there is a flat texture.
++    pub flat_coord_offset: Option<usize>,
++    /// The register of the flat texture: after the shader's own samplers.
++    pub flat_register: usize,
++}
++
++/// The input limit of ps_4_0_level_9_3 when SV_Position is not declared.
++pub const MAX_SLOTS: usize = 8;
++/// How far a loop whose bound is not a constant is unrolled.
++const LOOP_LIMIT: usize = 32;
++
++struct Emitter<'a> {
++    st: &'a hir::State,
++    out: String,
++    indent: usize,
++    errors: Vec<String>,
++    struct_names: HashSet<String>,
++    /// Array-typed locals initialised with an array constructor are emitted
++    /// with an initializer list instead.
++    uses_bitops: bool,
++    uses_discard: bool,
++    /// HLSL functions cannot return arrays, so an array result travels in a
++    /// struct: (wrapper name, element type, length).
++    array_wrappers: Vec<(String, String, usize)>,
++    /// The wrapper the function being emitted returns, if any.
++    ret_array: Option<String>,
++}
++
++fn floats_of(kind: hir::TypeKind) -> Option<usize> {
++    use hir::TypeKind::*;
++    Some(match kind {
++        Float | Int | UInt | Bool => 1,
++        Vec2 | IVec2 | UVec2 | BVec2 => 2,
++        Vec3 | IVec3 | UVec3 | BVec3 => 3,
++        Vec4 | IVec4 | UVec4 | BVec4 => 4,
++        Mat2 => 4,
++        Mat3 => 9,
++        Mat4 => 16,
++        _ => return None,
++    })
++}
++
++fn is_integer(kind: hir::TypeKind) -> bool {
++    use hir::TypeKind::*;
++    matches!(kind, Int | UInt | IVec2 | IVec3 | IVec4 | UVec2 | UVec3 | UVec4)
++}
++
++fn is_vector(kind: hir::TypeKind) -> bool {
++    use hir::TypeKind::*;
++    matches!(
++        kind,
++        Vec2 | Vec3 | Vec4 | IVec2 | IVec3 | IVec4 | UVec2 | UVec3 | UVec4 | BVec2 | BVec3 | BVec4
++    )
++}
++
++fn is_sampler(kind: hir::TypeKind) -> bool {
++    kind.is_sampler()
++}
++
++fn is_rect_sampler(kind: hir::TypeKind) -> bool {
++    use hir::TypeKind::*;
++    matches!(kind, Sampler2DRect | ISampler2DRect | USampler2DRect)
++}
++
++fn is_int_sampler(kind: hir::TypeKind) -> bool {
++    use hir::TypeKind::*;
++    matches!(kind, ISampler2D | ISampler2DRect | USampler2D | USampler2DRect)
++}
++
++impl<'a> Emitter<'a> {
++    fn err(&mut self, e: String) {
++        if !self.errors.contains(&e) {
++            self.errors.push(e);
++        }
++    }
++
++    fn line(&mut self, s: &str) {
++        for _ in 0..self.indent {
++            self.out.push_str("  ");
++        }
++        self.out.push_str(s);
++        self.out.push('\n');
++    }
++
++    fn type_kind(&mut self, kind: hir::TypeKind) -> String {
++        use hir::TypeKind::*;
++        let s = match kind {
++            Void => "void",
++            Bool => "bool",
++            Int | UInt => "int",
++            Float => "float",
++            Vec2 => "float2",
++            Vec3 => "float3",
++            Vec4 => "float4",
++            BVec2 => "bool2",
++            BVec3 => "bool3",
++            BVec4 => "bool4",
++            IVec2 | UVec2 => "int2",
++            IVec3 | UVec3 => "int3",
++            IVec4 | UVec4 => "int4",
++            Mat2 => "float2x2",
++            Mat3 => "float3x3",
++            Mat4 => "float4x4",
++            Mat23 => "float2x3",
++            Mat24 => "float2x4",
++            Mat32 => "float3x2",
++            Mat34 => "float3x4",
++            Mat42 => "float4x2",
++            Mat43 => "float4x3",
++            Struct(sym) => return self.st.sym(sym).name.clone(),
++            other => {
++                self.err(format!("type {:?} has no HLSL form here", other));
++                "float4"
++            }
++        };
++        s.to_string()
++    }
++
++    fn type_spec(&mut self, ts: &syntax::TypeSpecifier) -> String {
++        use syntax::TypeSpecifierNonArray as T;
++        let s = match &ts.ty {
++            T::Float => "float",
++            T::Int | T::UInt => "int",
++            T::Bool => "bool",
++            T::Vec2 => "float2",
++            T::Vec3 => "float3",
++            T::Vec4 => "float4",
++            T::IVec2 | T::UVec2 => "int2",
++            T::IVec3 | T::UVec3 => "int3",
++            T::IVec4 | T::UVec4 => "int4",
++            T::Mat2 => "float2x2",
++            T::Mat3 => "float3x3",
++            T::Mat4 => "float4x4",
++            T::TypeName(n) => return n.as_str().to_string(),
++            other => {
++                self.err(format!("parameter type {:?}", other));
++                "float4"
++            }
++        };
++        s.into()
++    }
++
++    fn array_suffix(&mut self, ty: &hir::Type) -> String {
++        let mut s = String::new();
++        if let Some(sizes) = &ty.array_sizes {
++            for e in &sizes.sizes {
++                s.push('[');
++                s.push_str(&self.expr(e));
++                s.push(']');
++            }
++        }
++        s
++    }
++
++    fn array_wrapper(&mut self, ty: &hir::Type) -> String {
++        let elem = self.type_kind(ty.kind);
++        let n = match ty.array_sizes.as_ref().and_then(|a| a.sizes.first()).and_then(int_const) {
++            Some(n) => n as usize,
++            None => {
++                self.err("an array type whose length is not a constant".into());
++                1
++            }
++        };
++        let name = format!("glsl_arr_{}_{}", elem, n);
++        if !self.array_wrappers.iter().any(|w| w.0 == name) {
++            self.array_wrappers.push((name.clone(), elem, n));
++        }
++        name
++    }
++
++    fn float(x: f32) -> String {
++        if x.is_finite() {
++            let s = format!("{:?}", x);
++            if s.contains('.') || s.contains('e') || s.contains("inf") {
++                s
++            } else {
++                s + ".0"
++            }
++        } else if x.is_nan() {
++            "(0.0/0.0)".into()
++        } else if x > 0.0 {
++            "1.#INF".into()
++        } else {
++            "-1.#INF".into()
++        }
++    }
++
++    fn sym_name(&self, sym: hir::SymRef) -> String {
++        let name = self.st.sym(sym).name.clone();
++        match name.as_str() {
++            // HLSL keywords and intrinsics that WebRender uses as names.
++            "sample" | "line" | "point" | "triangle" | "matrix" | "vector" | "texture"
++            | "half" | "linear" | "centroid" | "precise" | "register" | "packoffset"
++            | "input" | "output" | "string" | "technique" | "pass" | "compile" | "shared"
++            | "snorm" | "unorm" | "lerp" | "frac" | "saturate" | "min16float" | "globallycoherent"
++            | "groupshared" | "static" | "uniform" | "row_major" | "column_major" | "nointerpolation"
++            | "noperspective" | "sampler" | "texture2D" | "Texture2D" | "SamplerState" | "clip" => {
++                format!("{}_", name)
++            }
++            _ => name,
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Expressions
++
++    fn expr(&mut self, e: &hir::Expr) -> String {
++        use hir::ExprKind::*;
++        match &e.kind {
++            Variable(sym) => {
++                let s = self.st.sym(*sym);
++                match &s.decl {
++                    hir::SymDecl::Global(hir::StorageClass::Sampler(..), ..) => {
++                        // A sampler outside a call; only meaningful as an
++                        // argument, which fun_call handles.
++                        format!("{}_t", s.name)
++                    }
++                    _ => {
++                        drop(s);
++                        self.sym_name(*sym)
++                    }
++                }
++            }
++            IntConst(x) => format!("{}", x),
++            UIntConst(x) => format!("{}", x),
++            BoolConst(x) => format!("{}", x),
++            FloatConst(x) => Self::float(*x),
++            DoubleConst(x) => Self::float(*x as f32),
++            Unary(op, a) => {
++                let a_s = self.expr(a);
++                match op {
++                    syntax::UnaryOp::Inc => format!("(++{})", a_s),
++                    syntax::UnaryOp::Dec => format!("(--{})", a_s),
++                    syntax::UnaryOp::Add => format!("(+{})", a_s),
++                    syntax::UnaryOp::Minus => format!("(-{})", a_s),
++                    syntax::UnaryOp::Not => format!("(!{})", a_s),
++                    syntax::UnaryOp::Complement => {
++                        self.uses_bitops = true;
++                        // ~x == -x - 1 for two's complement integers.
++                        format!("(-({}) - 1)", a_s)
++                    }
++                }
++            }
++            Binary(op, l, r) => self.binary(op, l, r),
++            Ternary(c, a, b) => {
++                let c = self.expr(c);
++                let a = self.expr(a);
++                let b = self.expr(b);
++                format!("(({}) ? ({}) : ({}))", c, a, b)
++            }
++            Assignment(l, op, r) => self.assignment(l, op, r),
++            Bracket(a, idx) => {
++                let mut s = self.expr(a);
++                for i in idx {
++                    let i = self.expr(i);
++                    s = format!("{}[{}]", s, i);
++                }
++                s
++            }
++            FunCall(fun, args) => self.fun_call(e, fun, args),
++            Dot(a, field) => format!("{}.{}", self.expr(a), field.as_str()),
++            SwizzleSelector(a, sel) => {
++                let inner = self.expr(a);
++                format!("({}).{}", inner, sel.to_field_set(hir::FieldSet::Xyzw))
++            }
++            PostInc(a) => format!("({}++)", self.expr(a)),
++            PostDec(a) => format!("({}--)", self.expr(a)),
++            Comma(a, b) => {
++                let a = self.expr(a);
++                let b = self.expr(b);
++                format!("({}, {})", a, b)
++            }
++            Cond(..) | CondMask => {
++                self.err("SWGL condition masks in the HIR".into());
++                "0".into()
++            }
++        }
++    }
++
++    fn binary(&mut self, op: &syntax::BinaryOp, l: &hir::Expr, r: &hir::Expr) -> String {
++        use syntax::BinaryOp::*;
++        let ls = self.expr(l);
++        let rs = self.expr(r);
++        match op {
++            Or => format!("(({}) || ({}))", ls, rs),
++            And => format!("(({}) && ({}))", ls, rs),
++            Xor => format!("(({}) != ({}))", ls, rs),
++            Equal | NonEqual => {
++                let cmp = if *op == Equal { "==" } else { "!=" };
++                if is_vector(l.ty.kind) || is_vector(r.ty.kind) {
++                    // GLSL compares whole vectors; HLSL compares per
++                    // component.
++                    let f = if *op == Equal { "all" } else { "any" };
++                    format!("{}(({}) {} ({}))", f, ls, cmp, rs)
++                } else {
++                    format!("(({}) {} ({}))", ls, cmp, rs)
++                }
++            }
++            LT => format!("(({}) < ({}))", ls, rs),
++            GT => format!("(({}) > ({}))", ls, rs),
++            LTE => format!("(({}) <= ({}))", ls, rs),
++            GTE => format!("(({}) >= ({}))", ls, rs),
++            Add => format!("(({}) + ({}))", ls, rs),
++            Sub => format!("(({}) - ({}))", ls, rs),
++            Mult => self.mult(l, r, ls, rs),
++            Div => {
++                if is_integer(l.ty.kind) && is_integer(r.ty.kind) {
++                    // Integer division truncates toward zero, as in GLSL.
++                    format!("((int)(({}) / ({})))", ls, rs)
++                } else {
++                    format!("(({}) / ({}))", ls, rs)
++                }
++            }
++            Mod => {
++                if is_integer(l.ty.kind) {
++                    format!("glsl_imod({}, {})", ls, rs)
++                } else {
++                    self.err("% on a non-integer".into());
++                    format!("fmod({}, {})", ls, rs)
++                }
++            }
++            BitAnd => {
++                self.uses_bitops = true;
++                if let Some(p) = pow2_const(r) {
++                    format!("glsl_bit({}, {})", ls, p)
++                } else if let Some(p) = pow2_const(l) {
++                    format!("glsl_bit({}, {})", rs, p)
++                } else if let Some(m) = low_mask_const(r) {
++                    format!("glsl_imod({}, {})", ls, m + 1)
++                } else {
++                    format!("glsl_and({}, {})", ls, rs)
++                }
++            }
++            BitOr => {
++                self.uses_bitops = true;
++                format!("glsl_or({}, {})", ls, rs)
++            }
++            BitXor => {
++                self.uses_bitops = true;
++                format!("glsl_xor({}, {})", ls, rs)
++            }
++            LShift => format!("((int)(({}) * exp2({})))", ls, rs),
++            RShift => format!("((int)floor(({}) / exp2({})))", ls, rs),
++        }
++    }
++
++    fn mult(&mut self, l: &hir::Expr, r: &hir::Expr, ls: String, rs: String) -> String {
++        let lm = l.ty.kind.is_matrix();
++        let rm = r.ty.kind.is_matrix();
++        // GLSL matrices are column-major and constructed from columns; they
++        // are stored here as HLSL matrices whose rows are GLSL's columns, so
++        // M * v in GLSL is mul(v, M) here, and v * M is mul(M, v).
++        if lm && rm {
++            format!("mul({}, {})", rs, ls)
++        } else if lm && is_vector(r.ty.kind) {
++            format!("mul({}, {})", rs, ls)
++        } else if rm && is_vector(l.ty.kind) {
++            format!("mul({}, {})", rs, ls)
++        } else {
++            format!("(({}) * ({}))", ls, rs)
++        }
++    }
++
++    fn assignment(&mut self, l: &hir::Expr, op: &syntax::AssignmentOp, r: &hir::Expr) -> String {
++        use syntax::AssignmentOp::*;
++        let ls = self.expr(l);
++        let rs = self.expr(r);
++        match op {
++            Equal => format!("{} = {}", ls, rs),
++            Add => format!("{} += {}", ls, rs),
++            Sub => format!("{} -= {}", ls, rs),
++            Div => format!("{} /= {}", ls, rs),
++            Mult => {
++                if l.ty.kind.is_matrix() || r.ty.kind.is_matrix() {
++                    let m = self.mult(l, r, ls.clone(), rs);
++                    format!("{} = {}", ls, m)
++                } else {
++                    format!("{} *= {}", ls, rs)
++                }
++            }
++            Mod => format!("{} = glsl_imod({}, {})", ls, ls, rs),
++            LShift => format!("{} = (int)(({}) * exp2({}))", ls, ls, rs),
++            RShift => format!("{} = (int)floor(({}) / exp2({}))", ls, ls, rs),
++            And => {
++                self.uses_bitops = true;
++                format!("{} = glsl_and({}, {})", ls, ls, rs)
++            }
++            Or => {
++                self.uses_bitops = true;
++                format!("{} = glsl_or({}, {})", ls, ls, rs)
++            }
++            Xor => {
++                self.uses_bitops = true;
++                format!("{} = glsl_xor({}, {})", ls, ls, rs)
++            }
++        }
++    }
++
++    /// The three HLSL values a GLSL sampler stands for.
++    fn sampler_args(&mut self, e: &hir::Expr) -> Option<(String, hir::TypeKind)> {
++        if let hir::ExprKind::Variable(sym) = &e.kind {
++            let s = self.st.sym(*sym);
++            let kind = match &s.decl {
++                hir::SymDecl::Global(_, _, ty, _) | hir::SymDecl::Local(_, ty, _) => ty.kind,
++                _ => return None,
++            };
++            if is_sampler(kind) {
++                return Some((s.name.clone(), kind));
++            }
++        }
++        None
++    }
++
++    fn texel_coord(&mut self, name: &str, p: &str) -> String {
++        format!("(((float2)({}) + 0.5) * {}_size.zw)", p, name)
++    }
++
++    fn fun_call(&mut self, e: &hir::Expr, fun: &hir::FunIdentifier, args: &[hir::Expr]) -> String {
++        match fun {
++            hir::FunIdentifier::Constructor(ty) => self.constructor(ty, args),
++            hir::FunIdentifier::Identifier(sym) => {
++                let (name, native, is_struct) = {
++                    let s = self.st.sym(*sym);
++                    let native = matches!(s.decl, hir::SymDecl::NativeFunction(..));
++                    let is_struct = matches!(s.decl, hir::SymDecl::Struct(..));
++                    (s.name.clone(), native, is_struct)
++                };
++                if is_struct {
++                    let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
++                    return format!("make_{}({})", name, a.join(", "));
++                }
++                if native && is_type_name(&name) {
++                    return self.constructor(&e.ty, args);
++                }
++                if native {
++                    self.native_call(e, &name, args)
++                } else {
++                    let mut a = Vec::new();
++                    for arg in args {
++                        if let Some((sn, _)) = self.sampler_args(arg) {
++                            a.push(format!("{0}_t, {0}_s, {0}_size", sn));
++                        } else {
++                            a.push(self.expr(arg));
++                        }
++                    }
++                    let call = format!("{}({})", self.sym_name(*sym), a.join(", "));
++                    if e.ty.array_sizes.is_some() {
++                        format!("{}.v", call)
++                    } else {
++                        call
++                    }
++                }
++            }
++        }
++    }
++
++    fn native_call(&mut self, e: &hir::Expr, name: &str, args: &[hir::Expr]) -> String {
++        let simple = |em: &mut Self, f: &str| -> String {
++            let a: Vec<String> = args.iter().map(|x| em.expr(x)).collect();
++            format!("{}({})", f, a.join(", "))
++        };
++        match name {
++            "texture" | "textureLod" | "texture2D" | "textureGrad" => {
++                let (sn, kind) = match self.sampler_args(&args[0]) {
++                    Some(x) => x,
++                    None => {
++                        self.err(format!("{} on something that is not a sampler", name));
++                        return "0".into();
++                    }
++                };
++                let uv = self.expr(&args[1]);
++                let uv = if is_rect_sampler(kind) {
++                    format!("(({}) * {}_size.zw)", uv, sn)
++                } else {
++                    uv
++                };
++                let s = format!("{0}_t.Sample({0}_s, {1})", sn, uv);
++                if is_int_sampler(kind) {
++                    format!("((int4)({}))", s)
++                } else {
++                    s
++                }
++            }
++            "texelFetch" | "texelFetchOffset" => {
++                let (sn, kind) = match self.sampler_args(&args[0]) {
++                    Some(x) => x,
++                    None => {
++                        self.err("texelFetch on something that is not a sampler".into());
++                        return "0".into();
++                    }
++                };
++                let p = self.expr(&args[1]);
++                let p = if name == "texelFetchOffset" {
++                    // (sampler, coord, lod, offset) for 2D; (sampler, coord,
++                    // offset) for rect.
++                    let off = self.expr(args.last().unwrap());
++                    format!("(({}) + ({}))", p, off)
++                } else {
++                    p
++                };
++                let uv = self.texel_coord(&sn, &p);
++                let s = format!("{0}_t.Sample({0}_s, {1})", sn, uv);
++                if is_int_sampler(kind) {
++                    format!("((int4)({}))", s)
++                } else {
++                    s
++                }
++            }
++            "textureSize" => match self.sampler_args(&args[0]) {
++                Some((sn, _)) => format!("((int2)({}_size.xy))", sn),
++                None => {
++                    self.err("textureSize on something that is not a sampler".into());
++                    "int2(1, 1)".into()
++                }
++            },
++            "mix" => {
++                let a = self.expr(&args[0]);
++                let b = self.expr(&args[1]);
++                let t = self.expr(&args[2]);
++                if args[2].ty.kind.is_bool() {
++                    format!("(({}) ? ({}) : ({}))", t, b, a)
++                } else {
++                    format!("lerp({}, {}, {})", a, b, t)
++                }
++            }
++            "fract" => simple(self, "frac"),
++            "mod" => simple(self, "glsl_mod"),
++            "inversesqrt" => simple(self, "rsqrt"),
++            "atan" => simple(self, if args.len() == 2 { "atan2" } else { "atan" }),
++            "dFdx" => simple(self, "ddx"),
++            "dFdy" => format!("(-{})", simple(self, "ddy")),
++            "roundEven" => simple(self, "round"),
++            "recip" => format!("(1.0 / ({}))", self.expr(&args[0])),
++            "lessThan" => format!("({} < {})", self.expr(&args[0]), self.expr(&args[1])),
++            "lessThanEqual" => format!("({} <= {})", self.expr(&args[0]), self.expr(&args[1])),
++            "greaterThan" => format!("({} > {})", self.expr(&args[0]), self.expr(&args[1])),
++            "greaterThanEqual" => {
++                format!("({} >= {})", self.expr(&args[0]), self.expr(&args[1]))
++            }
++            "equal" => format!("({} == {})", self.expr(&args[0]), self.expr(&args[1])),
++            "notEqual" => format!("({} != {})", self.expr(&args[0]), self.expr(&args[1])),
++            "not" => format!("(!{})", self.expr(&args[0])),
++            "abs" | "sign" | "floor" | "ceil" | "trunc" | "round" | "min" | "max" | "clamp"
++            | "step" | "smoothstep" | "sqrt" | "pow" | "exp" | "exp2" | "log" | "log2" | "sin"
++            | "cos" | "tan" | "asin" | "acos" | "length" | "distance" | "dot" | "cross"
++            | "normalize" | "reflect" | "fwidth" | "any" | "all" | "transpose" | "isnan"
++            | "isinf" | "faceforward" | "sinh" | "cosh" | "tanh" | "determinant" => {
++                simple(self, name)
++            }
++            _ => {
++                let _ = e;
++                self.err(format!("builtin {} is not translated", name));
++                simple(self, name)
++            }
++        }
++    }
++
++    fn constructor(&mut self, ty: &hir::Type, args: &[hir::Expr]) -> String {
++        if ty.array_sizes.is_some() {
++            let w = self.array_wrapper(ty);
++            let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
++            return format!("make_{}({}).v", w, a.join(", "));
++        }
++        if let hir::TypeKind::Struct(sym) = ty.kind {
++            let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
++            return format!("make_{}({})", self.st.sym(sym).name, a.join(", "));
++        }
++        let tn = self.type_kind(ty.kind);
++        let target = floats_of(ty.kind).unwrap_or(1);
++        if args.len() == 1 {
++            let a = self.expr(&args[0]);
++            let src = floats_of(args[0].ty.kind).unwrap_or(1);
++            if ty.kind.is_matrix() && args[0].ty.kind.is_scalar() {
++                // mat(x) is x on the diagonal.
++                let n = match ty.kind {
++                    hir::TypeKind::Mat2 => 2,
++                    hir::TypeKind::Mat3 => 3,
++                    _ => 4,
++                };
++                let mut v = Vec::new();
++                for i in 0..n {
++                    for j in 0..n {
++                        v.push(if i == j { format!("({})", a) } else { "0.0".into() });
++                    }
++                }
++                return format!("{}({})", tn, v.join(", "));
++            }
++            // Broadcasts, truncations and conversions are all casts in HLSL.
++            let _ = (src, target);
++            return format!("(({})({}))", tn, a);
++        }
++        let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
++        format!("{}({})", tn, a.join(", "))
++    }
++
++    // ------------------------------------------------------------------
++    // Statements
++
++    fn declaration(&mut self, d: &hir::Declaration) {
++        match d {
++            hir::Declaration::InitDeclaratorList(list) => {
++                let head = &list.head;
++                let (ty, storage) = match &self.st.sym(head.name).decl {
++                    hir::SymDecl::Local(storage, ty, _) => (ty.clone(), *storage),
++                    hir::SymDecl::Global(storage, _, ty, _) => (ty.clone(), *storage),
++                    _ => (head.ty.clone(), hir::StorageClass::None),
++                };
++                let tn = self.type_kind(ty.kind);
++                let name = self.sym_name(head.name);
++                let arr = self.array_suffix(&ty);
++                let cst = if storage == hir::StorageClass::Const { "const " } else { "" };
++                match &head.initializer {
++                    Some(hir::Initializer::Simple(e)) => {
++                        let v = self.expr(e);
++                        self.line(&format!("{}{} {}{} = {};", cst, tn, name, arr, v));
++                    }
++                    Some(hir::Initializer::List(_)) => {
++                        self.err("initializer lists".into());
++                    }
++                    None => self.line(&format!("{} {}{};", tn, name, arr)),
++                }
++                for t in &list.tail {
++                    let mut tail_arr = arr.clone();
++                    if let Some(spec) = &t.ident.array_spec {
++                        let _ = spec;
++                        self.err("an array among several declarators".into());
++                        tail_arr = String::new();
++                    }
++                    let n = t.ident.ident.as_str().to_string();
++                    match &t.initializer {
++                        Some(hir::Initializer::Simple(e)) => {
++                            let v = self.expr(e);
++                            self.line(&format!("{}{} {}{} = {};", cst, tn, n, tail_arr, v));
++                        }
++                        Some(_) => self.err("initializer lists".into()),
++                        None => self.line(&format!("{} {}{};", tn, n, tail_arr)),
++                    }
++                }
++            }
++            hir::Declaration::StructDefinition(_) => {
++                self.err("a struct defined inside a function".into());
++            }
++            hir::Declaration::Precision(..) => {}
++            hir::Declaration::FunctionPrototype(_) => {}
++            hir::Declaration::Block(_) => self.err("interface blocks".into()),
++            hir::Declaration::Global(..) => {}
++        }
++    }
++
++    fn statement(&mut self, s: &hir::Statement) {
++        match s {
++            hir::Statement::Compound(c) => {
++                self.line("{");
++                self.indent += 1;
++                for s in &c.statement_list {
++                    self.statement(s);
++                }
++                self.indent -= 1;
++                self.line("}");
++            }
++            hir::Statement::Simple(s) => self.simple_statement(s),
++        }
++    }
++
++    fn body(&mut self, s: &hir::Statement) {
++        match s {
++            hir::Statement::Compound(_) => self.statement(s),
++            _ => {
++                self.line("{");
++                self.indent += 1;
++                self.statement(s);
++                self.indent -= 1;
++                self.line("}");
++            }
++        }
++    }
++
++    fn simple_statement(&mut self, s: &hir::SimpleStatement) {
++        match s {
++            hir::SimpleStatement::Declaration(d) => self.declaration(d),
++            hir::SimpleStatement::Expression(e) => {
++                if let Some(e) = e {
++                    let v = self.expr(e);
++                    self.line(&format!("{};", v));
++                } else {
++                    self.line(";");
++                }
++            }
++            hir::SimpleStatement::Selection(sel) => {
++                let c = self.expr(&sel.cond);
++                self.line(&format!("if ({})", c));
++                self.body(&sel.body);
++                if let Some(e) = &sel.else_stmt {
++                    self.line("else");
++                    self.body(e);
++                }
++            }
++            hir::SimpleStatement::Switch(sw) => {
++                let lowered = crate::lower_switch_to_ifs(sw);
++                self.simple_statement(&hir::SimpleStatement::Selection(lowered));
++            }
++            hir::SimpleStatement::Iteration(it) => self.iteration(it),
++            hir::SimpleStatement::Jump(j) => match j {
++                hir::JumpStatement::Continue => self.line("continue;"),
++                hir::JumpStatement::Break => self.line("break;"),
++                hir::JumpStatement::Discard => {
++                    self.uses_discard = true;
++                    self.line("discard;")
++                }
++                hir::JumpStatement::Return(e) => {
++                    if let (Some(e), Some(w)) = (e, self.ret_array.clone()) {
++                        let v = self.expr(e);
++                        self.line(&format!("{{ {0} glsl_r; glsl_r.v = {1}; return glsl_r; }}", w, v));
++                    } else if let Some(e) = e {
++                        let v = self.expr(e);
++                        self.line(&format!("return {};", v));
++                    } else {
++                        self.line("return;");
++                    }
++                }
++            },
++        }
++    }
++
++    fn iteration(&mut self, it: &hir::IterationStatement) {
++        match it {
++            hir::IterationStatement::For(init, rest, body) => {
++                // A loop the compiler can count is left as it is. Anything
++                // else is given a counter of its own and a limit, and the
++                // original condition becomes a break at the top.
++                self.line("{");
++                self.indent += 1;
++                match init {
++                    hir::ForInitStatement::Expression(Some(e)) => {
++                        let v = self.expr(e);
++                        self.line(&format!("{};", v));
++                    }
++                    hir::ForInitStatement::Expression(None) => {}
++                    hir::ForInitStatement::Declaration(d) => self.declaration(d),
++                }
++                let cond = match &rest.condition {
++                    Some(hir::Condition::Expr(c)) => self.expr(c),
++                    None => "true".into(),
++                };
++                let post = rest.post_expr.as_ref().map(|p| self.expr(p));
++                if contains_continue(body) {
++                    self.err("continue inside a loop".into());
++                }
++                self.line(&format!(
++                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
++                    LOOP_LIMIT
++                ));
++                self.line("{");
++                self.indent += 1;
++                self.line(&format!("if (!({})) break;", cond));
++                self.body(body);
++                if let Some(p) = post {
++                    self.line(&format!("{};", p));
++                }
++                self.indent -= 1;
++                self.line("}");
++                self.indent -= 1;
++                self.line("}");
++            }
++            hir::IterationStatement::While(hir::Condition::Expr(c), body) => {
++                let cond = self.expr(c);
++                self.line(&format!(
++                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
++                    LOOP_LIMIT
++                ));
++                self.line("{");
++                self.indent += 1;
++                self.line(&format!("if (!({})) break;", cond));
++                self.body(body);
++                self.indent -= 1;
++                self.line("}");
++            }
++            hir::IterationStatement::DoWhile(body, c) => {
++                let cond = self.expr(c);
++                self.line(&format!(
++                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
++                    LOOP_LIMIT
++                ));
++                self.line("{");
++                self.indent += 1;
++                self.body(body);
++                self.line(&format!("if (!({})) break;", cond));
++                self.indent -= 1;
++                self.line("}");
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Functions
++
++    fn function(&mut self, fd: &hir::FunctionDefinition, prototype_only: bool) {
++        let p = &fd.prototype;
++        let ret = if p.ty.array_sizes.is_some() {
++            self.array_wrapper(&p.ty.clone())
++        } else {
++            self.type_kind(p.ty.kind)
++        };
++        self.ret_array = if p.ty.array_sizes.is_some() { Some(ret.clone()) } else { None };
++        let mut params = Vec::new();
++        for param in &p.parameters {
++            match param {
++                hir::FunctionParameterDeclaration::Named(q, d) => {
++                    if is_sampler(d.ty.kind) {
++                        let n = d.name.as_str();
++                        params.push(format!(
++                            "Texture2D {0}_t, SamplerState {0}_s, float4 {0}_size",
++                            n
++                        ));
++                        continue;
++                    }
++                    let qs = match q {
++                        Some(hir::ParameterQualifier::Out) => "out ",
++                        Some(hir::ParameterQualifier::InOut) => "inout ",
++                        _ => "",
++                    };
++                    let tn = self.type_kind(d.ty.kind);
++                    let arr = self.array_suffix(&d.ty);
++                    params.push(format!("{}{} {}{}", qs, tn, self.sym_name(d.sym), arr));
++                }
++                hir::FunctionParameterDeclaration::Unnamed(_, ts) => {
++                    // `void f(void)`, or a prototype that names nothing.
++                    let is_void = matches!(ts.ty, syntax::TypeSpecifierNonArray::Void);
++                    if !is_void {
++                        let tn = self.type_spec(ts);
++                        params.push(format!("{} glsl_unnamed{}", tn, params.len()));
++                    }
++                }
++            }
++        }
++        let name = match p.name.as_str() {
++            "main" => "glsl_main".to_string(),
++            n => n.to_string(),
++        };
++        let head = format!("{} {}({})", ret, name, params.join(", "));
++        if prototype_only {
++            self.line(&format!("{};", head));
++            return;
++        }
++        self.line(&head);
++        self.line("{");
++        self.indent += 1;
++        for s in &fd.body.statement_list {
++            self.statement(s);
++        }
++        self.indent -= 1;
++        self.line("}");
++    }
++}
++
++fn is_type_name(n: &str) -> bool {
++    matches!(
++        n,
++        "float" | "int" | "uint" | "bool" | "vec2" | "vec3" | "vec4" | "ivec2" | "ivec3" | "ivec4"
++            | "uvec2" | "uvec3" | "uvec4" | "bvec2" | "bvec3" | "bvec4" | "mat2" | "mat3" | "mat4"
++            | "mat2x2" | "mat3x3" | "mat4x4"
++    )
++}
++
++fn contains_continue(s: &hir::Statement) -> bool {
++    match s {
++        hir::Statement::Compound(c) => c.statement_list.iter().any(contains_continue),
++        hir::Statement::Simple(s) => match &**s {
++            hir::SimpleStatement::Jump(hir::JumpStatement::Continue) => true,
++            hir::SimpleStatement::Selection(sel) => {
++                contains_continue(&sel.body)
++                    || sel.else_stmt.as_ref().map_or(false, |e| contains_continue(e))
++            }
++            // A continue in a nested loop belongs to that loop.
++            _ => false,
++        },
++    }
++}
++
++fn int_const(e: &hir::Expr) -> Option<i64> {
++    match &e.kind {
++        hir::ExprKind::IntConst(x) => Some(*x as i64),
++        hir::ExprKind::UIntConst(x) => Some(*x as i64),
++        _ => None,
++    }
++}
++
++fn pow2_const(e: &hir::Expr) -> Option<i64> {
++    int_const(e).filter(|x| *x > 0 && (x & (x - 1)) == 0)
++}
++
++fn low_mask_const(e: &hir::Expr) -> Option<i64> {
++    int_const(e).filter(|x| *x > 0 && (x & (x + 1)) == 0)
++}
++
++// ----------------------------------------------------------------------
++// Reachability: only what main uses is emitted. The preprocessed sources
++// carry every helper of every include, much of it written for GLSL 3 in ways
++// 9_3 cannot express, and none of it called.
++
++#[derive(Default)]
++struct Reach {
++    functions: HashSet<hir::SymRef>,
++    globals: HashSet<hir::SymRef>,
++    order: Vec<hir::SymRef>,
++}
++
++fn walk_expr(st: &hir::State, e: &hir::Expr, r: &mut Reach) {
++    use hir::ExprKind::*;
++    match &e.kind {
++        Variable(sym) => {
++            if matches!(st.sym(*sym).decl, hir::SymDecl::Global(..)) {
++                r.globals.insert(*sym);
++            }
++        }
++        Unary(_, a) | PostInc(a) | PostDec(a) | Dot(a, _) | SwizzleSelector(a, _) | Cond(_, a) => {
++            walk_expr(st, a, r)
++        }
++        Binary(_, a, b) | Assignment(a, _, b) | Comma(a, b) => {
++            walk_expr(st, a, r);
++            walk_expr(st, b, r);
++        }
++        Ternary(a, b, c) => {
++            walk_expr(st, a, r);
++            walk_expr(st, b, r);
++            walk_expr(st, c, r);
++        }
++        Bracket(a, idx) => {
++            walk_expr(st, a, r);
++            for i in idx {
++                walk_expr(st, i, r);
++            }
++        }
++        FunCall(fun, args) => {
++            for a in args {
++                walk_expr(st, a, r);
++            }
++            if let hir::FunIdentifier::Identifier(sym) = fun {
++                let fd = match &st.sym(*sym).decl {
++                    hir::SymDecl::UserFunction(fd, _) => Some(fd.clone()),
++                    _ => None,
++                };
++                if let Some(fd) = fd {
++                    walk_function(st, *sym, &fd, r);
++                }
++            }
++        }
++        _ => {}
++    }
++}
++
++fn walk_statement(st: &hir::State, s: &hir::Statement, r: &mut Reach) {
++    match s {
++        hir::Statement::Compound(c) => {
++            for s in &c.statement_list {
++                walk_statement(st, s, r);
++            }
++        }
++        hir::Statement::Simple(s) => match &**s {
++            hir::SimpleStatement::Declaration(hir::Declaration::InitDeclaratorList(l)) => {
++                if let Some(hir::Initializer::Simple(e)) = &l.head.initializer {
++                    walk_expr(st, e, r);
++                }
++                if let Some(sizes) = &l.head.ty.array_sizes {
++                    for e in &sizes.sizes {
++                        walk_expr(st, e, r);
++                    }
++                }
++            }
++            hir::SimpleStatement::Declaration(_) => {}
++            hir::SimpleStatement::Expression(Some(e)) => walk_expr(st, e, r),
++            hir::SimpleStatement::Expression(None) => {}
++            hir::SimpleStatement::Selection(sel) => {
++                walk_expr(st, &sel.cond, r);
++                walk_statement(st, &sel.body, r);
++                if let Some(e) = &sel.else_stmt {
++                    walk_statement(st, e, r);
++                }
++            }
++            hir::SimpleStatement::Switch(sw) => {
++                walk_expr(st, &sw.head, r);
++                for c in &sw.cases {
++                    if let hir::CaseLabel::Case(e) = &c.label {
++                        walk_expr(st, e, r);
++                    }
++                    for s in &c.stmts {
++                        walk_statement(st, s, r);
++                    }
++                }
++            }
++            hir::SimpleStatement::Iteration(it) => match it {
++                hir::IterationStatement::While(hir::Condition::Expr(c), b) => {
++                    walk_expr(st, c, r);
++                    walk_statement(st, b, r);
++                }
++                hir::IterationStatement::DoWhile(b, c) => {
++                    walk_statement(st, b, r);
++                    walk_expr(st, c, r);
++                }
++                hir::IterationStatement::For(init, rest, b) => {
++                    match init {
++                        hir::ForInitStatement::Expression(Some(e)) => walk_expr(st, e, r),
++                        hir::ForInitStatement::Declaration(d) => {
++                            if let hir::Declaration::InitDeclaratorList(l) = &**d {
++                                if let Some(hir::Initializer::Simple(e)) = &l.head.initializer {
++                                    walk_expr(st, e, r);
++                                }
++                            }
++                        }
++                        _ => {}
++                    }
++                    if let Some(hir::Condition::Expr(c)) = &rest.condition {
++                        walk_expr(st, c, r);
++                    }
++                    if let Some(p) = &rest.post_expr {
++                        walk_expr(st, p, r);
++                    }
++                    walk_statement(st, b, r);
++                }
++            },
++            hir::SimpleStatement::Jump(hir::JumpStatement::Return(Some(e))) => walk_expr(st, e, r),
++            hir::SimpleStatement::Jump(_) => {}
++        },
++    }
++}
++
++fn walk_function(
++    st: &hir::State,
++    sym: hir::SymRef,
++    fd: &Rc<hir::FunctionDefinition>,
++    r: &mut Reach,
++) {
++    if !r.functions.insert(sym) {
++        return;
++    }
++    for s in &fd.body.statement_list {
++        walk_statement(st, s, r);
++    }
++    r.order.push(sym);
++}
++
++const PRELUDE: &str = r#"// Generated by glsl-to-cxx for Direct3D feature level 9_3.
++#define glsl_mod(x, y) ((x) - (y) * floor((x) / (y)))
++int glsl_imod(int a, int b) { return (int)((float)a - (float)b * floor((float)a / (float)b)); }
++int2 glsl_imod(int2 a, int b) { return (int2)((float2)a - (float)b * floor((float2)a / (float)b)); }
++int2 glsl_imod(int2 a, int2 b) { return (int2)((float2)a - (float2)b * floor((float2)a / (float2)b)); }
++int4 glsl_imod(int4 a, int b) { return (int4)((float4)a - (float)b * floor((float4)a / (float)b)); }
++int4 glsl_imod(int4 a, int4 b) { return (int4)((float4)a - (float4)b * floor((float4)a / (float4)b)); }
++"#;
++
++const BITOPS: &str = r#"// No integer bit operations on 9_3; these values are small and non-negative.
++int glsl_bit(int a, int p) { return (int)(glsl_mod(floor((float)a / (float)p), 2.0) * (float)p); }
++int2 glsl_bit(int2 a, int p) { return (int2)(glsl_mod(floor((float2)a / (float)p), 2.0) * (float)p); }
++int4 glsl_bit(int4 a, int p) { return (int4)(glsl_mod(floor((float4)a / (float)p), 2.0) * (float)p); }
++int glsl_and(int a, int b) {
++  float r = 0.0, x = (float)a, y = (float)b, p = 1.0;
++  [unroll] for (int i = 0; i < 16; i++) {
++    r += glsl_mod(x, 2.0) * glsl_mod(y, 2.0) * p;
++    x = floor(x * 0.5); y = floor(y * 0.5); p *= 2.0;
++  }
++  return (int)r;
++}
++int glsl_or(int a, int b) { return a + b - glsl_and(a, b); }
++int glsl_xor(int a, int b) { return a + b - 2 * glsl_and(a, b); }
++"#;
++
++/// Translates a parsed fragment shader. `name` is only used in messages.
++pub fn translate_fragment(
++    st: &hir::State,
++    tu: &hir::TranslationUnit,
++) -> Result<(String, Layout), Vec<String>> {
++    let mut em = Emitter {
++        st,
++        out: String::new(),
++        indent: 0,
++        errors: Vec::new(),
++        struct_names: HashSet::new(),
++        uses_bitops: false,
++        uses_discard: false,
++        array_wrappers: Vec::new(),
++        ret_array: None,
++    };
++
++    // Find main and everything it reaches.
++    let mut reach = Reach::default();
++    let mut main_sym = None;
++    for ed in tu {
++        if let hir::ExternalDeclaration::FunctionDefinition(fd) = ed {
++            if fd.prototype.name.as_str() == "main" {
++                let sym = st.lookup("main");
++                main_sym = sym;
++                if let Some(sym) = sym {
++                    walk_function(st, sym, fd, &mut reach);
++                }
++            }
++        }
++    }
++    if main_sym.is_none() {
++        return Err(vec!["no main".into()]);
++    }
++
++    // Globals, in declaration order.
++    let mut layout = Layout::default();
++    let mut interps = Vec::new();
++    let mut flats = Vec::new();
++    let mut samplers = Vec::new();
++    let mut uniforms = Vec::new();
++    let mut statics = Vec::new();
++    let mut consts = Vec::new();
++    let mut structs = Vec::new();
++    let mut uses_fragcoord = false;
++    let mut seen = HashSet::new();
++    for ed in tu {
++        match ed {
++            hir::ExternalDeclaration::Declaration(hir::Declaration::StructDefinition(sym)) => {
++                structs.push(*sym);
++            }
++            hir::ExternalDeclaration::Declaration(hir::Declaration::InitDeclaratorList(l)) => {
++                let sym = l.head.name;
++                if !reach.globals.contains(&sym) || !seen.insert(sym) {
++                    continue;
++                }
++                let s = st.sym(sym);
++                match &s.decl {
++                    hir::SymDecl::Global(storage, interp, ty, _) => match storage {
++                        hir::StorageClass::In => {
++                            let flat = *interp == Some(syntax::InterpolationQualifier::Flat);
++                            if flat {
++                                flats.push((sym, s.name.clone(), ty.clone()));
++                            } else {
++                                interps.push((sym, s.name.clone(), ty.clone()));
++                            }
++                        }
++                        hir::StorageClass::Sampler(_) => samplers.push((s.name.clone(), ty.kind)),
++                        hir::StorageClass::Uniform => uniforms.push((sym, ty.clone())),
++                        hir::StorageClass::Const => consts.push(l.clone()),
++                        hir::StorageClass::Out | hir::StorageClass::FragColor(_) => {
++                            statics.push((sym, ty.clone()))
++                        }
++                        hir::StorageClass::None => statics.push((sym, ty.clone())),
++                    },
++                    _ => {}
++                }
++            }
++            _ => {}
++        }
++    }
++    for g in &reach.globals {
++        if st.sym(*g).name == "gl_FragCoord" {
++            uses_fragcoord = true;
++        }
++    }
++
++    // The packed layout: interpolated first, flat after. Whatever does not
++    // fit in eight float4s goes to the flat texture, flat values only.
++    let mut all = Vec::new();
++    for (list, flat) in [(&interps, false), (&flats, true)] {
++        for (_, name, ty) in list.iter() {
++            if ty.array_sizes.is_some() {
++                em.err(format!("varying {} is an array", name));
++                continue;
++            }
++            match floats_of(ty.kind) {
++                Some(n) => all.push((name.clone(), ty.kind, n, flat)),
++                None => em.err(format!("varying {} has type {:?}", name, ty.kind)),
++            }
++        }
++    }
++    let fc = if uses_fragcoord { 2 } else { 0 };
++    let total: usize = all.iter().map(|v| v.2).sum();
++    let capacity = MAX_SLOTS * 4;
++    let overflow = total + fc > capacity;
++    let room = if overflow { capacity - fc - 2 } else { capacity - fc };
++    let mut offset = 0;
++    let mut toffset = 0;
++    for (name, kind, n, flat) in all {
++        let in_texture = offset + n > room;
++        if in_texture && !flat {
++            em.err(format!("interpolated varying {} does not fit", name));
++        }
++        layout.varyings.push(Varying {
++            name,
++            kind,
++            floats: n,
++            offset: if in_texture { toffset } else { offset },
++            flat,
++            integer: is_integer(kind),
++            in_texture,
++        });
++        if in_texture {
++            toffset += n;
++        } else {
++            offset += n;
++        }
++    }
++    layout.varying_floats = offset;
++    layout.texture_floats = toffset;
++    if toffset > 0 {
++        layout.flat_coord_offset = Some(offset);
++        offset += 2;
++    }
++    if uses_fragcoord {
++        layout.fragcoord_offset = Some(offset);
++        offset += 2;
++    }
++    layout.slots = ((offset + 3) / 4).max(1);
++    if layout.slots > MAX_SLOTS {
++        em.err(format!("{} floats of varyings do not fit", offset));
++    }
++
++    // Emit.
++    em.out.push_str(PRELUDE);
++    let prelude_len = em.out.len();
++
++    for sym in &structs {
++        let (name, fields) = match &st.sym(*sym).decl {
++            hir::SymDecl::Struct(f) => (st.sym(*sym).name.clone(), f.clone()),
++            _ => continue,
++        };
++        em.struct_names.insert(name.clone());
++        em.line(&format!("struct {} {{", name));
++        em.indent += 1;
++        let mut params = Vec::new();
++        let mut assigns = Vec::new();
++        for f in &fields.fields {
++            let tn = em.type_kind(f.ty.kind);
++            let arr = em.array_suffix(&f.ty);
++            em.line(&format!("{} {}{};", tn, f.name.as_str(), arr));
++            params.push(format!("{} {}{}", tn, f.name.as_str(), arr));
++            assigns.push(format!("r.{0} = {0};", f.name.as_str()));
++        }
++        em.indent -= 1;
++        em.line("};");
++        em.line(&format!(
++            "{0} make_{0}({1}) {{ {0} r; {2} return r; }}",
++            name,
++            params.join(", "),
++            assigns.join(" ")
++        ));
++    }
++
++    for (i, (name, kind)) in samplers.iter().enumerate() {
++        em.line(&format!("Texture2D {0}_t : register(t{1});", name, i));
++        em.line(&format!("SamplerState {0}_s : register(s{1});", name, i));
++        layout.samplers.push(Sampler { name: name.clone(), kind: *kind, register: i });
++    }
++    layout.flat_register = samplers.len();
++    if layout.texture_floats > 0 {
++        em.line(&format!("Texture2D glsl_flat_t : register(t{});", layout.flat_register));
++        em.line(&format!("SamplerState glsl_flat_s : register(s{});", layout.flat_register));
++    }
++    // Sizes of every sampler (w, h, 1/w, 1/h), then the fragment
++    // shader's own uniforms.
++    em.line("cbuffer glsl_uniforms : register(b0) {");
++    em.indent += 1;
++    for (name, _) in &samplers {
++        em.line(&format!("float4 {}_size;", name));
++    }
++    if layout.texture_floats > 0 {
++        em.line("float4 glsl_flat_size;");
++    }
++    for (sym, ty) in &uniforms {
++        let tn = em.type_kind(ty.kind);
++        let arr = em.array_suffix(ty);
++        let n = em.sym_name(*sym);
++        em.line(&format!("{} {}{};", tn, n, arr));
++    }
++    if samplers.is_empty() && uniforms.is_empty() {
++        em.line("float4 glsl_unused;");
++    }
++    em.indent -= 1;
++    em.line("};");
++
++    for l in &consts {
++        let d = hir::Declaration::InitDeclaratorList(l.clone());
++        em.out.push_str("static ");
++        em.declaration(&d);
++    }
++    for (list, _) in [(&interps, false), (&flats, true)] {
++        for (sym, _, ty) in list.iter() {
++            let tn = em.type_kind(ty.kind);
++            let n = em.sym_name(*sym);
++            em.line(&format!("static {} {};", tn, n));
++        }
++    }
++    for (sym, ty) in &statics {
++        let tn = em.type_kind(ty.kind);
++        let n = em.sym_name(*sym);
++        let arr = em.array_suffix(ty);
++        em.line(&format!("static {} {}{};", tn, n, arr));
++    }
++    if uses_fragcoord {
++        em.line("static float4 gl_FragCoord;");
++    }
++
++    let wrappers_at = em.out.len();
++    // Prototypes first -- the sources forward-declare freely -- then the
++    // bodies in the order they were reached, callees before callers.
++    let mut defs: HashMap<hir::SymRef, Rc<hir::FunctionDefinition>> = HashMap::new();
++    for sym in &reach.order {
++        if let hir::SymDecl::UserFunction(fd, _) = &st.sym(*sym).decl {
++            defs.insert(*sym, fd.clone());
++        }
++    }
++    for sym in &reach.order {
++        let fd = defs[sym].clone();
++        if fd.prototype.name.as_str() != "main" {
++            em.function(&fd, true);
++        }
++    }
++    for sym in &reach.order {
++        let fd = defs[sym].clone();
++        em.function(&fd, false);
++    }
++
++    // The entry point: unpack the texture coordinates, run main.
++    let mut input = String::from("struct glsl_input {\n");
++    for i in 0..layout.slots {
++        let _ = writeln!(input, "  float4 t{0} : TEXCOORD{0};", i);
++    }
++    input.push_str("};\n");
++    em.out.push_str(&input);
++    em.line("float4 main(glsl_input glsl_in) : SV_Target");
++    em.line("{");
++    em.indent += 1;
++    em.line("float glsl_v[32];");
++    for i in 0..layout.slots {
++        for (c, comp) in "xyzw".chars().enumerate() {
++            em.line(&format!("glsl_v[{}] = glsl_in.t{}.{};", i * 4 + c, i, comp));
++        }
++    }
++    if let Some(o) = layout.flat_coord_offset {
++        let texels = (layout.texture_floats + 3) / 4;
++        em.line(&format!("float glsl_f[{}];", texels * 4));
++        em.line(&format!("float2 glsl_fuv = float2(glsl_v[{}], glsl_v[{}]);", o, o + 1));
++        for k in 0..texels {
++            em.line(&format!(
++                "{{ float4 t = glsl_flat_t.Sample(glsl_flat_s, glsl_fuv + float2({}.0 * glsl_flat_size.z, 0.0)); glsl_f[{}] = t.x; glsl_f[{}] = t.y; glsl_f[{}] = t.z; glsl_f[{}] = t.w; }}",
++                k, k * 4, k * 4 + 1, k * 4 + 2, k * 4 + 3
++            ));
++        }
++    }
++    for v in layout.varyings.clone() {
++        let tn = em.type_kind(v.kind);
++        let src = if v.in_texture { "glsl_f" } else { "glsl_v" };
++        let parts: Vec<String> = (0..v.floats)
++            .map(|k| {
++                if v.integer {
++                    format!("round({}[{}])", src, v.offset + k)
++                } else if v.kind.is_bool() {
++                    format!("({}[{}] > 0.5)", src, v.offset + k)
++                } else {
++                    format!("{}[{}]", src, v.offset + k)
++                }
++            })
++            .collect();
++        let value = if v.floats == 1 {
++            format!("({})({})", tn, parts[0])
++        } else {
++            format!("{}({})", tn, parts.join(", "))
++        };
++        let name = v.name.clone();
++        em.line(&format!("{} = {};", name, value));
++    }
++    if let Some(o) = layout.fragcoord_offset {
++        em.line(&format!("gl_FragCoord = float4(glsl_v[{}], glsl_v[{}], 0.0, 1.0);", o, o + 1));
++    }
++    em.line("glsl_main();");
++    // oFragColor is SWGL's name for the colour output.
++    let out_name = statics
++        .iter()
++        .map(|(sym, _)| em.sym_name(*sym))
++        .find(|n| n == "oFragColor")
++        .unwrap_or_else(|| "oFragColor".into());
++    em.line(&format!("return {};", out_name));
++    em.indent -= 1;
++    em.line("}");
++
++    let mut wrappers = String::new();
++    for (name, elem, n) in &em.array_wrappers {
++        let params: Vec<String> = (0..*n).map(|i| format!("{} a{}", elem, i)).collect();
++        let assigns: Vec<String> = (0..*n).map(|i| format!("r.v[{0}] = a{0};", i)).collect();
++        let _ = writeln!(wrappers, "struct {} {{ {} v[{}]; }};", name, elem, n);
++        let _ = writeln!(
++            wrappers,
++            "{0} make_{0}({1}) {{ {0} r; {2} return r; }}",
++            name,
++            params.join(", "),
++            assigns.join(" ")
++        );
++    }
++    em.out.insert_str(wrappers_at, &wrappers);
++    if em.uses_bitops {
++        em.out.insert_str(prelude_len, BITOPS);
++    }
++    layout.uses_discard = em.uses_discard;
++
++    if em.errors.is_empty() {
++        Ok((em.out, layout))
++    } else {
++        let mut e = em.errors;
++        e.push(format!("-- partial output --\n{}", em.out));
++        Err(e)
++    }
++}
++
++/// Parses and translates one preprocessed fragment shader file.
++pub fn translate_fragment_file(path: &str) -> Result<(String, Layout), Vec<String>> {
++    let (state, hir, _) = crate::parse_shader(path.to_string());
++    translate_fragment(&state, &hir)
++}
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index 0faac75fd0..53c72f5296 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -7,6 +7,7 @@
+ extern crate glsl;
+ 
+ mod hir;
++pub mod hlsl;
+ 
+ use glsl::parser::Parse;
+ use glsl::syntax;
+@@ -91,7 +92,7 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+     result
+ }
+ 
+-fn parse_shader(file: String) -> (hir::State, hir::TranslationUnit, bool) {
++pub(crate) fn parse_shader(file: String) -> (hir::State, hir::TranslationUnit, bool) {
+     let mut contents = String::new();
+     let is_frag = file.contains("frag");
+     std::fs::File::open(&file)
+diff --git a/gfx/wr/glsl-to-cxx/src/main.rs b/gfx/wr/glsl-to-cxx/src/main.rs
+index e40262c84e..15be885640 100644
+--- a/gfx/wr/glsl-to-cxx/src/main.rs
++++ b/gfx/wr/glsl-to-cxx/src/main.rs
+@@ -3,6 +3,49 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ use glsl_to_cxx::translate;
++use std::io::Write;
++
+ fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    // glsl-to-cxx --hlsl <out dir> <file.frag>...: the feature level 9_3
++    // pixel shaders, one .hlsl per preprocessed fragment shader, and a line
++    // per shader saying whether it translated and how its varyings are laid
++    // out. Compile the results with fxc /T ps_4_0_level_9_3.
++    if args.len() >= 3 && args[1] == "--hlsl" {
++        let out_dir = &args[2];
++        for f in &args[3..] {
++            let stem = std::path::Path::new(f)
++                .file_stem()
++                .unwrap()
++                .to_string_lossy()
++                .to_string();
++            match glsl_to_cxx::hlsl::translate_fragment_file(f) {
++                Ok((src, layout)) => {
++                    std::fs::File::create(format!("{}/{}.hlsl", out_dir, stem))
++                        .unwrap()
++                        .write_all(src.as_bytes())
++                        .unwrap();
++                    println!(
++                        "OK   {} slots {} varying floats {} texture floats {} fragcoord {:?} samplers {}",
++                        stem,
++                        layout.slots,
++                        layout.varying_floats,
++                        layout.texture_floats,
++                        layout.fragcoord_offset,
++                        layout.samplers.len()
++                    );
++                }
++                Err(errs) => {
++                    let msgs: Vec<&str> = errs
++                        .iter()
++                        .filter(|e| !e.starts_with("-- partial"))
++                        .map(|s| s.as_str())
++                        .collect();
++                    println!("FAIL {} : {}", stem, msgs.join(" | "));
++                }
++            }
++        }
++        return;
++    }
+     println!("{}", translate(&mut std::env::args()));
+ }

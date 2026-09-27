@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 16:28:17 +0400
+Subject: [PATCH 21/30] Windows 10 Mobile: do not start taskbar tabs or IP
+ protection
+
+Their startup hooks load 30 modules at every launch (IP protection
+initialises although the feature is off) for features a phone does not
+have; taskbar tabs also logged a TaskbarManager error each start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser/components/BrowserComponents.manifest | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/browser/components/BrowserComponents.manifest b/browser/components/BrowserComponents.manifest
+index 5fc7506631..aa00b8aee0 100644
+--- a/browser/components/BrowserComponents.manifest
++++ b/browser/components/BrowserComponents.manifest
+@@ -55,7 +55,9 @@ category browser-window-load chrome://browser/content/browser.js#gUIDensity gUID
+ category browser-window-load chrome://browser/content/browser.js#Win10TabletModeUpdater Win10TabletModeUpdater.init
+ category browser-window-load chrome://browser/content/browser.js#CombinedStopReload CombinedStopReload.ensureInitialized
+ category browser-window-load moz-src:///browser/modules/PrivateBrowsingUI.sys.mjs PrivateBrowsingUI.init
+-category browser-window-load resource:///modules/taskbartabs/TaskbarTabsChrome.sys.mjs TaskbarTabsChrome.init
++# Windows 10 Mobile: no taskbar and no IP protection on a phone, and their
++# modules cost memory at every start.
++# category browser-window-load resource:///modules/taskbartabs/TaskbarTabsChrome.sys.mjs TaskbarTabsChrome.init
+ category browser-window-load chrome://browser/content/browser-pageActions.js BrowserPageActions.init
+ category browser-window-load chrome://browser/content/browser-toolbarKeyNav.js ToolbarKeyboardNavigator.init
+ category browser-window-load moz-src:///browser/components/customkeys/CustomKeys.sys.mjs CustomKeys.initWindow
+@@ -66,7 +68,9 @@ category browser-window-delayed-startup moz-src:///browser/components/genai/Link
+ category browser-window-delayed-startup moz-src:///browser/components/reportbrokensite/ReportBrokenSite.sys.mjs ReportBrokenSite.init
+ category browser-window-delayed-startup moz-src:///browser/components/search/SearchUIUtils.sys.mjs SearchUIUtils.init
+ category browser-window-delayed-startup moz-src:///browser/components/sharing/SharePageAction.sys.mjs SharePageAction.init
+-category browser-window-delayed-startup resource:///modules/taskbartabs/TaskbarTabsPageAction.sys.mjs TaskbarTabsPageAction.init
++# Windows 10 Mobile: no taskbar and no IP protection on a phone, and their
++# modules cost memory at every start.
++# category browser-window-delayed-startup resource:///modules/taskbartabs/TaskbarTabsPageAction.sys.mjs TaskbarTabsPageAction.init
+ #ifdef XP_MACOSX
+ category browser-window-delayed-startup resource://gre/modules/RosettaUtils.sys.mjs RosettaUtils.maybeWarnAboutRosetta
+ #endif
+@@ -158,7 +162,9 @@ category browser-first-window-ready moz-src:///toolkit/profile/ProfilesDatastore
+ category browser-first-window-ready resource:///modules/profiles/SelectableProfileService.sys.mjs SelectableProfileService.init
+ category browser-first-window-ready moz-src:///browser/components/protections/ContentBlockingPrefs.sys.mjs ContentBlockingPrefs.init
+ category browser-first-window-ready moz-src:///toolkit/components/captchadetection/CaptchaDetectionPingUtils.sys.mjs CaptchaDetectionPingUtils.init
+-category browser-first-window-ready moz-src:///browser/components/ipprotection/IPProtectionHelpers.sys.mjs IPProtectionActivator.init
++# Windows 10 Mobile: no taskbar and no IP protection on a phone, and their
++# modules cost memory at every start.
++# category browser-first-window-ready moz-src:///browser/components/ipprotection/IPProtectionHelpers.sys.mjs IPProtectionActivator.init
+ category browser-first-window-ready moz-src:///browser/components/customizableui/SearchWidgetTracker.sys.mjs SearchWidgetTracker.init
+ #ifdef MOZ_SANDBOX
+ #ifdef XP_LINUX
+@@ -214,7 +220,9 @@ category browser-quit-application-granted moz-src:///browser/components/search/S
+ category browser-quit-application-granted resource://gre/modules/UpdateListener.sys.mjs UpdateListener.reset
+ #endif
+ category browser-quit-application-granted moz-src:///browser/components/urlbar/UrlbarSearchTermsPersistence.sys.mjs UrlbarSearchTermsPersistence.uninit
+-category browser-quit-application-granted moz-src:///browser/components/ipprotection/IPProtectionHelpers.sys.mjs IPProtectionActivator.uninit
++# Windows 10 Mobile: no taskbar and no IP protection on a phone, and their
++# modules cost memory at every start.
++# category browser-quit-application-granted moz-src:///browser/components/ipprotection/IPProtectionHelpers.sys.mjs IPProtectionActivator.uninit
+ 
+ category search-service-notification moz-src:///browser/components/search/SearchUIUtils.sys.mjs SearchUIUtils.showSearchServiceNotification
+ 

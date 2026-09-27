@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 11:52:06 +0400
+Subject: [PATCH 13/30] swgl gpu: depth buffers exactly the size of their
+ render target
+
+Direct3D 11 binds a depth-stencil view only with render targets of equal
+size (the debug layer calls anything else an error; desktop drivers let it
+pass). Compositor tiles come in several sizes, so the shared depth texture
+now keeps up to four spare buffers by size and takes the one that fits.
+Adds SWGL_GPU_DEBUG=1 (debug layer on SWGL's own device, messages on stderr)
+and test hooks for tile textures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/swgl/src/gpu_d3d11.h | 153 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 146 insertions(+), 7 deletions(-)
+
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 6cc36b8e03..78a408cf61 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -155,6 +155,17 @@ struct GpuBackend {
+   std::unordered_map<uint64_t,
+                      std::pair<ID3D11Texture2D*, ID3D11ShaderResourceView*>>
+       feedback;
++  // Direct3D binds a depth buffer only with a render target of exactly its
++  // size, and compositor tiles come in several: the shared depth texture
++  // takes the buffer that fits the tile at hand, the others wait here.
++  struct SpareDepth {
++    int w, h;
++    ID3D11Texture2D* tex;
++    ID3D11DepthStencilView* dsv;
++  };
++  std::vector<SpareDepth> spare_depth;
++  // Present when the device runs with the Direct3D debug layer.
++  ID3D11InfoQueue* iq = nullptr;
+ 
+   bool broken = false;
+ 
+@@ -201,6 +212,11 @@ struct GpuBackend {
+       f.second.first->Release();
+       f.second.second->Release();
+     }
++    for (auto& d : spare_depth) {
++      d.dsv->Release();
++      d.tex->Release();
++    }
++    safe_release(iq);
+     safe_release(dc);
+     safe_release(dev);
+   }
+@@ -208,6 +224,26 @@ struct GpuBackend {
+ 
+ namespace swgl_gpu {
+ 
++// With the Direct3D debug layer (SWGL_GPU_DEBUG=1 for a device of SWGL's
++// own), prints what it found wrong since the last call: devices differ in
++// what they forgive, and a phone's driver forgives less.
++static void debug_check(GpuBackend* g, const char* where) {
++  if (!g || !g->iq) return;
++  UINT64 n = g->iq->GetNumStoredMessages();
++  for (UINT64 i = 0; i < n; i++) {
++    SIZE_T len = 0;
++    if (FAILED(g->iq->GetMessage(i, nullptr, &len)) || !len) continue;
++    std::vector<char> buf(len);
++    D3D11_MESSAGE* m = (D3D11_MESSAGE*)buf.data();
++    if (FAILED(g->iq->GetMessage(i, m, &len))) continue;
++    if (m->Severity > D3D11_MESSAGE_SEVERITY_WARNING) continue;
++    fprintf(stderr, "gpu: d3d %s before %s: %.*s\n",
++            m->Severity == D3D11_MESSAGE_SEVERITY_WARNING ? "warning" : "ERROR",
++            where, int(m->DescriptionByteLength), m->pDescription);
++  }
++  g->iq->ClearStoredMessages();
++}
++
+ static bool init_backend(GpuBackend* g) {
+   HRESULT hr;
+   g->level = g->dev->GetFeatureLevel();
+@@ -455,11 +491,25 @@ static bool ensure_resource(GpuBackend* g, Texture& t, int min_w = 0,
+   }
+   int want_w = std::max(t.width, min_w);
+   int want_h = std::max(t.height, min_h);
++  bool depth = t.internal_format == GL_DEPTH_COMPONENT24;
++  // Sized for a render target: exactly its size (see SpareDepth).
++  bool exact = depth && (min_w > 0 || min_h > 0);
+   if (gt.tex && gt.width == t.width && gt.height == t.height &&
+-      gt.internal_format == t.internal_format && gt.tex_w >= want_w &&
+-      gt.tex_h >= want_h) {
++      gt.internal_format == t.internal_format &&
++      (exact ? gt.tex_w == want_w && gt.tex_h == want_h
++             : gt.tex_w >= want_w && gt.tex_h >= want_h)) {
+     return true;
+   }
++  if (depth && gt.tex && gt.dsv && gt.internal_format == t.internal_format) {
++    if (g->spare_depth.size() >= 4) {
++      g->spare_depth.front().dsv->Release();
++      g->spare_depth.front().tex->Release();
++      g->spare_depth.erase(g->spare_depth.begin());
++    }
++    g->spare_depth.push_back({gt.tex_w, gt.tex_h, gt.tex, gt.dsv});
++    gt.tex = nullptr;
++    gt.dsv = nullptr;
++  }
+   gt.release();
+   if (t.width <= 0 || t.height <= 0) return false;
+   DXGI_FORMAT format;
+@@ -467,6 +517,26 @@ static bool ensure_resource(GpuBackend* g, Texture& t, int min_w = 0,
+   if (!gl_format_on_gpu(g, t.internal_format, &format, &expanded)) {
+     return false;
+   }
++  if (depth) {
++    for (size_t i = 0; i < g->spare_depth.size(); i++) {
++      auto& d = g->spare_depth[i];
++      if (d.w != want_w || d.h != want_h) continue;
++      gt.tex = d.tex;
++      gt.dsv = d.dsv;
++      g->spare_depth.erase(g->spare_depth.begin() + i);
++      gt.format = format;
++      gt.internal_format = t.internal_format;
++      gt.width = t.width;
++      gt.height = t.height;
++      gt.tex_w = want_w;
++      gt.tex_h = want_h;
++      gt.expanded = expanded;
++      // What it held belongs to another tile.
++      gt.gpu_newer = false;
++      gt.cpu_newer = true;
++      return true;
++    }
++  }
+   D3D11_TEXTURE2D_DESC td = {};
+   td.Width = want_w;
+   td.Height = want_h;
+@@ -594,6 +664,7 @@ static ID3D11Texture2D* get_staging(GpuBackend* g, GpuTex& gt) {
+ 
+ // Copies the GPU copy back into the CPU buffer.
+ static void readback(GpuBackend* g, Texture& t) {
++  debug_check(g, "readback");
+   GpuTex& gt = *t.gpu;
+   if (!t.buf || !gt.tex) return;
+   if (t.internal_format == GL_DEPTH_COMPONENT24) {
+@@ -969,6 +1040,7 @@ static bool gpu_clear(Texture& t, const IntRect& rect, uint32_t color,
+   using namespace swgl_gpu;
+   GpuBackend* g = ctx ? ctx->gpu : nullptr;
+   if (!g || g->broken) return false;
++  debug_check(g, "clear");
+   if (is_depth) {
+     // Depth lives on the GPU whenever there is one: Direct3D can neither
+     // upload a depth buffer nor read one back, so a clear on the CPU would
+@@ -1171,12 +1243,12 @@ static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
+                      const IntRect& dst_rect) {
+   using namespace swgl_gpu;
+   GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  debug_check(g, "copy");
+   if (!g || g->broken || &src == &dst || !src.gpu || !src.gpu->tex) {
+     return false;
+   }
+   GpuTex& sg = *src.gpu;
+-  if (sg.cpu_newer || sg.external || sg.width != src.width ||
+-      sg.height != src.height) {
++  if (sg.cpu_newer || sg.width != src.width || sg.height != src.height) {
+     return false;
+   }
+   if (src.internal_format != dst.internal_format ||
+@@ -1189,7 +1261,9 @@ static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
+   s = s.intersection(dst.bounds() - IntPoint(dx, dy));
+   if (s.is_empty()) return true;
+   if (!to_gpu(g, dst) || dst.gpu->expanded != sg.expanded) return false;
+-  D3D11_BOX box = {UINT(s.x0), UINT(s.y0), 0, UINT(s.x1), UINT(s.y1), 1};
++  // A compositor tile is the rectangle at (ox, oy) of its texture.
++  D3D11_BOX box = {UINT(s.x0 + sg.ox), UINT(s.y0 + sg.oy), 0,
++                   UINT(s.x1 + sg.ox), UINT(s.y1 + sg.oy), 1};
+   g->dc->CopySubresourceRegion(dst.gpu->tex, 0, UINT(s.x0 + dx + dst.gpu->ox),
+                                UINT(s.y0 + dy + dst.gpu->oy), 0, sg.tex, 0,
+                                &box);
+@@ -1361,6 +1435,7 @@ static bool gpu_draw_elements(GLsizei count, GLsizei instancecount,
+                               Texture& depthtex) {
+   using namespace swgl_gpu;
+   GpuBackend* g = ctx->gpu;
++  debug_check(g, "draw");
+   Program& prog = ctx->programs[ctx->current_program];
+   ProgramImpl* impl = prog.gpu_impl;
+   const GpuProgramInfo* info = impl ? impl->gpu_info() : nullptr;
+@@ -1397,7 +1472,7 @@ static bool gpu_draw_elements(GLsizei count, GLsizei instancecount,
+   if (!to_gpu(g, colortex)) return refuse(g, false, "target on the GPU");
+   bool use_depth = ctx->depthtest && depthtex.buf;
+   if (use_depth) {
+-    // Direct3D wants the depth buffer at least as large as the render
++    // Direct3D wants the depth buffer exactly as large as the render
+     // target's texture, which for a compositor tile is the whole tile.
+     if (depthtex.width != colortex.width ||
+         depthtex.height != colortex.height ||
+@@ -1677,6 +1752,7 @@ bool SwglGpuSetTextureTarget(GLuint texid, void* d3d_texture, GLsizei width,
+   using namespace swgl_gpu;
+   GpuBackend* g = ctx ? ctx->gpu : nullptr;
+   if (!g || g->broken || !d3d_texture) return false;
++  debug_check(g, "tile target");
+   Texture& t = ctx->textures[texid];
+   if (t.width != width || t.height != height ||
+       t.internal_format != GL_RGBA8 || !t.should_free()) {
+@@ -1752,6 +1828,7 @@ bool SwglGpuAttach(void* device) {
+   g->dev = (ID3D11Device*)device;
+   g->dev->AddRef();
+   g->dev->GetImmediateContext(&g->dc);
++  g->dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&g->iq);
+   if (!swgl_gpu::init_backend(g)) {
+     delete g;
+     return false;
+@@ -1780,8 +1857,11 @@ bool SwglGpuAttachNewDevice(int max_level, bool warp) {
+   int first = 0;
+   while (first < 6 && int(all[first]) > max_level) first++;
+   ID3D11Device* dev = nullptr;
++  const char* debug = getenv("SWGL_GPU_DEBUG");
++  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
++  if (debug && *debug && *debug != '0') flags |= D3D11_CREATE_DEVICE_DEBUG;
+   HRESULT hr = create(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+-                      nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, all + first,
++                      nullptr, flags, all + first,
+                       UINT(7 - first), D3D11_SDK_VERSION, &dev, nullptr,
+                       nullptr);
+   if (FAILED(hr) || !dev) return false;
+@@ -1790,11 +1870,65 @@ bool SwglGpuAttachNewDevice(int max_level, bool warp) {
+   return ok;
+ }
+ 
++// For tests of the compositor-tile path: a tile texture on the attached
++// device, as a compositor would make one, and a way to read it back.
++void* SwglGpuTestCreateTile(int width, int height) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) return nullptr;
++  D3D11_TEXTURE2D_DESC td = {};
++  td.Width = width;
++  td.Height = height;
++  td.MipLevels = 1;
++  td.ArraySize = 1;
++  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++  td.SampleDesc.Count = 1;
++  td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
++  ID3D11Texture2D* tex = nullptr;
++  if (FAILED(g->dev->CreateTexture2D(&td, nullptr, &tex))) return nullptr;
++  return tex;
++}
++
++void SwglGpuTestReleaseTile(void* tex) {
++  if (tex) ((ID3D11Texture2D*)tex)->Release();
++}
++
++bool SwglGpuTestReadTile(void* tex, int x, int y, int width, int height,
++                         void* out, int stride) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || !tex || width <= 0 || height <= 0) return false;
++  swgl_gpu::debug_check(g, "tile readback");
++  D3D11_TEXTURE2D_DESC td = {};
++  td.Width = width;
++  td.Height = height;
++  td.MipLevels = 1;
++  td.ArraySize = 1;
++  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++  td.SampleDesc.Count = 1;
++  td.Usage = D3D11_USAGE_STAGING;
++  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++  ID3D11Texture2D* st = nullptr;
++  if (FAILED(g->dev->CreateTexture2D(&td, nullptr, &st))) return false;
++  D3D11_BOX box = {UINT(x), UINT(y), 0, UINT(x + width), UINT(y + height), 1};
++  g->dc->CopySubresourceRegion(st, 0, 0, 0, 0, (ID3D11Texture2D*)tex, 0, &box);
++  D3D11_MAPPED_SUBRESOURCE m;
++  bool ok = SUCCEEDED(g->dc->Map(st, 0, D3D11_MAP_READ, 0, &m));
++  if (ok) {
++    for (int row = 0; row < height; row++) {
++      memcpy((char*)out + size_t(row) * stride,
++             (const char*)m.pData + size_t(row) * m.RowPitch, size_t(width) * 4);
++    }
++    g->dc->Unmap(st, 0);
++  }
++  st->Release();
++  return ok;
++}
++
+ // Counters since the last call, for the log: GPU draws, CPU draws, quads,
+ // uploads, readbacks, GPU clears, draws refused for the program, refused for
+ // state. Zeroes if no device is attached.
+ void SwglGpuStats(uint32_t* out8) {
+   GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  swgl_gpu::debug_check(g, "stats");
+   if (!g) {
+     memset(out8, 0, 8 * sizeof(uint32_t));
+     return;
+@@ -1853,6 +1987,11 @@ bool SwglGpuSetTextureTarget(GLuint, void*, GLsizei, GLsizei, GLint, GLint) {
+   return false;
+ }
+ bool SwglGpuAttachNewDevice(int, bool) { return false; }
++void* SwglGpuTestCreateTile(int, int) { return nullptr; }
++void SwglGpuTestReleaseTile(void*) {}
++bool SwglGpuTestReadTile(void*, int, int, int, int, void*, int) {
++  return false;
++}
+ void SwglGpuStats(uint32_t* out8) { memset(out8, 0, 8 * sizeof(uint32_t)); }
+ }
+ 

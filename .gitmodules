@@ -1,4 +1,5 @@
 [submodule "engine/firefox"]
 	path = engine/firefox
-	url = https://github.com/mozilla-firefox/firefox
+	url = https://github.com/Computershik73/firefox
+	branch = w10m-port
 	ignore = dirty

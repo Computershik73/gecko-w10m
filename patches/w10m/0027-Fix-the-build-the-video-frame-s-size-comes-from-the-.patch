@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 25 Sep 2026 07:49:39 +0400
+Subject: [PATCH 27/30] Fix the build: the video frame's size comes from the
+ DXGI texture host
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/webrender_bindings/RenderD3D11TextureHost.cpp | 3 ++-
+ gfx/webrender_bindings/RenderD3D11TextureHost.h   | 3 ++-
+ gfx/webrender_bindings/RenderTextureHostSWGL.cpp  | 4 ++--
+ gfx/webrender_bindings/RenderTextureHostSWGL.h    | 6 ++++--
+ 4 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderD3D11TextureHost.cpp b/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
+index 2a2fe121e1..3b6fb744dd 100644
+--- a/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
++++ b/gfx/webrender_bindings/RenderD3D11TextureHost.cpp
+@@ -269,13 +269,14 @@ static bool MapTexture(T* aHost, RenderCompositor* aCompositor,
+ }
+ 
+ void* RenderDXGITextureHost::GetD3D11TextureForSWGL(
+-    RenderCompositor* aCompositor) {
++    RenderCompositor* aCompositor, gfx::IntSize* aSize) {
+   RenderCompositorD3D11SWGL* compositor =
+       aCompositor ? aCompositor->AsRenderCompositorD3D11SWGL() : nullptr;
+   if (!compositor || mArrayIndex != 0 || mKeyedMutex ||
+       !EnsureD3D11Texture2D(compositor->GetDevice())) {
+     return nullptr;
+   }
++  *aSize = GetSize(0);
+   return mTexture.get();
+ }
+ 
+diff --git a/gfx/webrender_bindings/RenderD3D11TextureHost.h b/gfx/webrender_bindings/RenderD3D11TextureHost.h
+index 8620eb1a53..4afb947368 100644
+--- a/gfx/webrender_bindings/RenderD3D11TextureHost.h
++++ b/gfx/webrender_bindings/RenderD3D11TextureHost.h
+@@ -70,7 +70,8 @@ class RenderDXGITextureHost final : public RenderTextureHostSWGL {
+   bool MapPlane(RenderCompositor* aCompositor, uint8_t aChannelIndex,
+                 PlaneInfo& aPlaneInfo) override;
+   void UnmapPlanes() override;
+-  void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor) override;
++  void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor,
++                               gfx::IntSize* aSize) override;
+   gfx::YUVRangedColorSpace GetYUVColorSpace() const override {
+     return ToYUVRangedColorSpace(ToYUVColorSpace(mColorSpace), mColorRange,
+                                  mTransferFunction);
+diff --git a/gfx/webrender_bindings/RenderTextureHostSWGL.cpp b/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
+index d03f919a61..2b2c7ebfc7 100644
+--- a/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
++++ b/gfx/webrender_bindings/RenderTextureHostSWGL.cpp
+@@ -37,8 +37,8 @@ bool RenderTextureHostSWGL::UpdatePlanes(RenderCompositor* aCompositor) {
+   // every frame (MapPlane).
+   if (planeCount == 1 && (format == gfx::SurfaceFormat::B8G8R8A8 ||
+                           format == gfx::SurfaceFormat::B8G8R8X8)) {
+-    if (void* texture = GetD3D11TextureForSWGL(aCompositor)) {
+-      gfx::IntSize size = GetSize(0);
++    gfx::IntSize size;
++    if (void* texture = GetD3D11TextureForSWGL(aCompositor, &size)) {
+       if (SwglGpuSetTextureSource(mPlanes[0].mTexture, texture, size.width,
+                                   size.height)) {
+         mPlanes[0].mSize = size;
+diff --git a/gfx/webrender_bindings/RenderTextureHostSWGL.h b/gfx/webrender_bindings/RenderTextureHostSWGL.h
+index fb50bbfbda..08e749b337 100644
+--- a/gfx/webrender_bindings/RenderTextureHostSWGL.h
++++ b/gfx/webrender_bindings/RenderTextureHostSWGL.h
+@@ -48,8 +48,10 @@ class RenderTextureHostSWGL : public RenderTextureHost {
+ 
+   // A Direct3D 11 texture holding the whole image, on the compositor's
+   // device, that SWGL shading on that device can sample directly instead of
+-  // mapping planes (Windows 10 Mobile). Null when there is none.
+-  virtual void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor) {
++  // mapping planes (Windows 10 Mobile), and the image's size. Null when
++  // there is none.
++  virtual void* GetD3D11TextureForSWGL(RenderCompositor* aCompositor,
++                                       gfx::IntSize* aSize) {
+     return nullptr;
+   }
+ 

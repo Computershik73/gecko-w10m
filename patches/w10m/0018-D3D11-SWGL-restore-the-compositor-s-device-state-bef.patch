@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 12:58:30 +0400
+Subject: [PATCH 18/30] D3D11 SWGL: restore the compositor's device state
+ before compositing tiles
+
+With a native compositor WebRender starts compositing (BeginFrameForWindow:
+render target, viewport, input layout, topology, rasterizer and blend
+state) before it draws the tiles, and with GPU shading SWGL draws them with
+the same immediate context, leaving its own state bound. Every tile quad
+then drew into SWGL's target with SWGL's pipeline and the screen stayed
+black although the tiles were right (the log's pixel probes showed both).
+CompositorEndFrame now sets that state again first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/layers/d3d11/CompositorD3D11.cpp             | 16 ++++++++++++++++
+ gfx/layers/d3d11/CompositorD3D11.h               |  5 +++++
+ .../RenderCompositorD3D11SWGL.cpp                |  9 +++++++++
+ .../RenderCompositorD3D11SWGL.h                  |  1 +
+ 4 files changed, 31 insertions(+)
+
+diff --git a/gfx/layers/d3d11/CompositorD3D11.cpp b/gfx/layers/d3d11/CompositorD3D11.cpp
+index e4657ace6e..faaaa4aef1 100644
+--- a/gfx/layers/d3d11/CompositorD3D11.cpp
++++ b/gfx/layers/d3d11/CompositorD3D11.cpp
+@@ -571,6 +571,22 @@ void CompositorD3D11::ForgetDeviceState() {
+   }
+ }
+ 
++void CompositorD3D11::RestoreDeviceState() {
++  if (!mContext || !mAttachments) {
++    return;
++  }
++  mContext->OMSetDepthStencilState(nullptr, 0);
++  mContext->RSSetState(mAttachments->mRasterizerState);
++  PrepareStaticVertexBuffer();
++  mContext->OMSetBlendState(mAttachments->mPremulBlendState, sBlendFactor,
++                            0xFFFFFFFF);
++  if (mCurrentRT) {
++    // Binds it again and sets its viewport.
++    RefPtr<CompositingRenderTargetD3D11> rt = std::move(mCurrentRT);
++    SetRenderTarget(rt);
++  }
++}
++
+ void CompositorD3D11::SetRenderTarget(CompositingRenderTarget* aRenderTarget) {
+   MOZ_ASSERT(aRenderTarget);
+   CompositingRenderTargetD3D11* newRT =
+diff --git a/gfx/layers/d3d11/CompositorD3D11.h b/gfx/layers/d3d11/CompositorD3D11.h
+index 9b081ba508..713e0adcaa 100644
+--- a/gfx/layers/d3d11/CompositorD3D11.h
++++ b/gfx/layers/d3d11/CompositorD3D11.h
+@@ -104,6 +104,11 @@ class CompositorD3D11 : public Compositor {
+   // bound, so that the next one is bound again, and leave no depth state.
+   void ForgetDeviceState();
+ 
++  // Someone else has drawn with the immediate context after BeginFrame --
++  // WebRender draws the tiles after it starts compositing: set again all the
++  // state BeginFrame set and the draws that follow rely on.
++  void RestoreDeviceState();
++
+   ID3D11DeviceContext* GetDC() { return mContext; }
+ 
+   virtual void RequestAllowFrameRecording(bool aWillRecord) override {
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+index 8861da2d64..d20a4f5091 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+@@ -167,6 +167,15 @@ bool RenderCompositorD3D11SWGL::ProbePixel(ID3D11Texture2D* aTexture, int aX,
+   return true;
+ }
+ 
++void RenderCompositorD3D11SWGL::CompositorEndFrame() {
++  if (mGpuShading) {
++    // WebRender started compositing before it drew the tiles, and SWGL drew
++    // them with this context: the composite needs its own state back.
++    GetCompositorD3D11()->RestoreDeviceState();
++  }
++  RenderCompositorLayersSWGL::CompositorEndFrame();
++}
++
+ RenderedFrameId RenderCompositorD3D11SWGL::EndFrame(
+     const nsTArray<DeviceIntRect>& aDirtyRects) {
+ #if defined(GECKO_W10M)
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
+index dfbbe21b8e..7bcf8b09fb 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
+@@ -41,6 +41,7 @@ class RenderCompositorD3D11SWGL : public RenderCompositorLayersSWGL {
+ 
+   bool BeginFrame() override;
+   RenderedFrameId EndFrame(const nsTArray<DeviceIntRect>& aDirtyRects) override;
++  void CompositorEndFrame() override;
+   void StartCompositing(wr::ColorF aClearColor,
+                         const wr::DeviceIntRect* aDirtyRects,
+                         size_t aNumDirtyRects,

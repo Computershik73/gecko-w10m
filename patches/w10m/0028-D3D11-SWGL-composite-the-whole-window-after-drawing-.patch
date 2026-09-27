@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 25 Sep 2026 09:48:40 +0400
+Subject: [PATCH 28/30] D3D11 SWGL: composite the whole window after drawing a
+ video surface
+
+With video frames on the GPU the Lumia 650 composited 30 times a second,
+yet the video jumped and showed old frames: the compositor redraws only
+WebRender's dirty rects (and nothing at all when there are none), and a
+video drawn as a compositor surface of its own changes without being in
+them, so where nothing else changed the flip-model back buffer kept the
+video as it was two frames before. After a frame that drew an external
+image, the next one is composited whole.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorD3D11SWGL.cpp               | 17 +++++++++++++++++
+ .../RenderCompositorD3D11SWGL.h                 |  4 ++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+index baf93c86cc..b9513cf066 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp
+@@ -152,6 +152,21 @@ void RenderCompositorD3D11SWGL::StartCompositing(
+     }
+ #endif
+   }
++  if (mDrewExternalImage) {
++    // A video surface changes with every frame of its own, and WebRender
++    // does not count that in its dirty rects: composite the whole window,
++    // or the back buffer would show the video as it was two frames ago
++    // (flip model) where nothing else changed.
++    gfx::IntSize size = GetBufferSize().ToUnknownSize();
++    wr::DeviceIntRect whole;
++    whole.min.x = 0;
++    whole.min.y = 0;
++    whole.max.x = size.width;
++    whole.max.y = size.height;
++    RenderCompositorLayersSWGL::StartCompositing(aClearColor, &whole, 1,
++                                                 aOpaqueRects, aNumOpaqueRects);
++    return;
++  }
+   RenderCompositorLayersSWGL::StartCompositing(aClearColor, aDirtyRects,
+                                                aNumDirtyRects, aOpaqueRects,
+                                                aNumOpaqueRects);
+@@ -189,6 +204,7 @@ bool RenderCompositorD3D11SWGL::ProbePixel(ID3D11Texture2D* aTexture, int aX,
+ }
+ 
+ void RenderCompositorD3D11SWGL::CompositorEndFrame() {
++  mDrewExternalImage = false;
+   if (mGpuShading) {
+     // WebRender started compositing before it drew the tiles, and SWGL drew
+     // them with this context: the composite needs its own state back.
+@@ -297,6 +313,7 @@ void RenderCompositorD3D11SWGL::HandleExternalImage(
+   }
+ 
+   gfx::Rect drawRect(0, 0, size.width, size.height);
++  mDrewExternalImage = true;
+ 
+ #if defined(GECKO_W10M)
+   static bool sNoted = false;
+diff --git a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
+index 7bcf8b09fb..9def55bf16 100644
+--- a/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
++++ b/gfx/webrender_bindings/RenderCompositorD3D11SWGL.h
+@@ -116,6 +116,10 @@ class RenderCompositorD3D11SWGL : public RenderCompositorLayersSWGL {
+   bool ProbePixel(ID3D11Texture2D* aTexture, int aX, int aY, uint32_t* aOut);
+   uint32_t mTileProbes = 0;
+   uint32_t mFrameProbes = 0;
++  // Whether the last composite drew an external image (video) as a surface
++  // of its own: its updates are not in WebRender's dirty rects, so the next
++  // frame is composited whole.
++  bool mDrewExternalImage = false;
+ };
+ 
+ class SurfaceD3D11SWGL : public RenderCompositorLayersSWGL::Surface {

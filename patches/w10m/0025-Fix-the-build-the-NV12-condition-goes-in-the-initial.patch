@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 23:00:30 +0400
+Subject: [PATCH 25/30] Fix the build: the NV12 condition goes in the
+ initializer list (const members)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/layers/D3D11ShareHandleImage.cpp | 28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/gfx/layers/D3D11ShareHandleImage.cpp b/gfx/layers/D3D11ShareHandleImage.cpp
+index 806fcaf6fb..0ab3216cb4 100644
+--- a/gfx/layers/D3D11ShareHandleImage.cpp
++++ b/gfx/layers/D3D11ShareHandleImage.cpp
+@@ -168,24 +168,32 @@ class MOZ_RAII D3D11TextureClientAllocationHelper
+   const RefPtr<ID3D11Device> mDevice;
+ };
+ 
++// Whether the compositor can take YUV textures as they are. At feature level
++// 9_3 (Windows 10 Mobile, where nothing can be shared either) it samples no
++// NV12: frames are made BGRA by the video processor on the way
++// (D3D11DXVA2Manager::CopyTextureToImage).
++static bool CompositorTakesYUVTextures() {
++#if defined(GECKO_W10M)
++  return gfx::DeviceManagerDx::Get()->TextureSharingWorks();
++#else
++  return true;
++#endif
++}
++
+ D3D11RecycleAllocator::D3D11RecycleAllocator(
+     KnowsCompositor* aAllocator, ID3D11Device* aDevice,
+     gfx::SurfaceFormat aPreferredFormat)
+     : TextureClientRecycleAllocator(aAllocator),
+       mDevice(aDevice),
+       mCanUseNV12(StaticPrefs::media_wmf_use_nv12_format() &&
+-                  gfx::DeviceManagerDx::Get()->CanUseNV12()),
++                  gfx::DeviceManagerDx::Get()->CanUseNV12() &&
++                  CompositorTakesYUVTextures()),
+       mCanUseP010(StaticPrefs::media_wmf_use_nv12_format() &&
+-                  gfx::DeviceManagerDx::Get()->CanUseP010()),
++                  gfx::DeviceManagerDx::Get()->CanUseP010() &&
++                  CompositorTakesYUVTextures()),
+       mCanUseP016(StaticPrefs::media_wmf_use_nv12_format() &&
+-                  gfx::DeviceManagerDx::Get()->CanUseP016()) {
+-#if defined(GECKO_W10M)
+-  // Feature level 9_3 compositing samples no NV12: frames are made BGRA by
+-  // the video processor on the way (D3D11DXVA2Manager::CopyTextureToImage).
+-  if (!gfx::DeviceManagerDx::Get()->TextureSharingWorks()) {
+-    mCanUseNV12 = mCanUseP010 = mCanUseP016 = false;
+-  }
+-#endif
++                  gfx::DeviceManagerDx::Get()->CanUseP016() &&
++                  CompositorTakesYUVTextures()) {
+   SetPreferredSurfaceFormat(aPreferredFormat);
+ }
+ 

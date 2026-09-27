@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 09:36:24 +0400
+Subject: [PATCH 12/30] SWGL GPU path: loops that do not fit go to the CPU quad
+ by quad
+
+WebRender scales a blur's source down only when the deviation is large on
+both axes, so a one-direction blur can need more steps than a 9_3 pixel
+shader can unroll. The unrolled loop then stopped early, and the result
+came out faint (dirty-rect-blur-*, filter-blur-scaled-xonly).
+
+For loops of the form `for (int i = c; i <= B; i += s)`, where B comes from
+flat varyings (through locals and min()), glsl-to-cxx now emits the
+condition under which the loop fits the unroll limit as gpu_accept(limit).
+The build records which limit the chosen pixel shader was unrolled to.
+Before a GPU draw, SWGL runs the vertex stage for each quad and asks. One
+refusal sends the draw to the CPU, where it is shaded and then placed by
+the GPU. A limit of 12 is tried between 16 and 8.
+
+SWGL_GPU_CPU=<substring> keeps matching programs on the CPU, for testing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/glsl-to-cxx/src/hlsl.rs | 120 ++++++++++++++++++++++++++++++++-
+ gfx/wr/glsl-to-cxx/src/lib.rs  |   6 +-
+ gfx/wr/swgl/build.rs           |  10 ++-
+ gfx/wr/swgl/src/gpu_d3d11.h    |  29 +++++++-
+ gfx/wr/swgl/src/program.h      |   7 ++
+ 5 files changed, 164 insertions(+), 8 deletions(-)
+
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+index d45da11e06..34cc8ebdb0 100644
+--- a/gfx/wr/glsl-to-cxx/src/hlsl.rs
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -66,6 +66,10 @@ pub struct Layout {
+     pub varying_floats: usize,
+     /// The float offset of gl_FragCoord.xy, when the shader reads it.
+     pub fragcoord_offset: Option<usize>,
++    /// C++ conditions, over the program's flat values, under which every loop
++    /// whose trip count they bound fits the unroll limit (`limit` in them).
++    /// A quad for which any is false is shaded on the CPU.
++    pub accept: Vec<String>,
+     /// Total float4 texture coordinates the pixel shader takes.
+     pub slots: usize,
+     pub uses_discard: bool,
+@@ -86,7 +90,7 @@ pub const MAX_SLOTS: usize = 8;
+ /// own loops are short: the gradient stop tree is five levels deep for 625
+ /// stops, a blur takes at most six steps once WebRender has scaled the
+ /// source so that the deviation is at most 4.
+-pub const LOOP_LIMITS: [usize; 3] = [32, 16, 8];
++pub const LOOP_LIMITS: [usize; 4] = [32, 16, 12, 8];
+ 
+ struct Emitter<'a> {
+     st: &'a hir::State,
+@@ -104,6 +108,11 @@ struct Emitter<'a> {
+     /// The wrapper the function being emitted returns, if any.
+     ret_array: Option<String>,
+     loop_limit: usize,
++    /// Flat inputs by name, and local initialisers, for working out what
++    /// bounds a loop.
++    flat_names: HashSet<String>,
++    local_inits: HashMap<hir::SymRef, hir::Expr>,
++    accepts: Vec<String>,
+ }
+ 
+ fn floats_of(kind: hir::TypeKind) -> Option<usize> {
+@@ -691,6 +700,7 @@ impl<'a> Emitter<'a> {
+                 let cst = if storage == hir::StorageClass::Const { "const " } else { "" };
+                 match &head.initializer {
+                     Some(hir::Initializer::Simple(e)) => {
++                        self.local_inits.insert(head.name, (**e).clone());
+                         let v = self.expr(e);
+                         self.line(&format!("{}{} {}{} = {};", cst, tn, name, arr, v));
+                     }
+@@ -802,6 +812,94 @@ impl<'a> Emitter<'a> {
+         }
+     }
+ 
++    /// C++ for a bound made of flat values, following local initialisers and
++    /// min() (which only lowers it, so dropping it is safe).
++    fn bound_cxx(&self, e: &hir::Expr, depth: usize) -> Option<String> {
++        if depth > 8 {
++            return None;
++        }
++        match &e.kind {
++            hir::ExprKind::Variable(sym) => {
++                let name = self.st.sym(*sym).name.clone();
++                if self.flat_names.contains(&name) {
++                    return Some(name);
++                }
++                let init = self.local_inits.get(sym)?.clone();
++                self.bound_cxx(&init, depth + 1)
++            }
++            hir::ExprKind::SwizzleSelector(inner, sel) if sel.components.len() == 1 => {
++                if let hir::ExprKind::Variable(sym) = &inner.kind {
++                    let name = self.st.sym(*sym).name.clone();
++                    if self.flat_names.contains(&name) {
++                        return Some(format!("{}.{}", name, sel.to_field_set(hir::FieldSet::Xyzw)));
++                    }
++                }
++                None
++            }
++            hir::ExprKind::FunCall(hir::FunIdentifier::Identifier(f), args)
++                if self.st.sym(*f).name == "min" && args.len() == 2 =>
++            {
++                self.bound_cxx(&args[0], depth + 1)
++                    .or_else(|| self.bound_cxx(&args[1], depth + 1))
++            }
++            hir::ExprKind::IntConst(x) => Some(format!("{}", x)),
++            _ => None,
++        }
++    }
++
++    /// For `for (int i = c; i <= B; i += s)` (or < B, or i++) whose bound B
++    /// comes from flat values: the C++ that says the loop fits `limit`.
++    fn loop_accept(
++        &self,
++        init: &hir::ForInitStatement,
++        rest: &hir::ForRestStatement,
++    ) -> Option<String> {
++        let (var, c0) = match init {
++            hir::ForInitStatement::Declaration(d) => match &**d {
++                hir::Declaration::InitDeclaratorList(l) => match &l.head.initializer {
++                    Some(hir::Initializer::Simple(e)) => (l.head.name, int_const(e)?),
++                    _ => return None,
++                },
++                _ => return None,
++            },
++            _ => return None,
++        };
++        let (inclusive, bound) = match &rest.condition {
++            Some(hir::Condition::Expr(c)) => match &c.kind {
++                hir::ExprKind::Binary(op, l, r) => match (&l.kind, op) {
++                    (hir::ExprKind::Variable(v), syntax::BinaryOp::LTE) if *v == var => (true, r),
++                    (hir::ExprKind::Variable(v), syntax::BinaryOp::LT) if *v == var => (false, r),
++                    _ => return None,
++                },
++                _ => return None,
++            },
++            None => return None,
++        };
++        let step = match rest.post_expr.as_deref().map(|p| &p.kind) {
++            Some(hir::ExprKind::PostInc(v)) | Some(hir::ExprKind::Unary(syntax::UnaryOp::Inc, v)) => {
++                match &v.kind {
++                    hir::ExprKind::Variable(s) if *s == var => 1,
++                    _ => return None,
++                }
++            }
++            Some(hir::ExprKind::Assignment(v, syntax::AssignmentOp::Add, s)) => match &v.kind {
++                hir::ExprKind::Variable(sv) if *sv == var => int_const(s)?,
++                _ => return None,
++            },
++            _ => return None,
++        };
++        if step <= 0 {
++            return None;
++        }
++        let b = self.bound_cxx(bound, 0)?;
++        // Iterations: i = c0, c0 + s, ... while i <= B (or < B).
++        let last = if inclusive { "0" } else { "1" };
++        Some(format!(
++            "(int({}) - {} <= {} + (limit - 1) * {})",
++            b, last, c0, step
++        ))
++    }
++
+     fn iteration(&mut self, it: &hir::IterationStatement) {
+         match it {
+             hir::IterationStatement::For(init, rest, body) => {
+@@ -822,6 +920,11 @@ impl<'a> Emitter<'a> {
+                     Some(hir::Condition::Expr(c)) => self.expr(c),
+                     None => "true".into(),
+                 };
++                if let Some(a) = self.loop_accept(init, rest) {
++                    if !self.accepts.contains(&a) {
++                        self.accepts.push(a);
++                    }
++                }
+                 let post = rest.post_expr.as_ref().map(|p| self.expr(p));
+                 if contains_continue(body) {
+                     self.err("continue inside a loop".into());
+@@ -1173,6 +1276,9 @@ pub fn translate_fragment_limited(
+         array_wrappers: Vec::new(),
+         ret_array: None,
+         loop_limit,
++        flat_names: HashSet::new(),
++        local_inits: HashMap::new(),
++        accepts: Vec::new(),
+     };
+ 
+     // Find main and everything it reaches.
+@@ -1305,6 +1411,10 @@ pub fn translate_fragment_limited(
+         em.err(format!("{} floats of varyings do not fit", offset));
+     }
+ 
++    for (_, name, _) in &flats {
++        em.flat_names.insert(name.clone());
++    }
++
+     // Emit.
+     em.out.push_str(PRELUDE);
+     let prelude_len = em.out.len();
+@@ -1498,6 +1608,7 @@ pub fn translate_fragment_limited(
+         em.out.insert_str(prelude_len, BITOPS);
+     }
+     layout.uses_discard = em.uses_discard;
++    layout.accept = em.accepts.clone();
+ 
+     if em.errors.is_empty() {
+         Ok((em.out, layout))
+@@ -1561,6 +1672,13 @@ pub fn cxx_glue(layout: &Layout) -> String {
+         }
+     }
+     s.push_str("}\n");
++    if !layout.accept.is_empty() {
++        let _ = writeln!(
++            s,
++            "bool gpu_accept(int limit) const override {{ return {}; }}",
++            layout.accept.join(" && ")
++        );
++    }
+     s.push_str("int gpu_sampler_unit(int i) const override {\n switch (i) {\n");
+     for smp in &layout.samplers {
+         let _ = writeln!(
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index b0558e2242..fb0643430a 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -57,7 +57,7 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+ pub fn translate_with_gpu(
+     args: &mut dyn Iterator<Item = String>,
+     gpu: bool,
+-) -> (String, Option<(Vec<String>, hlsl::Layout)>, Vec<String>) {
++) -> (String, Option<(Vec<(usize, String)>, hlsl::Layout)>, Vec<String>) {
+     let _cmd_name = args.next();
+     let vertex_file = args.next().unwrap();
+ 
+@@ -87,12 +87,12 @@ pub fn translate_with_gpu(
+         let clip = vs_state.used_clip_dist != 0;
+         match hlsl::translate_fragment_limited(&fs_state, &fs_hir, hlsl::LOOP_LIMITS[0], clip) {
+             Ok((first, layout)) => {
+-                let mut sources = vec![first];
++                let mut sources = vec![(hlsl::LOOP_LIMITS[0], first)];
+                 for &limit in &hlsl::LOOP_LIMITS[1..] {
+                     if let Ok((src, _)) =
+                         hlsl::translate_fragment_limited(&fs_state, &fs_hir, limit, clip)
+                     {
+-                        sources.push(src);
++                        sources.push((limit, src));
+                     }
+                 }
+                 Some((sources, layout))
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index 2ddfcd7fd0..6a0bc6e0fc 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -254,7 +254,7 @@ fn write_gpu_header(
+     out_dir: &str,
+     shader: &str,
+     fxc: Option<&str>,
+-    gpu: Option<(Vec<String>, glsl_to_cxx::hlsl::Layout)>,
++    gpu: Option<(Vec<(usize, String)>, glsl_to_cxx::hlsl::Layout)>,
+     errors: &[String],
+ ) -> bool {
+     let path = format!("{out_dir}/{shader}_gpu.h");
+@@ -273,9 +273,11 @@ fn write_gpu_header(
+     };
+     // Loops are unrolled; the first limit that fits in 512 instructions wins.
+     let mut compiled = Err(String::new());
+-    for hlsl in &sources {
++    let mut loop_limit = 0;
++    for (limit, hlsl) in &sources {
+         compiled = fxc_compile(fxc, hlsl, "ps_4_0_level_9_3", &format!("{out_dir}/{shader}_ps"));
+         if compiled.is_ok() {
++            loop_limit = *limit;
+             break;
+         }
+     }
+@@ -298,12 +300,14 @@ fn write_gpu_header(
+             );
+             let _ = writeln!(
+                 h,
+-                "static const GpuProgramInfo {shader}_gpu_info_data = {{ {shader}_ps, sizeof({shader}_ps), {}, {}, {}, {}, {}, \"{shader}\", {shader}_srect }};",
++                "static const GpuProgramInfo {shader}_gpu_info_data = {{ {shader}_ps, sizeof({shader}_ps), {}, {}, {}, {}, {}, \"{shader}\", {shader}_srect, {}, {} }};",
+                 layout.slots,
+                 layout.texture_floats,
+                 layout.flat_coord_offset.map_or(-1, |o| o as i64),
+                 layout.fragcoord_offset.map_or(-1, |o| o as i64),
+                 layout.samplers.len(),
++                loop_limit,
++                !layout.accept.is_empty() as i32,
+             );
+             let _ = writeln!(
+                 h,
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 16a61797eb..6cc36b8e03 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -1105,6 +1105,12 @@ static bool gpu_check(Texture& colortex, Texture** sampled,
+   if (!info || !gpu_vertex_shader) {
+     return refuse(g, true, "no GPU variant");
+   }
++  // SWGL_GPU_CPU=<substring>: keep matching programs on the CPU, for
++  // telling a GPU shader's fault from the rest when testing.
++  static const char* keep_on_cpu = getenv("SWGL_GPU_CPU");
++  if (keep_on_cpu && strstr(info->name, keep_on_cpu)) {
++    return refuse(g, true, "SWGL_GPU_CPU");
++  }
+   if (info->texture_floats > 0 && !g->flat_srv) {
+     return refuse(g, true, "no float texture for flat data");
+   }
+@@ -1364,9 +1370,30 @@ static bool gpu_draw_elements(GLsizei count, GLsizei instancecount,
+   ID3D11PixelShader* ps = nullptr;
+   if (!gpu_check(colortex, sampled, &bs, &ps)) return false;
+ 
+-  // Everything checks out: from here on the draw is the GPU's.
+   Buffer& indices_buf = ctx->buffers[v.element_array_buffer_binding];
+   if (!indices_buf.buf || offset >= indices_buf.size) return true;
++
++  // Some pixel shaders unroll a loop whose trip count comes with the quad (a
++  // blur's support): ask of every quad whether it fits before committing.
++  if (info->has_accept) {
++    size_t is = std::max(impl->interpolants_size(), sizeof(float));
++    if (g->interps.size() < is * 4) g->interps.resize(is * 4);
++    INDEX* ix = (INDEX*)(indices_buf.buf + offset);
++    GLsizei n = min(count, (GLsizei)((indices_buf.size - offset) / sizeof(INDEX)));
++    for (GLsizei instance = 0; instance < instancecount; instance++) {
++      for (GLsizei i = 0; i + 3 <= n; i += 3) {
++        bool quad = i + 6 <= n && ix[i + 5] == ix[i] + 3;
++        vs->load_attribs(v.attribs, ix[i], instance, quad ? 4 : 3);
++        vs->run_primitive(g->interps.data(), is);
++        if (!impl->gpu_accept(info->loop_limit)) {
++          return refuse(g, false, "a loop longer than the pixel shader's");
++        }
++        if (quad) i += 3;
++      }
++    }
++  }
++
++  // Everything checks out: from here on the draw is the GPU's.
+   if (!to_gpu(g, colortex)) return refuse(g, false, "target on the GPU");
+   bool use_depth = ctx->depthtest && depthtex.buf;
+   if (use_depth) {
+diff --git a/gfx/wr/swgl/src/program.h b/gfx/wr/swgl/src/program.h
+index 6fc3c2033c..ed1fb02a77 100644
+--- a/gfx/wr/swgl/src/program.h
++++ b/gfx/wr/swgl/src/program.h
+@@ -41,6 +41,10 @@ struct GpuProgramInfo {
+   const char* name;
+   // Per sampler: 1 for sampler2DRect (bound as GL_TEXTURE_RECTANGLE), else 0.
+   const unsigned char* sampler_rect;
++  // How far loops were unrolled to fit, and whether gpu_accept must be asked
++  // per quad whether this quad's loops fit.
++  int loop_limit;
++  int has_accept;
+ };
+ 
+ struct ProgramImpl {
+@@ -60,6 +64,9 @@ struct ProgramImpl {
+                         float* f) {}
+   // The texture unit behind the pixel shader's i-th sampler.
+   virtual int gpu_sampler_unit(int i) const { return -1; }
++  // After the vertex shader has run a quad: whether its loops fit the
++  // pixel shader's unroll limit (a long blur may not).
++  virtual bool gpu_accept(int limit) const { return true; }
+ };
+ 
+ typedef ProgramImpl* (*ProgramLoader)();

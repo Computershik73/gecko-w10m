@@ -1,14 +1,11 @@
-# Porting GeckoW10m (Gecko) to Windows 10 Mobile
+# Porting Gecko to Windows 10 Mobile
 
-This document describes how the iOS Gecko browser **GeckoW10m** is being ported to
-**Windows 10 Mobile (W10M)** as a native UWP application, with a **JIT-enabled**
-SpiderMonkey/Gecko engine.
+This document describes how a Gecko browser is built for **Windows 10 Mobile (W10M)** as a
+native UWP application, with a **JIT-enabled** SpiderMonkey/Gecko engine.
 
-The target device is a **personal, interop-unlocked, offline** phone. That matters:
-interop unlock is the W10M analogue of the TrollStore / jailbreak path GeckoW10m uses on
-iOS. It lets us sideload an appx that declares **restricted capabilities** and escape the
-default app-container restrictions, exactly as the iOS build escapes the WebKit-only /
-BrowserEngineKit restrictions.
+The target device is a **personal, interop-unlocked** phone. That matters: interop unlock
+lets us sideload an appx that declares **restricted capabilities** and escape the default
+app-container restrictions.
 
 ## The four hard problems and how each is solved
 

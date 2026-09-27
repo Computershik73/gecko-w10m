@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 22:58:53 +0400
+Subject: [PATCH 24/30] Video on feature level 9_3: DXVA frames stay on the GPU
+
+Frames decoded by DXVA were read back to memory, converted and uploaded
+again (three trips through the CPU per frame). Nothing on this device can
+be shared, but nothing needs to be: the port is one process. Now, when
+texture sharing does not work:
+- the decoder works on the compositor's own device;
+- frames are converted to BGRA by the video processor into plain textures
+  (no NT handle, keyed mutex or fence) that reach the compositor by id
+  through GpuProcessD3D11TextureMap, created in this process;
+- software WebRender with the D3D11 compositor takes DXGI images, which
+  become native compositor surfaces drawn by HandleExternalImage.
+If the video processor or any of this fails on the phone, the decoder
+falls back to reading frames back to memory, and the log says so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/platforms/wmf/DXVA2Manager.cpp      |  7 ++
+ .../platforms/wmf/WMFVideoMFTManager.cpp      | 70 +++++++++++++----
+ gfx/layers/D3D11ShareHandleImage.cpp          |  7 ++
+ .../d3d11/GpuProcessD3D11TextureMap.cpp       |  8 ++
+ gfx/layers/d3d11/TextureD3D11.cpp             | 76 +++++++++++++------
+ gfx/thebes/gfxPlatform.cpp                    | 11 +++
+ 6 files changed, 144 insertions(+), 35 deletions(-)
+
+diff --git a/dom/media/platforms/wmf/DXVA2Manager.cpp b/dom/media/platforms/wmf/DXVA2Manager.cpp
+index fdb985ada8..d81aaa281f 100644
+--- a/dom/media/platforms/wmf/DXVA2Manager.cpp
++++ b/dom/media/platforms/wmf/DXVA2Manager.cpp
+@@ -682,6 +682,13 @@ D3D11DXVA2Manager::InitInternal(layers::KnowsCompositor* aKnowsCompositor,
+     if (aKnowsCompositor && aKnowsCompositor->UsingHardwareWebRender()) {
+       flags += DeviceManagerDx::DeviceFlag::isHardwareWebRenderInUse;
+     }
++#if defined(GECKO_W10M)
++    // Feature level 9_3 shares no textures: decoding on the compositor's
++    // device is what lets a frame reach it without a trip through memory.
++    if (!DeviceManagerDx::Get()->TextureSharingWorks()) {
++      flags += DeviceManagerDx::DeviceFlag::isHardwareWebRenderInUse;
++    }
++#endif
+     mDevice = gfx::DeviceManagerDx::Get()->CreateDecoderDevice(flags);
+     if (!mDevice) {
+       aFailureReason.AssignLiteral("Failed to create D3D11 device for decoder");
+diff --git a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
+index e3cca0e8c6..14f1cc6dc9 100644
+--- a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
++++ b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
+@@ -303,7 +303,13 @@ MediaResult WMFVideoMFTManager::InitInternal() {
+       if (SUCCEEDED(hr)) {
+         mUseHwAccel = true;
+ #if defined(GECKO_W10M)
+-        mDXVAReadback = !gfx::DeviceManagerDx::Get()->TextureSharingWorks();
++        // No texture sharing: frames stay on the GPU only if the decoder
++        // works on the compositor's own device; otherwise they are read back.
++        mDXVAReadback =
++            !gfx::DeviceManagerDx::Get()->TextureSharingWorks() &&
++            (!mDXVA2Manager || mDXVA2Manager->GetD3D11Device() !=
++                                   gfx::DeviceManagerDx::Get()
++                                       ->GetCompositorDevice());
+ #endif
+       } else {
+         mDXVAFailureReason = nsPrintfCString(
+@@ -402,7 +408,7 @@ MediaResult WMFVideoMFTManager::InitInternal() {
+                          mUseHwAccel || mDXVAFailureReason.IsEmpty() ? "" : " -- ",
+                          mUseHwAccel ? (mDXVAReadback
+                                             ? " (frames read back to memory)"
+-                                            : "")
++                                            : " (frames stay on the GPU)")
+                                      : mDXVAFailureReason.get());
+     GeckoW10mNote(note.get());
+   }
+@@ -411,18 +417,26 @@ MediaResult WMFVideoMFTManager::InitInternal() {
+   // Now we need to convert the video decode output to a display format --
+   // unless the frames are read back to memory, which needs no conversion.
+   if (mUseHwAccel && !mDXVAReadback) {
++    HRESULT configured = mDXVA2Manager->ConfigureForSize(
++        outputType,
++        mColorSpace.refOr(
++            DefaultColorSpace({mImageSize.width, mImageSize.height})),
++        mColorRange, mColorDepth,
++        mVideoInfo.mTransferFunction.refOr(gfx::TransferFunction::BT709),
++        mVideoInfo.mHDRMetadata, mVideoInfo.ImageRect().width,
++        mVideoInfo.ImageRect().height);
++#if defined(GECKO_W10M)
++    if (FAILED(configured)) {
++      LOG("ConfigureForSize failed ({:x}): frames read back to memory",
++          unsigned(configured));
++      mDXVAReadback = true;
++    }
++#else
+     RETURN_PARAM_IF_FAILED(
+-        mDXVA2Manager->ConfigureForSize(
+-            outputType,
+-            mColorSpace.refOr(
+-                DefaultColorSpace({mImageSize.width, mImageSize.height})),
+-            mColorRange, mColorDepth,
+-            mVideoInfo.mTransferFunction.refOr(gfx::TransferFunction::BT709),
+-            mVideoInfo.mHDRMetadata, mVideoInfo.ImageRect().width,
+-            mVideoInfo.ImageRect().height),
+-        MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+-                    RESULT_DETAIL("Fail to configure image size for "
+-                                  "DXVA2Manager.")));
++        configured, MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
++                                RESULT_DETAIL("Fail to configure image size "
++                                              "for DXVA2Manager.")));
++#endif
+   }
+   if (!mUseHwAccel || mDXVAReadback) {
+     GetDefaultStride(outputType, mVideoInfo.ImageRect().width, &mVideoStride);
+@@ -1058,6 +1072,36 @@ WMFVideoMFTManager::Output(int64_t aStreamOffset, RefPtr<MediaData>& aOutData) {
+   RefPtr<VideoData> frame;
+   if (mUseHwAccel && !mDXVAReadback) {
+     hr = CreateD3DVideoFrame(sample, aStreamOffset, getter_AddRefs(frame));
++#if defined(GECKO_W10M)
++    if (FAILED(hr)) {
++      // The GPU path failed on this device: read this frame and the rest
++      // back to memory rather than lose the video.
++      LOG("CreateD3DVideoFrame failed ({:x}): frames read back to memory",
++          unsigned(hr));
++      nsPrintfCString note(
++          "media: frames that stayed on the GPU fail (%lx) -- reading them "
++          "back to memory",
++          hr);
++      GeckoW10mNote(note.get());
++      mDXVAReadback = true;
++      RefPtr<IMFMediaType> outputType;
++      if (SUCCEEDED(mDecoder->GetOutputMediaType(outputType))) {
++        GetDefaultStride(outputType, mVideoInfo.ImageRect().width,
++                         &mVideoStride);
++        UINT32 width = 0, height = 0;
++        if (SUCCEEDED(MFGetAttributeSize(outputType, MF_MT_FRAME_SIZE, &width,
++                                         &height))) {
++          mSoftwareImageSize = gfx::IntSize(width, height);
++        }
++        gfx::IntRect picture;
++        if (SUCCEEDED(GetPictureRegion(outputType, picture))) {
++          mSoftwarePictureSize = gfx::IntSize(picture.width, picture.height);
++        }
++      }
++      frame = nullptr;
++      hr = CreateBasicVideoFrame(sample, aStreamOffset, getter_AddRefs(frame));
++    }
++#endif
+   } else {
+     hr = CreateBasicVideoFrame(sample, aStreamOffset, getter_AddRefs(frame));
+   }
+diff --git a/gfx/layers/D3D11ShareHandleImage.cpp b/gfx/layers/D3D11ShareHandleImage.cpp
+index 5218c82a98..806fcaf6fb 100644
+--- a/gfx/layers/D3D11ShareHandleImage.cpp
++++ b/gfx/layers/D3D11ShareHandleImage.cpp
+@@ -179,6 +179,13 @@ D3D11RecycleAllocator::D3D11RecycleAllocator(
+                   gfx::DeviceManagerDx::Get()->CanUseP010()),
+       mCanUseP016(StaticPrefs::media_wmf_use_nv12_format() &&
+                   gfx::DeviceManagerDx::Get()->CanUseP016()) {
++#if defined(GECKO_W10M)
++  // Feature level 9_3 compositing samples no NV12: frames are made BGRA by
++  // the video processor on the way (D3D11DXVA2Manager::CopyTextureToImage).
++  if (!gfx::DeviceManagerDx::Get()->TextureSharingWorks()) {
++    mCanUseNV12 = mCanUseP010 = mCanUseP016 = false;
++  }
++#endif
+   SetPreferredSurfaceFormat(aPreferredFormat);
+ }
+ 
+diff --git a/gfx/layers/d3d11/GpuProcessD3D11TextureMap.cpp b/gfx/layers/d3d11/GpuProcessD3D11TextureMap.cpp
+index 3819f0c91c..6200b786af 100644
+--- a/gfx/layers/d3d11/GpuProcessD3D11TextureMap.cpp
++++ b/gfx/layers/d3d11/GpuProcessD3D11TextureMap.cpp
+@@ -21,19 +21,27 @@ StaticAutoPtr<GpuProcessD3D11TextureMap> GpuProcessD3D11TextureMap::sInstance;
+ 
+ /* static */
+ void GpuProcessD3D11TextureMap::Init() {
++  // Windows 10 Mobile: no GPU process, and textures that cannot be shared
++  // pass from the decoder to the compositor in the parent through this map.
++#if !defined(GECKO_W10M)
+   MOZ_ASSERT(XRE_IsGPUProcess());
++#endif
+   sInstance = new GpuProcessD3D11TextureMap();
+ }
+ 
+ /* static */
+ void GpuProcessD3D11TextureMap::Shutdown() {
++#if !defined(GECKO_W10M)
+   MOZ_ASSERT(XRE_IsGPUProcess());
++#endif
+   sInstance = nullptr;
+ }
+ 
+ /* static */
+ GpuProcessTextureId GpuProcessD3D11TextureMap::GetNextTextureId() {
++#if !defined(GECKO_W10M)
+   MOZ_ASSERT(XRE_IsGPUProcess());
++#endif
+   return GpuProcessTextureId::GetNext();
+ }
+ 
+diff --git a/gfx/layers/d3d11/TextureD3D11.cpp b/gfx/layers/d3d11/TextureD3D11.cpp
+index 1c0bc0054c..e20a8046d8 100644
+--- a/gfx/layers/d3d11/TextureD3D11.cpp
++++ b/gfx/layers/d3d11/TextureD3D11.cpp
+@@ -536,7 +536,22 @@ D3D11TextureData* D3D11TextureData::Create(IntSize aSize, SurfaceFormat aFormat,
+       D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+   bool useFence = false;
+   bool useKeyedMutex = false;
+-  if (!NS_IsMainThread()) {
++#if defined(GECKO_W10M)
++  // Feature level 9_3: nothing can be shared, and in this one-process port
++  // nothing needs to be when the texture is on the compositor's own device --
++  // it goes to the compositor by id through GpuProcessD3D11TextureMap, with
++  // no handle, fence or keyed mutex.
++  const bool unshared =
++      GpuProcessD3D11TextureMap::Get() &&
++      !DeviceManagerDx::Get()->TextureSharingWorks() &&
++      device == DeviceManagerDx::Get()->GetCompositorDevice();
++  if (unshared) {
++    newDesc.MiscFlags = 0;
++  }
++#else
++  const bool unshared = false;
++#endif
++  if (!NS_IsMainThread() && !unshared) {
+     // On the main thread we use the syncobject to handle synchronization.
+     if (!(aFlags & ALLOC_MANUAL_SYNCHRONIZATION)) {
+       if (!(aFlags & USE_D3D11_KEYED_MUTEX)) {
+@@ -628,30 +643,31 @@ D3D11TextureData* D3D11TextureData::Create(IntSize aSize, SurfaceFormat aFormat,
+     UnlockD3DTexture(texture11.get());
+   }
+ 
+-  RefPtr<IDXGIResource1> resource;
+-  texture11->QueryInterface((IDXGIResource1**)getter_AddRefs(resource));
+-  if (!resource) {
+-    gfxCriticalNoteOnce << "Failed to get IDXGIResource";
+-    return nullptr;
+-  }
++  RefPtr<gfx::FileHandleWrapper> handle;
++  if (!unshared) {
++    RefPtr<IDXGIResource1> resource;
++    texture11->QueryInterface((IDXGIResource1**)getter_AddRefs(resource));
++    if (!resource) {
++      gfxCriticalNoteOnce << "Failed to get IDXGIResource";
++      return nullptr;
++    }
+ 
+-  HANDLE sharedHandle;
+-  HRESULT hr = resource->GetSharedHandle(&sharedHandle);
+-  hr = resource->CreateSharedHandle(
+-      nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+-      &sharedHandle);
+-  if (FAILED(hr)) {
+-    gfxCriticalNoteOnce << "GetSharedHandle failed: " << gfx::hexa(hr);
+-    return nullptr;
++    HANDLE sharedHandle;
++    HRESULT hr = resource->GetSharedHandle(&sharedHandle);
++    hr = resource->CreateSharedHandle(
++        nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++        nullptr, &sharedHandle);
++    if (FAILED(hr)) {
++      gfxCriticalNoteOnce << "GetSharedHandle failed: " << gfx::hexa(hr);
++      return nullptr;
++    }
++    handle = MakeRefPtr<gfx::FileHandleWrapper>(UniqueFileHandle(sharedHandle));
+   }
+ 
+   texture11->SetPrivateDataInterface(
+       sD3D11TextureUsage,
+       new TextureMemoryMeasurer(newDesc.Width * newDesc.Height * 4));
+ 
+-  RefPtr handle =
+-      MakeRefPtr<gfx::FileHandleWrapper>(UniqueFileHandle(sharedHandle));
+-
+   if (useFence) {
+     auto* fencesHolderMap = CompositeProcessD3D11FencesHolderMap::Get();
+     fencesHolderMap->Register(fencesHolderId.ref());
+@@ -662,7 +678,7 @@ D3D11TextureData* D3D11TextureData::Create(IntSize aSize, SurfaceFormat aFormat,
+                            fencesHolderId, fence, aFlags);
+ 
+   texture11->GetDevice(getter_AddRefs(device));
+-  if (XRE_IsGPUProcess() &&
++  if ((XRE_IsGPUProcess() || unshared) &&
+       device == gfx::DeviceManagerDx::Get()->GetCompositorDevice()) {
+     const auto textureId = GpuProcessD3D11TextureMap::GetNextTextureId();
+     data->SetGpuProcessTextureId(textureId);
+@@ -1152,7 +1168,13 @@ uint32_t DXGITextureHostD3D11::NumSubTextures() {
+ void DXGITextureHostD3D11::PushResourceUpdates(
+     wr::TransactionBuilder& aResources, ResourceUpdateOp aOp,
+     const Range<wr::ImageKey>& aImageKeys, const wr::ExternalImageId& aExtID) {
+-  if (!gfx::gfxVars::UseWebRenderANGLE()) {
++  if (!gfx::gfxVars::UseWebRenderANGLE()
++#if defined(GECKO_W10M)
++      // Software WebRender with the D3D11 compositor: the frame is a native
++      // compositor surface (RenderCompositorD3D11SWGL::HandleExternalImage).
++      && !gfx::gfxVars::AllowSoftwareWebRenderD3D11()
++#endif
++  ) {
+     MOZ_ASSERT_UNREACHABLE("unexpected to be called without ANGLE");
+     return;
+   }
+@@ -1238,7 +1260,11 @@ void DXGITextureHostD3D11::PushDisplayItems(
+     const Range<wr::ImageKey>& aImageKeys, PushDisplayItemFlagSet aFlags) {
+   bool preferCompositorSurface =
+       aFlags.contains(PushDisplayItemFlag::PREFER_COMPOSITOR_SURFACE);
+-  if (!gfx::gfxVars::UseWebRenderANGLE()) {
++  if (!gfx::gfxVars::UseWebRenderANGLE()
++#if defined(GECKO_W10M)
++      && !gfx::gfxVars::AllowSoftwareWebRenderD3D11()
++#endif
++  ) {
+     MOZ_ASSERT_UNREACHABLE("unexpected to be called without ANGLE");
+     return;
+   }
+@@ -1444,7 +1470,13 @@ uint32_t DXGIYCbCrTextureHostD3D11::NumSubTextures() {
+ void DXGIYCbCrTextureHostD3D11::PushResourceUpdates(
+     wr::TransactionBuilder& aResources, ResourceUpdateOp aOp,
+     const Range<wr::ImageKey>& aImageKeys, const wr::ExternalImageId& aExtID) {
+-  if (!gfx::gfxVars::UseWebRenderANGLE()) {
++  if (!gfx::gfxVars::UseWebRenderANGLE()
++#if defined(GECKO_W10M)
++      // Software WebRender with the D3D11 compositor: the frame is a native
++      // compositor surface (RenderCompositorD3D11SWGL::HandleExternalImage).
++      && !gfx::gfxVars::AllowSoftwareWebRenderD3D11()
++#endif
++  ) {
+     MOZ_ASSERT_UNREACHABLE("unexpected to be called without ANGLE");
+     return;
+   }
+diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
+index 2575432397..a4e87b1711 100644
+--- a/gfx/thebes/gfxPlatform.cpp
++++ b/gfx/thebes/gfxPlatform.cpp
+@@ -81,6 +81,7 @@ extern "C" void GeckoW10mNote(const char* text);
+ #if defined(XP_WIN)
+ #  include "gfxWindowsPlatform.h"
+ #  include "mozilla/layers/CompositeProcessD3D11FencesHolderMap.h"
++#  include "mozilla/layers/GpuProcessD3D11TextureMap.h"
+ #  include "mozilla/widget/WinWindowOcclusionTracker.h"
+ #elif defined(XP_DARWIN)
+ #  include "gfxPlatformMac.h"
+@@ -1366,6 +1367,11 @@ void gfxPlatform::InitLayersIPC() {
+     if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+ #if defined(XP_WIN)
+       CompositeProcessD3D11FencesHolderMap::Init();
++#  if defined(GECKO_W10M)
++      // Decoded video reaches the compositor through it (see
++      // D3D11TextureData::Create).
++      GpuProcessD3D11TextureMap::Init();
++#  endif
+ #endif
+       RemoteTextureMap::Init();
+       wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
+@@ -1423,6 +1429,11 @@ void gfxPlatform::ShutdownLayersIPC() {
+     }
+ #if defined(XP_WIN)
+     CompositeProcessD3D11FencesHolderMap::Shutdown();
++#  if defined(GECKO_W10M)
++    if (GpuProcessD3D11TextureMap::Get()) {
++      GpuProcessD3D11TextureMap::Shutdown();
++    }
++#  endif
+     widget::WinWindowOcclusionTracker::ShutDown();
+ #endif
+   } else {

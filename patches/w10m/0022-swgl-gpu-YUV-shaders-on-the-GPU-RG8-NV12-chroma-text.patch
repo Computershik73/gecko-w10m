@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 21:35:26 +0400
+Subject: [PATCH 22/30] swgl gpu: YUV shaders on the GPU, RG8 (NV12 chroma)
+ textures
+
+Video frames were converted to RGB on the CPU on the Lumia 650 (300 of
+300 frames refused for the program): the YUV shaders had no GPU variant
+because their vertex stage, which SWGL runs on the CPU, builds the colour
+matrix per vertex with operations SWGL's runtime lacked (a nine-value
+mat3 constructor, mat3 * mat3, a vec2 three-way swizzle, a constant ivec4
+shifted per vertex). They are added, the YUV variants are built, and RG8
+textures map to R8G8_UNORM where the device samples it. YUV reftests match
+the CPU render on a 9_3 device; YV12 and NV12 draw on the GPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/swgl/build.rs        |  2 +-
+ gfx/wr/swgl/src/glsl.h      | 33 +++++++++++++++++++++++++++++++++
+ gfx/wr/swgl/src/gpu_d3d11.h | 16 ++++++++++++++--
+ 3 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index 6a0bc6e0fc..d44d9d7078 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -175,7 +175,7 @@ fn translate_shader(
+     };
+     // YUV: the GPU dialect's colour-matrix code needs matrix operations SWGL's
+     // C++ runtime lacks. Video reaches the compositor as its own surfaces.
+-    if shader_key.contains("YUV") || shader_key.contains("yuv") {
++    if std::env::var("SWGL_GPU_NO_YUV").is_ok() && (shader_key.contains("YUV") || shader_key.contains("yuv")) {
+         return false;
+     }
+     // Shaders glsl-to-cxx cannot take outside SWGL's dialect just have no GPU
+diff --git a/gfx/wr/swgl/src/glsl.h b/gfx/wr/swgl/src/glsl.h
+index a4cbcedf74..83f6adf5b2 100644
+--- a/gfx/wr/swgl/src/glsl.h
++++ b/gfx/wr/swgl/src/glsl.h
+@@ -559,6 +559,7 @@ struct vec2 {
+   }
+   Float& sel(XYZW c1) { return select(c1); }
+   vec2 sel(XYZW c1, XYZW c2) { return vec2(select(c1), select(c2)); }
++  vec3 sel(XYZW c1, XYZW c2, XYZW c3);
+ 
+   vec4 sel(XYZW c1, XYZW c2, XYZW c3, XYZW c4);
+ 
+@@ -1255,6 +1256,11 @@ struct ivec4 {
+   I32 w;
+ };
+ 
++// A constant vector shifted per vertex (the GPU variants' YUV set-up).
++inline ivec4 operator<<(ivec4_scalar a, I32 b) {
++  return ivec4(I32(a.x) << b, I32(a.y) << b, I32(a.z) << b, I32(a.w) << b);
++}
++
+ ivec4_scalar force_scalar(const ivec4& v) {
+   return ivec4_scalar{force_scalar(v.x), force_scalar(v.y), force_scalar(v.z),
+                       force_scalar(v.w)};
+@@ -1930,6 +1936,11 @@ struct vec4_scalar {
+ vec3_scalar vec2_scalar::sel(XYZW c1, XYZW c2, XYZW c3) {
+   return {select(c1), select(c2), select(c3)};
+ }
++// For the GPU variants, whose vertex stage runs on vectors what SWGL's own
++// shaders run on scalars (the YUV colour set-up, for one).
++vec3 vec2::sel(XYZW c1, XYZW c2, XYZW c3) {
++  return vec3(select(c1), select(c2), select(c3));
++}
+ vec4_scalar vec2_scalar::sel(XYZW c1, XYZW c2, XYZW c3, XYZW c4) {
+   return vec4_scalar{select(c1), select(c2), select(c3), select(c4)};
+ }
+@@ -2638,6 +2649,28 @@ mat3 make_mat3(const X& x, const Y& y, const Z& z) {
+   return mat3(x, y, z);
+ }
+ 
++// Nine components of which some vary per vertex (the GPU variants' vertex
++// stage), and products of such matrices.
++template <typename A, typename B, typename C, typename D, typename E,
++          typename F, typename G, typename H, typename I>
++mat3 make_mat3(const A& m0, const B& m1, const C& m2, const D& m3,
++               const E& m4, const F& m5, const G& m6, const H& m7,
++               const I& m8) {
++  return mat3(Float(m0), Float(m1), Float(m2), Float(m3), Float(m4),
++              Float(m5), Float(m6), Float(m7), Float(m8));
++}
++
++inline mat3 operator*(const mat3& a, const mat3& b) {
++  mat3 r;
++  for (int c = 0; c < 3; c++) {
++    const vec3& v = b[c];
++    r[c].x = a[0].x * v.x + a[1].x * v.y + a[2].x * v.z;
++    r[c].y = a[0].y * v.x + a[1].y * v.y + a[2].y * v.z;
++    r[c].z = a[0].z * v.x + a[1].z * v.y + a[2].z * v.z;
++  }
++  return r;
++}
++
+ struct mat3x4_scalar {
+   vec4_scalar data[3];
+ 
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 2ef964ed07..100dadae70 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -66,6 +66,7 @@ static int64_t gpu_cache_bytes = 0;
+ 
+ static int64_t texel_bytes(DXGI_FORMAT f, int64_t w, int64_t h) {
+   int b = f == DXGI_FORMAT_R8_UNORM                ? 1
++          : f == DXGI_FORMAT_R8G8_UNORM            ? 2
+           : f == DXGI_FORMAT_R32G32B32A32_FLOAT    ? 16
+                                                    : 4;
+   return w * h * b;
+@@ -165,6 +166,7 @@ struct GpuBackend {
+   D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_9_1;
+ 
+   bool r8_ok = false;
++  bool rg8_ok = false;
+   bool rgba32f_ok = false;
+ 
+   ID3D11VertexShader* vs[9] = {};
+@@ -315,6 +317,11 @@ static bool init_backend(GpuBackend* g) {
+              (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) &&
+              (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE);
+   support = 0;
++  g->rg8_ok = SUCCEEDED(g->dev->CheckFormatSupport(DXGI_FORMAT_R8G8_UNORM,
++                                                   &support)) &&
++              (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) &&
++              (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE);
++  support = 0;
+   g->rgba32f_ok =
+       SUCCEEDED(g->dev->CheckFormatSupport(DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                            &support)) &&
+@@ -521,6 +528,10 @@ static inline bool gl_format_on_gpu(GpuBackend* g, GLenum internal_format,
+         *expanded = true;
+       }
+       return true;
++    case GL_RG8:
++      // The chroma plane of NV12 video.
++      *format = DXGI_FORMAT_R8G8_UNORM;
++      return g->rg8_ok;
+     case GL_RGBA32F:
+     case GL_RGBA32I:
+       *format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+@@ -1979,9 +1990,10 @@ void SwglGpuDescribe(char* out, size_t size) {
+     if (p && p->gpu_impl && p->gpu_impl->gpu_info()) programs++;
+   }
+   snprintf(out, size,
+-           "feature level %x, R8 targets %s, float textures %s (flat data "
+-           "and gradients %s), max texture %d",
++           "feature level %x, R8 targets %s, RG8 textures %s (NV12 video), "
++           "float textures %s (flat data and gradients %s), max texture %d",
+            unsigned(g->level), g->r8_ok ? "yes" : "no (BGRA instead)",
++           g->rg8_ok ? "yes" : "no",
+            g->rgba32f_ok ? "yes" : "NO", g->rgba32f_ok ? "on the GPU" : "on the CPU",
+            gpu_max_texture_size());
+   (void)programs;

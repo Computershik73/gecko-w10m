@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 08:16:26 +0400
+Subject: [PATCH 06/30] swgl GPU path: loops that fit, clip distances, GPU
+ copies, feedback reads
+
+- Loops are unrolled to 32, 16 or 8 iterations, whichever is the largest
+  that fits ps_2_x's 512 instructions. This brings the blurs (at most six
+  steps once WebRender scales the deviation down to 4) and the gradient
+  stop tree (five levels for 625 stops) onto the GPU.
+- Vertex shaders that write gl_ClipDistance pass the distances as one more
+  interpolated varying, and the pixel shader discards where any is
+  negative, which is the clip SWGL applies. Glyph-transformed text now
+  runs on the GPU too.
+- BlitFramebuffer and CopyImageSubData copy on the GPU with
+  CopySubresourceRegion when the source's GPU copy is current, so backdrop
+  copies and texture cache moves need no readback. The CPU blit now marks
+  its destination as written.
+- A draw that samples its own render target reads from a copy, because
+  Direct3D unbinds one binding when the other is set.
+
+Only cs_svg_filter_node and the dual-source glyph-transform text variant
+(no dual-source blending at 9_3) stay on the CPU. On the PC, 133 of the
+144 filter reftests match the CPU render. Most remaining differences are a
+few hundred antialiased edge pixels on rotated content. One real bug is
+still open: backdrop-filter-isolation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/glsl-to-cxx/src/hlsl.rs | 40 +++++++++++++--
+ gfx/wr/glsl-to-cxx/src/lib.rs  | 29 +++++++----
+ gfx/wr/swgl/build.rs           | 14 +++--
+ gfx/wr/swgl/src/composite.h    |  5 ++
+ gfx/wr/swgl/src/gl.cc          |  8 ++-
+ gfx/wr/swgl/src/gpu_d3d11.h    | 93 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 170 insertions(+), 19 deletions(-)
+
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+index ca94f7ffe5..d45da11e06 100644
+--- a/gfx/wr/glsl-to-cxx/src/hlsl.rs
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -80,8 +80,13 @@ pub struct Layout {
+ 
+ /// The input limit of ps_4_0_level_9_3 when SV_Position is not declared.
+ pub const MAX_SLOTS: usize = 8;
+-/// How far a loop whose bound is not a constant is unrolled.
+-const LOOP_LIMIT: usize = 32;
++/// How far a loop whose bound is not a constant is unrolled, unless the
++/// caller asks for less: 9_3 allows 512 instructions, and the build tries
++/// smaller limits until the shader fits (see swgl's build.rs). WebRender's
++/// own loops are short: the gradient stop tree is five levels deep for 625
++/// stops, a blur takes at most six steps once WebRender has scaled the
++/// source so that the deviation is at most 4.
++pub const LOOP_LIMITS: [usize; 3] = [32, 16, 8];
+ 
+ struct Emitter<'a> {
+     st: &'a hir::State,
+@@ -98,6 +103,7 @@ struct Emitter<'a> {
+     array_wrappers: Vec<(String, String, usize)>,
+     /// The wrapper the function being emitted returns, if any.
+     ret_array: Option<String>,
++    loop_limit: usize,
+ }
+ 
+ fn floats_of(kind: hir::TypeKind) -> Option<usize> {
+@@ -822,7 +828,7 @@ impl<'a> Emitter<'a> {
+                 }
+                 self.line(&format!(
+                     "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    LOOP_LIMIT
++                    self.loop_limit
+                 ));
+                 self.line("{");
+                 self.indent += 1;
+@@ -840,7 +846,7 @@ impl<'a> Emitter<'a> {
+                 let cond = self.expr(c);
+                 self.line(&format!(
+                     "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    LOOP_LIMIT
++                    self.loop_limit
+                 ));
+                 self.line("{");
+                 self.indent += 1;
+@@ -853,7 +859,7 @@ impl<'a> Emitter<'a> {
+                 let cond = self.expr(c);
+                 self.line(&format!(
+                     "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    LOOP_LIMIT
++                    self.loop_limit
+                 ));
+                 self.line("{");
+                 self.indent += 1;
+@@ -1142,6 +1148,19 @@ int glsl_xor(int a, int b) { return a + b - 2 * glsl_and(a, b); }
+ pub fn translate_fragment(
+     st: &hir::State,
+     tu: &hir::TranslationUnit,
++) -> Result<(String, Layout), Vec<String>> {
++    translate_fragment_limited(st, tu, LOOP_LIMITS[0], false)
++}
++
++/// `clip_distance`: the vertex half writes gl_ClipDistance. SWGL clips such
++/// quads while rasterising; here the distances travel as one more
++/// interpolated varying (swgl_ClipDistance, first in InterpOutputs) and the
++/// pixel shader discards where any is negative, which is the same clip.
++pub fn translate_fragment_limited(
++    st: &hir::State,
++    tu: &hir::TranslationUnit,
++    loop_limit: usize,
++    clip_distance: bool,
+ ) -> Result<(String, Layout), Vec<String>> {
+     let mut em = Emitter {
+         st,
+@@ -1153,6 +1172,7 @@ pub fn translate_fragment(
+         uses_discard: false,
+         array_wrappers: Vec::new(),
+         ret_array: None,
++        loop_limit,
+     };
+ 
+     // Find main and everything it reaches.
+@@ -1228,6 +1248,9 @@ pub fn translate_fragment(
+     // The packed layout: interpolated first, flat after. Whatever does not
+     // fit in eight float4s goes to the flat texture, flat values only.
+     let mut all = Vec::new();
++    if clip_distance {
++        all.push(("swgl_ClipDistance".to_string(), hir::TypeKind::Vec4, 4, false));
++    }
+     for (list, flat) in [(&interps, false), (&flats, true)] {
+         for (_, name, ty) in list.iter() {
+             if ty.array_sizes.is_some() {
+@@ -1366,6 +1389,9 @@ pub fn translate_fragment(
+     if uses_fragcoord {
+         em.line("static float4 gl_FragCoord;");
+     }
++    if clip_distance {
++        em.line("static float4 swgl_ClipDistance;");
++    }
+ 
+     let wrappers_at = em.out.len();
+     // Prototypes first -- the sources forward-declare freely -- then the
+@@ -1439,6 +1465,10 @@ pub fn translate_fragment(
+     if let Some(o) = layout.fragcoord_offset {
+         em.line(&format!("gl_FragCoord = float4(glsl_v[{}], glsl_v[{}], 0.0, 1.0);", o, o + 1));
+     }
++    if clip_distance {
++        em.uses_discard = true;
++        em.line("if (any(swgl_ClipDistance < 0.0)) discard;");
++    }
+     em.line("glsl_main();");
+     // oFragColor is SWGL's name for the colour output.
+     let out_name = statics
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index 3add024e10..9dddd99eb7 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -51,14 +51,13 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+ }
+ 
+ /// As translate(), and when `gpu` is set, also the feature level 9_3 pixel
+-/// shader for the fragment half (see hlsl.rs) with its layout, and the
+-/// program class then carries the C++ that packs varyings for it. Shaders
+-/// whose vertex half writes gl_ClipDistance stay on the CPU: SWGL clips
+-/// those quads itself.
++/// shaders for the fragment half (see hlsl.rs), one per loop limit, with
++/// their layout; the program class then carries the C++ that packs varyings
++/// for them.
+ pub fn translate_with_gpu(
+     args: &mut dyn Iterator<Item = String>,
+     gpu: bool,
+-) -> (String, Option<(String, hlsl::Layout)>, Vec<String>) {
++) -> (String, Option<(Vec<String>, hlsl::Layout)>, Vec<String>) {
+     let _cmd_name = args.next();
+     let vertex_file = args.next().unwrap();
+ 
+@@ -82,12 +81,22 @@ pub fn translate_with_gpu(
+     let mut gpu_errors = Vec::new();
+     let gpu_result = if !gpu {
+         None
+-    } else if vs_state.used_clip_dist != 0 {
+-        gpu_errors.push("the vertex shader writes gl_ClipDistance".to_string());
+-        None
+     } else {
+-        match hlsl::translate_fragment(&fs_state, &fs_hir) {
+-            Ok(r) => Some(r),
++        // One pixel shader per loop limit, most generous first; the caller
++        // keeps the first one its compiler accepts. The layout is the same.
++        let clip = vs_state.used_clip_dist != 0;
++        match hlsl::translate_fragment_limited(&fs_state, &fs_hir, hlsl::LOOP_LIMITS[0], clip) {
++            Ok((first, layout)) => {
++                let mut sources = vec![first];
++                for &limit in &hlsl::LOOP_LIMITS[1..] {
++                    if let Ok((src, _)) =
++                        hlsl::translate_fragment_limited(&fs_state, &fs_hir, limit, clip)
++                    {
++                        sources.push(src);
++                    }
++                }
++                Some((sources, layout))
++            }
+             Err(e) => {
+                 gpu_errors = e.into_iter().filter(|e| !e.starts_with("-- partial")).collect();
+                 None
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index aed33baf70..164a219a7e 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -204,12 +204,12 @@ fn write_gpu_header(
+     out_dir: &str,
+     shader: &str,
+     fxc: Option<&str>,
+-    gpu: Option<(String, glsl_to_cxx::hlsl::Layout)>,
++    gpu: Option<(Vec<String>, glsl_to_cxx::hlsl::Layout)>,
+     errors: &[String],
+ ) {
+     let path = format!("{out_dir}/{shader}_gpu.h");
+     let stub = format!("static const GpuProgramInfo* {shader}_gpu_info() {{ return nullptr; }}\n");
+-    let (fxc, (hlsl, layout)) = match (fxc, gpu) {
++    let (fxc, (sources, layout)) = match (fxc, gpu) {
+         (Some(f), Some(g)) => (f, g),
+         (Some(_), None) => {
+             println!("cargo:warning=swgl: {shader} stays on the CPU: {}", errors.join(" | "));
+@@ -221,7 +221,15 @@ fn write_gpu_header(
+             return;
+         }
+     };
+-    match fxc_compile(fxc, &hlsl, "ps_4_0_level_9_3", &format!("{out_dir}/{shader}_ps")) {
++    // Loops are unrolled; the first limit that fits in 512 instructions wins.
++    let mut compiled = Err(String::new());
++    for hlsl in &sources {
++        compiled = fxc_compile(fxc, hlsl, "ps_4_0_level_9_3", &format!("{out_dir}/{shader}_ps"));
++        if compiled.is_ok() {
++            break;
++        }
++    }
++    match compiled {
+         Ok(bytes) => {
+             let mut h = bytes_array(&format!("{shader}_ps"), &bytes);
+             let rect: Vec<String> = layout
+diff --git a/gfx/wr/swgl/src/composite.h b/gfx/wr/swgl/src/composite.h
+index aff43fb4c7..3d9a473ae1 100644
+--- a/gfx/wr/swgl/src/composite.h
++++ b/gfx/wr/swgl/src/composite.h
+@@ -503,6 +503,10 @@ void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+     return;
+   }
+   IntRect clipRect = {0, 0, dstReq.width(), dstReq.height()};
++  if (!invertY && srcReq.same_size(dstReq) &&
++      gpu_copy(srctex, srcReq, dsttex, dstReq)) {
++    return;
++  }
+   prepare_texture(srctex);
+   prepare_texture(dsttex, &dstReq);
+   if (!srcReq.same_size(dstReq) && srctex.width >= 2 && filter == GL_LINEAR &&
+@@ -512,6 +516,7 @@ void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+   } else {
+     scale_blit(srctex, srcReq, dsttex, dstReq, invertY, clipRect);
+   }
++  gpu_cpu_wrote(dsttex);
+ }
+ 
+ // Get the underlying buffer for a locked resource
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index e3a1f77c80..62c2c34f83 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -948,6 +948,8 @@ static void gpu_storage_changed(Texture& t);
+ static void gpu_invalidate(Texture& t);
+ static bool gpu_clear(Texture& t, const IntRect& rect, uint32_t color,
+                       bool is_depth, float depth);
++static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
++                     const IntRect& dst_rect);
+ 
+ template <typename S>
+ static inline void init_filter(S* s, Texture& t) {
+@@ -2949,10 +2951,14 @@ void CopyImageSubData(GLuint srcName, GLenum srcTarget, UNUSED GLint srcLevel,
+   }
+   Texture& srctex = ctx->textures[srcName];
+   if (!srctex.buf) return;
+-  prepare_texture(srctex);
+   Texture& dsttex = ctx->textures[dstName];
+   if (!dsttex.buf) return;
+   assert(!dsttex.locked);
++  if (gpu_copy(srctex, IntRect{srcX, srcY, srcX + srcWidth, srcY + srcHeight},
++               dsttex, IntRect{dstX, dstY, dstX + srcWidth, dstY + srcHeight})) {
++    return;
++  }
++  prepare_texture(srctex);
+   IntRect skip = {dstX, dstY, dstX + srcWidth, dstY + srcHeight};
+   prepare_texture(dsttex, &skip);
+   assert(srctex.internal_format == dsttex.internal_format);
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index d4b2520da2..83a44b1e9b 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -130,6 +130,10 @@ struct GpuBackend {
+ 
+   // Readback staging textures by (format, width, height).
+   std::unordered_map<uint64_t, ID3D11Texture2D*> staging;
++  // Copies of render targets that a draw also samples, likewise.
++  std::unordered_map<uint64_t,
++                     std::pair<ID3D11Texture2D*, ID3D11ShaderResourceView*>>
++      feedback;
+ 
+   bool broken = false;
+ 
+@@ -169,6 +173,10 @@ struct GpuBackend {
+     for (auto& b : blends) b.second->Release();
+     for (auto& p : pixel_shaders) p.second->Release();
+     for (auto& s : staging) s.second->Release();
++    for (auto& f : feedback) {
++      f.second.first->Release();
++      f.second.second->Release();
++    }
+     safe_release(dc);
+     safe_release(dev);
+   }
+@@ -733,6 +741,45 @@ static ID3D11BlendState* blend_state(GpuBackend* g) {
+   return s;
+ }
+ 
++// A copy of a texture that is also the draw's target, for reading from.
++static ID3D11ShaderResourceView* feedback_copy(GpuBackend* g, GpuTex& gt) {
++  uint64_t key = (uint64_t(gt.format) << 48) | (uint64_t(gt.width) << 24) |
++                 uint64_t(gt.height);
++  auto it = g->feedback.find(key);
++  if (it == g->feedback.end()) {
++    D3D11_TEXTURE2D_DESC td = {};
++    td.Width = gt.width;
++    td.Height = gt.height;
++    td.MipLevels = 1;
++    td.ArraySize = 1;
++    td.Format = gt.format;
++    td.SampleDesc.Count = 1;
++    td.Usage = D3D11_USAGE_DEFAULT;
++    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    ID3D11Texture2D* t = nullptr;
++    ID3D11ShaderResourceView* v = nullptr;
++    if (FAILED(g->dev->CreateTexture2D(&td, nullptr, &t))) return nullptr;
++    if (FAILED(g->dev->CreateShaderResourceView(t, nullptr, &v))) {
++      t->Release();
++      return nullptr;
++    }
++    // One or two sizes recur; do not hoard.
++    if (g->feedback.size() >= 2) {
++      for (auto& e : g->feedback) {
++        e.second.first->Release();
++        e.second.second->Release();
++      }
++      g->feedback.clear();
++    }
++    it = g->feedback.emplace(key, std::make_pair(t, v)).first;
++  }
++  g->dc->CopyResource(it->second.first, gt.tex);
++  if (trace()) {
++    fprintf(stderr, "gpu: feedback copy %dx%d\n", gt.width, gt.height);
++  }
++  return it->second.second;
++}
++
+ static ID3D11PixelShader* pixel_shader(GpuBackend* g,
+                                        const GpuProgramInfo* info) {
+   auto it = g->pixel_shaders.find(info);
+@@ -987,6 +1034,42 @@ static bool gpu_can_draw(Texture& colortex) {
+   return gpu_check(colortex, sampled, &bs, &ps);
+ }
+ 
++// A copy of a rectangle between two textures of one format, on the GPU,
++// when the source's GPU copy is current: the backdrop copies and texture
++// cache moves then need no readback. Rectangles are in texture space and of
++// one size. Returns false to leave it to the CPU.
++static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
++                     const IntRect& dst_rect) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || &src == &dst || !src.gpu || !src.gpu->tex) {
++    return false;
++  }
++  GpuTex& sg = *src.gpu;
++  if (sg.cpu_newer || sg.width != src.width || sg.height != src.height) {
++    return false;
++  }
++  if (src.internal_format != dst.internal_format ||
++      !renderable(src.internal_format)) {
++    return false;
++  }
++  int dx = dst_rect.x0 - src_rect.x0;
++  int dy = dst_rect.y0 - src_rect.y0;
++  IntRect s = IntRect(src_rect).intersection(src.bounds());
++  s = s.intersection(dst.bounds() - IntPoint(dx, dy));
++  if (s.is_empty()) return true;
++  if (!to_gpu(g, dst) || dst.gpu->expanded != sg.expanded) return false;
++  D3D11_BOX box = {UINT(s.x0), UINT(s.y0), 0, UINT(s.x1), UINT(s.y1), 1};
++  g->dc->CopySubresourceRegion(dst.gpu->tex, 0, UINT(s.x0 + dx),
++                               UINT(s.y0 + dy), 0, sg.tex, 0, &box);
++  dst.gpu->gpu_newer = true;
++  dst.gpu->cpu_newer = false;
++  if (trace()) {
++    fprintf(stderr, "gpu: copy %dx%d\n", s.width(), s.height());
++  }
++  return true;
++}
++
+ // Draws the current program's instances on the GPU. Returns false, having
+ // changed nothing, when this draw has to run on the CPU instead.
+ template <typename INDEX>
+@@ -1048,6 +1131,13 @@ static bool gpu_draw_elements(GLsizei count, GLsizei instancecount,
+   for (int i = 0; i < info->num_samplers; i++) {
+     Texture& st = *sampled[i];
+     srvs[i] = st.gpu->srv;
++    if (&st == &colortex) {
++      // WebRender reads one part of a render target while drawing into
++      // another (a backdrop copy, an atlas); SWGL allows it, Direct3D unbinds
++      // the one while the other is bound. The read goes to a copy.
++      srvs[i] = feedback_copy(g, *st.gpu);
++      if (!srvs[i]) return false;
++    }
+     bool linear = st.mag_filter == GL_LINEAR &&
+                   st.internal_format != GL_RGBA32F &&
+                   st.internal_format != GL_RGBA32I;
+@@ -1322,6 +1412,9 @@ static inline bool gpu_clear(Texture&, const IntRect&, uint32_t, bool, float) {
+   return false;
+ }
+ static inline void gpu_invalidate(Texture&) {}
++static inline bool gpu_copy(Texture&, const IntRect&, Texture&, const IntRect&) {
++  return false;
++}
+ static inline void gpu_count_cpu_draw() {}
+ static inline bool gpu_can_draw(Texture&) { return false; }
+ template <typename INDEX>

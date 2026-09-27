@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 09:30:55 +0400
+Subject: [PATCH 11/30] SWGL GPU path: a GPU depth clear must not mark the CPU
+ runs cleared
+
+gpu_clear set the texture's cleared flag before the CPU cleared its own
+depth runs. After a depth buffer was re-specified at a new size, SWGL then
+took a partial clear as a fill of existing runs in a buffer that held none,
+and walked garbage forever: every backdrop-filter reftest hung. The CPU
+clear that follows sets the flag itself. Draws also trace their entry now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/swgl/src/gl.cc       |  2 ++
+ gfx/wr/swgl/src/gpu_d3d11.h | 16 +++++++++++++---
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index dacac89efc..52a8fcb174 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -973,6 +973,7 @@ static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
+                      const IntRect& dst_rect);
+ static bool gpu_resolve_external(Texture& t);
+ static void gpu_record_quad(const vec4& pos, int nump);
++static void gpu_trace_draw(Texture& colortex, int instances);
+ static Texture* gpu_cpu_composite_begin(Texture& colortex);
+ static void gpu_cpu_composite_end(Texture& colortex, Texture& depthtex);
+ static bool gpu_resolve_external_pending(Texture& t);
+@@ -3177,6 +3178,7 @@ void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
+ 
+   ctx->shaded_rows = 0;
+   ctx->shaded_pixels = 0;
++  gpu_trace_draw(colortex, instancecount);
+ 
+   // The pixels go to the GPU when a device is attached and this draw can run
+   // there; its samplers are bound for the vertex stage without reading back
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 9a3d325f16..16a61797eb 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -1062,9 +1062,9 @@ static bool gpu_clear(Texture& t, const IntRect& rect, uint32_t color,
+     g->dc->OMSetDepthStencilState(is_depth ? g->depth_clear : g->depth_off, 0);
+     g->dc->DrawIndexed(6, 0, 0);
+   }
+-  if (t.internal_format == GL_DEPTH_COMPONENT24) {
+-    t.set_cleared(true);
+-  }
++  // Not t.set_cleared(): that flag speaks for SWGL's CPU depth runs, which the
++  // caller clears next -- marking them cleared first would have it fill runs
++  // in a buffer that holds none yet.
+   t.disable_delayed_clear();
+   gt.gpu_newer = true;
+   gt.cpu_newer = false;
+@@ -1195,6 +1195,15 @@ static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
+   return true;
+ }
+ 
++static void gpu_trace_draw(Texture& colortex, int instances) {
++  if (!ctx->gpu || !swgl_gpu::trace()) return;
++  ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
++  fprintf(stderr, "gpu: > %s x%d into %dx%d depth %d blend %d\n",
++          impl ? impl->get_name() : "?", instances, colortex.width,
++          colortex.height, ctx->depthtest, ctx->blend);
++  fflush(stderr);
++}
++
+ static void gpu_record_quad(const vec4& pos, int nump) {
+   GpuBackend* g = ctx ? ctx->gpu : nullptr;
+   if (!g || !g->recording) return;
+@@ -1794,6 +1803,7 @@ static inline bool gpu_copy(Texture&, const IntRect&, Texture&, const IntRect&)
+ }
+ static inline bool gpu_resolve_external(Texture&) { return false; }
+ static inline void gpu_record_quad(const vec4&, int) {}
++static inline void gpu_trace_draw(Texture&, int) {}
+ static inline Texture* gpu_cpu_composite_begin(Texture&) { return nullptr; }
+ static inline void gpu_cpu_composite_end(Texture&, Texture&) {}
+ static inline bool gpu_resolve_external_pending(Texture&) { return false; }
