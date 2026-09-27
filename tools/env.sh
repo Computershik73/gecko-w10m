@@ -48,11 +48,17 @@ fi
 export GECKO_W10M_JOBS
 
 # MozillaBuild's msys has a HOME of its own; rustup, cargo and mach's state
-# live in the Windows profile.
-if [ -n "$USERPROFILE" ]; then
-  HOME="$(cygpath -u "$USERPROFILE")"
-  export HOME
+# live in the Windows profile. msys2 does not always hand USERPROFILE on to the
+# processes it starts, and Windows Python then cannot find a home directory at
+# all (mach fails in pathlib's Path.home()), so it is asked for from Windows
+# when it is missing.
+if [ -z "$USERPROFILE" ]; then
+  USERPROFILE="$(powershell.exe -NoProfile -Command "[Environment]::GetFolderPath('UserProfile')" | tr -d '\r')"
 fi
+export USERPROFILE="$(cygpath -w "$USERPROFILE")"
+[ -n "$LOCALAPPDATA" ] || export LOCALAPPDATA="$USERPROFILE\\AppData\\Local"
+HOME="$(cygpath -u "$USERPROFILE")"
+export HOME
 export MOZBUILD_STATE_PATH="${MOZBUILD_STATE_PATH:-$HOME/.mozbuild}"
 export ProgramFiles="C:/Program Files"
 export PROGRAMW6432="C:/Program Files"
