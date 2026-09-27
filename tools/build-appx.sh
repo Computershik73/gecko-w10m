@@ -13,27 +13,28 @@
 # switches, not paths.
 set -e
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(dirname "$0")/env.sh"
+ROOT="$GECKO_W10M_ROOT"
 APP="$ROOT/app/GeckoW10m"
 # The packaged tree (mach package): two omni.ja archives instead of eight
 # thousand loose files, and a preload list ordered by startup use. The raw
 # dist/bin is the fallback when it has not been made.
-if [ -z "$GECKO_W10M_DIST" ] && [ -f C:/rw-obj/dist/firefox/omni.ja ]; then
-  GECKO_W10M_DIST=C:/rw-obj/dist/firefox
+if [ -z "$GECKO_W10M_DIST" ] && [ -f "$GECKO_W10M_OBJ/dist/firefox/omni.ja" ]; then
+  GECKO_W10M_DIST="$GECKO_W10M_OBJ/dist/firefox"
 fi
-DIST="${GECKO_W10M_DIST:-C:/rw-obj/dist/bin}"
+DIST="${GECKO_W10M_DIST:-$GECKO_W10M_OBJ/dist/bin}"
 # The object directory, for the linker maps the binary patches below need.
 # It used to be derived from DIST by stripping /dist/bin, which the packaged
 # tree does not end in -- and the thunk patch then silently found no map.
-OBJ="${GECKO_W10M_OBJ:-C:/rw-obj}"
+OBJ="$GECKO_W10M_OBJ"
 OUT="$ROOT/app/GeckoW10m/AppPackages"
 STAGE="$OUT/stage"
 
-VS="C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/14.44.35207"
-SDK="C:/Program Files (x86)/Windows Kits/10"
-SDKV="10.0.22621.0"
+VS="$GECKO_W10M_VC"
+SDK="$GECKO_W10M_SDK"
+SDKV="$GECKO_W10M_SDK_VERSION"
 CL="$VS/bin/Hostx64/arm/cl.exe"
-LLVM="/c/Program Files/LLVM/bin"
+LLVM="$(cygpath -u "$GECKO_W10M_LLVM")"
 BIN="$SDK/bin/$SDKV/x64"
 
 export INCLUDE="$VS/include;$SDK/Include/$SDKV/ucrt;$SDK/Include/$SDKV/shared;$SDK/Include/$SDKV/um;$SDK/Include/$SDKV/winrt;$SDK/Include/$SDKV/cppwinrt"
@@ -42,7 +43,7 @@ export INCLUDE="$VS/include;$SDK/Include/$SDKV/ucrt;$SDK/Include/$SDKV/shared;$S
 # phone: the loader then refuses the whole executable before a line of ours
 # runs. Headers stay at the newest SDK (cppwinrt lives only there); the
 # libraries can be pinned to the oldest OS the package should start on.
-SDKV_LIB="${GECKO_W10M_SDK_LIB:-$SDKV}"
+SDKV_LIB="$GECKO_W10M_SDK_LIB"
 export LIB="$VS/lib/arm/store;$VS/lib/arm;$SDK/Lib/$SDKV_LIB/ucrt/arm;$SDK/Lib/$SDKV_LIB/um/arm"
 echo "    shell links against SDK $SDKV_LIB libraries"
 export PATH="$VS/bin/Hostx64/x64:$PATH"
@@ -645,14 +646,17 @@ echo "=== sign ==="
 # Signing runs through PowerShell because msys2 leaves TEMP and TMP empty in
 # the environment it hands to children, and signtool needs a temp directory to
 # repack an appx. See tools/sign-appx.ps1.
-# Signed as CN=Computershik, which is what the manifest's Publisher says;
-# the two must match exactly or the package will not install. Gecko.cer beside
-# it is the certificate to trust on the phone.
+# The signer's subject must be exactly the manifest's Publisher or the package
+# will not install. app/GeckoW10m/Gecko.pfx (not tracked) is used when it is
+# there; otherwise sign-appx.ps1 makes a self-signed certificate for that
+# Publisher. Gecko.cer beside it is the certificate to trust on the phone.
 CERT="$APP/Gecko.pfx"
+PUBLISHER="$(tr -d '\r' < "$APP/Package.appxmanifest" | sed -n '/<Identity/,/\/>/{s/.*Publisher="\([^"]*\)".*/\1/p}' | head -1)"
 powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -File "$(cygpath -w "$ROOT/tools/sign-appx.ps1")" \
   -Package "$(cygpath -w "$PKG")" \
   -Certificate "$(cygpath -w "$CERT")" \
+  -Subject "$PUBLISHER" \
   -SdkBin "$(cygpath -w "$BIN")"
 
 # The certificate the package is signed with. A phone will not install a

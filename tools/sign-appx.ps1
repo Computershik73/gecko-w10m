@@ -9,7 +9,10 @@
 param(
     [Parameter(Mandatory = $true)][string]$Package,
     [Parameter(Mandatory = $true)][string]$Certificate,
-    [string]$Password = 'gecko_w10m',
+    # The manifest's Publisher: a certificate made here gets it as its subject,
+    # and an existing one must already have it or the package will not install.
+    [string]$Subject = '',
+    [string]$Password = $(if ($env:GECKO_W10M_PFX_PASSWORD) { $env:GECKO_W10M_PFX_PASSWORD } else { 'gecko_w10m' }),
     [string]$SdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64'
 )
 
@@ -45,8 +48,9 @@ if (-not (Test-Path $signtool)) { throw "signtool not found at $signtool" }
 if (-not (Test-Path $Package)) { throw "package not found: $Package" }
 
 if (-not (Test-Path $Certificate)) {
-    Write-Output "    creating a self-signed certificate (CN=GeckoW10m)"
-    $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=GeckoW10m' `
+    if (-not $Subject) { throw "no certificate at $Certificate, and no -Subject to make one for" }
+    Write-Output "    creating a self-signed certificate ($Subject)"
+    $cert = New-SelfSignedCertificate -Type Custom -Subject $Subject `
         -KeyUsage DigitalSignature -FriendlyName 'GeckoW10m W10M' `
         -CertStoreLocation 'Cert:\CurrentUser\My' `
         -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')

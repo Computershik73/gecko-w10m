@@ -17,11 +17,12 @@ header is printed with the results -- check it against the package.
 """
 
 import bisect
+import os
 import re
 import sys
 from pathlib import Path
 
-DEFAULT_MAP = Path("C:/rw-obj/toolkit/library/build/xul.map")
+DEFAULT_MAP = Path(os.environ.get("GECKO_W10M_OBJ", "C:/rw-obj")) / "toolkit/library/build/xul.map"
 
 # " 0001:0377d500       ?XRE_mainInit@XREMain@@... 000000001377e500   nsAppRunner.obj"
 SYMBOL = re.compile(

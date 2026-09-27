@@ -1,7 +1,7 @@
 # mozconfig for GeckoW10m on Windows 10 Mobile (arm-uwp), JIT-enabled, single-process.
 #
-# Consumed by tools/build-gecko-uwp.ps1, which also exports the VS2017 and
-# Windows 10 SDK paths that mozbuild needs.
+# Used by tools/browser-configure.sh, browser-build.sh and package.sh, which
+# set up the toolchain paths (tools/env.sh).
 
 # ---- Target -----------------------------------------------------------------
 # 32-bit ARM, the only ISA W10M ships on (Snapdragon 2xx/4xx/8xx phones).
@@ -12,8 +12,8 @@ ac_add_options --enable-project=browser
 # Short objdir on purpose: the deepest libwebrtc object path, resolved
 # relative to toolkit/library/build, otherwise exceeds MAX_PATH and GNU make
 # 4.1 (no long-path manifest) then reports "No rule to make target" while
-# linking xul.dll. The old location is a junction to this one.
-mk_add_options MOZ_OBJDIR=C:/rw-obj
+# linking xul.dll. GECKO_W10M_OBJ overrides it (tools/env.sh).
+mk_add_options MOZ_OBJDIR=${GECKO_W10M_OBJ:-C:/rw-obj}
 
 # ---- UWP app container ------------------------------------------------------
 # Adds MOZ_UWP + WINAPI_FAMILY=WINAPI_FAMILY_APP + GECKO_W10M, links the
@@ -93,7 +93,7 @@ export CXXFLAGS="-FIgecko_w10m_arm_intrin.h -DU_PLATFORM_HAS_WINUWP_API=1 -DGECK
 
 # bindgen runs libclang in gcc-driver mode, so it needs the intrinsics shim
 # spelled -include rather than -FI, and the objdir include path explicitly.
-export BINDGEN_CFLAGS="-include gecko_w10m_arm_intrin.h -IC:/rw-obj/dist/include -DGECKO_W10M=1"
+export BINDGEN_CFLAGS="-include gecko_w10m_arm_intrin.h -I${GECKO_W10M_OBJ:-C:/rw-obj}/dist/include -DGECKO_W10M=1"
 
 # ---- Trim / optimize (js standalone knows only these) -----------------------
 # NOTE: --disable-crashreporter/updater/maintenance-service/webrtc are browser
@@ -108,7 +108,7 @@ ac_add_options --enable-release
 # bitcode); disable LTO for this bring-up.
 ac_add_options --disable-lto
 
-# ---- Toolchain (paths exported by build-gecko-uwp.ps1) ----------------------
+# ---- Toolchain (paths exported by tools/env.sh) ------------------------------
 # CC / CXX must be clang-cl targeting thumbv7 (the Mozilla clang toolchain from
 # `mach bootstrap`); MSVC cl.exe cannot target ARM with the flags Gecko uses.
 
