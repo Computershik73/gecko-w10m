@@ -13,6 +13,10 @@ export VC_PATH='C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tool
 export PATH="/c/Users/User/.cargo/bin:/c/Program Files/nodejs:/c/Program Files/LLVM/bin:/c/mozilla-build/python3:/c/mozilla-build/python3/Scripts:/c/mozilla-build/bin:/c/mozilla-build/msys2/usr/bin:$PATH"
 cd /c/Users/User/Documents/GitHub/gecko-w10m/engine/firefox
 export MOZCONFIG=/c/Users/User/Documents/GitHub/gecko-w10m/mozconfig/mozconfig.arm-uwp-browser
+# The mozconfig force-includes this header (-FI) and finds it through the
+# object directory's dist/include, so it goes there before every build.
+mkdir -p C:/rw-obj/dist/include
+cp -f /c/Users/User/Documents/GitHub/gecko-w10m/mozconfig/gecko_w10m_arm_intrin.h C:/rw-obj/dist/include/
 echo "=== browser configure start $(date) ==="
 ./mach configure < /dev/null 2>&1
 echo "=== configure exit=$? at $(date) ==="

@@ -61,7 +61,8 @@ export HOST_CXX="clang-cl"
 # clang's own <intrin.h>, which lacks the ARM32 intrinsics that <bit> uses;
 # intrin0.h declares them (guarded on _M_ARM). Bare filename => no msys2 path
 # mangling.
-# gecko_w10m_arm_intrin.h lives in obj/dist/include (on the -I path); it defines
+# gecko_w10m_arm_intrin.h (kept in mozconfig/, copied to obj/dist/include by
+# tools/browser-build.sh and browser-configure.sh -- on the -I path); it defines
 # _CountLeadingZeros{,64} for clang. Bare filename => no msys2 path mangling.
 # -DU_PLATFORM_HAS_WINUWP_API=1 makes ICU take its UWP code paths (CreateFile2
 # etc.) instead of the desktop-only CreateFileA/GetFileSize.
