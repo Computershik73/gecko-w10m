@@ -36,7 +36,7 @@ echo "toolchain: $(rustc "${TC[@]}" -V)"
 mkdir -p "$SYSROOT_DIR"
 cp "$GECKO_W10M_ROOT/mozconfig/rust-targets/$TARGET.json" "$SYSROOT_DIR/target.json"
 
-WORK="$(mktemp -d)"; cd "$WORK"
+WORK="$(mktemp -d -p "$TMPDIR")"; cd "$WORK"
 cargo "${TC[@]}" new --bin stdbuild > /dev/null 2>&1; cd stdbuild
 printf '[profile.dev]\npanic = "abort"\n' >> Cargo.toml
 cargo "${TC[@]}" build --release -Z build-std=std,panic_abort --target "$TARGET" || true
