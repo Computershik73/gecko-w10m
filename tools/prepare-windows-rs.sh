@@ -22,7 +22,19 @@ mkdir -p "$DEST"
 if [ ! -f "$CRATE" ]; then
   curl -sSfL -o "$CRATE" "https://static.crates.io/crates/windows/windows-$VERSION.crate"
 fi
-echo "$SHA256  $CRATE" | sha256sum -c --quiet
-tar -xzf "$CRATE" -C "$DEST"
+# Python rather than sha256sum and tar: MozillaBuild's tar forks gzip, and a
+# fork between two msys runtimes (MozillaBuild's and Git Bash's) can fail.
+python - "$CRATE" "$DEST" "$SHA256" <<'PY'
+import hashlib, sys, tarfile
+crate, dest, want = sys.argv[1:4]
+got = hashlib.sha256(open(crate, "rb").read()).hexdigest()
+if got != want:
+    sys.exit(f"{crate}: sha256 {got}, expected {want}")
+with tarfile.open(crate, "r:gz") as t:
+    try:
+        t.extractall(dest, filter="data")
+    except TypeError:  # Python older than 3.12
+        t.extractall(dest)
+PY
 python "$ROOT/tools/patch-windows-rs-arm32.py" "$DEST/windows-$VERSION/src"
 echo "windows-$VERSION fetched and patched into engine/third_party"
