@@ -74,7 +74,20 @@ PY
 echo "=== version $VERSION (build $BUILD) ==="
 PKG="$OUT/Gecko_${VERSION}_ARM.appx"
 
-rm -rf "$STAGE"; mkdir -p "$STAGE" "$OUT/obj"
+# A stage left over from the last build must really be gone: files that were
+# just written can still be held open for a moment (the antivirus scans them),
+# Windows then only marks them for deletion, and rm -rf leaves directories
+# behind without failing -- stale files that end up in the package.
+for try in 1 2 3 4 5; do
+  rm -rf "$STAGE" 2> /dev/null
+  [ -e "$STAGE" ] || break
+  sleep 2
+done
+if [ -e "$STAGE" ]; then
+  echo "cannot remove $STAGE; something still holds files in it" >&2
+  exit 1
+fi
+mkdir -p "$STAGE" "$OUT/obj"
 cd "$APP"
 
 STAGE_W="$(cygpath -w "$STAGE")"
@@ -226,7 +239,8 @@ if [ -d "$DIST" ]; then
     cp "$MCF/mobile-config-autoconfig.js" "$STAGE/mobile-config-autoconfig.js"
     mkdir -p "$STAGE/mobile-config-firefox" "$STAGE/browser/distribution"
     cp -r "$MCF/modules/." "$STAGE/mobile-config-firefox/"
-    cp -r "$MCF/themes" "$STAGE/mobile-config-firefox/themes"
+    mkdir -p "$STAGE/mobile-config-firefox/themes"
+    cp -r "$MCF/themes/." "$STAGE/mobile-config-firefox/themes/"
     cp "$MCF/policies.json" "$STAGE/browser/distribution/policies.json"
     echo "    mobile-config-firefox staged"
   fi
