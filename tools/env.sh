@@ -60,9 +60,11 @@ export USERPROFILE="$(cygpath -w "$USERPROFILE")"
 HOME="$(cygpath -u "$USERPROFILE")"
 export HOME
 export MOZBUILD_STATE_PATH="${MOZBUILD_STATE_PATH:-$HOME/.mozbuild}"
-export ProgramFiles="C:/Program Files"
-export PROGRAMW6432="C:/Program Files"
-export ProgramW6432="C:/Program Files"
+# Set only when missing in either spelling: Windows treats the names as one,
+# and a child given both (PowerShell's Start-Process, for one) refuses the
+# environment outright.
+[ -n "$ProgramFiles$PROGRAMFILES" ] || export ProgramFiles="C:/Program Files"
+[ -n "$ProgramW6432$PROGRAMW6432" ] || export ProgramW6432="C:/Program Files"
 
 # A writable temp directory: msys2 can leave TMP pointing at C:\Windows.
 _tmp="$(cygpath -u "${LOCALAPPDATA:-$USERPROFILE/AppData/Local}")/Temp/geckow10mbuild"
