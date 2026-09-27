@@ -10,6 +10,11 @@
 # Stops at the first step that fails. Locations: tools/env.sh.
 set -e
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
+# Each step runs in this same bash. env.sh puts MozillaBuild's msys first on
+# PATH, and a plain "bash" would then be MozillaBuild's: started from another
+# msys runtime (Git Bash's, say) it inherits none of the exported variables --
+# GECKO_W10M_OBJ included, so the step would build into the default objdir.
+SH="$BASH"
 source "$TOOLS/env.sh"
 
 if [ ! -f "$GECKO_W10M_ROOT/engine/firefox/mach" ]; then
@@ -18,23 +23,23 @@ if [ ! -f "$GECKO_W10M_ROOT/engine/firefox/mach" ]; then
 fi
 
 echo "##### 1/5 windows-rs"
-bash "$TOOLS/prepare-windows-rs.sh"
+"$SH" "$TOOLS/prepare-windows-rs.sh"
 
 echo "##### 2/5 Rust std for thumbv7a-uwp-windows-msvchf"
 TARGET_DIR="$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/thumbv7a-uwp-windows-msvchf"
 if ls "$TARGET_DIR"/lib/libstd-*.rlib > /dev/null 2>&1 && [ -f "$TARGET_DIR/target.json" ]; then
   echo "already installed in $TARGET_DIR"
 else
-  bash "$TOOLS/uwp-install-std.sh"
+  "$SH" "$TOOLS/uwp-install-std.sh"
 fi
 
 echo "##### 3/5 engine"
-bash "$TOOLS/browser-build.sh" | tee "$TMPDIR/build.log"
+"$SH" "$TOOLS/browser-build.sh" | tee "$TMPDIR/build.log"
 grep -q "=== build exit=0" "$TMPDIR/build.log" || { echo "engine build failed; log: $TMPDIR/build.log" >&2; exit 1; }
 
 echo "##### 4/5 package"
-bash "$TOOLS/package.sh" > "$TMPDIR/package.log" 2>&1 || { tail -20 "$TMPDIR/package.log"; echo "package failed; log: $TMPDIR/package.log" >&2; exit 1; }
+"$SH" "$TOOLS/package.sh" > "$TMPDIR/package.log" 2>&1 || { tail -20 "$TMPDIR/package.log"; echo "package failed; log: $TMPDIR/package.log" >&2; exit 1; }
 tail -1 "$TMPDIR/package.log"
 
 echo "##### 5/5 appx"
-bash "$TOOLS/build-appx.sh"
+"$SH" "$TOOLS/build-appx.sh"
