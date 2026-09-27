@@ -14,6 +14,12 @@
 set -e
 
 source "$(dirname "$0")/env.sh"
+# This script needs nothing from MozillaBuild, and its msys tools must be the
+# ones of the shell running it: env.sh puts MozillaBuild's first, and with
+# MSYS2_ARG_CONV_EXCL set below, MozillaBuild's rm, started from Git Bash, does
+# not understand /c/... paths -- and rm -f then deletes nothing and says
+# nothing.
+PATH="/usr/bin:$PATH"
 ROOT="$GECKO_W10M_ROOT"
 APP="$ROOT/app/GeckoW10m"
 # The packaged tree (mach package): two omni.ja archives instead of eight
