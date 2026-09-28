@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Fri, 25 Sep 2026 09:48:40 +0400
-Subject: [PATCH 28/30] D3D11 SWGL: composite the whole window after drawing a
- video surface
+Subject: [PATCH] D3D11 SWGL: composite the whole window after drawing a video
+ surface
 
 With video frames on the GPU the Lumia 650 composited 30 times a second,
 yet the video jumped and showed old frames: the compositor redraws only

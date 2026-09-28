@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 07:44:52 +0400
-Subject: [PATCH 04/30] swgl: shade pixels on a Direct3D 11 device of feature
- level 9_3
+Subject: [PATCH] swgl: shade pixels on a Direct3D 11 device of feature level
+ 9_3
 
 gpu_d3d11.h is the runtime for the pixel shaders the build now makes. With
 a device attached (SwglGpuAttach, or SwglGpuAttachNewDevice for testing),

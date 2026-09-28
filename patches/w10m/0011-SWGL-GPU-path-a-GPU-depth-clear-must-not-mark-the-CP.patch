@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 09:30:55 +0400
-Subject: [PATCH 11/30] SWGL GPU path: a GPU depth clear must not mark the CPU
- runs cleared
+Subject: [PATCH] SWGL GPU path: a GPU depth clear must not mark the CPU runs
+ cleared
 
 gpu_clear set the texture's cleared flag before the CPU cleared its own
 depth runs. After a depth buffer was re-specified at a new size, SWGL then

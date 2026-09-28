@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 09:06:25 +0400
-Subject: [PATCH 10/30] SWGL GPU path: empty samplers, CPU draws placed by the
- GPU, dual depth clears
+Subject: [PATCH] SWGL GPU path: empty samplers, CPU draws placed by the GPU,
+ dual depth clears
 
 - A sampler with nothing bound reads (0, 0, 0, 1) from a 1x1 texture,
   as in GL, instead of sending the draw to the CPU. The GPU variants of

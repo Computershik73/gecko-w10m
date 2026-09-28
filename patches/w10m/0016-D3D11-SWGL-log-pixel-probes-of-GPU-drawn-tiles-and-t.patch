@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 11:53:50 +0400
-Subject: [PATCH 16/30] D3D11 SWGL: log pixel probes of GPU-drawn tiles and the
+Subject: [PATCH] D3D11 SWGL: log pixel probes of GPU-drawn tiles and the
  composited screen
 
 For the first tiles and frames (then now and again) the log gets the

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 07:16:53 +0400
-Subject: [PATCH 02/30] glsl-to-cxx: translate WebRender's fragment shaders to
- HLSL for feature level 9_3
+Subject: [PATCH] glsl-to-cxx: translate WebRender's fragment shaders to HLSL
+ for feature level 9_3
 
 The first step toward drawing pages on GPUs that stop at Direct3D feature
 level 9_3, like the Adreno 3xx in the Lumia 550/650/950. WebRender cannot

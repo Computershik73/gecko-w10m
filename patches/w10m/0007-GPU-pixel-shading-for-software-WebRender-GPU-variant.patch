@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 08:35:05 +0400
-Subject: [PATCH 07/30] GPU pixel shading for software WebRender: GPU variants,
+Subject: [PATCH] GPU pixel shading for software WebRender: GPU variants,
  tiles, Gecko
 
 GPU variants. SWGL's builds of WebRender's shaders lean on its rasterizer:

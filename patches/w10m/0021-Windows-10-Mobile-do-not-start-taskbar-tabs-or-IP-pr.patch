@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 16:28:17 +0400
-Subject: [PATCH 21/30] Windows 10 Mobile: do not start taskbar tabs or IP
- protection
+Subject: [PATCH] Windows 10 Mobile: do not start taskbar tabs or IP protection
 
 Their startup hooks load 30 modules at every launch (IP protection
 initialises although the feature is off) for features a phone does not

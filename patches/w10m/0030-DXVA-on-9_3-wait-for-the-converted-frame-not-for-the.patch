@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Fri, 25 Sep 2026 13:08:15 +0400
-Subject: [PATCH 30/30] DXVA on 9_3: wait for the converted frame, not for the
+Subject: [PATCH] DXVA on 9_3: wait for the converted frame, not for the
  decoded one
 
 The wait before the video processor did not stop old frames from showing and

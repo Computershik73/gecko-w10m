@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 22:58:53 +0400
-Subject: [PATCH 24/30] Video on feature level 9_3: DXVA frames stay on the GPU
+Subject: [PATCH] Video on feature level 9_3: DXVA frames stay on the GPU
 
 Frames decoded by DXVA were read back to memory, converted and uploaded
 again (three trips through the CPU per frame). Nothing on this device can

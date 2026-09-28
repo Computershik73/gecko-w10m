@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Fri, 25 Sep 2026 07:38:31 +0400
-Subject: [PATCH 26/30] SWGL samples video frames on the GPU where they were
- decoded
+Subject: [PATCH] SWGL samples video frames on the GPU where they were decoded
 
 With frames staying on the GPU, the Lumia 650 decoded 30 frames a second
 but showed about 10: the frames were not promoted to compositor surfaces

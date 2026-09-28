@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 07:26:20 +0400
-Subject: [PATCH 03/30] swgl: build the feature level 9_3 pixel shaders and the
- glue that feeds them
+Subject: [PATCH] swgl: build the feature level 9_3 pixel shaders and the glue
+ that feeds them
 
 For Windows targets, swgl's build script now translates each program's
 fragment half with glsl-to-cxx's HLSL back end and compiles it with fxc

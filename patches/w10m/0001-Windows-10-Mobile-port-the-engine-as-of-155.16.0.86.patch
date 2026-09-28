@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 07:00:34 +0400
-Subject: [PATCH 01/30] Windows 10 Mobile port: the engine as of 155.16.0.86
+Subject: [PATCH] Windows 10 Mobile port: the engine as of 155.16.0.86
 
 Everything the port has changed in the Gecko tree up to the package that
 brought feature level 9_3 composition to the Lumia 650. Until now these

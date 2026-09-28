@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 11:52:08 +0400
-Subject: [PATCH 15/30] wrench: SWGL_GPU_NATIVE=1 renders through compositor
- tiles on the GPU
+Subject: [PATCH] wrench: SWGL_GPU_NATIVE=1 renders through compositor tiles on
+ the GPU
 
 A native compositor whose tiles are Direct3D textures that SWGL draws into,
 as Gecko's D3D11 SWGL compositor does on the phone; the tiles are read

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 15:27:23 +0400
-Subject: [PATCH 20/30] swgl gpu: count Direct3D texture memory, keep two
- readback staging textures
+Subject: [PATCH] swgl gpu: count Direct3D texture memory, keep two readback
+ staging textures
 
 The log now says how much the GPU copies of SWGL's textures, SWGL's caches
 (spare depth buffers, readback staging, feedback copies) and the

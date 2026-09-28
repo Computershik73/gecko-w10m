@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 07:53:28 +0400
-Subject: [PATCH 05/30] swgl GPU path: depth goes to the GPU as a clear, and
- never comes back
+Subject: [PATCH] swgl GPU path: depth goes to the GPU as a clear, and never
+ comes back
 
 Direct3D takes no UpdateSubresource into a depth buffer and at feature
 level 9 copies no depth buffer anywhere, so the upload silently did

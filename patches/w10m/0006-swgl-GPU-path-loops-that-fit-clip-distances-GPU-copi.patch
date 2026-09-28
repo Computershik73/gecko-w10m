@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 08:16:26 +0400
-Subject: [PATCH 06/30] swgl GPU path: loops that fit, clip distances, GPU
- copies, feedback reads
+Subject: [PATCH] swgl GPU path: loops that fit, clip distances, GPU copies,
+ feedback reads
 
 - Loops are unrolled to 32, 16 or 8 iterations, whichever is the largest
   that fits ps_2_x's 512 instructions. This brings the blurs (at most six

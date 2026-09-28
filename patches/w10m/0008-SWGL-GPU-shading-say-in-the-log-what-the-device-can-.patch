@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 08:35:41 +0400
-Subject: [PATCH 08/30] SWGL GPU shading: say in the log what the device can do
+Subject: [PATCH] SWGL GPU shading: say in the log what the device can do
 
 Feature level, whether R8 render targets and float textures are available
 (without float textures the programs needing flat data or the GPU buffer

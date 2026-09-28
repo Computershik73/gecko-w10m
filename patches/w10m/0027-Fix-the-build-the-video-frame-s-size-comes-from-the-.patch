@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Fri, 25 Sep 2026 07:49:39 +0400
-Subject: [PATCH 27/30] Fix the build: the video frame's size comes from the
- DXGI texture host
+Subject: [PATCH] Fix the build: the video frame's size comes from the DXGI
+ texture host
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

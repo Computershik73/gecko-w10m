@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 14:29:39 +0400
-Subject: [PATCH 19/30] swgl gpu: colour textures live on the GPU only, CPU
- buffers on demand
+Subject: [PATCH] swgl gpu: colour textures live on the GPU only, CPU buffers
+ on demand
 
 With GPU shading every SWGL texture had a CPU buffer and a Direct3D copy,
 and on a phone the GPU's memory is the phone's: render targets and atlases

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 11:52:07 +0400
-Subject: [PATCH 14/30] swgl gpu: blits and copies read compositor tiles
+Subject: [PATCH] swgl gpu: blits and copies read compositor tiles
 
 A tile that lives only in the compositor's texture has no CPU buffer, and
 BlitFramebuffer/CopyImageSubData returned early on it, so mix-blend

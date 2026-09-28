@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 12:58:30 +0400
-Subject: [PATCH 18/30] D3D11 SWGL: restore the compositor's device state
- before compositing tiles
+Subject: [PATCH] D3D11 SWGL: restore the compositor's device state before
+ compositing tiles
 
 With a native compositor WebRender starts compositing (BeginFrameForWindow:
 render target, viewport, input layout, topology, rasterizer and blend

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Fri, 25 Sep 2026 12:01:38 +0400
-Subject: [PATCH 29/30] DXVA on 9_3: wait for the decoded surface before the
- video processor reads it
+Subject: [PATCH] DXVA on 9_3: wait for the decoded surface before the video
+ processor reads it
 
 With frames staying on the GPU the Lumia 650 showed 30 frames a second,
 but jumping back to older ones now and then. The Adreno decodes on its own

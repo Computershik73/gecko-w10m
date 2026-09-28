@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 11:52:06 +0400
-Subject: [PATCH 13/30] swgl gpu: depth buffers exactly the size of their
- render target
+Subject: [PATCH] swgl gpu: depth buffers exactly the size of their render
+ target
 
 Direct3D 11 binds a depth-stencil view only with render targets of equal
 size (the debug layer calls anything else an error; desktop drivers let it

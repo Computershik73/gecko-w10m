@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 23:00:30 +0400
-Subject: [PATCH 25/30] Fix the build: the NV12 condition goes in the
- initializer list (const members)
+Subject: [PATCH] Fix the build: the NV12 condition goes in the initializer
+ list (const members)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

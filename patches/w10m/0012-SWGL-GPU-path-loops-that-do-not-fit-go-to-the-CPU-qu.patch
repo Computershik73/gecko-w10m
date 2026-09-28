@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
 Date: Thu, 24 Sep 2026 09:36:24 +0400
-Subject: [PATCH 12/30] SWGL GPU path: loops that do not fit go to the CPU quad
- by quad
+Subject: [PATCH] SWGL GPU path: loops that do not fit go to the CPU quad by
+ quad
 
 WebRender scales a blur's source down only when the deviation is large on
 both axes, so a one-direction blur can need more steps than a 9_3 pixel

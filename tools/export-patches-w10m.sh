@@ -6,6 +6,9 @@
 # Run it after committing to the engine, then commit patches/w10m together
 # with the submodule update, so the two never disagree.
 #
+# --no-numbered keeps "[PATCH n/m]" out of the subjects, so adding a commit
+# changes one file here, not all of them.
+#
 # Before replacing anything, the new series is replayed onto the release tag
 # in a scratch index -- nothing is checked out -- and the resulting tree must
 # be the branch's tree exactly.
@@ -23,7 +26,7 @@ OUT="$ROOT/patches/w10m"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-git -C "$GECKO" format-patch --binary --no-signature --zero-commit -q \
+git -C "$GECKO" format-patch --binary --no-signature --zero-commit --no-numbered -q \
   -o "$WORK/series" "$TAG..$BRANCH"
 
 # Check the series against the branch.
