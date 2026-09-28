@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 28 Sep 2026 16:23:41 +0400
+Subject: [PATCH] Notes: compositor frame rate and time, video frames dropped,
+ pinch decisions
+
+Every ten seconds of compositing: frames, their average and longest time, and
+how many took over 16.7 ms; every ten seconds of video: frames shown and
+frames the compositor dropped. And for a pinch: whether two fingers reached
+the gesture listener, and when it begins, which scroll frame took it and
+whether the page's zoom constraints and touch-action allow zooming.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/layers/apz/src/AsyncPanZoomController.cpp | 19 +++++++++
+ gfx/layers/apz/src/GestureEventListener.cpp   |  9 ++++
+ gfx/layers/composite/ImageComposite.cpp       | 33 +++++++++++++++
+ gfx/webrender_bindings/RendererOGL.cpp        | 41 +++++++++++++++++++
+ 4 files changed, 102 insertions(+)
+
+diff --git a/gfx/layers/apz/src/AsyncPanZoomController.cpp b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+index 2eabe92cfc..5644081c2b 100644
+--- a/gfx/layers/apz/src/AsyncPanZoomController.cpp
++++ b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+@@ -1662,6 +1662,25 @@ nsEventStatus AsyncPanZoomController::OnScaleBegin(
+ 
+   mPinchLocked = false;
+   mPinchPaintTimerSet = false;
++#if defined(GECKO_W10M)
++  {
++    // Whether the pinch can zoom: which frame took it, and what the page
++    // allows there (its viewport meta tag decides mAllowZoom and the range).
++    RecursiveMutexAutoLock lock(mRecursiveMutex);
++    nsPrintfCString note(
++        "pinch: began on %s scroll frame; zoom %s, %.2f to %.2f, now %.2f; "
++        "touch-action %s",
++        IsRootContent() ? "the page's root" : "an inner",
++        mZoomConstraints.mAllowZoom ? "allowed" : "NOT allowed by the page",
++        mZoomConstraints.mMinZoom.scale, mZoomConstraints.mMaxZoom.scale,
++        Metrics().GetZoom().scale,
++        !HasReadyTouchBlock() ? "unknown"
++        : GetCurrentTouchBlock()->TouchActionAllowsPinchZoom()
++            ? "allows it"
++            : "FORBIDS it");
++    GeckoW10mNote(note.get());
++  }
++#endif
+   // Note that there may not be a touch block at this point, if we received the
+   // PinchGestureEvent directly from widget code without any touch events.
+   if (HasReadyTouchBlock() &&
+diff --git a/gfx/layers/apz/src/GestureEventListener.cpp b/gfx/layers/apz/src/GestureEventListener.cpp
+index 0ae874bab6..61873a8df7 100644
+--- a/gfx/layers/apz/src/GestureEventListener.cpp
++++ b/gfx/layers/apz/src/GestureEventListener.cpp
+@@ -224,6 +224,15 @@ nsEventStatus GestureEventListener::HandleInputTouchSingleStart() {
+ 
+ nsEventStatus GestureEventListener::HandleInputTouchMultiStart() {
+   nsEventStatus rv = nsEventStatus_eIgnore;
++#if defined(GECKO_W10M)
++  {
++    // Two fingers reached the gesture listener: from here APZ can make a
++    // pinch of them. If this never appears, the second finger is lost before.
++    nsPrintfCString note("pinch: %zu fingers down, gesture state %s",
++                         mTouches.Length(), ToString(mState).c_str());
++    GeckoW10mNote(note.get());
++  }
++#endif
+ 
+   switch (mState) {
+     case GESTURE_NONE:
+diff --git a/gfx/layers/composite/ImageComposite.cpp b/gfx/layers/composite/ImageComposite.cpp
+index d24d7dfdd6..b8e4c691a3 100644
+--- a/gfx/layers/composite/ImageComposite.cpp
++++ b/gfx/layers/composite/ImageComposite.cpp
+@@ -4,6 +4,11 @@
+ 
+ #include "ImageComposite.h"
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ #include <inttypes.h>
+ 
+ #include "gfxPlatform.h"
+@@ -249,6 +254,34 @@ bool ImageComposite::UpdateCompositedFrame(
+     dropped = 0;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    // Every ten seconds of video: frames the compositor showed and frames it
++    // skipped because a newer one was already due -- what YouTube's "dropped
++    // frames" counts.
++    static TimeStamp sVideoStart;
++    static uint32_t sVideoShown = 0;
++    static uint32_t sVideoDropped = 0;
++    const TimeStamp now = TimeStamp::Now();
++    if (sVideoStart.IsNull()) {
++      sVideoStart = now;
++    }
++    ++sVideoShown;
++    sVideoDropped += std::max(dropped, 0);
++    const double span = (now - sVideoStart).ToSeconds();
++    if (span >= 10) {
++      if (sVideoShown >= 50) {
++        nsPrintfCString note(
++            "video: %u frames shown in %.1f s (%.1f a second), %u dropped by "
++            "the compositor",
++            sVideoShown, span, sVideoShown / span, sVideoDropped);
++        GeckoW10mNote(note.get());
++      }
++      sVideoStart = now;
++      sVideoShown = sVideoDropped = 0;
++    }
++  }
++#endif
+   if (dropped > 0) {
+     mDroppedFrames += dropped;
+     if (profiler_thread_is_being_profiled_for_markers()) {
+diff --git a/gfx/webrender_bindings/RendererOGL.cpp b/gfx/webrender_bindings/RendererOGL.cpp
+index 91a8791450..1ebbbc4fb0 100644
+--- a/gfx/webrender_bindings/RendererOGL.cpp
++++ b/gfx/webrender_bindings/RendererOGL.cpp
+@@ -196,6 +196,9 @@ RenderedFrameId RendererOGL::UpdateAndRender(
+   bool needPostRenderCall = false;
+   bool beginFrame = !mThread->IsHandlingDeviceReset();
+ 
++#if defined(GECKO_W10M)
++  const TimeStamp frameStart = TimeStamp::Now();
++#endif
+   if (beginFrame && present) {
+     if (!mCompositor->GetWidget()->PreRender(&widgetContext)) {
+       // XXX This could cause oom in webrender since pending_texture_updates is
+@@ -329,6 +332,44 @@ RenderedFrameId RendererOGL::UpdateAndRender(
+ #endif
+     MOZ_ASSERT(needPostRenderCall);
+     mCompositor->GetWidget()->PostRender(&widgetContext);
++#if defined(GECKO_W10M)
++    // Every ten seconds of steady compositing: how many frames reached the
++    // screen and how long each took, render and present. A 60 fps video
++    // needs a composite every 16.7 ms; each one over that is a video frame
++    // the compositor never shows, which YouTube counts as dropped.
++    static TimeStamp sStatsStart;
++    static uint32_t sStatsFrames = 0;
++    static uint32_t sStatsSlow = 0;
++    static double sStatsTotalMs = 0;
++    static double sStatsMaxMs = 0;
++    const TimeStamp now = TimeStamp::Now();
++    const double ms = (now - frameStart).ToMilliseconds();
++    if (sStatsStart.IsNull()) {
++      sStatsStart = now;
++    }
++    ++sStatsFrames;
++    sStatsTotalMs += ms;
++    sStatsMaxMs = std::max(sStatsMaxMs, ms);
++    if (ms > 16.7) {
++      ++sStatsSlow;
++    }
++    const double span = (now - sStatsStart).ToSeconds();
++    if (span >= 10) {
++      if (sStatsFrames >= 100) {
++        char note[200];
++        SprintfLiteral(note,
++                       "compositor: %u frames in %.1f s (%.1f a second), "
++                       "each %.1f ms on average, %.1f ms at most, over 16.7 "
++                       "ms %u times",
++                       sStatsFrames, span, sStatsFrames / span,
++                       sStatsTotalMs / sStatsFrames, sStatsMaxMs, sStatsSlow);
++        GeckoW10mNote(note);
++      }
++      sStatsStart = now;
++      sStatsFrames = sStatsSlow = 0;
++      sStatsTotalMs = sStatsMaxMs = 0;
++    }
++#endif
+   }
+ 
+ #if defined(ENABLE_FRAME_LATENCY_LOG)

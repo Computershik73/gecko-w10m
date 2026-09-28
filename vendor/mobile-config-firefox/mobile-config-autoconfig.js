@@ -1066,12 +1066,30 @@ function gecko_h264ify() {
 // pixels wide and shrunk to the screen, which here is 540 CSS pixels -- every
 // control at half size, and the settings unusable. They get the phone's own
 // width instead, which is what mobile-config-firefox's stylesheets for them
-// are written for. gecko.about.viewport=false turns it off.
+// are written for.
+//
+// Off by default: on the phone the tag made the settings enormous -- one
+// small control could fill the screen -- so the scale the page is given with
+// it is wrong somewhere. gecko.about.viewport=true turns it back on. Either
+// way the page's viewport numbers go to the log, which is what fixing it
+// needs.
 function gecko_about_viewport() {
-    if (!Services.prefs.getBoolPref("gecko.about.viewport", true)) {
-        return;
-    }
+    const enabled = Services.prefs.getBoolPref("gecko.about.viewport", false);
     const XHTML = "http://www.w3.org/1999/xhtml";
+    const report = (win, doc, when) => {
+        try {
+            const vv = win.visualViewport;
+            const meta = doc.querySelector("meta[name=viewport]");
+            Services.console.logStringMessage(
+                "gecko: viewport of " + doc.documentURI + " " + when + ": inner " +
+                win.innerWidth + "x" + win.innerHeight + ", devicePixelRatio " +
+                win.devicePixelRatio + ", screen " + win.screen.width + "x" +
+                win.screen.height + ", visual viewport " +
+                (vv ? Math.round(vv.width) + "x" + Math.round(vv.height) +
+                      " at scale " + vv.scale.toFixed(3) : "none") +
+                ", meta viewport " + (meta ? "\"" + meta.content + "\"" : "none"));
+        } catch (e) {}
+    };
     const fit = doc => {
         try {
             if (doc.querySelector("meta[name=viewport]")) {
@@ -1097,7 +1115,13 @@ function gecko_about_viewport() {
                 }
                 // The parser has not reached <head> yet; wait for the page
                 // to be read, and leave a page alone that has a tag of its own.
-                win.addEventListener("DOMContentLoaded", () => fit(doc), { once: true });
+                win.addEventListener("DOMContentLoaded", () => {
+                    report(win, doc, "as loaded");
+                    if (enabled) {
+                        fit(doc);
+                    }
+                    win.setTimeout(() => report(win, doc, "a second later"), 1000);
+                }, { once: true });
             } catch (e) {}
         }
     }, "document-element-inserted");
