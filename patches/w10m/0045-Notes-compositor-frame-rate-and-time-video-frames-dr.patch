@@ -49,7 +49,7 @@ index 2eabe92cfc..5644081c2b 100644
    // PinchGestureEvent directly from widget code without any touch events.
    if (HasReadyTouchBlock() &&
 diff --git a/gfx/layers/apz/src/GestureEventListener.cpp b/gfx/layers/apz/src/GestureEventListener.cpp
-index 0ae874bab6..61873a8df7 100644
+index d9bf3d00a6..f6526bb826 100644
 --- a/gfx/layers/apz/src/GestureEventListener.cpp
 +++ b/gfx/layers/apz/src/GestureEventListener.cpp
 @@ -224,6 +224,15 @@ nsEventStatus GestureEventListener::HandleInputTouchSingleStart() {
@@ -120,7 +120,7 @@ index d24d7dfdd6..b8e4c691a3 100644
      mDroppedFrames += dropped;
      if (profiler_thread_is_being_profiled_for_markers()) {
 diff --git a/gfx/webrender_bindings/RendererOGL.cpp b/gfx/webrender_bindings/RendererOGL.cpp
-index 91a8791450..1ebbbc4fb0 100644
+index 28ebf8a9a0..95053bee1f 100644
 --- a/gfx/webrender_bindings/RendererOGL.cpp
 +++ b/gfx/webrender_bindings/RendererOGL.cpp
 @@ -196,6 +196,9 @@ RenderedFrameId RendererOGL::UpdateAndRender(

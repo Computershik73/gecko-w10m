@@ -1,0 +1,884 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] XPCOM: xptcall for 32-bit ARM Windows
+
+The invoke and stub halves of XPCOM's calling glue for the ARM32 Windows ABI
+(AAPCS with VFP), which upstream has only for Linux and Android.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xpcom/reflect/xptcall/md/win32/moz.build      |  15 +
+ .../xptcall/md/win32/xptcinvoke_arm.cpp       | 268 +++++++++++++++
+ .../xptcall/md/win32/xptcstubs_arm.cpp        | 243 ++++++++++++++
+ .../xptcall/md/win32/xptcstubs_asm_arm.asm    | 310 ++++++++++++++++++
+ 4 files changed, 836 insertions(+)
+ create mode 100644 xpcom/reflect/xptcall/md/win32/xptcinvoke_arm.cpp
+ create mode 100644 xpcom/reflect/xptcall/md/win32/xptcstubs_arm.cpp
+ create mode 100644 xpcom/reflect/xptcall/md/win32/xptcstubs_asm_arm.asm
+
+diff --git a/xpcom/reflect/xptcall/md/win32/moz.build b/xpcom/reflect/xptcall/md/win32/moz.build
+index 2c1845f51d..0f92afa3c2 100644
+--- a/xpcom/reflect/xptcall/md/win32/moz.build
++++ b/xpcom/reflect/xptcall/md/win32/moz.build
+@@ -25,6 +25,21 @@ elif CONFIG["TARGET_CPU"] == "x86":
+             "xptcstubs.cpp",
+         ]
+         SOURCES["xptcinvoke_asm_x86_msvc.asm"].flags += ["-safeseh"]
++elif CONFIG["TARGET_CPU"] == "arm":
++    # Windows on ARM32: AAPCS, hard-float. The invoke side is the VFP half
++    # of the shared ARM implementation; the stubs need Windows name
++    # mangling and so are their own files.
++    SOURCES += [
++        "xptcinvoke_arm.cpp",
++        "xptcstubs_arm.cpp",
++    ]
++    GeneratedFile(
++        "xptcstubs_arm_gen.asm",
++        script="preprocess.py",
++        entry_point="preprocess",
++        inputs=["xptcstubs_asm_arm.asm"],
++    )
++    SOURCES += ["!xptcstubs_arm_gen.asm"]
+ elif CONFIG["TARGET_CPU"] == "aarch64":
+     SOURCES += [
+         "xptcinvoke_aarch64.cpp",
+diff --git a/xpcom/reflect/xptcall/md/win32/xptcinvoke_arm.cpp b/xpcom/reflect/xptcall/md/win32/xptcinvoke_arm.cpp
+new file mode 100644
+index 0000000000..6d8cbbb73d
+--- /dev/null
++++ b/xpcom/reflect/xptcall/md/win32/xptcinvoke_arm.cpp
+@@ -0,0 +1,268 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* Platform specific code to invoke XPCOM methods on native objects.
++ *
++ * Windows on 32-bit ARM. The calling convention is AAPCS with the hard-float
++ * (VFP) variant -- clang reports it as __ARM_PCS_VFP for thumbv7-windows-msvc
++ * -- so this is the same code as the __ARM_PCS_VFP half of
++ * xpcom/reflect/xptcall/md/unix/xptcinvoke_arm.cpp, which that file guards
++ * behind a Linux/iOS-only #error. Keep the two in sync.
++ */
++
++#include "xptcprivate.h"
++
++#include "mozilla/Compiler.h"
++
++#if !defined(_M_ARM) || !defined(_WIN32)
++#  error "This code is for 32-bit ARM Windows only."
++#endif
++
++#if !defined(__ARM_PCS_VFP)
++#  error "Windows on ARM32 uses the hard-float AAPCS variant."
++#endif
++
++
++/* "Procedure Call Standard for the ARM Architecture" document, sections
++ * "5.5 Parameter Passing" and "6.1.2 Procedure Calling" contain all the
++ * needed information.
++ *
++ * http://infocenter.arm.com/help/topic/com.arm.doc.ihi0042d/IHI0042D_aapcs.pdf
++ */
++
++#if defined(__thumb__) && !defined(__thumb2__)
++#error "Thumb1 is not supported"
++#endif
++
++#ifndef __ARMEL__
++#error "Only little endian compatibility was tested"
++#endif
++
++/*
++ * Allocation of integer function arguments initially to registers r1-r3
++ * and then to stack. Handling of 'this' argument which goes to r0 registers
++ * is handled separately and does not belong to these two inline functions.
++ *
++ * The doubleword arguments are allocated to even:odd
++ * register pairs or get aligned at 8-byte boundary on stack. The "holes"
++ * which may appear as a result of this realignment remain unused.
++ *
++ * 'ireg_args'  - pointer to the current position in the buffer,
++ *                corresponding to the register arguments
++ * 'stack_args' - pointer to the current position in the buffer,
++ *                corresponding to the arguments on stack
++ * 'end'        - pointer to the end of the registers argument
++ *                buffer (it is guaranteed to be 8-bytes aligned)
++ */
++
++static inline void copy_word(uint32_t* &ireg_args,
++                             uint32_t* &stack_args,
++                             uint32_t* end,
++                             uint32_t  data)
++{
++  if (ireg_args < end) {
++    *ireg_args = data;
++    ireg_args++;
++  } else {
++    *stack_args = data;
++    stack_args++;
++  }
++}
++
++static inline void copy_dword(uint32_t* &ireg_args,
++                              uint32_t* &stack_args,
++                              uint32_t* end,
++                              uint64_t  data)
++{
++  if (ireg_args + 1 < end) {
++    if ((uint32_t)ireg_args & 4) {
++      ireg_args++;
++    }
++    *(uint64_t *)ireg_args = data;
++    ireg_args += 2;
++  } else {
++    ireg_args = end;
++    if ((uint32_t)stack_args & 4) {
++      stack_args++;
++    }
++    *(uint64_t *)stack_args = data;
++    stack_args += 2;
++  }
++}
++
++/*
++ * Allocation of floating point arguments to VFP registers (s0-s15, d0-d7).
++ *
++ * Unlike integer registers allocation, "back-filling" needs to be
++ * supported. For example, the third floating point argument in the
++ * following function is going to be allocated to s1 register, back-filling
++ * the "hole":
++ *    void f(float s0, double d1, float s1)
++ *
++ * Refer to the "Procedure Call Standard for the ARM Architecture" document
++ * for more details.
++ *
++ * 'vfp_s_args' - pointer to the current position in the buffer with
++ *                the next unallocated single precision register
++ * 'vfp_d_args' - pointer to the current position in the buffer with
++ *                the next unallocated double precision register,
++ *                it has the same value as 'vfp_s_args' when back-filling
++ *                is not used
++ * 'end'        - pointer to the end of the vfp registers argument
++ *                buffer (it is guaranteed to be 8-bytes aligned)
++ *
++ * Mozilla bugtracker has a test program attached which be used for
++ * experimenting with VFP registers allocation code and testing its
++ * correctness:
++ * https://bugzilla.mozilla.org/show_bug.cgi?id=601914#c19
++ */
++
++static inline bool copy_vfp_single(float* &vfp_s_args, double* &vfp_d_args,
++                                   float* end, float data)
++{
++  if (vfp_s_args >= end)
++    return false;
++
++  *vfp_s_args = data;
++  vfp_s_args++;
++  if (vfp_s_args < (float *)vfp_d_args) {
++    // It was the case of back-filling, now the next free single precision
++    // register should overlap with the next free double precision register
++    vfp_s_args = (float *)vfp_d_args;
++  } else if (vfp_s_args > (float *)vfp_d_args) {
++    // also update the pointer to the next free double precision register
++    vfp_d_args++;
++  }
++  return true;
++}
++
++static inline bool copy_vfp_double(float* &vfp_s_args, double* &vfp_d_args,
++                                   float* end, double data)
++{
++  if (vfp_d_args >= (double *)end) {
++    // The back-filling continues only so long as no VFP CPRC has been
++    // allocated to a slot on the stack. Basically no VFP registers can
++    // be allocated after this point.
++    vfp_s_args = end;
++    return false;
++  }
++
++  if (vfp_s_args == (float *)vfp_d_args) {
++    // also update the pointer to the next free single precision register
++    vfp_s_args += 2;
++  }
++  *vfp_d_args = data;
++  vfp_d_args++;
++  return true;
++}
++
++static void
++invoke_copy_to_stack(uint32_t* stk, uint32_t *end,
++                     uint32_t paramCount, nsXPTCVariant* s)
++{
++  uint32_t *ireg_args  = end - 3;
++  float    *vfp_s_args = (float *)end;
++  double   *vfp_d_args = (double *)end;
++  float    *vfp_end    = vfp_s_args + 16;
++
++  for (uint32_t i = 0; i < paramCount; i++, s++) {
++    if (s->IsIndirect()) {
++      copy_word(ireg_args, stk, end, (uint32_t)&s->val);
++      continue;
++    }
++    // According to the ARM EABI, integral types that are smaller than a word
++    // are to be sign/zero-extended to a full word and treated as 4-byte values
++    switch (s->type)
++    {
++      case nsXPTType::T_FLOAT:
++        if (!copy_vfp_single(vfp_s_args, vfp_d_args, vfp_end, s->val.f)) {
++          copy_word(end, stk, end, reinterpret_cast<uint32_t&>(s->val.f));
++        }
++        break;
++      case nsXPTType::T_DOUBLE:
++        if (!copy_vfp_double(vfp_s_args, vfp_d_args, vfp_end, s->val.d)) {
++          copy_dword(end, stk, end, reinterpret_cast<uint64_t&>(s->val.d));
++        }
++        break;
++      case nsXPTType::T_I8:  copy_word(ireg_args, stk, end, s->val.i8);   break;
++      case nsXPTType::T_I16: copy_word(ireg_args, stk, end, s->val.i16);  break;
++      case nsXPTType::T_I32: copy_word(ireg_args, stk, end, s->val.i32);  break;
++      case nsXPTType::T_I64: copy_dword(ireg_args, stk, end, s->val.i64); break;
++      case nsXPTType::T_U8:  copy_word(ireg_args, stk, end, s->val.u8);   break;
++      case nsXPTType::T_U16: copy_word(ireg_args, stk, end, s->val.u16);  break;
++      case nsXPTType::T_U32: copy_word(ireg_args, stk, end, s->val.u32);  break;
++      case nsXPTType::T_U64: copy_dword(ireg_args, stk, end, s->val.u64); break;
++      case nsXPTType::T_BOOL: copy_word(ireg_args, stk, end, s->val.b);   break;
++      case nsXPTType::T_CHAR: copy_word(ireg_args, stk, end, s->val.c);   break;
++      case nsXPTType::T_WCHAR: copy_word(ireg_args, stk, end, s->val.wc); break;
++      default:
++        // all the others are plain pointer types
++        copy_word(ireg_args, stk, end, reinterpret_cast<uint32_t>(s->val.p));
++        break;
++    }
++  }
++}
++
++typedef uint32_t (*vtable_func)(nsISupports *, uint32_t, uint32_t, uint32_t);
++
++EXPORT_XPCOM_API(nsresult)
++NS_InvokeByIndex(nsISupports* that, uint32_t methodIndex,
++                   uint32_t paramCount, nsXPTCVariant* params)
++{
++  vtable_func *vtable = *reinterpret_cast<vtable_func **>(that);
++  vtable_func func = vtable[methodIndex];
++  // 'register uint32_t result asm("r0")' could be used here, but it does not
++  //  seem to be reliable in all cases: http://gcc.gnu.org/PR46164
++  nsresult result;
++  asm (
++    "mov    r3, sp\n"
++    "mov    %[stack_space_size], %[param_count_plus_2], lsl #3\n"
++    "tst    r3, #4\n" /* check stack alignment */
++
++    "add    %[stack_space_size], #(4 * 16)\n" /* space for VFP registers */
++    "mov    r3, %[params]\n"
++
++    "it     ne\n"
++    "addne  %[stack_space_size], %[stack_space_size], #4\n"
++    "sub    r0, sp, %[stack_space_size]\n" /* allocate space on stack */
++
++    "sub    r2, %[param_count_plus_2], #2\n"
++    "mov    sp, r0\n"
++
++    "add    r1, r0, %[param_count_plus_2], lsl #3\n"
++    "blx    %[invoke_copy_to_stack]\n"
++
++    "add    ip, sp, %[param_count_plus_2], lsl #3\n"
++    "mov    r0, %[that]\n"
++    "ldmdb  ip, {r1, r2, r3}\n"
++    "vldm   ip, {d0, d1, d2, d3, d4, d5, d6, d7}\n"
++    "blx    %[func]\n"
++
++    "add    sp, sp, %[stack_space_size]\n" /* cleanup stack */
++    "mov    %[stack_space_size], r0\n" /* it's actually 'result' variable */
++    : [stack_space_size]     "=&r" (result)
++    : [func]                 "r"   (func),
++      [that]                 "r"   (that),
++      [params]               "r"   (params),
++      [param_count_plus_2]   "r"   (paramCount + 2),
++      [invoke_copy_to_stack] "r"   (invoke_copy_to_stack)
++    : "cc", "memory",
++      // Mark all the scratch registers as clobbered because they may be
++      // modified by the functions, called from this inline assembly block
++      "r0", "r1", "r2", "r3", "ip", "lr",
++      "d0",  "d1",  "d2",  "d3",  "d4",  "d5",  "d6",  "d7",
++      // Also unconditionally mark d16-d31 registers as clobbered even though
++      // they actually don't exist in vfpv2 and vfpv3-d16 variants. There is
++      // no way to identify VFP variant using preprocessor at the momemnt
++      // (see http://gcc.gnu.org/PR46128 for more details), but fortunately
++      // current versions of gcc do not seem to complain about these registers
++      // even when this code is compiled with '-mfpu=vfpv3-d16' option.
++      // If gcc becomes more strict in the future and/or provides a way to
++      // identify VFP variant, the following d16-d31 registers list needs
++      // to be wrapped into some #ifdef
++      "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23",
++      "d24", "d25", "d26", "d27", "d28", "d29", "d30", "d31"
++  );
++  return result;
++}
+diff --git a/xpcom/reflect/xptcall/md/win32/xptcstubs_arm.cpp b/xpcom/reflect/xptcall/md/win32/xptcstubs_arm.cpp
+new file mode 100644
+index 0000000000..b30695e720
+--- /dev/null
++++ b/xpcom/reflect/xptcall/md/win32/xptcstubs_arm.cpp
+@@ -0,0 +1,243 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* Implement shared vtbl methods. */
++
++#include "xptcprivate.h"
++
++/*
++ * Windows on 32-bit ARM: AAPCS with the hard-float (VFP) variant, which is
++ * what clang reports through __ARM_PCS_VFP for thumbv7-windows-msvc.
++ *
++ * The corresponding assembly (xptcstubs_asm_arm.asm) saves the argument
++ * registers before calling here:
++ *
++ *   gprData  -> r1, r2, r3          (r0 holds 'self' and is passed separately)
++ *   fprData  -> d0 .. d7            (also addressable as s0 .. s15)
++ *   args     -> the caller's stack arguments, i.e. everything that did not
++ *               fit in the registers above
++ *
++ * Argument allocation follows the "Procedure Call Standard for the ARM
++ * Architecture":
++ *
++ *   - Integer and pointer arguments take the next free core register (NCRN),
++ *     starting at r1 because r0 is 'this'. A 64-bit argument needs an
++ *     even-numbered register pair, so r1 may be skipped. Once the core
++ *     registers are exhausted every later integer argument goes on the stack;
++ *     the core registers are never revisited.
++ *   - Stack arguments are word aligned, and 8-byte aligned for 64-bit types.
++ *   - Floating point arguments take VFP registers with back-filling: a float
++ *     may land in a single-precision slot that an earlier double left empty.
++ *     Once a floating point argument goes to the stack, no later one may use a
++ *     VFP register.
++ */
++
++// Number of single-precision VFP slots usable for arguments (s0 - s15).
++#define VFP_SINGLE_COUNT 16
++// First core register number past the argument registers.
++#define CORE_REG_END 4
++
++namespace {
++
++// Tracks the VFP argument slots, in units of single-precision registers.
++struct VfpAllocator {
++  // Next free single-precision slot.
++  uint32_t nextSingle = 0;
++  // Next free double-precision slot, expressed in single-precision units so
++  // that it can be compared with nextSingle directly. Always even.
++  uint32_t nextDouble = 0;
++  // Set once an argument had to go to the stack.
++  bool exhausted = false;
++
++  // Returns the index of the single-precision slot to read, or -1 when the
++  // argument belongs on the stack.
++  int32_t takeSingle() {
++    if (exhausted || nextSingle >= VFP_SINGLE_COUNT) {
++      exhausted = true;
++      return -1;
++    }
++    int32_t slot = int32_t(nextSingle);
++    nextSingle++;
++    if (nextSingle < nextDouble) {
++      // We just filled a hole left by an earlier double; the next single
++      // continues after that double.
++      nextSingle = nextDouble;
++    } else if (nextSingle > nextDouble) {
++      nextDouble = nextSingle + (nextSingle & 1);
++    }
++    return slot;
++  }
++
++  // Returns the index of the double-precision slot to read (in units of
++  // doubles), or -1 when the argument belongs on the stack.
++  int32_t takeDouble() {
++    if (exhausted || nextDouble + 2 > VFP_SINGLE_COUNT) {
++      exhausted = true;
++      return -1;
++    }
++    int32_t slot = int32_t(nextDouble / 2);
++    nextDouble += 2;
++    if (nextSingle < nextDouble - 2) {
++      // A hole is left behind for a later float to back-fill; nextSingle stays
++      // where it is.
++    } else {
++      nextSingle = nextDouble;
++    }
++    return slot;
++  }
++};
++
++// Tracks the core registers and the stack.
++struct CoreAllocator {
++  uint32_t* gprData;  // r1, r2, r3
++  uint32_t* stack;    // next stacked argument
++  uint32_t next = 1;  // next core register number; r0 is 'this'
++
++  explicit CoreAllocator(uint32_t* aGprData, uint32_t* aStack)
++      : gprData(aGprData), stack(aStack) {}
++
++  uint32_t* takeWord() {
++    if (next < CORE_REG_END) {
++      return &gprData[next++ - 1];
++    }
++    next = CORE_REG_END;
++    return stack++;
++  }
++
++  uint32_t* takeDoubleWord() {
++    // 64-bit values need an even-numbered core register pair.
++    if (next & 1) {
++      next++;
++    }
++    if (next + 1 < CORE_REG_END) {
++      uint32_t* p = &gprData[next - 1];
++      next += 2;
++      return p;
++    }
++    next = CORE_REG_END;
++    // ... and 8-byte alignment on the stack.
++    if (uintptr_t(stack) & 4) {
++      stack++;
++    }
++    uint32_t* p = stack;
++    stack += 2;
++    return p;
++  }
++};
++
++}  // namespace
++
++extern "C" nsresult PrepareAndDispatch(nsXPTCStubBase* self,
++                                       uint32_t methodIndex, uint32_t* args,
++                                       uint32_t* gprData, double* fprData) {
++  nsXPTCMiniVariant paramBuffer[PARAM_BUFFER_COUNT];
++  const nsXPTMethodInfo* info;
++
++  NS_ASSERTION(self, "no self");
++
++  self->mEntry->GetMethodInfo(uint16_t(methodIndex), &info);
++  NS_ASSERTION(info, "no method info");
++
++  uint32_t paramCount = info->ParamCount();
++  const uint8_t indexOfJSContext = info->IndexOfJSContext();
++
++  CoreAllocator core(gprData, args);
++  VfpAllocator vfp;
++  const float* fprSingles = reinterpret_cast<const float*>(fprData);
++
++  for (uint32_t i = 0; i < paramCount; i++) {
++    const nsXPTParamInfo& param = info->Param(i);
++    const nsXPTType& type = param.GetType();
++    nsXPTCMiniVariant* dp = &paramBuffer[i];
++
++    if (i == indexOfJSContext) {
++      // The JSContext argument is passed like any other pointer, but is not
++      // part of the variant list; consume its slot and move on.
++      core.takeWord();
++    }
++
++    if (param.IsOut() || !type.IsArithmetic()) {
++      dp->val.p = *reinterpret_cast<void**>(core.takeWord());
++      continue;
++    }
++
++    switch (type) {
++      case nsXPTType::T_I8:
++        dp->val.i8 = int8_t(*core.takeWord());
++        break;
++      case nsXPTType::T_I16:
++        dp->val.i16 = int16_t(*core.takeWord());
++        break;
++      case nsXPTType::T_I32:
++        dp->val.i32 = int32_t(*core.takeWord());
++        break;
++      case nsXPTType::T_I64:
++        dp->val.i64 = *reinterpret_cast<int64_t*>(core.takeDoubleWord());
++        break;
++      case nsXPTType::T_U8:
++        dp->val.u8 = uint8_t(*core.takeWord());
++        break;
++      case nsXPTType::T_U16:
++        dp->val.u16 = uint16_t(*core.takeWord());
++        break;
++      case nsXPTType::T_U32:
++        dp->val.u32 = *core.takeWord();
++        break;
++      case nsXPTType::T_U64:
++        dp->val.u64 = *reinterpret_cast<uint64_t*>(core.takeDoubleWord());
++        break;
++      case nsXPTType::T_FLOAT: {
++        int32_t slot = vfp.takeSingle();
++        if (slot >= 0) {
++          dp->val.f = fprSingles[slot];
++        } else {
++          dp->val.f = *reinterpret_cast<float*>(core.stack++);
++        }
++        break;
++      }
++      case nsXPTType::T_DOUBLE: {
++        int32_t slot = vfp.takeDouble();
++        if (slot >= 0) {
++          dp->val.d = fprData[slot];
++        } else {
++          if (uintptr_t(core.stack) & 4) {
++            core.stack++;
++          }
++          dp->val.d = *reinterpret_cast<double*>(core.stack);
++          core.stack += 2;
++        }
++        break;
++      }
++      case nsXPTType::T_BOOL:
++        dp->val.b = bool(uint8_t(*core.takeWord()));
++        break;
++      case nsXPTType::T_CHAR:
++        dp->val.c = char(*core.takeWord());
++        break;
++      case nsXPTType::T_WCHAR:
++        dp->val.wc = char16_t(*core.takeWord());
++        break;
++      default:
++        NS_ERROR("bad type");
++        break;
++    }
++  }
++
++  nsresult result =
++      self->mOuter->CallMethod(uint16_t(methodIndex), info, paramBuffer);
++
++  return result;
++}
++
++// The StubN entry points live in xptcstubs_asm_arm.asm; only the sentinels are
++// generated here.
++#define STUB_ENTRY(n) /* defined in the assembly file */
++
++#define SENTINEL_ENTRY(n)                        \
++  nsresult nsXPTCStubBase::Sentinel##n() {       \
++    NS_ERROR("nsXPTCStubBase::Sentinel called"); \
++    return NS_ERROR_NOT_IMPLEMENTED;             \
++  }
++
++#include "xptcstubsdef.inc"
+diff --git a/xpcom/reflect/xptcall/md/win32/xptcstubs_asm_arm.asm b/xpcom/reflect/xptcall/md/win32/xptcstubs_asm_arm.asm
+new file mode 100644
+index 0000000000..a66a7fd106
+--- /dev/null
++++ b/xpcom/reflect/xptcall/md/win32/xptcstubs_asm_arm.asm
+@@ -0,0 +1,310 @@
++; This Source Code Form is subject to the terms of the Mozilla Public
++; License, v. 2.0. If a copy of the MPL was not distributed with this
++; file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++; Shared vtable stubs for Windows on 32-bit ARM (AAPCS, hard-float).
++;
++; Each StubN entry puts its own method index in r12 and tail-branches to
++; SharedStub, which spills the argument registers and hands them to
++; PrepareAndDispatch (see xptcstubs_arm.cpp):
++;
++;   PrepareAndDispatch(self, methodIndex, stackArgs, gprData, fprData)
++;
++; Stack layout while inside SharedStub (sp = entry sp - 104):
++;
++;   [sp +   0]  fprData, the fifth argument, passed on the stack
++;   [sp +   4]  padding, keeping the frame 8-byte aligned
++;   [sp +   8]  d0 - d7                                       (64 bytes)
++;   [sp +  72]  saved r1, r2, r3                              (12 bytes)
++;   [sp +  84]  padding
++;   [sp +  88]  saved r4, r5, r11, lr                         (16 bytes)
++;   [sp + 104]  the caller's stack arguments
++;
++; r0 already holds 'self' on entry and is left alone, so it is the first
++; argument to PrepareAndDispatch, and r0 on return is the result.
++
++        AREA    |.text|, CODE, READONLY, ALIGN=2
++
++        IMPORT  PrepareAndDispatch
++
++        EXPORT  SharedStub
++
++SharedStub PROC
++        push    {r4, r5, r11, lr}
++        sub     sp, sp, #88
++
++        str     r1, [sp, #72]
++        str     r2, [sp, #76]
++        str     r3, [sp, #80]
++
++        mov     r1, r12                 ; methodIndex, before r12 is reused
++        add     r12, sp, #8
++        vstm    r12, {d0-d7}
++        str     r12, [sp]               ; fprData
++        add     r2, sp, #104            ; the caller's stack arguments
++        add     r3, sp, #72             ; gprData: saved r1, r2, r3
++
++        bl      PrepareAndDispatch
++
++        add     sp, sp, #88
++        pop     {r4, r5, r11, pc}
++        ENDP
++
++        MACRO
++        STUBENTRY $functionname, $paramcount
++        EXPORT  $functionname
++$functionname PROC
++        mov     r12, #$paramcount
++        b       SharedStub
++        ENDP
++        MEND
++
++    STUBENTRY |?Stub3@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 3
++    STUBENTRY |?Stub4@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 4
++    STUBENTRY |?Stub5@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 5
++    STUBENTRY |?Stub6@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 6
++    STUBENTRY |?Stub7@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 7
++    STUBENTRY |?Stub8@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 8
++    STUBENTRY |?Stub9@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 9
++    STUBENTRY |?Stub10@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 10
++    STUBENTRY |?Stub11@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 11
++    STUBENTRY |?Stub12@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 12
++    STUBENTRY |?Stub13@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 13
++    STUBENTRY |?Stub14@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 14
++    STUBENTRY |?Stub15@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 15
++    STUBENTRY |?Stub16@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 16
++    STUBENTRY |?Stub17@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 17
++    STUBENTRY |?Stub18@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 18
++    STUBENTRY |?Stub19@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 19
++    STUBENTRY |?Stub20@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 20
++    STUBENTRY |?Stub21@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 21
++    STUBENTRY |?Stub22@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 22
++    STUBENTRY |?Stub23@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 23
++    STUBENTRY |?Stub24@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 24
++    STUBENTRY |?Stub25@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 25
++    STUBENTRY |?Stub26@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 26
++    STUBENTRY |?Stub27@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 27
++    STUBENTRY |?Stub28@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 28
++    STUBENTRY |?Stub29@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 29
++    STUBENTRY |?Stub30@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 30
++    STUBENTRY |?Stub31@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 31
++    STUBENTRY |?Stub32@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 32
++    STUBENTRY |?Stub33@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 33
++    STUBENTRY |?Stub34@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 34
++    STUBENTRY |?Stub35@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 35
++    STUBENTRY |?Stub36@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 36
++    STUBENTRY |?Stub37@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 37
++    STUBENTRY |?Stub38@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 38
++    STUBENTRY |?Stub39@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 39
++    STUBENTRY |?Stub40@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 40
++    STUBENTRY |?Stub41@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 41
++    STUBENTRY |?Stub42@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 42
++    STUBENTRY |?Stub43@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 43
++    STUBENTRY |?Stub44@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 44
++    STUBENTRY |?Stub45@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 45
++    STUBENTRY |?Stub46@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 46
++    STUBENTRY |?Stub47@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 47
++    STUBENTRY |?Stub48@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 48
++    STUBENTRY |?Stub49@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 49
++    STUBENTRY |?Stub50@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 50
++    STUBENTRY |?Stub51@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 51
++    STUBENTRY |?Stub52@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 52
++    STUBENTRY |?Stub53@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 53
++    STUBENTRY |?Stub54@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 54
++    STUBENTRY |?Stub55@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 55
++    STUBENTRY |?Stub56@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 56
++    STUBENTRY |?Stub57@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 57
++    STUBENTRY |?Stub58@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 58
++    STUBENTRY |?Stub59@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 59
++    STUBENTRY |?Stub60@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 60
++    STUBENTRY |?Stub61@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 61
++    STUBENTRY |?Stub62@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 62
++    STUBENTRY |?Stub63@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 63
++    STUBENTRY |?Stub64@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 64
++    STUBENTRY |?Stub65@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 65
++    STUBENTRY |?Stub66@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 66
++    STUBENTRY |?Stub67@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 67
++    STUBENTRY |?Stub68@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 68
++    STUBENTRY |?Stub69@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 69
++    STUBENTRY |?Stub70@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 70
++    STUBENTRY |?Stub71@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 71
++    STUBENTRY |?Stub72@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 72
++    STUBENTRY |?Stub73@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 73
++    STUBENTRY |?Stub74@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 74
++    STUBENTRY |?Stub75@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 75
++    STUBENTRY |?Stub76@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 76
++    STUBENTRY |?Stub77@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 77
++    STUBENTRY |?Stub78@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 78
++    STUBENTRY |?Stub79@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 79
++    STUBENTRY |?Stub80@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 80
++    STUBENTRY |?Stub81@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 81
++    STUBENTRY |?Stub82@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 82
++    STUBENTRY |?Stub83@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 83
++    STUBENTRY |?Stub84@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 84
++    STUBENTRY |?Stub85@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 85
++    STUBENTRY |?Stub86@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 86
++    STUBENTRY |?Stub87@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 87
++    STUBENTRY |?Stub88@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 88
++    STUBENTRY |?Stub89@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 89
++    STUBENTRY |?Stub90@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 90
++    STUBENTRY |?Stub91@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 91
++    STUBENTRY |?Stub92@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 92
++    STUBENTRY |?Stub93@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 93
++    STUBENTRY |?Stub94@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 94
++    STUBENTRY |?Stub95@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 95
++    STUBENTRY |?Stub96@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 96
++    STUBENTRY |?Stub97@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 97
++    STUBENTRY |?Stub98@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 98
++    STUBENTRY |?Stub99@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 99
++    STUBENTRY |?Stub100@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 100
++    STUBENTRY |?Stub101@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 101
++    STUBENTRY |?Stub102@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 102
++    STUBENTRY |?Stub103@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 103
++    STUBENTRY |?Stub104@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 104
++    STUBENTRY |?Stub105@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 105
++    STUBENTRY |?Stub106@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 106
++    STUBENTRY |?Stub107@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 107
++    STUBENTRY |?Stub108@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 108
++    STUBENTRY |?Stub109@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 109
++    STUBENTRY |?Stub110@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 110
++    STUBENTRY |?Stub111@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 111
++    STUBENTRY |?Stub112@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 112
++    STUBENTRY |?Stub113@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 113
++    STUBENTRY |?Stub114@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 114
++    STUBENTRY |?Stub115@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 115
++    STUBENTRY |?Stub116@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 116
++    STUBENTRY |?Stub117@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 117
++    STUBENTRY |?Stub118@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 118
++    STUBENTRY |?Stub119@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 119
++    STUBENTRY |?Stub120@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 120
++    STUBENTRY |?Stub121@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 121
++    STUBENTRY |?Stub122@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 122
++    STUBENTRY |?Stub123@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 123
++    STUBENTRY |?Stub124@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 124
++    STUBENTRY |?Stub125@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 125
++    STUBENTRY |?Stub126@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 126
++    STUBENTRY |?Stub127@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 127
++    STUBENTRY |?Stub128@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 128
++    STUBENTRY |?Stub129@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 129
++    STUBENTRY |?Stub130@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 130
++    STUBENTRY |?Stub131@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 131
++    STUBENTRY |?Stub132@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 132
++    STUBENTRY |?Stub133@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 133
++    STUBENTRY |?Stub134@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 134
++    STUBENTRY |?Stub135@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 135
++    STUBENTRY |?Stub136@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 136
++    STUBENTRY |?Stub137@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 137
++    STUBENTRY |?Stub138@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 138
++    STUBENTRY |?Stub139@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 139
++    STUBENTRY |?Stub140@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 140
++    STUBENTRY |?Stub141@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 141
++    STUBENTRY |?Stub142@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 142
++    STUBENTRY |?Stub143@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 143
++    STUBENTRY |?Stub144@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 144
++    STUBENTRY |?Stub145@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 145
++    STUBENTRY |?Stub146@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 146
++    STUBENTRY |?Stub147@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 147
++    STUBENTRY |?Stub148@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 148
++    STUBENTRY |?Stub149@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 149
++    STUBENTRY |?Stub150@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 150
++    STUBENTRY |?Stub151@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 151
++    STUBENTRY |?Stub152@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 152
++    STUBENTRY |?Stub153@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 153
++    STUBENTRY |?Stub154@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 154
++    STUBENTRY |?Stub155@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 155
++    STUBENTRY |?Stub156@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 156
++    STUBENTRY |?Stub157@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 157
++    STUBENTRY |?Stub158@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 158
++    STUBENTRY |?Stub159@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 159
++    STUBENTRY |?Stub160@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 160
++    STUBENTRY |?Stub161@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 161
++    STUBENTRY |?Stub162@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 162
++    STUBENTRY |?Stub163@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 163
++    STUBENTRY |?Stub164@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 164
++    STUBENTRY |?Stub165@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 165
++    STUBENTRY |?Stub166@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 166
++    STUBENTRY |?Stub167@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 167
++    STUBENTRY |?Stub168@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 168
++    STUBENTRY |?Stub169@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 169
++    STUBENTRY |?Stub170@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 170
++    STUBENTRY |?Stub171@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 171
++    STUBENTRY |?Stub172@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 172
++    STUBENTRY |?Stub173@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 173
++    STUBENTRY |?Stub174@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 174
++    STUBENTRY |?Stub175@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 175
++    STUBENTRY |?Stub176@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 176
++    STUBENTRY |?Stub177@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 177
++    STUBENTRY |?Stub178@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 178
++    STUBENTRY |?Stub179@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 179
++    STUBENTRY |?Stub180@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 180
++    STUBENTRY |?Stub181@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 181
++    STUBENTRY |?Stub182@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 182
++    STUBENTRY |?Stub183@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 183
++    STUBENTRY |?Stub184@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 184
++    STUBENTRY |?Stub185@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 185
++    STUBENTRY |?Stub186@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 186
++    STUBENTRY |?Stub187@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 187
++    STUBENTRY |?Stub188@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 188
++    STUBENTRY |?Stub189@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 189
++    STUBENTRY |?Stub190@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 190
++    STUBENTRY |?Stub191@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 191
++    STUBENTRY |?Stub192@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 192
++    STUBENTRY |?Stub193@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 193
++    STUBENTRY |?Stub194@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 194
++    STUBENTRY |?Stub195@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 195
++    STUBENTRY |?Stub196@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 196
++    STUBENTRY |?Stub197@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 197
++    STUBENTRY |?Stub198@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 198
++    STUBENTRY |?Stub199@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 199
++    STUBENTRY |?Stub200@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 200
++    STUBENTRY |?Stub201@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 201
++    STUBENTRY |?Stub202@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 202
++    STUBENTRY |?Stub203@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 203
++    STUBENTRY |?Stub204@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 204
++    STUBENTRY |?Stub205@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 205
++    STUBENTRY |?Stub206@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 206
++    STUBENTRY |?Stub207@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 207
++    STUBENTRY |?Stub208@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 208
++    STUBENTRY |?Stub209@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 209
++    STUBENTRY |?Stub210@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 210
++    STUBENTRY |?Stub211@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 211
++    STUBENTRY |?Stub212@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 212
++    STUBENTRY |?Stub213@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 213
++    STUBENTRY |?Stub214@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 214
++    STUBENTRY |?Stub215@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 215
++    STUBENTRY |?Stub216@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 216
++    STUBENTRY |?Stub217@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 217
++    STUBENTRY |?Stub218@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 218
++    STUBENTRY |?Stub219@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 219
++    STUBENTRY |?Stub220@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 220
++    STUBENTRY |?Stub221@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 221
++    STUBENTRY |?Stub222@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 222
++    STUBENTRY |?Stub223@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 223
++    STUBENTRY |?Stub224@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 224
++    STUBENTRY |?Stub225@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 225
++    STUBENTRY |?Stub226@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 226
++    STUBENTRY |?Stub227@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 227
++    STUBENTRY |?Stub228@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 228
++    STUBENTRY |?Stub229@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 229
++    STUBENTRY |?Stub230@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 230
++    STUBENTRY |?Stub231@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 231
++    STUBENTRY |?Stub232@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 232
++    STUBENTRY |?Stub233@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 233
++    STUBENTRY |?Stub234@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 234
++    STUBENTRY |?Stub235@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 235
++    STUBENTRY |?Stub236@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 236
++    STUBENTRY |?Stub237@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 237
++    STUBENTRY |?Stub238@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 238
++    STUBENTRY |?Stub239@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 239
++    STUBENTRY |?Stub240@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 240
++    STUBENTRY |?Stub241@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 241
++    STUBENTRY |?Stub242@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 242
++    STUBENTRY |?Stub243@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 243
++    STUBENTRY |?Stub244@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 244
++    STUBENTRY |?Stub245@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 245
++    STUBENTRY |?Stub246@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 246
++    STUBENTRY |?Stub247@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 247
++    STUBENTRY |?Stub248@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 248
++    STUBENTRY |?Stub249@nsXPTCStubBase@@UAA?AW4nsresult@@XZ|, 249
++
++        END

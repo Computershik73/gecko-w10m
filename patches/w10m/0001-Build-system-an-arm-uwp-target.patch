@@ -1,0 +1,876 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] Build system: an arm-uwp target
+
+--enable-uwp and the 32-bit ARM Windows toolchain: clang-cl for thumbv7,
+armasm, an SDK with ARM32 libraries, the app-container CRT, the custom
+Rust target, and the moz.build files that decide what is built for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .cargo/config.toml.in                         | 14 ++++
+ accessible/interfaces/ia2/moz.build           | 41 +++++++-----
+ accessible/interfaces/msaa/moz.build          | 46 ++++++++-----
+ browser/app/moz.build                         | 28 ++++----
+ browser/installer/package-manifest.in         | 12 ++++
+ build/moz.configure/compile-checks.configure  |  2 +-
+ build/moz.configure/rust.configure            | 16 ++++-
+ build/moz.configure/toolchain.configure       |  5 ++
+ build/moz.configure/uwp.configure             | 47 +++++++++++++
+ .../moz.configure/windows-toolchain.configure | 21 +++++-
+ build/moz.configure/windows.configure         | 66 ++++++++++++-------
+ config/create_res.py                          |  7 +-
+ config/external/nspr/pr/moz.build             |  3 +
+ js/src/build/moz.build                        | 20 ++++--
+ moz.configure                                 |  1 +
+ mozglue/baseprofiler/moz.build                |  1 +
+ mozglue/build/moz.build                       |  6 ++
+ security/nss/lib/freebl/freebl.gyp            |  7 +-
+ third_party/sqlite3/src/moz.build             |  5 ++
+ toolkit/library/build/moz.build               |  8 +++
+ toolkit/moz.configure                         | 38 ++++++++++-
+ 21 files changed, 310 insertions(+), 84 deletions(-)
+ create mode 100644 build/moz.configure/uwp.configure
+
+diff --git a/.cargo/config.toml.in b/.cargo/config.toml.in
+index 0456f504e1..319587a456 100644
+--- a/.cargo/config.toml.in
++++ b/.cargo/config.toml.in
+@@ -170,3 +170,17 @@ directory = "third_party/rust"
+ #filter substitution
+ [source."@REPLACE_NAME@"]
+ directory = "@top_srcdir@/@VENDORED_DIRECTORY@"
++
++# GeckoW10m: the ARM32 UWP build uses a Rust target of our own -- the built-in
++# thumbv7a-uwp-windows-msvc with llvm-target changed so that it ends in "hf",
++# which is what rustc tests to decide whether homogeneous float aggregates go
++# in the VFP registers. Without that, a struct of four floats is passed in
++# r1-r3 and the stack while clang-cl passes it in s0-s3, and every argument
++# after it is read from the wrong place.
++#
++# rustc finds the target through RUST_TARGET_PATH, and it has to be set here
++# rather than exported from the shell or from make: msys2 rewrites any variable
++# whose name ends in PATH, and the value never arrives. Cargo sets this itself
++# for every rustc it runs, so nothing is left to the environment.
++[env]
++RUST_TARGET_PATH = "C:/Users/User/Documents/GitHub/gecko-w10m/mozconfig/rust-targets"
+diff --git a/accessible/interfaces/ia2/moz.build b/accessible/interfaces/ia2/moz.build
+index 6db32c5c05..1792f877ed 100644
+--- a/accessible/interfaces/ia2/moz.build
++++ b/accessible/interfaces/ia2/moz.build
+@@ -2,20 +2,28 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-GeckoSharedLibrary("IA2Marshal", linkage=None)
+-DEFINES["REGISTER_PROXY_DLL"] = True
+-# {F9A6CC32-B0EF-490B-B102-179DDEEB08ED}
+-DEFINES["PROXY_CLSID_IS"] = (
+-    "{0xF9A6CC32,0xB0EF,0x490B,{0xB1,0x02,0x17,0x9D,0xDE,0xEB,0x08,0xED}}"
+-)
+-DEFFILE = "IA2Marshal.def"
+-OS_LIBS += [
+-    "uuid",
+-    "kernel32",
+-    "rpcrt4",
+-    "ole32",
+-    "oleaut32",
+-]
++# MIDL's 32-bit Windows proxy/stub output guards its whole body with
++# !defined(_ARM_), so on Windows/ARM32 these files compile to nothing and
++# there is no marshaller to put in a DLL. The generated headers and IID
++# definitions are still produced and exported: those are what the rest of
++# accessible/ consumes.
++build_marshal_dll = CONFIG["TARGET_CPU"] != "arm"
++
++if build_marshal_dll:
++    GeckoSharedLibrary("IA2Marshal", linkage=None)
++    DEFINES["REGISTER_PROXY_DLL"] = True
++    # {F9A6CC32-B0EF-490B-B102-179DDEEB08ED}
++    DEFINES["PROXY_CLSID_IS"] = (
++        "{0xF9A6CC32,0xB0EF,0x490B,{0xB1,0x02,0x17,0x9D,0xDE,0xEB,0x08,0xED}}"
++    )
++    DEFFILE = "IA2Marshal.def"
++    OS_LIBS += [
++        "uuid",
++        "kernel32",
++        "rpcrt4",
++        "ole32",
++        "oleaut32",
++    ]
+ 
+ midl_enums = [
+     "AccessibleEventId",
+@@ -78,6 +86,8 @@ for iface in midl_interfaces:
+     EXPORTS += ["!" + iface + ".h", "!" + iface + "_i.c"]
+ 
+     for p in [iface + "_p.c", iface + "_i.c"]:
++        if not build_marshal_dll:
++            continue
+         SOURCES += ["!%s" % p]
+ 
+         # Give some symbols a unique name in each translation unit, to avoid
+@@ -110,7 +120,8 @@ GeneratedFile(
+     script="/build/midl.py",
+     entry_point="merge_dlldata",
+ )
+-SOURCES += ["!dlldata.c"]
++if build_marshal_dll:
++    SOURCES += ["!dlldata.c"]
+ 
+ # Suppress warnings from the MIDL generated code.
+ if CONFIG["CC_TYPE"] == "clang-cl":
+diff --git a/accessible/interfaces/msaa/moz.build b/accessible/interfaces/msaa/moz.build
+index 00be2f6e4a..3ce4bc247f 100644
+--- a/accessible/interfaces/msaa/moz.build
++++ b/accessible/interfaces/msaa/moz.build
+@@ -2,7 +2,15 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-GeckoSharedLibrary("AccessibleMarshal")
++# MIDL's 32-bit Windows proxy/stub output guards its whole body with
++# !defined(_ARM_), so on Windows/ARM32 these files compile to nothing and
++# there is no marshaller to put in a DLL. The generated headers and IID
++# definitions are still produced and exported: those are what the rest of
++# accessible/ consumes.
++build_marshal_dll = CONFIG["TARGET_CPU"] != "arm"
++
++if build_marshal_dll:
++    GeckoSharedLibrary("AccessibleMarshal")
+ 
+ # Missing here, is the notion that changes to the idl files included by
+ # ISimpleDOM.idl (e.g. ISimpleDOMNode.idl) should rebuild the outputs.
+@@ -18,32 +26,34 @@ GeneratedFile(
+     flags=["-I", SRCDIR, "-robust", "-dlldata", OBJDIR + "/ISimpleDOM_dlldata.c"],
+ )
+ 
+-SOURCES += [
+-    "!ISimpleDOM_dlldata.c",
+-    "!ISimpleDOM_i.c",
+-    "!ISimpleDOM_p.c",
+-    "AccessibleMarshalThunk.c",
+-]
++if build_marshal_dll:
++    SOURCES += [
++        "!ISimpleDOM_dlldata.c",
++        "!ISimpleDOM_i.c",
++        "!ISimpleDOM_p.c",
++        "AccessibleMarshalThunk.c",
++    ]
+ 
+ EXPORTS += [
+     "!ISimpleDOM.h",
+     "!ISimpleDOM_i.c",
+ ]
+ 
+-DEFINES["REGISTER_PROXY_DLL"] = True
+-# The following line is required to preserve compatibility with older versions
+-# of AccessibleMarshal.dll.
+-DEFINES["PROXY_CLSID"] = "IID_ISimpleDOMNode"
++if build_marshal_dll:
++    DEFINES["REGISTER_PROXY_DLL"] = True
++    # The following line is required to preserve compatibility with older
++    # versions of AccessibleMarshal.dll.
++    DEFINES["PROXY_CLSID"] = "IID_ISimpleDOMNode"
+ 
+-DEFFILE = "AccessibleMarshal.def"
++    DEFFILE = "AccessibleMarshal.def"
+ 
+-OS_LIBS += [
+-    "kernel32",
+-    "rpcrt4",
+-    "oleaut32",
+-]
++    OS_LIBS += [
++        "kernel32",
++        "rpcrt4",
++        "oleaut32",
++    ]
+ 
+-RCINCLUDE = "AccessibleMarshal.rc"
++    RCINCLUDE = "AccessibleMarshal.rc"
+ 
+ # Suppress warnings from the MIDL generated code.
+ if CONFIG["CC_TYPE"] == "clang-cl":
+diff --git a/browser/app/moz.build b/browser/app/moz.build
+index db09aba7e9..74a5ec41ae 100644
+--- a/browser/app/moz.build
++++ b/browser/app/moz.build
+@@ -159,17 +159,21 @@ if CONFIG["CC_TYPE"] == "clang-cl":
+ 
+ if CONFIG["OS_ARCH"] == "WINNT":
+     RCINCLUDE = "splash.rc"
+-    DIRS += [
+-        "installation_dir_layout",
+-        "pbproxy",
+-        "winlauncher",
+-    ]
+-    USE_LIBS += [
+-        "winlauncher",
+-    ]
+-    LOCAL_INCLUDES += [
+-        "/browser/app/winlauncher",
+-    ]
++    # GeckoW10m: the launcher stub, its private-browsing proxy and the install
++    # layout are desktop-only machinery. A UWP app is started by the platform
++    # and cannot spawn/inject into helper processes.
++    if not CONFIG["MOZ_UWP"]:
++        DIRS += [
++            "installation_dir_layout",
++            "pbproxy",
++            "winlauncher",
++        ]
++        USE_LIBS += [
++            "winlauncher",
++        ]
++        LOCAL_INCLUDES += [
++            "/browser/app/winlauncher",
++        ]
+     OS_LIBS += [
+         "advapi32",
+         "shell32",
+@@ -197,7 +201,7 @@ if CONFIG["OS_ARCH"] == "WINNT":
+     # only enable it for processes that are not using JIT in xul.dll.
+     LINK_FLAGS["CETCOMPAT"] = []
+ 
+-if CONFIG["DESKTOP_LAUNCHER_ENABLED"]:
++if CONFIG["DESKTOP_LAUNCHER_ENABLED"] and not CONFIG["MOZ_UWP"]:
+     DIRS += [
+         "desktop-launcher",
+     ]
+diff --git a/browser/installer/package-manifest.in b/browser/installer/package-manifest.in
+index 9944fbec40..b88ebb0873 100644
+--- a/browser/installer/package-manifest.in
++++ b/browser/installer/package-manifest.in
+@@ -94,8 +94,10 @@
+ #endif
+ #ifdef XP_WIN
+ @BINPATH@/@MOZ_CHILD_PROCESS_NAME@
++#ifndef MOZ_UWP
+ @BINPATH@/@DLL_PREFIX@InstallationDirLayout@DLL_SUFFIX@
+ @BINPATH@/installation_dir_layout/versioned/@DLL_PREFIX@InstallationDirLayout@DLL_SUFFIX@
++#endif
+ #if MOZ_PACKAGE_MSVC_DLLS
+ @BINPATH@/@MSVC_C_RUNTIME_DLL@
+ #ifdef MSVC_C_RUNTIME_1_DLL
+@@ -104,6 +106,7 @@
+ @BINPATH@/@MSVC_CXX_RUNTIME_DLL@
+ @BINPATH@/@MSVC_CXX_RUNTIME_ATOMIC_WAIT_DLL@
+ #endif
++#ifndef MOZ_UWP
+ ; Windows App SDK DLLs
+ @BINPATH@/@DLL_PREFIX@CoreMessagingXP@DLL_SUFFIX@
+ @BINPATH@/@DLL_PREFIX@marshal@DLL_SUFFIX@
+@@ -114,6 +117,7 @@
+ @BINPATH@/@DLL_PREFIX@Microsoft.UI.Windowing.Core@DLL_SUFFIX@
+ @BINPATH@/@DLL_PREFIX@Microsoft.UI.Windowing@DLL_SUFFIX@
+ #endif
++#endif
+ #ifdef MOZ_GTK
+ ; This is a standalone binary launched by Firefox on Linux to verify
+ ; the system's graphics capabilities and behavior.
+@@ -151,7 +155,9 @@
+ @BINPATH@/firefox.VisualElementsManifest.xml
+ @BINPATH@/browser/VisualElements/VisualElements_150.png
+ @BINPATH@/browser/VisualElements/VisualElements_70.png
++#ifndef MOZ_UWP
+ @BINPATH@/private_browsing.exe
++#endif
+ @BINPATH@/private_browsing.VisualElementsManifest.xml
+ @BINPATH@/browser/VisualElements/PrivateBrowsing_150.png
+ @BINPATH@/browser/VisualElements/PrivateBrowsing_70.png
+@@ -176,14 +182,18 @@
+ @BINPATH@/@DLL_PREFIX@gkcodecs@DLL_SUFFIX@
+ @BINPATH@/@DLL_PREFIX@mozavutil@DLL_SUFFIX@
+ @BINPATH@/@DLL_PREFIX@mozavcodec@DLL_SUFFIX@
++#ifndef MOZ_UWP
+ @BINPATH@/@DLL_PREFIX@mozinference@DLL_SUFFIX@
++#endif
+ 
+ ; [Components]
+ #ifdef ACCESSIBILITY
+ #ifdef XP_WIN
++#ifndef MOZ_UWP
+ @BINPATH@/AccessibleMarshal.dll
+ #endif
+ #endif
++#endif
+ 
+ ; JavaScript components
+ @RESPATH@/browser/components/*.manifest
+@@ -453,8 +463,10 @@ bin/libfreebl_64int_3.so
+ #endif
+ 
+ #if defined(DESKTOP_LAUNCHER_ENABLED)
++#ifndef MOZ_UWP
+ @BINPATH@/desktop-launcher/desktop-launcher@BIN_SUFFIX@
+ #endif
++#endif
+ 
+ #if defined(BUILT_BY_MOZILLA)
+ @RESPATH@/distribution/*
+diff --git a/build/moz.configure/compile-checks.configure b/build/moz.configure/compile-checks.configure
+index f710e61474..73d943bac1 100644
+--- a/build/moz.configure/compile-checks.configure
++++ b/build/moz.configure/compile-checks.configure
+@@ -395,7 +395,7 @@ def check_and_add_warning_impl(warning, compiler=None, when=None, check=True):
+ 
+ # When changing this version, please check that no warning support have been
+ # removed.
+-clang_latest_release = dependable("22.1.0")
++clang_latest_release = dependable("22.1.8")  # GeckoW10m: local clang-cl
+ 
+ 
+ @depends(c_compiler, clang_latest_release, when=moz_automation)
+diff --git a/build/moz.configure/rust.configure b/build/moz.configure/rust.configure
+index ea19412890..94b3afbd25 100644
+--- a/build/moz.configure/rust.configure
++++ b/build/moz.configure/rust.configure
+@@ -525,9 +525,21 @@ def rust_host_triple(rustc, host, rustc_host, rust_supported_targets, arm_target
+     return rustc_target
+ 
+ 
+-@depends(rustc, target, rust_supported_targets, arm_target, when=rust_compiler)
++@depends(rustc, target, rust_supported_targets, arm_target, uwp, when=rust_compiler)
+ @checking("for rust target triplet")
+-def rust_target_triple(rustc, target, rust_supported_targets, arm_target):
++def rust_target_triple(rustc, target, rust_supported_targets, arm_target, uwp):
++    # GeckoW10m: for the ARM32 UWP (app container) build, use our own target rather
++    # than the desktop -pc variant the vendor-based detection would select. It is
++    # the built-in thumbv7a-uwp-windows-msvc with one field changed -- see
++    # mozconfig/rust-targets/ -- so that homogeneous float aggregates are passed
++    # in the VFP registers, the way the ARM32 Windows ABI requires and the way
++    # clang-cl passes them.
++    #
++    # The compile check is skipped for it: it builds a std-using crate with plain
++    # rustc, and this target's std lives in the sysroot only after
++    # tools/uwp-install-std.sh has run, which is itself driven from here.
++    if uwp and target.cpu == "arm":
++        return "thumbv7a-uwp-windows-msvchf"
+     rustc_target = detect_rustc_target(target, arm_target, rust_supported_targets)
+     assert_rust_compile(target, rustc_target, rustc)
+     return rustc_target
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index eb1251f51f..32267ecebb 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -3163,6 +3163,11 @@ def as_info(target, c_compiler):
+     if c_compiler.type == "clang-cl":
+         if target.cpu == "aarch64":
+             return namespace(type="armasm", names=("armasm64.exe",))
++        # 32-bit ARM has its own assembler, and clang cannot stand in for it:
++        # the xptcall stubs are hand-written in armasm syntax, and clang has no
++        # SEH on this target to compile them with anyway.
++        if target.cpu == "arm":
++            return namespace(type="armasm", names=("armasm.exe",))
+         ml = {
+             "x86": "ml.exe",
+             "x86_64": "ml64.exe",
+diff --git a/build/moz.configure/uwp.configure b/build/moz.configure/uwp.configure
+new file mode 100644
+index 0000000000..a17c703f9f
+--- /dev/null
++++ b/build/moz.configure/uwp.configure
+@@ -0,0 +1,47 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++# GeckoW10m: Universal Windows Platform (UWP) target support.
++#
++# Enables building Gecko as an app-container binary for Windows 10 (incl.
++# Windows 10 Mobile / arm). This restricts the Win32 surface to
++# WINAPI_FAMILY_APP, links the /store CRT, and turns off subsystems that rely
++# on spawning child processes (UWP runs single-process here).
++
++option("--enable-uwp", help="Build for the Universal Windows Platform (app container)")
++
++
++@depends("--enable-uwp", target)
++def uwp(enable_uwp, target):
++    if enable_uwp:
++        if target.os != "WINNT":
++            die("--enable-uwp is only valid when targeting Windows")
++        return True
++
++
++set_config("MOZ_UWP", True, when=uwp)
++set_define("MOZ_UWP", True, when=uwp)
++
++# Windows 10 Mobile is full Windows NT underneath: the ARM32 Windows SDK ships
++# import libraries for the whole desktop Win32 surface (kernel32, user32,
++# gdi32, shlwapi, version, wintrust, ...), and the OS exports those entry
++# points. WINAPI_PARTITION_APP is a certification policy expressed in headers,
++# not a kernel boundary, so building against the desktop partition is what lets
++# layout/gfx/widget compile at all. The binary is still linked -APPCONTAINER
++# and still runs inside the app container; anything the container blocks at
++# runtime shows up as a failing call, not a missing symbol.
++set_define("WINAPI_FAMILY", "WINAPI_FAMILY_DESKTOP_APP", when=uwp)
++
++# GeckoW10m's JIT wrappers key off this (see patches/w10m/runtime).
++set_define("GECKO_W10M", True, when=uwp)
++
++
++@depends(uwp)
++def uwp_single_process(uwp):
++    # UWP forbids CreateProcess for arbitrary children; force single-process.
++    return bool(uwp)
++
++
++set_config("MOZ_GECKO_SINGLE_PROCESS", True, when=uwp_single_process)
++set_define("MOZ_GECKO_SINGLE_PROCESS", True, when=uwp_single_process)
+diff --git a/build/moz.configure/windows-toolchain.configure b/build/moz.configure/windows-toolchain.configure
+index 54a9fd07bb..08cfdcf46d 100644
+--- a/build/moz.configure/windows-toolchain.configure
++++ b/build/moz.configure/windows-toolchain.configure
+@@ -2,7 +2,7 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ @imports("glob")
+-def get_sdk_dirs(sdk, subdir):
++def get_sdk_dirs(sdk, subdir, require_arch=None):
+     def get_dirs_containing(sdk, stem, subdir):
+         return [
+             os.path.dirname(p) for p in glob.glob(os.path.join(sdk, stem, "*", subdir))
+@@ -15,6 +15,18 @@ def get_sdk_dirs(sdk, subdir):
+     lib_dirs = categorize(get_dirs_containing(sdk, "Lib", subdir))
+ 
+     valid_versions = sorted(set(include_dirs) & set(lib_dirs), reverse=True)
++    # GeckoW10m: recent Win11 SDKs (>= 10.0.26100) dropped the 32-bit ARM
++    # libraries. When targeting arm, skip versions that lack them so the newest
++    # arm-capable SDK is chosen instead.
++    if require_arch:
++        # lib_dirs[vv] is .../Lib/<ver>; the arch libs live under <subdir>/<arch>.
++        # os.path.isdir isn't available in this sandboxed scope; glob of a path
++        # with no wildcard returns [path] iff it exists.
++        valid_versions = [
++            vv
++            for vv in valid_versions
++            if glob.glob(os.path.join(lib_dirs[vv], subdir, require_arch))
++        ]
+     return [
+         namespace(
+             path=sdk,
+@@ -113,6 +125,7 @@ def valid_windows_sdk_dir_result(value):
+ 
+ 
+ @depends(
++    target,
+     target.abi,
+     host.abi,
+     windows_sdk_dir,
+@@ -123,6 +136,7 @@ def valid_windows_sdk_dir_result(value):
+ @imports(_from="__builtin__", _import="Exception")
+ @imports(_from="__builtin__", _import="open")
+ def valid_windows_sdk_dir(
++    target,
+     target_windows_abi,
+     host_windows_abi,
+     windows_sdk_dir,
+@@ -133,9 +147,10 @@ def valid_windows_sdk_dir(
+         return None
+     if windows_sdk_dir_env:
+         windows_sdk_dir_env = windows_sdk_dir_env[0]
++    require_arch = "arm" if target.cpu == "arm" else None
+     sdks = {}
+     for d in windows_sdk_dir:
+-        sdklist = get_sdk_dirs(d, "um")
++        sdklist = get_sdk_dirs(d, "um", require_arch)
+         for sdk in sdklist:
+             maxver = None
+             winsdkver = os.path.join(sdk.include, "um", "winsdkver.h")
+@@ -269,6 +284,8 @@ def vc_compiler_paths_for_version(host, env, vc_path, winsysroot):
+             # The cross toolchains require DLLs from the native x64 toolchain.
+             "x86": [os.path.join(path, "x86"), os.path.join(path, "x64")],
+             "arm64": [os.path.join(path, "arm64"), os.path.join(path, "x64")],
++            # GeckoW10m: ARM32 (Windows 10 Mobile / UWP) cross toolchain.
++            "arm": [os.path.join(path, "arm"), os.path.join(path, "x64")],
+         }
+ 
+ 
+diff --git a/build/moz.configure/windows.configure b/build/moz.configure/windows.configure
+index e15e758b20..994c4c9514 100644
+--- a/build/moz.configure/windows.configure
++++ b/build/moz.configure/windows.configure
+@@ -9,20 +9,21 @@ def valid_ucrt_sdk_dir_result(value):
+         return "%s in %s" % (value.version, quote(value.path))
+ 
+ 
+-@depends(windows_sdk_dir, "WINDOWSSDKDIR", target.abi, host.abi)
++@depends(windows_sdk_dir, "WINDOWSSDKDIR", target, target.abi, host.abi)
+ @checking("for Universal CRT SDK", valid_ucrt_sdk_dir_result)
+ @imports("os")
+ @imports(_import="mozpack.path", _as="mozpath")
+ def valid_ucrt_sdk_dir(
+-    windows_sdk_dir, windows_sdk_dir_env, target_windows_abi, host_windows_abi
++    windows_sdk_dir, windows_sdk_dir_env, target, target_windows_abi, host_windows_abi
+ ):
+     if target_windows_abi != "msvc" and host_windows_abi != "msvc":
+         return None
+     if windows_sdk_dir_env:
+         windows_sdk_dir_env = windows_sdk_dir_env[0]
++    require_arch = "arm" if target.cpu == "arm" else None
+     sdks = {}
+     for d in windows_sdk_dir:
+-        sdklist = get_sdk_dirs(d, "ucrt")
++        sdklist = get_sdk_dirs(d, "ucrt", require_arch)
+         for sdk in sdklist:
+             version = os.path.basename(sdk.include)
+             # We're supposed to always find a version in the directory, because
+@@ -94,13 +95,14 @@ def valid_ucrt_sdk_dir(
+     )
+ 
+ 
+-@depends(vc_path, valid_windows_sdk_dir, valid_ucrt_sdk_dir)
++@depends(vc_path, valid_windows_sdk_dir, valid_ucrt_sdk_dir, uwp)
+ @imports("os")
+-def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir):
++def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir, uwp):
+     if not vc_path:
+         return
++    # UWP (app container) builds do not use ATL/MFC.
+     atlmfc_dir = os.path.join(vc_path, "atlmfc", "include")
+-    if not os.path.isdir(atlmfc_dir):
++    if not uwp and not os.path.isdir(atlmfc_dir):
+         die(
+             "Cannot find the ATL/MFC headers in the Visual C++ directory (%s). "
+             "Please install them." % vc_path
+@@ -124,7 +126,8 @@ def include_path(vc_path, windows_sdk_dir, ucrt_sdk_dir):
+         normalize_path_list_entry(p)
+         for p in (
+             os.path.join(vc_path, "include"),
+-            atlmfc_dir,
++            # atlmfc_dir omitted for UWP (no ATL/MFC).
++            *([] if uwp else [atlmfc_dir]),
+             os.path.join(windows_sdk_dir.include, "shared"),
+             os.path.join(windows_sdk_dir.include, "um"),
+             winrt_dir,
+@@ -177,9 +180,10 @@ def lib_path_for(host_or_target):
+         valid_windows_sdk_dir,
+         valid_ucrt_sdk_dir,
+         c_compiler,
++        uwp,
+     )
+     @imports("os")
+-    def lib_path(target, is_host, vc_path, windows_sdk_dir, ucrt_sdk_dir, compiler):
++    def lib_path(target, is_host, vc_path, windows_sdk_dir, ucrt_sdk_dir, compiler, uwp):
+         if not vc_path or target.os != "WINNT":
+             return
+         sdk_target = {
+@@ -189,26 +193,31 @@ def lib_path_for(host_or_target):
+             "aarch64": "arm64",
+         }.get(target.cpu)
+ 
+-        # MSVC2017 switched to use the same target naming as the sdk.
+-        atlmfc_dir = os.path.join(vc_path, "atlmfc", "lib", sdk_target)
+-        if not os.path.isdir(atlmfc_dir):
+-            die(
+-                "Cannot find the ATL/MFC libraries in the Visual C++ directory "
+-                "(%s). Please install them." % vc_path
+-            )
++        # The UWP target builds against the desktop Win32 partition (Windows 10
++        # Mobile ships the full NT API surface), so it links the ordinary CRT,
++        # not the /store variant. ATL/MFC is skipped: this Visual Studio has no
++        # 32-bit ARM ATL, and Gecko's UWP configuration does not use it.
++        skip_atl = bool(uwp)
+ 
+         libs = []
+         lib_env = os.environ.get("LIB")
+         if lib_env and not is_host:
+             libs.extend(lib_env.split(";"))
+-        libs.extend(
+-            (
+-                os.path.join(vc_path, "lib", sdk_target),
+-                atlmfc_dir,
+-                os.path.join(windows_sdk_dir.lib, "um", sdk_target),
+-                os.path.join(ucrt_sdk_dir.lib, "ucrt", sdk_target),
+-            )
+-        )
++
++        vc_lib = os.path.join(vc_path, "lib", sdk_target)
++        entries = [vc_lib]
++        if not skip_atl:
++            # MSVC2017 switched to use the same target naming as the sdk.
++            atlmfc_dir = os.path.join(vc_path, "atlmfc", "lib", sdk_target)
++            if not os.path.isdir(atlmfc_dir):
++                die(
++                    "Cannot find the ATL/MFC libraries in the Visual C++ directory "
++                    "(%s). Please install them." % vc_path
++                )
++            entries.append(atlmfc_dir)
++        entries.append(os.path.join(windows_sdk_dir.lib, "um", sdk_target))
++        entries.append(os.path.join(ucrt_sdk_dir.lib, "ucrt", sdk_target))
++        libs.extend(entries)
+         if compiler.type == "clang-cl":
+             runtime_dir = check_cmd_output(
+                 compiler.compiler,
+@@ -386,6 +395,8 @@ def cpu_arch_macro_definition(target):
+         return "_AMD64_"
+     elif target.cpu == "aarch64":
+         return "_ARM64_"
++    elif target.cpu == "arm":
++        return "_ARM_"
+     else:
+         return "_CPU_ARCH_NOT_DEFINED"
+ 
+@@ -463,7 +474,14 @@ with only_when(depends(c_compiler)(lambda c: c.type == "clang-cl")):
+     # Work around issues with newer STL and older runtimes, see bug 1994496.
+     set_define("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR", True)
+ 
+-    set_define("HAVE_SEH_EXCEPTIONS", True)
++    # clang implements no structured exception handling on 32-bit ARM
++    # Windows ("cannot select: cleanupret"), so MOZ_SEH_TRY has to fall back to
++    # plain blocks there.
++    set_define(
++        "HAVE_SEH_EXCEPTIONS",
++        True,
++        when=depends(target)(lambda target: target.cpu != "arm"),
++    )
+     set_define("HAVE_IO_H", True)
+ 
+     def win32_subsystem_version():
+diff --git a/config/create_res.py b/config/create_res.py
+index fd62031f3c..d826faa384 100644
+--- a/config/create_res.py
++++ b/config/create_res.py
+@@ -51,7 +51,12 @@ def generate_res():
+             command = buildconfig.substs["CXXCPP"] + CPPFlag.all_flags
+             command.extend(("-DRC_INVOKED", args.input))
+ 
+-            cpu_arch_dict = {"x86_64": "_AMD64_", "x86": "_X86_", "aarch64": "_ARM64_"}
++            cpu_arch_dict = {
++                "x86_64": "_AMD64_",
++                "x86": "_X86_",
++                "aarch64": "_ARM64_",
++                "arm": "_ARM_",
++            }
+ 
+             # add a preprocessor #define that specifies the CPU architecture
+             cpu_arch_ppd = cpu_arch_dict[buildconfig.substs["TARGET_CPU"]]
+diff --git a/config/external/nspr/pr/moz.build b/config/external/nspr/pr/moz.build
+index bb691f97dd..98332f711d 100644
+--- a/config/external/nspr/pr/moz.build
++++ b/config/external/nspr/pr/moz.build
+@@ -98,6 +98,9 @@ elif CONFIG["OS_TARGET"] == "WINNT":
+         DEFINES["_X86_"] = True
+     elif CONFIG["TARGET_CPU"] == "aarch64":
+         DEFINES["_ARM64_"] = True
++    elif CONFIG["TARGET_CPU"] == "arm":
++        # GeckoW10m: 32-bit ARM (Windows 10 Mobile).
++        DEFINES["_ARM_"] = True
+     else:
+         error("Unsupported TARGET_CPU value: %s" % CONFIG["TARGET_CPU"])
+ else:
+diff --git a/js/src/build/moz.build b/js/src/build/moz.build
+index 2d5343a58e..94a535be13 100644
+--- a/js/src/build/moz.build
++++ b/js/src/build/moz.build
+@@ -82,11 +82,21 @@ if CONFIG["OS_ARCH"] == "SunOS":
+     ]
+ 
+ if CONFIG["OS_ARCH"] == "WINNT":
+-    OS_LIBS += [
+-        "bcrypt",
+-        "ntdll",
+-        "synchronization",
+-    ]
++    if CONFIG["MOZ_UWP"]:
++        # WindowsApp.lib is the app-container umbrella import library: it
++        # provides the base Win32 surface (WaitForSingleObject, GetLastError,
++        # CloseHandle, ...) plus the *FromApp allocators used for JIT.
++        OS_LIBS += [
++            "WindowsApp",
++            "bcrypt",
++            "synchronization",
++        ]
++    else:
++        OS_LIBS += [
++            "bcrypt",
++            "ntdll",
++            "synchronization",
++        ]
+ 
+ OS_LIBS += CONFIG["LIBATOMIC_LIBS"]
+ 
+diff --git a/moz.configure b/moz.configure
+index ccb0f7b9ea..e118739a50 100755
+--- a/moz.configure
++++ b/moz.configure
+@@ -231,6 +231,7 @@ set_config("ENABLE_UNIFIED_BUILD", True, when="--enable-unified-build")
+ 
+ 
+ include("build/moz.configure/bootstrap.configure")
++include("build/moz.configure/uwp.configure")
+ 
+ 
+ # The execution model of the configure sandbox doesn't allow for
+diff --git a/mozglue/baseprofiler/moz.build b/mozglue/baseprofiler/moz.build
+index bdad42c5bb..ce70d6cea4 100644
+--- a/mozglue/baseprofiler/moz.build
++++ b/mozglue/baseprofiler/moz.build
+@@ -59,6 +59,7 @@ if not CONFIG["JS_STANDALONE"]:
+         ]
+     elif CONFIG["OS_TARGET"] == "WINNT" and CONFIG["TARGET_CPU"] in (
+         "aarch64",
++        "arm",
+         "x86",
+         "x86_64",
+     ):
+diff --git a/mozglue/build/moz.build b/mozglue/build/moz.build
+index f8f01e999e..14f7290096 100644
+--- a/mozglue/build/moz.build
++++ b/mozglue/build/moz.build
+@@ -92,3 +92,9 @@ if CONFIG["MOZ_LINKER"] and CONFIG["TARGET_CPU"] == "arm":
+ DIST_INSTALL = True
+ 
+ include("replace_malloc.mozbuild")
++
++# Same reason as toolkit/library/build: this port has no debug symbols, so a
++# crash address inside mozglue resolves to nothing without a linker map. See
++# tools/symbolize.py.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:mozglue.map"]
+diff --git a/security/nss/lib/freebl/freebl.gyp b/security/nss/lib/freebl/freebl.gyp
+index cf5616c0f4..3a29081917 100644
+--- a/security/nss/lib/freebl/freebl.gyp
++++ b/security/nss/lib/freebl/freebl.gyp
+@@ -687,11 +687,16 @@
+       }, {
+         'have_int128_support%': 0,
+       }],
+-      [ 'target_arch=="arm"', {
++      [ 'target_arch=="arm" and OS!="win"', {
+         # When the compiler uses the softfloat ABI, we want to use the compatible softfp ABI when enabling NEON for these objects.
+         # Confusingly, __SOFTFP__ is the name of the define for the softfloat ABI, not for the softfp ABI.
+         'softfp_cflags': '<!(sh -c "${CC:-cc} -o - -E -dM - ${CFLAGS} < /dev/null | grep __SOFTFP__ > /dev/null && echo -mfloat-abi=softfp || true")',
+       }],
++      [ 'target_arch=="arm" and OS=="win"', {
++        # GeckoW10m: Windows on ARM32 has a fixed float ABI and the gcc-style
++        # probe above does not work with clang-cl; no extra flags needed.
++        'softfp_cflags': '',
++      }],
+       [ 'target_arch=="ppc64" or target_arch=="ppc64le"', {
+        'ppc_abi': '<!(sh -c "${CC:-cc} -dM -E - < /dev/null | awk \'\\$2 == \\"_CALL_ELF\\" {print \\$3}\'")',
+       }],
+diff --git a/third_party/sqlite3/src/moz.build b/third_party/sqlite3/src/moz.build
+index da931832e0..cb79cc589a 100644
+--- a/third_party/sqlite3/src/moz.build
++++ b/third_party/sqlite3/src/moz.build
+@@ -142,3 +142,8 @@ DEFINES['SQLITE_ENABLE_CARRAY'] = 1
+ 
+ # The percentile extension is part of the amalgamation but disabled by default.
+ DEFINES['SQLITE_ENABLE_PERCENTILE'] = 1
++
++# clang implements no structured exception handling on 32-bit ARM Windows, and
++# SQLite turns SEH on by default for any _MSC_VER build.
++if CONFIG["TARGET_CPU"] == "arm":
++    DEFINES["SQLITE_OMIT_SEH"] = True
+diff --git a/toolkit/library/build/moz.build b/toolkit/library/build/moz.build
+index 72b02071e5..3961ca488a 100644
+--- a/toolkit/library/build/moz.build
++++ b/toolkit/library/build/moz.build
+@@ -40,3 +40,11 @@ if CONFIG["OS_ARCH"] == "Linux":
+     OBJDIR_FILES.dist.bin += ["../libxul.so-gdb.py"]
+ 
+ DUMP_SYMBOLS_FLAGS += ["--count-ctors"]
++
++# The Windows 10 Mobile port builds without debug symbols -- the objects would
++# not fit the machine and the link would take hours -- so a crash address off
++# the device has nothing to resolve against. A linker map costs only link time
++# and gives every symbol its RVA, which is enough to turn "xul.dll+0x3782930"
++# in the on-device log into a function name. See tools/symbolize.py.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:xul.map"]
+diff --git a/toolkit/moz.configure b/toolkit/moz.configure
+index e313d971ec..a14da4a283 100644
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -857,7 +857,14 @@ pkg_check_modules("MOZ_SYSTEM_LIBDAV1D", "dav1d >= 1.2.1", when="--with-system-a
+ 
+ @depends(target, "--with-system-av1", when=compile_environment)
+ def dav1d_asm(target, system_av1):
+-    if not system_av1 and target.cpu in ("arm", "aarch64", "x86", "x86_64"):
++    if system_av1:
++        return
++    if target.cpu == "arm" and target.kernel == "WINNT":
++        # dav1d's 32-bit ARM assembly is A32 (ARM mode) written for the
++        # ELF/Mach-O toolchains; Windows on ARM32 is Thumb-2 only and its
++        # assembler is armasm. dav1d falls back to its C implementations.
++        return
++    if target.cpu in ("arm", "aarch64", "x86", "x86_64"):
+         return True
+ 
+ 
+@@ -978,7 +985,9 @@ set_config("MOZ_EME_MODULES", eme_modules | dependable([]))
+ # ==============================================================
+ @depends(eme_modules, when=wmfmediaengine)
+ def wmfcdm(modules):
+-    if "wmfcdm" in modules:
++    # eme_modules is None when eme_choices is empty (see the comment above),
++    # which is the case for targets without EME support such as arm-uwp.
++    if modules and "wmfcdm" in modules:
+         return True
+ 
+ 
+@@ -1988,6 +1997,9 @@ def midl_flags(flags, target, midl):
+             "x86": "win32",
+             "x86_64": "x64",
+             "aarch64": "arm64",
++            # GeckoW10m: 32-bit ARM (Windows 10 Mobile). MIDL treats it as win32
++            # (32-bit) for interface marshalling purposes.
++            "arm": "win32",
+         }[target.cpu]
+         return flags + ["-nologo", "-no_cpp", "-env", env]
+ 
+@@ -2175,6 +2187,8 @@ def llvm_dlltool_flags(target):
+         "x86": "i386",
+         "x86_64": "i386:x86-64",
+         "aarch64": "arm64",
++        # GeckoW10m: 32-bit ARM (Windows 10 Mobile).
++        "arm": "arm",
+     }[target.cpu]
+ 
+     return ["-m", arch]
+@@ -2340,6 +2354,12 @@ with only_when(compile_environment):
+     @depends(in_tree_vpx, vpx_nasm, target, neon_flags)
+     def vpx_as_flags(vpx, vpx_nasm, target, neon_flags):
+         if vpx and vpx.arm_asm:
++            if target.kernel == "WINNT":
++                # Windows on ARM32 assembles libvpx's .asm with armasm.exe,
++                # which rejects gcc-style -mfpu flags. Its default ARMv7
++                # target already covers NEON, and clang-cl gets NEON from the
++                # thumbv7-windows-msvc triple.
++                return ()
+             # These flags are a lie; they're just used to enable the requisite
+             # opcodes; actual arch detection is done at runtime.
+             return neon_flags
+@@ -2586,6 +2606,11 @@ def ffvpx(target):
+         elif target.cpu == "aarch64":
+             flags = ["-DPIC", "-DWIN64"]
+             use_nasm = False
++        elif target.cpu == "arm":
++            # GeckoW10m: 32-bit ARM (Windows 10 Mobile) has no x86 asm paths, so
++            # nasm is not needed; audio-only codecs like the other ARM targets.
++            flags = ["-DPIC"]
++            use_nasm = False
+     elif target.kernel == "Darwin":
+         # 32/64-bit macosx assemblers need to prefix symbols with an
+         # underscore.
+@@ -2771,7 +2796,14 @@ with only_when(target_is_windows):
+         with only_when(dxcompiler.from_sdk):
+             set_config("MOZ_DXC_DLL_PATH", dxcompiler.dxc_path)
+ 
+-with only_when(target_is_windows & compile_environment):
++@depends(target)
++def needs_windows_app_sdk(target):
++    # GeckoW10m: there is no 32-bit ARM Windows App SDK artifact, and the SDK
++    # itself post-dates Windows 10 Mobile, so skip it for the arm-uwp target.
++    return target.cpu != "arm"
++
++
++with only_when(target_is_windows & compile_environment & needs_windows_app_sdk):
+     option(
+         env="MOZ_WINDOWS_APP_SDK_DIR",
+         nargs=1,

@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] SpiderMonkey: JIT code through the *FromApp allocators, ARM32
+ Windows
+
+Executable memory comes from VirtualAllocFromApp/VirtualProtectFromApp,
+which the codeGeneration capability allows; plus the ARM32 Windows bits the
+JIT and Wasm lack (division helpers, signal handling, atomics).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ js/src/builtin/TestingFunctions.cpp        |   8 ++
+ js/src/ctypes/CTypes.cpp                   |  17 +++-
+ js/src/gc/Memory.cpp                       |   7 ++
+ js/src/jit/AtomicOp.h                      |   7 ++
+ js/src/jit/ProcessExecutableMemory.cpp     | 101 ++++++++++++++++++++-
+ js/src/jit/ProcessExecutableMemory.h       |  10 +-
+ js/src/jit/arm/Architecture-arm.cpp        |  36 +++++++-
+ js/src/shell/js.cpp                        |  14 +++
+ js/src/threading/windows/WindowsThread.cpp |   6 ++
+ js/src/vm/JSContext.cpp                    |  45 +++++++++
+ js/src/vm/SharedArrayObject.cpp            |   4 +
+ js/src/wasm/WasmCode.cpp                   |   8 +-
+ js/src/wasm/WasmGenerator.cpp              |  10 +-
+ js/src/wasm/WasmSignalHandlers.cpp         |  25 ++++-
+ js/xpconnect/src/XPCJSContext.cpp          |  26 ++++++
+ 15 files changed, 305 insertions(+), 19 deletions(-)
+
+diff --git a/js/src/builtin/TestingFunctions.cpp b/js/src/builtin/TestingFunctions.cpp
+index c66908cd9f..07b5e88dc7 100644
+--- a/js/src/builtin/TestingFunctions.cpp
++++ b/js/src/builtin/TestingFunctions.cpp
+@@ -8827,10 +8827,18 @@ static bool GetTimeZone(JSContext* cx, unsigned argc, Value* vp) {
+   auto getTimeZone = [](std::time_t* now) -> const char* {
+     std::tm local{};
+ #  if defined(_WIN32)
++#    if defined(GECKO_W10M)
++    // _tzname is a desktop-partition CRT global not available in the app
++    // container; fall back to UTC for this testing helper.
++    if (localtime_s(&local, now) == 0) {
++      return "UTC";
++    }
++#    else
+     _tzset();
+     if (localtime_s(&local, now) == 0) {
+       return _tzname[local.tm_isdst > 0];
+     }
++#    endif
+ #  else
+     tzset();
+ #    if defined(HAVE_LOCALTIME_R)
+diff --git a/js/src/ctypes/CTypes.cpp b/js/src/ctypes/CTypes.cpp
+index ed9f43ded1..11e3109e39 100644
+--- a/js/src/ctypes/CTypes.cpp
++++ b/js/src/ctypes/CTypes.cpp
+@@ -6552,7 +6552,13 @@ static bool GetABI(JSContext* cx, HandleValue abiType, ffi_abi* result) {
+ #  endif
+       return true;
+ #elif defined(_WIN32)
++#  if defined(_M_ARM)
++      // 32-bit ARM Windows has a single calling convention, so thiscall is an
++      // alias for the default one, as it already is on the 64-bit targets.
++      *result = FFI_DEFAULT_ABI;
++#  else
+       *result = FFI_THISCALL;
++#  endif
+       return true;
+ #else
+       break;
+@@ -6560,7 +6566,12 @@ static bool GetABI(JSContext* cx, HandleValue abiType, ffi_abi* result) {
+     case ABI_STDCALL:
+     case ABI_WINAPI:
+ #if (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
++#  if defined(_M_ARM)
++      // Single calling convention; see the ABI_THISCALL case above.
++      *result = FFI_DEFAULT_ABI;
++#  else
+       *result = FFI_STDCALL;
++#  endif
+       return true;
+ #elif (defined(_WIN64))
+       // We'd like the same code to work across Win32 and Win64, so stdcall_api
+@@ -6718,7 +6729,11 @@ void FunctionType::BuildSymbolName(JSContext* cx, JSString* name,
+       break;
+ 
+     case ABI_STDCALL: {
+-#if (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
++#if defined(_M_ARM)
++      // 32-bit ARM Windows has a single calling convention and no stdcall name
++      // decoration, so the symbol name is used as-is.
++      AppendString(cx, result, name);
++#elif (defined(_WIN32) && !defined(_WIN64)) || defined(_OS2)
+       // On WIN32, stdcall functions look like:
+       //   _foo@40
+       // where 'foo' is the function name, and '40' is the aligned size of the
+diff --git a/js/src/gc/Memory.cpp b/js/src/gc/Memory.cpp
+index 475ba17963..cb9d34e653 100644
+--- a/js/src/gc/Memory.cpp
++++ b/js/src/gc/Memory.cpp
+@@ -1102,9 +1102,16 @@ void* AllocateMappedContent(int fd, size_t offset, size_t length,
+     }
+     UnmapInternal(reinterpret_cast<void*>(region), mappedLength);
+     // If the offset or length are out of bounds, this call will fail.
++#if defined(GECKO_W10M)
++    // MapViewOfFileEx (fixed-address mapping) is not available in the app
++    // container; fail this last-ditch aligned mapping so the caller falls back.
++    (void)region;
++    map = nullptr;
++#else
+     map = static_cast<uint8_t*>(
+         MapViewOfFileEx(hMap, FILE_MAP_COPY, offsetH, offsetL, alignedLength,
+                         reinterpret_cast<void*>(region)));
++#endif
+     if (map) {
+       break;
+     }
+diff --git a/js/src/jit/AtomicOp.h b/js/src/jit/AtomicOp.h
+index 1a5ff25334..1e8fee5a5e 100644
+--- a/js/src/jit/AtomicOp.h
++++ b/js/src/jit/AtomicOp.h
+@@ -7,6 +7,13 @@
+ 
+ #include <stdint.h>
+ 
++// On Windows/ARM, <winnt.h> defines MemoryBarrier as a macro (__dmb(...)),
++// which collides with js::jit::MemoryBarrier below. (On x86/x64 it is an inline
++// function, so this only bites on ARM.)
++#ifdef MemoryBarrier
++#  undef MemoryBarrier
++#endif
++
+ namespace js {
+ namespace jit {
+ 
+diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
+index cea7d764ca..16d6faaa88 100644
+--- a/js/src/jit/ProcessExecutableMemory.cpp
++++ b/js/src/jit/ProcessExecutableMemory.cpp
+@@ -8,6 +8,7 @@
+ #include "mozilla/Atomics.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/Maybe.h"
++#include "mozilla/Sprintf.h"
+ #include "mozilla/PodOperations.h"
+ #include "mozilla/TaggedAnonymousMemory.h"
+ #include "mozilla/XorShift128PlusRNG.h"
+@@ -47,6 +48,25 @@
+ using namespace js;
+ using namespace js::jit;
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
++#if defined(XP_WIN) && defined(GECKO_W10M)
++// Inside an app container, VirtualAlloc and VirtualProtect refuse
++// PAGE_EXECUTE_READ / PAGE_EXECUTE_READWRITE no matter what the package
++// declares. The codeGeneration capability unlocks the *FromApp entry points
++// instead, which take identical arguments. Every executable-memory allocation
++// in this file has to go through them, or the JIT dies at startup on device.
++//
++// This is deliberately placed after the last #include so the macros only
++// rewrite the call sites below.
++#  define VirtualAlloc VirtualAllocFromApp
++#  define VirtualProtect VirtualProtectFromApp
++#endif
++
+ #ifdef XP_WIN
+ #  if defined(HAVE_64BIT_BUILD)
+ #    define NEED_JIT_UNWIND_HANDLING
+@@ -67,7 +87,10 @@ static void* ComputeRandomAllocationAddress() {
+ #  ifdef HAVE_64BIT_BUILD
+   static const uintptr_t base = 0x0000000080000000;
+   static const uintptr_t mask = 0x000003ffffff0000;
+-#  elif defined(_M_IX86) || defined(__i386__)
++#  elif defined(_M_IX86) || defined(__i386__) || defined(_M_ARM) || \
++      defined(__arm__)
++  // 32-bit x86 and 32-bit ARM (Windows 10 Mobile) share the same randomized
++  // executable-memory address range.
+   static const uintptr_t base = 0x04000000;
+   static const uintptr_t mask = 0x3fff0000;
+ #  else
+@@ -378,12 +401,47 @@ static DWORD ProtectionSettingToFlags(ProtectionSetting protection) {
+ 
+ [[nodiscard]] static bool CommitPages(void* addr, size_t bytes,
+                                       ProtectionSetting protection) {
+-  void* p = VirtualAlloc(addr, bytes, MEM_COMMIT,
+-                         ProtectionSettingToFlags(protection));
++  const DWORD wanted = ProtectionSettingToFlags(protection);
++
++#if defined(GECKO_W10M)
++  // An app container will not hand out an executable page at commit time:
++  // VirtualAllocFromApp answers PAGE_EXECUTE_READ with ERROR_INVALID_PARAMETER
++  // however the capability is declared. What codeGeneration grants is the
++  // transition, not the initial state -- memory is committed writable and then
++  // turned over, which is exactly the sequence the shell's startup probe has
++  // been demonstrating all along.
++  const DWORD committed = (wanted == PAGE_READWRITE) ? wanted : PAGE_READWRITE;
++#else
++  const DWORD committed = wanted;
++#endif
++
++  void* p = VirtualAlloc(addr, bytes, MEM_COMMIT, committed);
+   if (!p) {
++#if defined(GECKO_W10M)
++    char note[128];
++    SprintfLiteral(note, "jit: commit of %u bytes at %p failed, 0x%x, err %u",
++                   unsigned(bytes), addr, unsigned(committed),
++                   unsigned(GetLastError()));
++    GeckoW10mNote(note);
++#endif
+     return false;
+   }
+   MOZ_RELEASE_ASSERT(p == addr);
++
++#if defined(GECKO_W10M)
++  if (committed != wanted) {
++    ULONG previous = 0;
++    if (!VirtualProtect(addr, bytes, wanted, &previous)) {
++      char note[128];
++      SprintfLiteral(note, "jit: protect of %u bytes at %p to 0x%x failed, err %u",
++                     unsigned(bytes), addr, unsigned(wanted),
++                     unsigned(GetLastError()));
++      GeckoW10mNote(note);
++      return false;
++    }
++  }
++#endif
++
+   return true;
+ }
+ 
+@@ -718,6 +776,17 @@ class ProcessExecutableMemory {
+     MOZ_RELEASE_ASSERT(gc::SystemPageSize() <= ExecutableCodePageSize);
+ 
+     void* p = ReserveProcessExecutableMemory(MaxCodeBytesPerProcess);
++#if defined(GECKO_W10M)
++    {
++      // Whether this succeeded decides whether there is a JIT at all, and a
++      // failure is otherwise only visible as an out-of-memory report from the
++      // first thing that tries to compile.
++      char note[96];
++      SprintfLiteral(note, "jit: reserved %u MB of executable memory at %p",
++                     unsigned(MaxCodeBytesPerProcess / (1024 * 1024)), p);
++      GeckoW10mNote(note);
++    }
++#endif
+     if (!p) {
+       return false;
+     }
+@@ -783,6 +852,15 @@ void* ProcessExecutableMemory::allocate(size_t bytes,
+ 
+     // Check if we have enough pages available.
+     if (pagesAllocated_ + numPages >= MaxCodePages) {
++#if defined(GECKO_W10M)
++      // The other way out of this function without a page, and the one that
++      // would mean the pool is simply too small rather than unusable.
++      char note[96];
++      SprintfLiteral(note, "jit: pool exhausted, %u of %u pages used, wanted %u",
++                     unsigned(pagesAllocated_), unsigned(MaxCodePages),
++                     unsigned(numPages));
++      GeckoW10mNote(note);
++#endif
+       return nullptr;
+     }
+ 
+@@ -975,11 +1053,28 @@ bool js::jit::ReprotectRegion(void* start, size_t size,
+ 
+ #  ifdef XP_WIN
+   DWORD flags = ProtectionSettingToFlags(protection);
++#    if defined(GECKO_W10M)
++  // Not the re-commit trick here. An app container will not hand out an
++  // executable page through VirtualAllocFromApp at all -- it answers
++  // PAGE_EXECUTE_READ with ERROR_INVALID_PARAMETER, whatever the package
++  // declares. Changing the protection of a page the process already owns is a
++  // different question, and the one codeGeneration actually answers yes to.
++  ULONG previous = 0;
++  if (!VirtualProtect(pageStart, size, flags, &previous)) {
++    char note[128];
++    SprintfLiteral(note, "jit: reprotect of %u bytes at %p to 0x%x failed, err %u",
++                   unsigned(size), pageStart, unsigned(flags),
++                   unsigned(GetLastError()));
++    GeckoW10mNote(note);
++    return false;
++  }
++#    else
+   // This is a essentially a VirtualProtect, but with lighter impact on
+   // antivirus analysis. See bug 1823634.
+   if (!VirtualAlloc(pageStart, size, MEM_COMMIT, flags)) {
+     return false;
+   }
++#    endif
+ #  else
+   unsigned flags = ProtectionSettingToFlags(protection);
+   if (mprotect(pageStart, size, flags)) {
+diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
+index 4a08d4a623..86edca70c1 100644
+--- a/js/src/jit/ProcessExecutableMemory.h
++++ b/js/src/jit/ProcessExecutableMemory.h
+@@ -16,7 +16,15 @@ namespace jit {
+ 
+ // Limit on the number of bytes of executable memory to prevent JIT spraying
+ // attacks.
+-#if JS_BITS_PER_WORD == 32
++#if defined(GECKO_W10M)
++// This is reserved as one contiguous block at startup, and a phone running a
++// 32-bit process has to fit it alongside a 132 MB engine and everything the
++// app host has already mapped. 140 MB is a reasonable share of a desktop's
++// address space and an unreasonable one here; when the reservation fails the
++// JIT has no memory to allocate from at all, and the first compile reports
++// out of memory on a device using 23 MB of its 2048 MB allowance.
++static const size_t MaxCodeBytesPerProcess = 32 * 1024 * 1024;
++#elif JS_BITS_PER_WORD == 32
+ static const size_t MaxCodeBytesPerProcess = 140 * 1024 * 1024;
+ #else
+ // This is the largest number which satisfies various alignment static
+diff --git a/js/src/jit/arm/Architecture-arm.cpp b/js/src/jit/arm/Architecture-arm.cpp
+index 82c37d2d2a..44bc09786f 100644
+--- a/js/src/jit/arm/Architecture-arm.cpp
++++ b/js/src/jit/arm/Architecture-arm.cpp
+@@ -4,7 +4,8 @@
+ 
+ #include "jit/arm/Architecture-arm.h"
+ 
+-#if !defined(JS_SIMULATOR_ARM) && !defined(__APPLE__)
++#if !defined(JS_SIMULATOR_ARM) && !defined(__APPLE__) && defined(__linux__)
++// <elf.h> (ELF auxv hwcap parsing) is Linux-specific; not present on Windows.
+ #  include <elf.h>
+ #endif
+ 
+@@ -19,6 +20,10 @@
+ #  include <libkern/OSCacheControl.h>
+ #endif
+ 
++#if defined(XP_WIN)
++#  include <processthreadsapi.h>  // FlushInstructionCache, GetCurrentProcess
++#endif
++
+ #include "jit/arm/Assembler-arm.h"
+ #include "jit/FlushICache.h"  // js::jit::FlushICache
+ #include "jit/RegisterSets.h"
+@@ -503,6 +508,10 @@ void FlushICache(void* code, size_t size) {
+ #elif defined(XP_IOS)
+   sys_icache_invalidate(code, size);
+ 
++#elif defined(XP_WIN)
++  // Windows on ARM: flush the instruction cache via the Win32 API.
++  ::FlushInstructionCache(::GetCurrentProcess(), code, size);
++
+ #else
+ #  error "Unexpected platform"
+ #endif
+@@ -520,3 +529,28 @@ void FlushExecutionContext() {
+ 
+ }  // namespace jit
+ }  // namespace js
++
++#if defined(XP_WIN) && defined(_M_ARM)
++// SpiderMonkey's ARM JIT soft-divide path emits calls to these ARM EABI divide
++// helpers (declared in js/src/jit/VMFunctions.h). On Android they come from
++// compiler-rt; the LLVM Windows package ships no ARM32 builtins lib, so define
++// them here. Signatures MUST match VMFunctions.h: int64_t f(int, int), with the
++// quotient in the low word (r0) and remainder in the high word (r1). Built with
++// +hwdiv so `/` and `%` use the hardware divide instruction.
++extern "C" {
++MOZ_EXPORT int64_t __aeabi_uidivmod(int aNum, int aDen) {
++  unsigned n = static_cast<unsigned>(aNum);
++  unsigned d = static_cast<unsigned>(aDen);
++  unsigned q = n / d;
++  unsigned r = n - q * d;
++  return static_cast<int64_t>((static_cast<uint64_t>(r) << 32) | q);
++}
++MOZ_EXPORT int64_t __aeabi_idivmod(int aNum, int aDen) {
++  int q = aNum / aDen;
++  int r = aNum - q * aDen;
++  return static_cast<int64_t>(
++      (static_cast<uint64_t>(static_cast<unsigned>(r)) << 32) |
++      static_cast<unsigned>(q));
++}
++}  // extern "C"
++#endif  // XP_WIN && _M_ARM
+diff --git a/js/src/shell/js.cpp b/js/src/shell/js.cpp
+index 414e277ea1..e1da335d00 100644
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -7059,7 +7059,11 @@ class AutoPipe {
+ 
+   bool init() {
+ #  ifdef XP_WIN
++#    if defined(GECKO_W10M)
++    return false;  // _pipe is unavailable in the app container
++#    else
+     return !_pipe(fds_, 4096, O_BINARY);
++#    endif
+ #  else
+     return !pipe(fds_);
+ #  endif
+@@ -7168,7 +7172,11 @@ static bool CompileAndSerializeInSeparateProcess(JSContext* cx,
+     return false;
+   }
+ 
++#if defined(GECKO_W10M)
++  int childPid = -1;  // process spawning is unavailable in the app container
++#else
+   int childPid = _spawnv(P_NOWAIT, sArgv[0], argv.get());
++#endif
+   if (childPid == -1) {
+     return false;
+   }
+@@ -7216,7 +7224,11 @@ static bool CompileAndSerializeInSeparateProcess(JSContext* cx,
+ 
+   int status;
+ #  ifdef XP_WIN
++#if defined(GECKO_W10M)
++  if (true) {  // _cwait unavailable in the app container
++#else
+   if (_cwait(&status, childPid, WAIT_CHILD) == -1) {
++#endif
+     return false;
+   }
+ #  else
+@@ -12584,9 +12596,11 @@ static void PreInit() {
+   if (crash_option && crash_option[0] == '1') {
+     // Disable the segfault dialog. We want to fail the tests immediately
+     // instead of hanging automation.
++#if !defined(GECKO_W10M)
+     UINT newMode = SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+     UINT prevMode = SetErrorMode(newMode);
+     SetErrorMode(prevMode | newMode);
++#endif
+   }
+ #endif
+ }
+diff --git a/js/src/threading/windows/WindowsThread.cpp b/js/src/threading/windows/WindowsThread.cpp
+index 4f989de2d1..531c706ae8 100644
+--- a/js/src/threading/windows/WindowsThread.cpp
++++ b/js/src/threading/windows/WindowsThread.cpp
+@@ -104,12 +104,18 @@ void ThisThread::SetName(const char* name) {
+   info.dwThreadID = GetCurrentThreadId();
+   info.dwFlags = 0;
+ 
++#  if defined(_M_ARM) && defined(__clang__)
++  // clang does not implement SEH (__try/__except) on 32-bit ARM Windows. The
++  // debugger thread-naming exception is a best-effort nicety, so skip it.
++  (void)info;
++#  else
+   __try {
+     RaiseException(THREAD_NAME_EXCEPTION, 0, sizeof(info) / sizeof(ULONG_PTR),
+                    (ULONG_PTR*)&info);
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+     // Do nothing.
+   }
++#  endif
+ #endif  // _MSC_VER
+ }
+ 
+diff --git a/js/src/vm/JSContext.cpp b/js/src/vm/JSContext.cpp
+index 2cbeec9ce6..870d61e874 100644
+--- a/js/src/vm/JSContext.cpp
++++ b/js/src/vm/JSContext.cpp
+@@ -298,9 +298,48 @@ void JSContext::onOutOfMemory() {
+   reportResourceExhaustion();
+ }
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++
++// InitSelfHostedCode fails here with the engine genuinely reporting out of
++// memory, on a device using 23 MB of the 2048 MB it is allowed. Something is
++// failing an allocation that has room to succeed, and an OOM report says
++// nothing about which. The return address does: run it through
++// tools/symbolize.py against the build's map and it names the caller.
++//
++// Only the first few are reported. Once the engine is out of memory it says so
++// repeatedly, and the first one is the one that has not yet been caused by the
++// others.
++static mozilla::Atomic<uint32_t> gGeckoW10mOomReports{0};
++
++static void GeckoW10mNoteOom(const char* kind, void* from) {
++  if (gGeckoW10mOomReports++ >= 8) {
++    return;
++  }
++  // A raw address means nothing in the next process -- ASLR moves the module
++  // between runs and the log is read afterwards. Measuring against a symbol in
++  // the same library makes it portable: look ReportLargeOutOfMemory up in the
++  // build's map, add the offset, and symbolize that.
++  auto* anchor = reinterpret_cast<const char*>(
++      static_cast<void (*)(JSContext*)>(js::ReportLargeOutOfMemory));
++  ptrdiff_t offset = reinterpret_cast<const char*>(from) - anchor;
++
++  char note[128];
++  SprintfLiteral(note, "js: %s out of memory, reported from ReportLargeOutOfMemory%+td",
++                 kind, offset);
++  GeckoW10mNote(note);
++}
++#endif
++
+ JS_PUBLIC_API void js::ReportOutOfMemory(JSContext* cx) {
+   MaybeReportOutOfMemoryForDifferentialTesting();
+ 
++#if defined(GECKO_W10M)
++  GeckoW10mNoteOom("context", __builtin_return_address(0));
++#endif
++
+   cx->onOutOfMemory();
+ }
+ 
+@@ -311,6 +350,12 @@ JS_PUBLIC_API void js::ReportLargeOutOfMemory(JSContext* cx) {
+ JS_PUBLIC_API void js::ReportOutOfMemory(FrontendContext* fc) {
+   MaybeReportOutOfMemoryForDifferentialTesting();
+ 
++#if defined(GECKO_W10M)
++  // The parser and bytecode emitter report through this one, which is the
++  // likelier of the two while self-hosted code is being compiled.
++  GeckoW10mNoteOom("frontend", __builtin_return_address(0));
++#endif
++
+   fc->onOutOfMemory();
+ }
+ 
+diff --git a/js/src/vm/SharedArrayObject.cpp b/js/src/vm/SharedArrayObject.cpp
+index b27860a878..e05c4eec32 100644
+--- a/js/src/vm/SharedArrayObject.cpp
++++ b/js/src/vm/SharedArrayObject.cpp
+@@ -220,11 +220,15 @@ void WasmSharedArrayRawBuffer::discard(size_t byteOffset, size_t byteLen) {
+     AtomicOperations::memsetSafeWhenRacy(
+         addr + (i * wasm::StandardPageSizeBytes), 0,
+         wasm::StandardPageSizeBytes);
++#if !defined(GECKO_W10M)
++    // VirtualUnlock is a desktop-partition API; the memset above already
++    // zeroed the pages, which is all we need in the app container.
+     DebugOnly<bool> result =
+         VirtualUnlock(addr.unwrap() + (i * wasm::StandardPageSizeBytes),
+                       wasm::StandardPageSizeBytes);
+     MOZ_ASSERT(!result);  // this always "fails" when unlocking unlocked
+                           // memory...which is the only case we care about
++#endif
+   }
+ #elif defined(__wasi__)
+   AtomicOperations::memsetSafeWhenRacy(addr, 0, byteLen);
+diff --git a/js/src/wasm/WasmCode.cpp b/js/src/wasm/WasmCode.cpp
+index 63a93cac93..28f49390b5 100644
+--- a/js/src/wasm/WasmCode.cpp
++++ b/js/src/wasm/WasmCode.cpp
+@@ -128,13 +128,13 @@ bool wasm::StaticallyLink(jit::AutoMarkJitCodeWritableForThread& writable,
+     Assembler::Bind(base, label);
+   }
+ 
+-  for (CallFarJump far : linkData.callFarJumps) {
++  for (CallFarJump farJump : linkData.callFarJumps) {
+     MOZ_ASSERT(maybeCode && maybeCode->mode() == CompileMode::LazyTiering);
+-    const CodeBlock& bestBlock = maybeCode->funcCodeBlock(far.targetFuncIndex);
+-    uint32_t stubRangeIndex = bestBlock.funcToCodeRange[far.targetFuncIndex];
++    const CodeBlock& bestBlock = maybeCode->funcCodeBlock(farJump.targetFuncIndex);
++    uint32_t stubRangeIndex = bestBlock.funcToCodeRange[farJump.targetFuncIndex];
+     const CodeRange& stubRange = bestBlock.codeRanges[stubRangeIndex];
+     uint8_t* stubBase = bestBlock.base();
+-    MacroAssembler::patchFarJump(base + far.jumpOffset,
++    MacroAssembler::patchFarJump(base + farJump.jumpOffset,
+                                  stubBase + stubRange.funcUncheckedCallEntry());
+   }
+ 
+diff --git a/js/src/wasm/WasmGenerator.cpp b/js/src/wasm/WasmGenerator.cpp
+index 0a9d9660d6..b6240ae2bf 100644
+--- a/js/src/wasm/WasmGenerator.cpp
++++ b/js/src/wasm/WasmGenerator.cpp
+@@ -915,12 +915,12 @@ bool ModuleGenerator::finishCodeBlock(CodeBlockResult* result) {
+     return false;
+   }
+ 
+-  for (CallFarJump far : callFarJumps_) {
+-    if (funcIsCompiledInBlock(far.targetFuncIndex)) {
++  for (CallFarJump farJump : callFarJumps_) {
++    if (funcIsCompiledInBlock(farJump.targetFuncIndex)) {
+       masm_->patchFarJump(
+-          jit::CodeOffset(far.jumpOffset),
+-          funcCodeRangeInBlock(far.targetFuncIndex).funcUncheckedCallEntry());
+-    } else if (!linkData_->callFarJumps.append(far)) {
++          jit::CodeOffset(farJump.jumpOffset),
++          funcCodeRangeInBlock(farJump.targetFuncIndex).funcUncheckedCallEntry());
++    } else if (!linkData_->callFarJumps.append(farJump)) {
+       return false;
+     }
+   }
+diff --git a/js/src/wasm/WasmSignalHandlers.cpp b/js/src/wasm/WasmSignalHandlers.cpp
+index c06cefcce0..b63af617eb 100644
+--- a/js/src/wasm/WasmSignalHandlers.cpp
++++ b/js/src/wasm/WasmSignalHandlers.cpp
+@@ -69,9 +69,16 @@ using namespace js::wasm;
+ #    define RSP_sig(p) ((p)->Rsp)
+ #    define RBP_sig(p) ((p)->Rbp)
+ #    define R11_sig(p) ((p)->R11)
+-#    define R13_sig(p) ((p)->R13)
+-#    define R14_sig(p) ((p)->R14)
+-#    define R15_sig(p) ((p)->R15)
++#    if defined(_M_ARM)
++// 32-bit ARM Windows CONTEXT names these Sp/Lr/Pc, not R13/R14/R15.
++#      define R13_sig(p) ((p)->Sp)
++#      define R14_sig(p) ((p)->Lr)
++#      define R15_sig(p) ((p)->Pc)
++#    else
++#      define R13_sig(p) ((p)->R13)
++#      define R14_sig(p) ((p)->R14)
++#      define R15_sig(p) ((p)->R15)
++#    endif
+ #    define EPC_sig(p) ((p)->Pc)
+ #    define RFP_sig(p) ((p)->Fp)
+ #    define R31_sig(p) ((p)->Sp)
+@@ -584,6 +591,11 @@ struct AutoHandlingTrap {
+ // =============================================================================
+ 
+ #  if defined(XP_WIN)
++// UWP has no vectored exception handler; the whole Windows async-trap handler
++// is compiled out and wasm uses explicit bounds checks (see the early return in
++// EnsureEagerProcessSignalHandlers). Keeping the XP_WIN arm avoids falling
++// through to the POSIX signal path.
++#    if !defined(GECKO_W10M)
+ // Obtained empirically from thread_local codegen on x86/x64/arm64.
+ // Compiled in all user binaries, so should be stable over time.
+ static const unsigned sThreadLocalArrayPointerIndex = 11;
+@@ -617,6 +629,7 @@ static LONG WINAPI WasmTrapHandler(LPEXCEPTION_POINTERS exception) {
+ 
+   return EXCEPTION_CONTINUE_EXECUTION;
+ }
++#    endif  // !GECKO_W10M
+ 
+ #  elif defined(XP_DARWIN)
+ // On OSX we are forced to use the lower-level Mach exception mechanism instead
+@@ -879,7 +892,11 @@ void wasm::EnsureEagerProcessSignalHandlers() {
+   sAlreadyHandlingTrap.infallibleInit();
+ 
+   // Install whatever exception/signal handler is appropriate for the OS.
+-#  if defined(XP_WIN)
++#  if defined(XP_WIN) && defined(GECKO_W10M)
++  // UWP has no AddVectoredExceptionHandler; run wasm with explicit bounds
++  // checks instead of the async trap handler.
++  return;
++#  elif defined(XP_WIN)
+ 
+ #    if defined(MOZ_ASAN)
+   // Under ASan we need to let the ASan runtime's ShadowExceptionHandler stay
+diff --git a/js/xpconnect/src/XPCJSContext.cpp b/js/xpconnect/src/XPCJSContext.cpp
+index 93645d0826..b2fa3a8f68 100644
+--- a/js/xpconnect/src/XPCJSContext.cpp
++++ b/js/xpconnect/src/XPCJSContext.cpp
+@@ -1233,6 +1233,12 @@ static AtomicLogLevel& GetLevelRef(JS::OpaqueLogger aLogger) {
+ static JS::LoggingInterface loggingInterface = {GetLoggerByName, LogPrintVA,
+                                                 LogPrintFMT, GetLevelRef};
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ nsresult XPCJSContext::Initialize() {
+   if (StaticPrefs::javascript_options_external_thread_pool_DoNotUseDirectly()) {
+     size_t threadCount = TaskController::GetPoolThreadCount();
+@@ -1407,6 +1413,11 @@ nsresult XPCJSContext::Initialize() {
+   // Initialize the MIME type used for the bytecode cache, after calling
+   // SetProcessBuildIdOp and loading JS prefs.
+   if (!nsContentUtils::InitJSBytecodeMimeType()) {
++#if defined(GECKO_W10M)
++    // Both aborts in this function report OOM without a size, so from a crash
++    // address alone there is no telling which one fired.
++    GeckoW10mNote("xpc: InitJSBytecodeMimeType failed");
++#endif
+     NS_ABORT_OOM(0);  // Size is unknown.
+   }
+ 
+@@ -1433,7 +1444,22 @@ nsresult XPCJSContext::Initialize() {
+     }
+   }
+ 
++#if defined(GECKO_W10M)
++  GeckoW10mNote("xpc: InitSelfHostedCode starting");
++#endif
+   if (!JS::InitSelfHostedCode(cx, shm.Content(), writer)) {
++#if defined(GECKO_W10M)
++    // "Failure is due to OOM" is an inference, not a report: it is what is
++    // left when nothing was thrown. On a fresh port that inference is worth
++    // doubting, and 22 MB of a 2 GB allowance is not out of memory.
++    {
++      nsPrintfCString note(
++          "xpc: InitSelfHostedCode failed, exception=%d oom=%d shm=%d",
++          int(JS_IsExceptionPending(cx)), int(JS_IsThrowingOutOfMemory(cx)),
++          int(!shm.Content().IsEmpty()));
++      GeckoW10mNote(note.get());
++    }
++#endif
+     // Note: If no exception is pending, failure is due to OOM.
+     if (!JS_IsExceptionPending(cx) || JS_IsThrowingOutOfMemory(cx)) {
+       NS_ABORT_OOM(0);  // Size is unknown.

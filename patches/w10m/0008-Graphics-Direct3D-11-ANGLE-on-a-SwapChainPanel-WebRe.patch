@@ -1,0 +1,3043 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] Graphics: Direct3D 11, ANGLE on a SwapChainPanel, WebRender
+ on the phone's GPUs
+
+Hardware WebRender through ANGLE presenting into the shell's
+SwapChainPanel, the D3D11 compositor for GPUs that stop at feature level
+9_3, the phone GPUs treated as known vendors, and a smaller texture cache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/2d/Factory.cpp                            |  17 +-
+ .../cairo/src/win32/cairo-dwrite-private.hpp  |   9 +-
+ gfx/gl/GLContextProviderEGL.cpp               |  45 ++
+ gfx/graphite2/src/inc/Machine.h               |   6 +
+ gfx/layers/apz/src/AsyncPanZoomController.cpp |  20 +
+ gfx/layers/apz/src/GestureEventListener.cpp   |  14 +
+ gfx/layers/apz/src/InputBlockState.cpp        |  16 +
+ gfx/layers/apz/src/InputQueue.cpp             |   5 +
+ gfx/layers/apz/util/APZEventState.cpp         |   6 +
+ gfx/layers/d3d11/CompositorD3D11.cpp          | 103 ++++-
+ gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp  | 180 ++++++++
+ gfx/layers/d3d11/GeckoW10mPanelSwapChain.h    |  25 ++
+ gfx/layers/moz.build                          |   6 +
+ gfx/pixman/pixman/pixman/moz.build            |  12 +-
+ gfx/pixman/pixman/pixman/pixman-arm.c         |   8 +
+ gfx/skia/skia/src/utils/win/SkDWrite.cpp      |  10 +-
+ gfx/src/DriverCrashGuard.cpp                  |  18 +
+ gfx/thebes/DeviceManagerDx.cpp                |   8 +
+ gfx/thebes/gfxPlatform.cpp                    |  97 ++++-
+ gfx/thebes/moz.build                          |  12 +-
+ gfx/webrender_bindings/RenderCompositor.cpp   |  69 ++-
+ .../RenderCompositorEGL.cpp                   |  46 ++
+ gfx/webrender_bindings/RenderCompositorEGL.h  |  11 +
+ gfx/webrender_bindings/RendererOGL.cpp        |  37 ++
+ gfx/webrender_bindings/WebRenderAPI.cpp       |   9 +
+ gfx/webrender_bindings/src/bindings.rs        |  12 +-
+ gfx/wr/webrender/src/device/gl.rs             | 200 +++++++++
+ gfx/wr/webrender/src/device/query_gl.rs       |   7 +
+ gfx/wr/webrender/src/renderer/mod.rs          |  11 +
+ gfx/ycbcr/moz.build                           |   5 +-
+ gfx/ycbcr/ycbcr_to_rgb565.h                   |   4 +-
+ modules/libpref/init/StaticPrefList.yaml      |  13 +
+ .../angle_d3d_format_tables_gn/moz.build      |   9 +-
+ .../angle/angle_gpu_info_util_gn/moz.build    |   9 +-
+ third_party/angle/libANGLE_gn/moz.build       |  10 +-
+ .../angle/libANGLE_no_vulkan_gn/moz.build     |  11 +-
+ third_party/angle/libEGL_gn/moz.build         |   9 +
+ third_party/angle/libGLESv2_gn/moz.build      |  28 +-
+ third_party/angle/moz.build                   |   1 -
+ third_party/angle/src/libANGLE/Program.cpp    |  20 +
+ .../angle/src/libANGLE/ProgramExecutable.cpp  |  22 +
+ .../renderer/d3d/ProgramExecutableD3D.cpp     |  76 +++-
+ .../d3d/angle_d3d11_backend_gn/moz.build      |  11 +-
+ .../d3d/angle_d3d9_backend_gn/moz.build       |  10 +-
+ .../d3d/angle_d3d_shared_gn/moz.build         |   9 +-
+ .../renderer/d3d/d3d11/ResourceManager11.cpp  |  77 ++++
+ .../renderer/d3d/d3d11/SwapChain11.cpp        |  46 ++
+ .../d3d/d3d11/winrt/NativeWindow11WinRT.cpp   | 402 ++++++++++++++++++
+ .../d3d/d3d11/winrt/NativeWindow11WinRT.h     |  96 +++++
+ 49 files changed, 1853 insertions(+), 34 deletions(-)
+ create mode 100644 gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp
+ create mode 100644 gfx/layers/d3d11/GeckoW10mPanelSwapChain.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+
+diff --git a/gfx/2d/Factory.cpp b/gfx/2d/Factory.cpp
+index d52f761dc9..ce6976e2dc 100644
+--- a/gfx/2d/Factory.cpp
++++ b/gfx/2d/Factory.cpp
+@@ -639,9 +639,20 @@ RefPtr<IDWriteFactory> Factory::EnsureDWriteFactory() {
+     return nullptr;
+   }
+ 
+-  HRESULT hr =
+-      createDWriteFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+-                          reinterpret_cast<IUnknown**>(&mDWriteFactory));
++  HRESULT hr = createDWriteFactory(
++#if defined(GECKO_W10M)
++      // Shared means shared with the app host. A packaged app draws its own
++      // text through this very factory, and a guest that registers font
++      // collections and fallbacks on it corrupts the host's next text layout
++      // -- which is how XAML came to fault inside CoreUIComponents with no
++      // Gecko frame anywhere on its stack. An isolated factory is the same
++      // DirectWrite with none of the sharing.
++      DWRITE_FACTORY_TYPE_ISOLATED,
++#else
++      DWRITE_FACTORY_TYPE_SHARED,
++#endif
++      __uuidof(IDWriteFactory),
++      reinterpret_cast<IUnknown**>(&mDWriteFactory));
+ 
+   if (FAILED(hr)) {
+     gfxWarning() << "Failed to create DWrite Factory.";
+diff --git a/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp b/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
+index 7834485f3e..4fc0912109 100644
+--- a/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
++++ b/gfx/cairo/cairo/src/win32/cairo-dwrite-private.hpp
+@@ -92,7 +92,14 @@ public:
+ #endif
+ 	    if (createDWriteFactory) {
+ 		HRESULT hr = createDWriteFactory(
+-		    DWRITE_FACTORY_TYPE_SHARED,
++#if defined(GECKO_W10M)
++                    // Isolated, not shared: see gfx/2d/Factory.cpp. The host
++                    // app owns the shared factory and lays out its own text
++                    // with it.
++                    DWRITE_FACTORY_TYPE_ISOLATED,
++#else
++                    DWRITE_FACTORY_TYPE_SHARED,
++#endif
+ 		    __uuidof(IDWriteFactory),
+ 		    reinterpret_cast<IUnknown**>(&mFactoryInstance));
+ 		assert(SUCCEEDED(hr));
+diff --git a/gfx/gl/GLContextProviderEGL.cpp b/gfx/gl/GLContextProviderEGL.cpp
+index 728fa98356..35c704d502 100644
+--- a/gfx/gl/GLContextProviderEGL.cpp
++++ b/gfx/gl/GLContextProviderEGL.cpp
+@@ -12,6 +12,26 @@
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_JAVA_SURFACE))
+ #  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
+     (aWidget->AsAndroid()->GetEGLNativeWindow())
++#elif defined(GECKO_W10M)
++// There is no HWND to give: an app container is handed none, and this widget
++// is headless. What EGL gets instead is the XAML SwapChainPanel the shell is
++// showing, which ANGLE knows how to make a composition swap chain for -- so
++// the frame is handed to the system compositor as a texture rather than
++// copied out through main memory.
++//
++// It travels as an EGLNativeWindowType because that is what EGL takes. The
++// typedef stays HWND-shaped here: this build claims the desktop API family on
++// purpose, so that the rest of Gecko keeps its Win32 APIs.
++//
++// Declared rather than included -- the panel belongs to the headless widget,
++// and gfx has no business including widget headers.
++extern "C" void* gecko_w10m_egl_native_window();
++extern "C" void GeckoW10mNote(const char* text);
++#  include "mozilla/Sprintf.h"
++#  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
++#  define GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aWidget) \
++    ((EGLNativeWindowType)gecko_w10m_egl_native_window())
+ #elif defined(XP_WIN)
+ #  define GET_NATIVE_WINDOW_FROM_REAL_WIDGET(aWidget) \
+     ((EGLNativeWindowType)aWidget->GetNativeData(NS_NATIVE_WINDOW))
+@@ -194,6 +214,27 @@ static EGLSurface CreateSurfaceFromNativeWindow(
+   if (!newSurface) {
+     const auto err = egl.mLib->fGetError();
+     gfxCriticalNote << "Failed to create EGLSurface!: " << gfx::hexa(err);
++#if defined(GECKO_W10M)
++    // Here, not at the call site: fGetError clears the error, so the note
++    // above was eating it and my own read a moment later got EGL_SUCCESS.
++    //
++    // 0x3009 EGL_BAD_MATCH means the config has no window bit -- the context
++    // was made for offscreen use and its config cannot carry a window.
++    // 0x300b EGL_BAD_NATIVE_WINDOW means ANGLE looked at the panel and said no,
++    // which is the case that reaches IsValidNativeWindow.
++    char note[128];
++    SprintfLiteral(note, "gfx: eglCreateWindowSurface refused it, egl 0x%04x",
++                   unsigned(err));
++    GeckoW10mNote(note);
++    EGLint surfaceType = 0;
++    if (egl.fGetConfigAttrib(config, LOCAL_EGL_SURFACE_TYPE, &surfaceType)) {
++      SprintfLiteral(note,
++                     "gfx: the config's surface type is 0x%04x, window bit %s",
++                     unsigned(surfaceType),
++                     (surfaceType & LOCAL_EGL_WINDOW_BIT) ? "set" : "MISSING");
++      GeckoW10mNote(note);
++    }
++#endif
+   }
+   return newSurface;
+ }
+@@ -336,6 +377,10 @@ EGLSurface GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+   MOZ_ASSERT(aCompositorWidget);
+   EGLNativeWindowType window =
+       GET_NATIVE_WINDOW_FROM_COMPOSITOR_WIDGET(aCompositorWidget);
++#if defined(GECKO_W10M)
++  GeckoW10mNote(window ? "gfx: making an EGL surface for the panel"
++                     : "gfx: asked for an EGL surface but there is no panel");
++#endif
+   if (!window) {
+     gfxCriticalNote << "window is null";
+     return EGL_NO_SURFACE;
+diff --git a/gfx/graphite2/src/inc/Machine.h b/gfx/graphite2/src/inc/Machine.h
+index 5ceedc296d..67b20e2a1d 100644
+--- a/gfx/graphite2/src/inc/Machine.h
++++ b/gfx/graphite2/src/inc/Machine.h
+@@ -58,6 +58,12 @@ typedef Slot * slotref;
+ 
+ enum {VARARGS = 0xff, MAX_NAME_LEN=32};
+ 
++// <winnt.h> defines DELETE as an access-mask constant; the opcode names
++// below are graphite2's own and must win inside this enum.
++#ifdef DELETE
++#  undef DELETE
++#endif
++
+ enum opcode {
+     NOP = 0,
+ 
+diff --git a/gfx/layers/apz/src/AsyncPanZoomController.cpp b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+index 1098039b42..2eabe92cfc 100644
+--- a/gfx/layers/apz/src/AsyncPanZoomController.cpp
++++ b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+@@ -118,6 +118,11 @@ static mozilla::LazyLogModule sApzCtlLog("apz.controller");
+ #define APZC_LOGV_FM(fm, prefix, ...) \
+   APZC_LOG_FM_COMMON(fm, prefix, LogLevel::Verbose, __VA_ARGS__)
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace layers {
+ 
+@@ -2032,6 +2037,21 @@ Maybe<LayoutDevicePoint> AsyncPanZoomController::ConvertToGecko(
+           *layoutPoint,
+           PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent)));
+     }
++#if defined(GECKO_W10M)
++    // The transform would not invert. Every caller treats that as "drop the
++    // gesture", and says nothing -- OnSingleTapUp has a comment admitting it.
++    // It is the last silent exit on the path a tap takes, and it is where a
++    // tap in fullscreen ends: the hit test finds a target, the page lets the
++    // block through, and then nothing at all.
++    //
++    // Take the point as it stands. It is wrong by whatever async transform was
++    // in play, which in fullscreen is nothing -- the page reports its viewport
++    // at scale 1, offset 0,0, and the fullscreen element covering all of it --
++    // and a tap in nearly the right place beats no tap.
++    return Some(LayoutDevicePoint(ViewAs<LayoutDevicePixel>(
++        aPoint,
++        PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent)));
++#endif
+   }
+   return Nothing();
+ }
+diff --git a/gfx/layers/apz/src/GestureEventListener.cpp b/gfx/layers/apz/src/GestureEventListener.cpp
+index 9c4f4b9e3b..d9bf3d00a6 100644
+--- a/gfx/layers/apz/src/GestureEventListener.cpp
++++ b/gfx/layers/apz/src/GestureEventListener.cpp
+@@ -23,6 +23,11 @@
+ static mozilla::LazyLogModule sApzGelLog("apz.gesture");
+ #define GEL_LOG(...) MOZ_LOG(sApzGelLog, LogLevel::Debug, (__VA_ARGS__))
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace layers {
+ 
+@@ -308,6 +313,15 @@ nsEventStatus GestureEventListener::HandleInputTouchMove() {
+     case GESTURE_FIRST_SINGLE_TOUCH_MAX_TAP_DOWN: {
+       // If we move too much, bail out of the tap.
+       if (MoveDistanceIsLarge()) {
++#if defined(GECKO_W10M)
++        {
++          nsPrintfCString note(
++              "tap: given up -- the finger moved past the %d px a tap is "
++              "allowed",
++              int(mAsyncPanZoomController->GetTouchStartTolerance()));
++          GeckoW10mNote(note.get());
++        }
++#endif
+         CancelLongTapTimeoutTask();
+         CancelMaxTapTimeoutTask();
+         mSingleTapSent = Nothing();
+diff --git a/gfx/layers/apz/src/InputBlockState.cpp b/gfx/layers/apz/src/InputBlockState.cpp
+index 222dd0909a..580cfa84a8 100644
+--- a/gfx/layers/apz/src/InputBlockState.cpp
++++ b/gfx/layers/apz/src/InputBlockState.cpp
+@@ -21,6 +21,10 @@
+ static mozilla::LazyLogModule sApzIbsLog("apz.inputstate");
+ #define TBS_LOG(...) MOZ_LOG(sApzIbsLog, LogLevel::Debug, (__VA_ARGS__))
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace layers {
+ 
+@@ -76,6 +80,18 @@ bool InputBlockState::SetConfirmedTargetApzc(
+   if (mTargetConfirmed != TargetConfirmationState::eUnconfirmed) {
+     return false;
+   }
++#if defined(GECKO_W10M)
++  // A confirmation of "nothing" throws away the target the compositor's own
++  // hit test already found, and every event in the block with it. The main
++  // thread comes back empty for content in the top layer -- a fullscreen
++  // video -- and the result is a tap that is never made and never explained.
++  // Keeping what we had is strictly better than dropping the gesture.
++  if (!aTargetApzc && mTargetApzc) {
++    mTargetConfirmed = aState;
++    return true;
++  }
++#endif
++
+   mTargetConfirmed = aState;
+ 
+   TBS_LOG("%p got confirmed target APZC %p\n", this, mTargetApzc.get());
+diff --git a/gfx/layers/apz/src/InputQueue.cpp b/gfx/layers/apz/src/InputQueue.cpp
+index 6f3a2ebd45..a24b44fe4d 100644
+--- a/gfx/layers/apz/src/InputQueue.cpp
++++ b/gfx/layers/apz/src/InputQueue.cpp
+@@ -25,6 +25,11 @@ static mozilla::LazyLogModule sApzInpLog("apz.inputqueue");
+ #define INPQ_LOG(...) MOZ_LOG(sApzInpLog, LogLevel::Debug, (__VA_ARGS__))
+ #define INPQ_LOG_TEST() MOZ_LOG_TEST(sApzInpLog, LogLevel::Debug)
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace layers {
+ 
+diff --git a/gfx/layers/apz/util/APZEventState.cpp b/gfx/layers/apz/util/APZEventState.cpp
+index dc8fe69c06..13bf763037 100644
+--- a/gfx/layers/apz/util/APZEventState.cpp
++++ b/gfx/layers/apz/util/APZEventState.cpp
+@@ -44,6 +44,11 @@
+ static mozilla::LazyLogModule sApzEvtLog("apz.eventstate");
+ #define APZES_LOG(...) MOZ_LOG(sApzEvtLog, LogLevel::Debug, (__VA_ARGS__))
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ namespace layers {
+ 
+@@ -79,6 +84,7 @@ void APZEventState::ProcessSingleTap(const CSSPoint& aPoint,
+     return;
+   }
+ 
++
+   if (mTouchEndCancelled) {
+     return;
+   }
+diff --git a/gfx/layers/d3d11/CompositorD3D11.cpp b/gfx/layers/d3d11/CompositorD3D11.cpp
+index 0586caaf45..d518429646 100644
+--- a/gfx/layers/d3d11/CompositorD3D11.cpp
++++ b/gfx/layers/d3d11/CompositorD3D11.cpp
+@@ -27,6 +27,13 @@
+ #include "nsIWidget.h"
+ #include "nsWindowsHelpers.h"
+ 
++#if defined(GECKO_W10M)
++#  include <algorithm>
++#  include "GeckoW10mPanelSwapChain.h"
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ namespace mozilla {
+ 
+ using namespace gfx;
+@@ -134,6 +141,83 @@ bool CompositorD3D11::Initialize(nsCString* const out_failureReason) {
+ 
+   mFeatureLevel = mDevice->GetFeatureLevel();
+ 
++#if defined(GECKO_W10M)
++  // An app container is handed no HWND and the widget is headless, so there
++  // is no window to make a swap chain for. The chain is made for composition
++  // instead and given to the shell's XAML SwapChainPanel -- the same panel
++  // ANGLE presents to on phones whose GPU can run hardware WebRender. This is
++  // the path for the ones that cannot: feature level 9_3, software WebRender
++  // drawing the tiles, this compositor putting them on the screen.
++  if (!mWidget->AsWindows()) {
++    memset(&mVSConstants, 0, sizeof(VertexShaderConstants));
++
++    RefPtr<IDXGIDevice> dxgiDevice;
++    RefPtr<IDXGIAdapter> dxgiAdapter;
++    RefPtr<IDXGIFactory2> dxgiFactory2;
++    mDevice->QueryInterface(dxgiDevice.StartAssignment());
++    if (dxgiDevice) {
++      dxgiDevice->GetAdapter(getter_AddRefs(dxgiAdapter));
++    }
++    if (dxgiAdapter) {
++      dxgiAdapter->GetParent(IID_PPV_ARGS(dxgiFactory2.StartAssignment()));
++    }
++    if (!dxgiFactory2 || !GeckoW10mHasPanel()) {
++      GeckoW10mNote("d3d11: no DXGI 1.2 factory or no panel -- not compositing");
++      *out_failureReason = "FEATURE_FAILURE_D3D11_NO_PANEL";
++      return false;
++    }
++
++    LayoutDeviceIntSize size = mWidget->GetClientSize();
++    DXGI_SWAP_CHAIN_DESC1 swapDesc = {};
++    swapDesc.Width = std::max(size.width, 1);
++    swapDesc.Height = std::max(size.height, 1);
++    swapDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    swapDesc.SampleDesc.Count = 1;
++    swapDesc.SampleDesc.Quality = 0;
++    swapDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    swapDesc.BufferCount = 2;
++    swapDesc.Scaling = DXGI_SCALING_STRETCH;
++    swapDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++    swapDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++    swapDesc.Flags = 0;
++
++    RefPtr<IDXGISwapChain1> swapChain;
++    hr = dxgiFactory2->CreateSwapChainForComposition(
++        mDevice, &swapDesc, nullptr, getter_AddRefs(swapChain));
++    {
++      char note[192];
++      SprintfLiteral(note,
++                     "d3d11: feature level 0x%04x, %ux%u composition swap "
++                     "chain -> 0x%08lx",
++                     unsigned(mFeatureLevel), swapDesc.Width, swapDesc.Height,
++                     static_cast<unsigned long>(hr));
++      GeckoW10mNote(note);
++    }
++    if (FAILED(hr) || !swapChain) {
++      *out_failureReason = "FEATURE_FAILURE_D3D11_SWAP_CHAIN";
++      return false;
++    }
++    if (FAILED(GeckoW10mAttachSwapChainToPanel(swapChain))) {
++      *out_failureReason = "FEATURE_FAILURE_D3D11_PANEL";
++      return false;
++    }
++    mSwapChain = swapChain;
++    mIsDoubleBuffered = true;
++
++    if (!mWidget->InitCompositor(this)) {
++      *out_failureReason = "FEATURE_FAILURE_D3D11_INIT_COMPOSITOR";
++      return false;
++    }
++    // Partial presents are Present1 with dirty rects: worth having, but they
++    // are one more thing an old Adreno driver can get wrong, and the first
++    // job is a picture at all.
++    mAllowPartialPresents = false;
++
++    reporter.SetSuccessful();
++    return true;
++  }
++#endif
++
+   mHwnd = mWidget->AsWindows()->GetHwnd();
+ 
+   memset(&mVSConstants, 0, sizeof(VertexShaderConstants));
+@@ -1084,12 +1168,29 @@ void CompositorD3D11::PrepareViewport(const gfx::IntSize& aSize,
+ void CompositorD3D11::EnsureSize() { mSize = mWidget->GetClientSize(); }
+ 
+ bool CompositorD3D11::VerifyBufferSize() {
+-  mWidget->AsWindows()->UpdateCompositorWndSizeIfNecessary();
++#if defined(GECKO_W10M)
++  if (mWidget->AsWindows())
++#endif
++    mWidget->AsWindows()->UpdateCompositorWndSizeIfNecessary();
+ 
+   DXGI_SWAP_CHAIN_DESC swapDesc;
+   HRESULT hr;
+ 
+   hr = mSwapChain->GetDesc(&swapDesc);
++#if defined(GECKO_W10M)
++  // A chain made for composition is described by GetDesc1; only the fields
++  // read below are needed.
++  if (FAILED(hr) && !mWidget->AsWindows()) {
++    RefPtr<IDXGISwapChain1> chain1;
++    DXGI_SWAP_CHAIN_DESC1 desc1 = {};
++    if (SUCCEEDED(mSwapChain->QueryInterface(
++            IID_PPV_ARGS(chain1.StartAssignment()))) &&
++        SUCCEEDED(hr = chain1->GetDesc1(&desc1))) {
++      swapDesc.BufferDesc.Width = desc1.Width;
++      swapDesc.BufferDesc.Height = desc1.Height;
++    }
++  }
++#endif
+   if (FAILED(hr)) {
+     gfxCriticalError() << "Failed to get the description " << hexa(hr) << ", "
+                        << mSize << ", " << (int)mVerifyBuffersFailed;
+diff --git a/gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp b/gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp
+new file mode 100644
+index 0000000000..cbb0706321
+--- /dev/null
++++ b/gfx/layers/d3d11/GeckoW10mPanelSwapChain.cpp
+@@ -0,0 +1,180 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// Handing CompositorD3D11's swap chain to the shell's XAML SwapChainPanel.
++//
++// The phones that matter most -- the Lumia 550, 650, 950 and their like --
++// have Adrenos that stop at Direct3D feature level 9_3. ANGLE there offers
++// only GLES2, which hardware WebRender will not run on, so the page is
++// rasterised in software. It used to be composited in software as well and
++// copied out through main memory into a XAML Image, every frame. This is the
++// other half: software WebRender draws the tiles, and the old D3D11 layers
++// compositor -- whose shaders are built for 9_3 -- puts them together on the
++// GPU and presents them to the same panel ANGLE uses on the bigger phones.
++//
++// CompositorD3D11 was written for a window. There is no window in an app
++// container, so its swap chain is made for composition and given to the
++// panel, exactly as NativeWindow11WinRT does for ANGLE. That file cannot be
++// reused: ANGLE is a separate library that xul does not link against. It is
++// in a file of its own because the WinRT headers do not belong anywhere near
++// a unified build.
++
++#include "GeckoW10mPanelSwapChain.h"
++
++#include <atomic>
++#include <cstdio>
++#include <functional>
++
++#include <dxgi1_3.h>
++#include <windows.ui.core.h>
++#include <windows.ui.xaml.h>
++#include <windows.ui.xaml.controls.h>
++#include <windows.ui.xaml.media.dxinterop.h>
++#include <wrl.h>
++#include <wrl/wrappers/corewrappers.h>
++
++extern "C" void GeckoW10mNote(const char* text);
++
++// The panel the shell handed over; HeadlessCompositorWidget keeps it.
++extern "C" void* gecko_w10m_egl_native_window();
++
++namespace {
++
++std::atomic<bool> sPresenting{false};
++
++// A SwapChainPanel may only be touched from the thread that owns it. Calling
++// SetSwapChain from the render thread does not fail -- it corrupts the system
++// compositor, and the process dies a moment later inside CoreUIComponents.
++// So the call is handed to the panel's own dispatcher and waited on.
++HRESULT RunOnUIThread(std::function<HRESULT()>&& aWork,
++                      ABI::Windows::UI::Core::ICoreDispatcher* aDispatcher) {
++  boolean hasAccess = FALSE;
++  HRESULT hr = aDispatcher->get_HasThreadAccess(&hasAccess);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  if (hasAccess) {
++    return aWork();
++  }
++
++  Microsoft::WRL::Wrappers::Event done(CreateEventExW(
++      nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS));
++  if (!done.IsValid()) {
++    return E_FAIL;
++  }
++
++  HRESULT inner = E_FAIL;
++  Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IAsyncAction> action;
++  hr = aDispatcher->RunAsync(
++      ABI::Windows::UI::Core::CoreDispatcherPriority_Normal,
++      Microsoft::WRL::Callback<Microsoft::WRL::Implements<
++          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
++          ABI::Windows::UI::Core::IDispatchedHandler,
++          Microsoft::WRL::FtmBase>>([&aWork, &inner, &done]() -> HRESULT {
++        inner = aWork();
++        SetEvent(done.Get());
++        return S_OK;
++      })
++          .Get(),
++      &action);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  WaitForSingleObjectEx(done.Get(), INFINITE, FALSE);
++  return inner;
++}
++
++void NoteHr(const char* aWhat, HRESULT aHr) {
++  char note[160];
++  snprintf(note, sizeof(note), "d3d11: %s, 0x%08lx", aWhat,
++           static_cast<unsigned long>(aHr));
++  GeckoW10mNote(note);
++}
++
++}  // namespace
++
++namespace mozilla::layers {
++
++bool GeckoW10mHasPanel() { return gecko_w10m_egl_native_window() != nullptr; }
++
++HRESULT GeckoW10mAttachSwapChainToPanel(IDXGISwapChain1* aSwapChain) {
++  using namespace ABI::Windows::UI;
++  auto* window = static_cast<IInspectable*>(gecko_w10m_egl_native_window());
++  if (!window || !aSwapChain) {
++    GeckoW10mNote("d3d11: there is no panel to present to");
++    return E_INVALIDARG;
++  }
++
++  Microsoft::WRL::ComPtr<ISwapChainPanelNative> native;
++  HRESULT hr = window->QueryInterface(IID_PPV_ARGS(native.GetAddressOf()));
++  if (FAILED(hr)) {
++    NoteHr("what was handed over is not a SwapChainPanel", hr);
++    return hr;
++  }
++  Microsoft::WRL::ComPtr<Xaml::IDependencyObject> dependency;
++  hr = window->QueryInterface(IID_PPV_ARGS(dependency.GetAddressOf()));
++  if (FAILED(hr)) {
++    NoteHr("the panel is not a XAML object", hr);
++    return hr;
++  }
++  Microsoft::WRL::ComPtr<Core::ICoreDispatcher> dispatcher;
++  hr = dependency->get_Dispatcher(dispatcher.GetAddressOf());
++  if (FAILED(hr) || !dispatcher) {
++    NoteHr("the panel would not say which thread it belongs to", hr);
++    return FAILED(hr) ? hr : E_FAIL;
++  }
++  // The scale is a property of the panel, so it is read on the panel's thread
++  // in the same trip that hands the chain over.
++  Microsoft::WRL::ComPtr<Xaml::Controls::ISwapChainPanel> panel;
++  window->QueryInterface(IID_PPV_ARGS(panel.GetAddressOf()));
++
++  float scaleX = 1.0f;
++  float scaleY = 1.0f;
++  ISwapChainPanelNative* rawNative = native.Get();
++  Xaml::Controls::ISwapChainPanel* rawPanel = panel.Get();
++  hr = RunOnUIThread(
++      [rawNative, rawPanel, aSwapChain, &scaleX, &scaleY]() -> HRESULT {
++        if (rawPanel) {
++          rawPanel->get_CompositionScaleX(&scaleX);
++          rawPanel->get_CompositionScaleY(&scaleY);
++        }
++        return rawNative->SetSwapChain(aSwapChain);
++      },
++      dispatcher.Get());
++  if (FAILED(hr)) {
++    NoteHr("the panel would not take the swap chain", hr);
++    return hr;
++  }
++
++  // XAML shows a swap chain's pixels as logical units; on a 200% phone that
++  // is a picture twice too big. The inverse transform makes it one to one.
++  if (scaleX <= 0) scaleX = 1.0f;
++  if (scaleY <= 0) scaleY = 1.0f;
++  Microsoft::WRL::ComPtr<IDXGISwapChain2> chain2;
++  HRESULT scaled = aSwapChain->QueryInterface(IID_PPV_ARGS(chain2.GetAddressOf()));
++  if (SUCCEEDED(scaled)) {
++    DXGI_MATRIX_3X2_F inverse = {};
++    inverse._11 = 1.0f / scaleX;
++    inverse._22 = 1.0f / scaleY;
++    scaled = chain2->SetMatrixTransform(&inverse);
++  }
++  char note[160];
++  snprintf(note, sizeof(note),
++           "d3d11: the panel took the swap chain, scale %.3fx%.3f, inverse "
++           "transform -> 0x%08lx",
++           scaleX, scaleY, static_cast<unsigned long>(scaled));
++  GeckoW10mNote(note);
++
++  sPresenting = true;
++  return S_OK;
++}
++
++}  // namespace mozilla::layers
++
++// Polled by the shell. The software path fills the buffer the splash waits
++// for; this one presents on its own, so the shell has to be told.
++extern "C" __declspec(dllexport) int32_t gecko_w10m_panel_presenting() {
++  return sPresenting ? 1 : 0;
++}
+diff --git a/gfx/layers/d3d11/GeckoW10mPanelSwapChain.h b/gfx/layers/d3d11/GeckoW10mPanelSwapChain.h
+new file mode 100644
+index 0000000000..9c5de85d2e
+--- /dev/null
++++ b/gfx/layers/d3d11/GeckoW10mPanelSwapChain.h
+@@ -0,0 +1,25 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef MOZILLA_GFX_GECKOW10MPANELSWAPCHAIN_H
++#define MOZILLA_GFX_GECKOW10MPANELSWAPCHAIN_H
++
++#include <windows.h>
++
++struct IDXGISwapChain1;
++
++namespace mozilla::layers {
++
++// Whether the shell has given the engine a XAML SwapChainPanel.
++bool GeckoW10mHasPanel();
++
++// Gives a composition swap chain to that panel, on the panel's own thread,
++// and undoes the panel's composition scale so one buffer pixel is one screen
++// pixel. See GeckoW10mPanelSwapChain.cpp.
++HRESULT GeckoW10mAttachSwapChainToPanel(IDXGISwapChain1* aSwapChain);
++
++}  // namespace mozilla::layers
++
++#endif  // MOZILLA_GFX_GECKOW10MPANELSWAPCHAIN_H
+diff --git a/gfx/layers/moz.build b/gfx/layers/moz.build
+index 6ca0e1774c..2a0979d990 100644
+--- a/gfx/layers/moz.build
++++ b/gfx/layers/moz.build
+@@ -56,6 +56,12 @@ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "windows":
+         "d3d11/CompositorD3D11.cpp",
+         "d3d11/DeviceAttachmentsD3D11.cpp",
+     ]
++    if CONFIG["MOZ_UWP"]:
++        # CompositorD3D11 presents to the shell's XAML SwapChainPanel; the
++        # WinRT headers stay in a file of their own.
++        SOURCES += [
++            "d3d11/GeckoW10mPanelSwapChain.cpp",
++        ]
+ 
+     if CONFIG["MOZ_WMF_MEDIA_ENGINE"]:
+         EXPORTS.mozilla.layers += [
+diff --git a/gfx/pixman/pixman/pixman/moz.build b/gfx/pixman/pixman/pixman/moz.build
+index 9699e3186c..088f2388c3 100644
+--- a/gfx/pixman/pixman/pixman/moz.build
++++ b/gfx/pixman/pixman/pixman/moz.build
+@@ -78,7 +78,13 @@ elif CONFIG['TARGET_CPU'] == 'aarch64' and CONFIG['OS_TARGET'] in ('Android', 'L
+     ]
+     SOURCES['pixman-arm-neon.c'].flags += ['-march=armv8-a']
+ elif CONFIG['TARGET_CPU'] == 'arm':
+-    if CONFIG['HAVE_ARM_NEON']:
++    # pixman's hand-written 32-bit ARM assembly is A32 (ARM mode). Windows on
++    # ARM32 is Thumb-2 only -- the assembler rejects it outright with "target
++    # does not support ARM mode" -- so those fast paths are unavailable there
++    # and pixman falls back to its generic C implementations.
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        pass
++    elif CONFIG['HAVE_ARM_NEON']:
+         DEFINES['USE_ARM_NEON'] = True
+         SOURCES += [
+             'pixman-arm-neon-asm-bilinear.S',
+@@ -86,14 +92,14 @@ elif CONFIG['TARGET_CPU'] == 'arm':
+             'pixman-arm-neon.c',
+         ]
+         SOURCES['pixman-arm-neon.c'].flags += CONFIG['NEON_FLAGS']
+-    if CONFIG['HAVE_ARM_SIMD']:
++    if CONFIG['HAVE_ARM_SIMD'] and CONFIG['OS_TARGET'] != 'WINNT':
+         DEFINES['USE_ARM_SIMD'] = True
+         SOURCES += [
+             'pixman-arm-simd-asm-scaled.S',
+             'pixman-arm-simd-asm.S',
+             'pixman-arm-simd.c',
+         ]
+-    if CONFIG['HAVE_ARM_NEON'] or CONFIG['HAVE_ARM_SIMD']:
++    if (CONFIG['HAVE_ARM_NEON'] or CONFIG['HAVE_ARM_SIMD']) and CONFIG['OS_TARGET'] != 'WINNT':
+         DEFINES['ASM_HAVE_SYNTAX_UNIFIED'] = True
+     if CONFIG['OS_TARGET'] == 'Android':
+         # For cpu-features.h
+diff --git a/gfx/pixman/pixman/pixman/pixman-arm.c b/gfx/pixman/pixman/pixman/pixman-arm.c
+index d271e96a72..020ba52b6e 100644
+--- a/gfx/pixman/pixman/pixman/pixman-arm.c
++++ b/gfx/pixman/pixman/pixman/pixman-arm.c
+@@ -48,6 +48,13 @@ detect_cpu_features (void)
+ {
+     arm_cpu_features_t features = 0;
+ 
++#if defined(__clang__)
++    /* clang implements no structured exception handling on 32-bit ARM Windows,
++     * so the trap-based probe cannot be compiled. Every Windows-on-ARM device
++     * is ARMv7 with mandatory NEON, which is what the probe would find. */
++    features |= ARM_V6;
++    features |= ARM_NEON;
++#else
+     __try
+     {
+ 	pixman_msvc_try_arm_simd_op ();
+@@ -65,6 +72,7 @@ detect_cpu_features (void)
+     __except (GetExceptionCode () == EXCEPTION_ILLEGAL_INSTRUCTION)
+     {
+     }
++#endif
+ 
+     return features;
+ }
+diff --git a/gfx/skia/skia/src/utils/win/SkDWrite.cpp b/gfx/skia/skia/src/utils/win/SkDWrite.cpp
+index b159e14d6c..5fb116ba62 100644
+--- a/gfx/skia/skia/src/utils/win/SkDWrite.cpp
++++ b/gfx/skia/skia/src/utils/win/SkDWrite.cpp
+@@ -49,7 +49,15 @@ static void create_dwrite_factory(IDWriteFactory** factory) {
+         HRVM(hr, "Could not get DWriteCreateFactory proc.");
+     }
+ 
+-    HRVM(dWriteCreateFactoryProc(DWRITE_FACTORY_TYPE_SHARED,
++    HRVM(dWriteCreateFactoryProc(
++#if defined(GECKO_W10M)
++                    // Isolated, not shared: see gfx/2d/Factory.cpp. The host
++                    // app owns the shared factory and lays out its own text
++                    // with it.
++                    DWRITE_FACTORY_TYPE_ISOLATED,
++#else
++                    DWRITE_FACTORY_TYPE_SHARED,
++#endif
+                                  __uuidof(IDWriteFactory),
+                                  reinterpret_cast<IUnknown**>(factory)),
+          "Could not create DirectWrite factory.");
+diff --git a/gfx/src/DriverCrashGuard.cpp b/gfx/src/DriverCrashGuard.cpp
+index fe7a27e03c..e7dedab149 100644
+--- a/gfx/src/DriverCrashGuard.cpp
++++ b/gfx/src/DriverCrashGuard.cpp
+@@ -60,6 +60,24 @@ void DriverCrashGuard::InitializeIfNeeded() {
+ }
+ 
+ static inline bool AreCrashGuardsEnabled(CrashGuardType aType) {
++#if defined(GECKO_W10M)
++  // A guard tells "crashed while initialising graphics" from "was killed
++  // while initialising graphics" by asking the crash reporter, and there is
++  // none here. On a phone the second is what a user does to a slow launch,
++  // and one device log shows it twice, followed by hardware compositing off
++  // for good on every launch after. The environment switch below never
++  // reaches this process from the shell, so the answer is given here.
++  return false;
++#endif
++#if defined(GECKO_W10M)
++  // A guard tells "crashed while initialising graphics" from "was killed
++  // while initialising graphics" by asking the crash reporter, and there is
++  // none here. On a phone the second is what a user does to a slow launch,
++  // and one device log shows it twice, followed by hardware compositing off
++  // for good on every launch after. The environment switch below never
++  // reaches this process from the shell, so the answer is given here.
++  return false;
++#endif
+   // Crash guard isn't supported in the GPU or RDD process since the entire
+   // process is basically a crash guard.
+   if (XRE_IsGPUProcess() || XRE_IsRDDProcess()) {
+diff --git a/gfx/thebes/DeviceManagerDx.cpp b/gfx/thebes/DeviceManagerDx.cpp
+index f9048e5a42..8695626386 100644
+--- a/gfx/thebes/DeviceManagerDx.cpp
++++ b/gfx/thebes/DeviceManagerDx.cpp
+@@ -72,6 +72,14 @@ DeviceManagerDx::DeviceManagerDx()
+   mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_11_0);
+   mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_10_1);
+   mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_10_0);
++#if defined(GECKO_W10M)
++  // The Adreno 304/305/306 in the Lumia 550, 650 and their like stop at 9_3.
++  // Without this they get no device at all, and with no device nothing is
++  // composited on the GPU. At 9_3 texture sharing is off, so ANGLE and
++  // hardware WebRender stay off too; what it buys is software WebRender with
++  // the D3D11 compositor, whose shaders are built for 9_3.
++  mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_9_3);
++#endif
+   MOZ_COUNT_CTOR(DeviceManagerDx);
+ }
+ 
+diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
+index f45971a4ec..a892c5ff9d 100644
+--- a/gfx/thebes/gfxPlatform.cpp
++++ b/gfx/thebes/gfxPlatform.cpp
+@@ -3,6 +3,14 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "gfxPlatform.h"
++#if defined(GECKO_W10M) && defined(XP_WIN)
++#  include "mozilla/gfx/DeviceManagerDx.h"
++#endif
++
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
+ 
+ #include "GfxDriverInfo.h"
+ #include "VRProcessManager.h"
+@@ -1344,7 +1352,14 @@ void gfxPlatform::InitLayersIPC() {
+ 
+   if (XRE_IsParentProcess()) {
+ #if defined(XP_WIN)
+-    if (gfxConfig::IsEnabled(gfx::Feature::WINDOW_OCCLUSION)) {
++    // There is nothing to track when there are no windows. Headless has none
++    // by definition, and a packaged app has a CoreWindow rather than the
++    // desktop windows this watches. Either way the tracker's constructor
++    // reaches WinEventWindow::Ensure, which registers a window class and
++    // creates a message-only window -- neither of which exists on a device
++    // without USER32's window functions, and it crashes rather than fail.
++    if (!gfxPlatform::IsHeadless() &&
++        gfxConfig::IsEnabled(gfx::Feature::WINDOW_OCCLUSION)) {
+       widget::WinWindowOcclusionTracker::Ensure();
+     }
+ #endif
+@@ -2552,11 +2567,23 @@ void gfxPlatform::InitCompositorAccelerationPrefs() {
+                          "Acceleration blocked by safe-mode",
+                          "FEATURE_FAILURE_COMP_SAFEMODE"_ns);
+   }
++#if defined(GECKO_W10M)
++  // Not here. Headless blocks acceleration because a headless window has
++  // nothing to present to -- which was true of this one until it was given a
++  // XAML SwapChainPanel. It is headless because an app container is handed no
++  // HWND, not because there is no screen; the screen is the phone's.
++  //
++  // This is the single line that was keeping the frame in software. It turned
++  // off hardware compositing, which turned off D3D11 compositing, which turned
++  // off WebRender -- the log named all three and only the last two gave a
++  // reason, because the reason was this one.
++#else
+   if (IsHeadless()) {
+     feature.ForceDisable(FeatureStatus::Blocked,
+                          "Acceleration blocked by headless mode",
+                          "FEATURE_FAILURE_COMP_HEADLESSMODE"_ns);
+   }
++#endif
+ }
+ 
+ /*static*/
+@@ -2648,6 +2675,33 @@ void gfxPlatform::InitWebRenderConfig() {
+ 
+   gfxVars::SetUseSoftwareWebRender(!hasHardware);
+ 
++#if defined(GECKO_W10M)
++  {
++    // Which of these is off, and the reason it gives, is the whole answer to
++    // why the frame is still being rasterised in software -- and the decision
++    // is made here, long before anything reaches RenderCompositor.
++    auto say = [](const char* name, gfx::Feature aFeature) {
++      auto& feature = gfxConfig::GetFeature(aFeature);
++      const char* why = feature.GetFailureMessage();
++      char note[256];
++      SprintfLiteral(note, "gfx: %s is %s%s%s", name,
++                     feature.IsEnabled() ? "on" : "off",
++                     (why && *why) ? " -- " : "", (why && *why) ? why : "");
++      GeckoW10mNote(note);
++    };
++    say("hardware compositing", Feature::HW_COMPOSITING);
++    say("webrender", Feature::WEBRENDER);
++    say("d3d11 hardware angle", Feature::D3D11_HW_ANGLE);
++    say("webrender angle", Feature::WEBRENDER_ANGLE);
++    say("d3d11 compositing", Feature::D3D11_COMPOSITING);
++    say("hardware video decoding", Feature::HARDWARE_VIDEO_DECODING);
++    // Not canvas 2d: it is configured a few lines later than this runs, and
++    // says so itself from AcceleratedCanvas2DPrefChangeCallback.
++    say("gpu process", Feature::GPU_PROCESS);
++    GeckoW10mNote(AsyncPanZoomEnabled() ? "gfx: apz is on" : "gfx: apz is off");
++  }
++#endif
++
+   Preferences::RegisterPrefixCallbackAndCall(SwapIntervalPrefChangeCallback,
+                                              "gfx.swap-interval");
+ 
+@@ -3136,6 +3190,26 @@ void gfxPlatform::InitHardwareVideoConfig() {
+                                           canUseVulkanDecode);
+   gfxVars::SetCanUseHardwareVideoEncoding(featureEnc.IsEnabled());
+ 
++#if defined(GECKO_W10M)
++  {
++    // This runs long after the feature notes above, and it is the decision
++    // that decides whether video is decoded on the GPU or on four phone
++    // cores. Texture sharing is named too, because it is the one thing that
++    // can force the feature off no matter what the prefs say.
++    const char* why = featureDec.GetFailureMessage();
++    bool sharing = false;
++    if (auto* dm = gfx::DeviceManagerDx::Get()) {
++      sharing = dm->TextureSharingWorks();
++    }
++    char note[256];
++    SprintfLiteral(note, "gfx: hardware video decoding is %s%s%s (texture sharing %s)",
++                   featureDec.IsEnabled() ? "ON" : "off",
++                   (why && *why) ? " -- " : "", (why && *why) ? why : "",
++                   sharing ? "works" : "does NOT work");
++    GeckoW10mNote(note);
++  }
++#endif
++
+ #ifdef MOZ_WIDGET_ANDROID
+ #  define CODEC_HW_FEATURE_SETUP_PLATFORM(name, type, encoder)             \
+     feature##type##name.SetDefault(gfxAndroidPlatform::IsHwCodecSupported( \
+@@ -3536,6 +3610,20 @@ static void AcceleratedCanvas2DPrefChangeCallback(const char*, void*) {
+   }
+ 
+   gfxVars::SetUseAcceleratedCanvas2D(feature.IsEnabled());
++
++#if defined(GECKO_W10M)
++  {
++    // The feature note near the WebRender ones is printed by
++    // InitWebRenderConfig, which runs before this -- so it always said "off",
++    // whatever this then decided. Here is the decision itself.
++    const char* why = feature.GetFailureMessage();
++    char note[256];
++    SprintfLiteral(note, "gfx: accelerated canvas 2d is %s%s%s",
++                   feature.IsEnabled() ? "ON" : "off",
++                   (why && *why) ? " -- " : "", (why && *why) ? why : "");
++    GeckoW10mNote(note);
++  }
++#endif
+ }
+ 
+ void gfxPlatform::InitAcceleratedCanvas2DConfig() {
+@@ -3975,11 +4063,16 @@ bool gfxPlatform::UseDesktopZoomingScrollbars() {
+ 
+ /*static*/
+ bool gfxPlatform::AsyncPanZoomEnabled() {
+-#if !defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_WIDGET_UIKIT)
++#if !defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_WIDGET_UIKIT) && \
++    !defined(GECKO_W10M)
+   // For XUL applications (everything but Firefox on Android)
+   // we only want to use APZ when E10S is enabled. If
+   // we ever get input events off the main thread we can consider relaxing
+   // this requirement.
++  //
++  // GeckoW10m runs the whole browser in one process, like Android used to, and
++  // wants its panning and zooming on the compositor for the same reason a
++  // phone always did: a finger cannot wait for the main thread.
+   if (!BrowserTabsRemoteAutostart()) {
+     return false;
+   }
+diff --git a/gfx/thebes/moz.build b/gfx/thebes/moz.build
+index a9f68b0563..de29fd5e09 100644
+--- a/gfx/thebes/moz.build
++++ b/gfx/thebes/moz.build
+@@ -161,7 +161,6 @@ elif CONFIG["MOZ_WIDGET_TOOLKIT"] == "windows":
+     ]
+     EXPORTS.mozilla.gfx += [
+         "PrintTargetPDF.h",
+-        "PrintTargetWindows.h",
+     ]
+     SOURCES += [
+         "DisplayConfigWindows.cpp",
+@@ -171,8 +170,17 @@ elif CONFIG["MOZ_WIDGET_TOOLKIT"] == "windows":
+         "gfxWindowsPlatform.cpp",
+         "gfxWindowsSurface.cpp",
+         "PrintTargetPDF.cpp",
+-        "PrintTargetWindows.cpp",
+     ]
++    # The GDI print target wraps cairo's win32 printing surface, which cairo
++    # only builds with printing on; without the gate the target linked
++    # against a symbol that no longer existed.
++    if CONFIG["NS_PRINTING"]:
++        EXPORTS.mozilla.gfx += [
++            "PrintTargetWindows.h",
++        ]
++        SOURCES += [
++            "PrintTargetWindows.cpp",
++        ]
+     UNIFIED_SOURCES += [
+         "gfxDWriteFontList.cpp",
+     ]
+diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
+index 06ed553c01..ffda8c272a 100644
+--- a/gfx/webrender_bindings/RenderCompositor.cpp
++++ b/gfx/webrender_bindings/RenderCompositor.cpp
+@@ -15,14 +15,24 @@
+ #include "mozilla/webrender/RenderCompositorLayersSWGL.h"
+ #include "mozilla/webrender/RenderCompositorOGL.h"
+ #include "mozilla/webrender/RenderCompositorSWGL.h"
++#include "mozilla/webrender/RenderThread.h"
++#include "mozilla/webrender/webrender_ffi.h"
++#include "mozilla/TimeStamp.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++#  include "nsString.h"
++extern "C" void GeckoW10mNote(const char* text);
++extern "C" bool gecko_w10m_widget_is_overlay(mozilla::widget::CompositorWidget* aWidget);
++#endif
++
+ #ifdef XP_WIN
+ #  include "mozilla/webrender/RenderCompositorANGLE.h"
+ #  include "mozilla/widget/WinCompositorWidget.h"
+ #endif
+ 
+-#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
++#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK) ||     defined(GECKO_W10M)
+ #  include "mozilla/webrender/RenderCompositorEGL.h"
+ #endif
+ 
+@@ -213,12 +223,36 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
+         aWidget->GetCompositorOptions().AllowNativeCompositor()) {
+       return RenderCompositorNativeSWGL::Create(aWidget, aError);
+     }
++#endif
++#if defined(GECKO_W10M)
++    // One XAML SwapChainPanel, and it belongs to the browser window. Menus,
++    // panels and dialogs are drawn in software into the widget's own buffer
++    // and laid over it by the shell; only the browser window is composited by
++    // D3D11, which presents to the panel. That is the path for GPUs that stop
++    // at feature level 9_3, where hardware WebRender cannot run.
++    if (gecko_w10m_widget_is_overlay(aWidget.get())) {
++      GeckoW10mNote("gfx: an overlay window -- software compositor over the panel");
++      return RenderCompositorSWGL::Create(aWidget, aError);
++    }
++    GeckoW10mNote("gfx: software WebRender, trying the D3D11 compositor");
+ #endif
+     UniquePtr<RenderCompositor> comp =
+         RenderCompositorLayersSWGL::Create(aWidget, aError);
+     if (comp) {
++#if defined(GECKO_W10M)
++      GeckoW10mNote("gfx: the D3D11 compositor is up -- tiles go to the GPU");
++#endif
+       return comp;
+     }
++#if defined(GECKO_W10M)
++    {
++      char note[192];
++      SprintfLiteral(note,
++                     "gfx: no D3D11 compositor (%s) -- software all the way",
++                     nsPromiseFlatCString(aError).get());
++      GeckoW10mNote(note);
++    }
++#endif
+ #if defined(MOZ_WIDGET_ANDROID)
+     // On Android, we do not want to fallback from RenderCompositorOGLSWGL to
+     // RenderCompositorSWGL.
+@@ -229,7 +263,38 @@ UniquePtr<RenderCompositor> RenderCompositor::Create(
+     return RenderCompositorSWGL::Create(aWidget, aError);
+   }
+ 
+-#ifdef XP_WIN
++#if defined(GECKO_W10M)
++  // RenderCompositorANGLE is written around mWidget->AsWindows() -- GetHwnd,
++  // GetCompositorHwnd, MakeWindowAssociation, DestroyCompositorWindow. An app
++  // container is given no HWND and this widget is headless, so there is
++  // nothing for it to hold on to.
++  //
++  // RenderCompositorEGL is the one that asks the widget for a native window
++  // and leaves the rest to EGL, which is how Android and Wayland present. Here
++  // EGL is ANGLE, the native window is the XAML SwapChainPanel, and ANGLE
++  // makes a composition swap chain for it -- so the frame is handed to the
++  // system compositor as a texture instead of being copied out through main
++  // memory.
++  // Menus, panels and dialogs are windows of their own. There is one panel
++  // and it belongs to the browser window, so these are drawn in software --
++  // into the compositor widget's own buffer, as on the software path -- and
++  // the shell lays that buffer over the GPU picture.
++  if (gecko_w10m_widget_is_overlay(aWidget.get())) {
++    GeckoW10mNote("gfx: an overlay window -- software compositor over the panel");
++    return RenderCompositorSWGL::Create(aWidget, aError);
++  }
++  GeckoW10mNote("gfx: making the EGL compositor");
++  auto compositor = RenderCompositorEGL::Create(aWidget, aError);
++  if (compositor) {
++    GeckoW10mNote("gfx: the EGL compositor is up");
++  } else {
++    char note[192];
++    SprintfLiteral(note, "gfx: the EGL compositor failed -- %s",
++                   nsPromiseFlatCString(aError).get());
++    GeckoW10mNote(note);
++  }
++  return compositor;
++#elif defined(XP_WIN)
+   if (gfx::gfxVars::UseWebRenderANGLE()) {
+     return RenderCompositorANGLE::Create(aWidget, aError);
+   }
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index 0a9e5b4a85..4cc36669dc 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -29,6 +29,11 @@
+ #  include "mozilla/widget/AndroidCompositorWidget.h"
+ #endif
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* text);
++extern "C" void* gecko_w10m_egl_native_window();
++#endif
++
+ namespace mozilla::wr {
+ 
+ extern LazyLogModule gRenderThreadLog;
+@@ -54,6 +59,32 @@ UniquePtr<RenderCompositor> RenderCompositorEGL::Create(
+ 
+ EGLSurface RenderCompositorEGL::CreateEGLSurface() {
+   EGLSurface surface = EGL_NO_SURFACE;
++#if defined(GECKO_W10M)
++  // The surface has to be made on the context's own display, not on the
++  // default one. CreateEGLSurfaceForCompositorWidget fetches DefaultEglDisplay
++  // and is handed the context's config -- fine on Android and Wayland, where
++  // those are the same display, and wrong here: RenderThread::SingletonGL
++  // builds its context on a display made from Gecko's D3D11 device, so the
++  // config belongs to that one. EGL refused with 0x3005, EGL_BAD_CONFIG,
++  // before it ever looked at the window, which is why nothing in ANGLE's
++  // SwapChainPanel code ever ran.
++  //
++  // CreateCompatibleSurface takes both the display and the config from the
++  // context, which is the pairing EGL requires.
++  {
++    const auto& gle = gl::GLContextEGL::Cast(gl());
++    void* const window = gecko_w10m_egl_native_window();
++    if (!window) {
++      GeckoW10mNote("gfx: no panel to make a surface for");
++      return EGL_NO_SURFACE;
++    }
++    surface = gle->CreateCompatibleSurface(window);
++    GeckoW10mNote(surface == EGL_NO_SURFACE
++                    ? "gfx: the context's own display refused the panel too"
++                    : "gfx: the panel has a surface on the context's display");
++    return surface;
++  }
++#endif
+   surface = gl::GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+       mWidget, gl::GLContextEGL::Cast(gl())->mSurfaceConfig);
+   if (surface == EGL_NO_SURFACE) {
+@@ -71,6 +102,21 @@ RenderCompositorEGL::RenderCompositorEGL(
+     : RenderCompositor(aWidget), mGL(aGL), mEGLSurface(EGL_NO_SURFACE) {
+   MOZ_ASSERT(mGL);
+   LOG("RenderCompositorEGL::RenderCompositorEGL()");
++#if defined(GECKO_W10M)
++  // Nobody was making the surface. Wayland makes it here, Android makes it in
++  // Resume, and this target is neither -- so mEGLSurface stayed EGL_NO_SURFACE
++  // for the whole of a run. WebRender then drew into a 1x1 pbuffer and
++  // SwapBuffers returned false every frame, which is why ANGLE's window code
++  // was never reached and nothing ever appeared. The panel is the surface, and
++  // it is made the same way Wayland makes its own.
++  mEGLSurface = CreateEGLSurface();
++  if (mEGLSurface == EGL_NO_SURFACE) {
++    GeckoW10mNote("gfx: the panel would not give an EGL surface");
++  } else {
++    gl::GLContextEGL::Cast(gl())->SetEGLSurfaceOverride(mEGLSurface);
++    GeckoW10mNote("gfx: the panel has an EGL surface, frames go to the GPU");
++  }
++#endif
+ #ifdef MOZ_WAYLAND
+   if (widget::GdkIsWaylandDisplay()) {
+     mEGLSurface = CreateEGLSurface();
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 3ef9219df9..c286cf5970 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -31,7 +31,18 @@ class RenderCompositorEGL : public RenderCompositor {
+ 
+   bool MakeCurrent() override;
+ 
++#if defined(GECKO_W10M)
++  // Here EGL *is* ANGLE, on D3D11, which is what this flag means to the rest
++  // of the stack: it says the compositor can take a D3D11 texture instead of
++  // a buffer of pixels. It travels to the decoder as
++  // TextureFactoryIdentifier::mUseANGLE, and without it
++  // KnowsCompositor::SupportsD3D11() is false and WMF turns DXVA down with
++  // "Unsupported layers backend" -- which is what kept every frame on the CPU
++  // even once hardware decoding was enabled and texture sharing worked.
++  bool UseANGLE() const override { return true; }
++#else
+   bool UseANGLE() const override { return false; }
++#endif
+ 
+   LayoutDeviceIntSize GetBufferSize() override;
+ 
+diff --git a/gfx/webrender_bindings/RendererOGL.cpp b/gfx/webrender_bindings/RendererOGL.cpp
+index bdc8146983..28ebf8a9a0 100644
+--- a/gfx/webrender_bindings/RendererOGL.cpp
++++ b/gfx/webrender_bindings/RendererOGL.cpp
+@@ -19,6 +19,18 @@
+ #include "mozilla/webrender/RenderCompositor.h"
+ #include "mozilla/webrender/RenderTextureHost.h"
+ #include "mozilla/widget/CompositorWidget.h"
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++// The window is hidden a few hundred milliseconds after hardware WebRender
++// starts drawing. Note the stages of the first frames so the hide can be
++// placed against them.
++static uint32_t gGeckoW10mFrame = 0;
++static bool GeckoW10mFrameNoted(uint32_t frame) {
++  return frame <= 8 || frame == 10 || frame == 30 || frame == 60 ||
++         frame == 120 || frame == 300;
++}
++#endif
+ 
+ #ifdef MOZ_WIDGET_ANDROID
+ #  include "GLContextEGL.h"
+@@ -203,6 +215,15 @@ RenderedFrameId RendererOGL::UpdateAndRender(
+     if (!mCompositor->BeginFrame()) {
+       beginFrame = false;
+     }
++#if defined(GECKO_W10M)
++    ++gGeckoW10mFrame;
++    if (GeckoW10mFrameNoted(gGeckoW10mFrame)) {
++      char note[128];
++      SprintfLiteral(note, "frame %u: begin -- %s", gGeckoW10mFrame,
++                     beginFrame ? "current" : "BeginFrame refused");
++      GeckoW10mNote(note);
++    }
++#endif
+ 
+     fullRender = mCompositor->RequestFullRender();
+     // When we're rendering to an external target, we want to render everything.
+@@ -240,6 +261,15 @@ RenderedFrameId RendererOGL::UpdateAndRender(
+       wr_renderer_render(mRenderer, size.width, size.height, bufferAge,
+                          aOutStats, &dirtyRects, &didRasterize);
+   FlushPipelineInfo();
++#if defined(GECKO_W10M)
++  if (GeckoW10mFrameNoted(gGeckoW10mFrame)) {
++    char note[160];
++    SprintfLiteral(note, "frame %u: rendered %dx%d -- %s, %zu dirty rects",
++                   gGeckoW10mFrame, size.width, size.height,
++                   rendered ? "ok" : "FAILED", dirtyRects.Length());
++    GeckoW10mNote(note);
++  }
++#endif
+ 
+   // Track whether any tiles were rasterized for reftest support.
+   // Use OR to accumulate - once rasterization is detected, keep it set
+@@ -290,6 +320,13 @@ RenderedFrameId RendererOGL::UpdateAndRender(
+     // might invalidate it.
+     MaybeRecordFrame(mLastPipelineInfo);
+     frameId = mCompositor->EndFrame(dirtyRects);
++#if defined(GECKO_W10M)
++    if (GeckoW10mFrameNoted(gGeckoW10mFrame)) {
++      char note[96];
++      SprintfLiteral(note, "frame %u: ended, buffers swapped", gGeckoW10mFrame);
++      GeckoW10mNote(note);
++    }
++#endif
+     MOZ_ASSERT(needPostRenderCall);
+     mCompositor->GetWidget()->PostRender(&widgetContext);
+   }
+diff --git a/gfx/webrender_bindings/WebRenderAPI.cpp b/gfx/webrender_bindings/WebRenderAPI.cpp
+index 8f7928c42a..9b245775d1 100644
+--- a/gfx/webrender_bindings/WebRenderAPI.cpp
++++ b/gfx/webrender_bindings/WebRenderAPI.cpp
+@@ -3,6 +3,9 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "WebRenderAPI.h"
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* text);
++#endif
+ 
+ #include "GLContext.h"
+ #include "TextDrawTarget.h"
+@@ -279,6 +282,9 @@ RefPtr<WebRenderAPI::CreatePromise> WebRenderAPI::Create(
+               "Failed to make GL context current"_ns, __func__);
+         }
+ 
++#if defined(GECKO_W10M)
++        GeckoW10mNote("gfx: making the WebRender renderer");
++#endif
+         if (!wr_window_new(
+                 aWindowId, aSize.width, aSize.height,
+                 aWindowKind == WindowKind::MAIN, supportLowPriorityTransactions,
+@@ -312,6 +318,9 @@ RefPtr<WebRenderAPI::CreatePromise> WebRenderAPI::Create(
+         }
+         MOZ_ASSERT(wrRenderer);
+         MOZ_ASSERT(docHandle);
++#if defined(GECKO_W10M)
++        GeckoW10mNote("gfx: the WebRender renderer is up");
++#endif
+ 
+         const WebRenderBackend backend = compositor->BackendType();
+         const WebRenderCompositor compositorType = compositor->CompositorType();
+diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
+index 1abd565edc..2c8dac45c8 100644
+--- a/gfx/webrender_bindings/src/bindings.rs
++++ b/gfx/webrender_bindings/src/bindings.rs
+@@ -2233,7 +2233,17 @@ pub extern "C" fn wr_window_new(
+         None
+     };
+ 
+-    let texture_cache_config = if is_main_window {
++    let texture_cache_config = if is_main_window && static_prefs::pref!("gfx.webrender.texture-cache.small") {
++        // A phone: see the pref. Each shared page is a quarter of the default.
++        TextureCacheConfig {
++            color8_linear_texture_size: 1024,
++            color8_nearest_texture_size: 512,
++            color8_glyph_texture_size: 1024,
++            alpha8_texture_size: 512,
++            alpha8_glyph_texture_size: 1024,
++            alpha16_texture_size: 512,
++        }
++    } else if is_main_window {
+         TextureCacheConfig::DEFAULT
+     } else {
+         TextureCacheConfig {
+diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
+index 17d84a4c3c..3928dbd1e2 100644
+--- a/gfx/wr/webrender/src/device/gl.rs
++++ b/gfx/wr/webrender/src/device/gl.rs
+@@ -7,6 +7,83 @@ use api::{ImageDescriptor, ImageFormat, Parameter, BoolParameter, IntParameter,
+ use api::{MixBlendMode, ImageBufferKind, VoidPtrToSizeFn};
+ use api::{CrashAnnotator, CrashAnnotation, CrashAnnotatorGuard};
+ use api::units::*;
++
++// GeckoW10m: the phone shell hides the window shortly after hardware WebRender
++// starts drawing. Note what the device does in its first frames so the hide
++// can be placed against a texture or a frame. GeckoW10mNote lives in xul.
++#[cfg(windows)]
++extern "C" {
++    fn GeckoW10mNote(text: *const std::os::raw::c_char);
++}
++// Off unless GECKO_W10M_WR_TRACE is set. Two of these go out per composited
++// frame, and every one of them used to open the note file, seek, write, flush
++// it to the eMMC and close it again -- on the renderer thread, between frames.
++// That is what held compositing to about thirty frames a second, which a
++// sixty-frame video notices as every second frame dropped.
++#[cfg(windows)]
++static GECKO_W10M_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++
++#[cfg(windows)]
++pub fn gecko_w10m_note(text: &str) {
++    if !*GECKO_W10M_TRACE.get_or_init(|| std::env::var_os("GECKO_W10M_WR_TRACE").is_some()) {
++        return;
++    }
++    if let Ok(c) = std::ffi::CString::new(text) {
++        unsafe { GeckoW10mNote(c.as_ptr()) }
++    }
++}
++#[cfg(not(windows))]
++pub fn gecko_w10m_note(_text: &str) {}
++static GECKO_W10M_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_TEXTURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_CLEARS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_BLITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_TARGETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_UPLOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++fn gecko_w10m_count(counter: &std::sync::atomic::AtomicU32, first: u32) -> Option<u32> {
++    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++    GECKO_W10M_PULSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    if n <= first || n % 100 == 0 { Some(n) } else { None }
++}
++// A pulse the shell can read from its heartbeat: it rises on every noted GL
++// call, and `where` says what the renderer thread is inside right now
++// (0 idle, 1 a draw call, 2 a program link, 3 an instance-buffer upload,
++// 4 use_program). If the pulse stops rising while `where` stays non-zero, the
++// renderer thread is stuck inside that call.
++pub static GECKO_W10M_PULSE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++pub static GECKO_W10M_WHERE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[no_mangle]
++pub extern "C" fn gecko_w10m_wr_pulse_rust() -> u32 {
++    GECKO_W10M_PULSE.load(std::sync::atomic::Ordering::Relaxed)
++}
++#[no_mangle]
++pub extern "C" fn gecko_w10m_wr_where_rust() -> u32 {
++    GECKO_W10M_WHERE.load(std::sync::atomic::Ordering::Relaxed)
++}
++pub static GECKO_W10M_WR_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++extern "system" {
++    fn GetCurrentThreadId() -> u32;
++}
++#[no_mangle]
++pub extern "C" fn gecko_w10m_wr_thread_rust() -> u32 {
++    GECKO_W10M_WR_TID.load(std::sync::atomic::Ordering::Relaxed)
++}
++fn gecko_w10m_where(stage: u32) {
++    #[cfg(windows)]
++    {
++        if GECKO_W10M_WR_TID.load(std::sync::atomic::Ordering::Relaxed) == 0 {
++            GECKO_W10M_WR_TID.store(unsafe { GetCurrentThreadId() }, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++    GECKO_W10M_WHERE.store(stage, std::sync::atomic::Ordering::Relaxed);
++    GECKO_W10M_PULSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++}
++fn gecko_w10m_frame_noted(frame: u32) -> bool {
++    frame <= 4 || frame == 10 || frame == 30 || frame == 60 || frame == 120 || frame == 300
++}
+ use euclid::default::Transform3D;
+ use gleam::gl;
+ use crate::render_api::MemoryReport;
+@@ -2225,6 +2302,12 @@ impl Device {
+     pub fn begin_frame(&mut self) -> GpuFrameId {
+         debug_assert!(!self.inside_frame);
+         self.inside_frame = true;
++        {
++            let frame = GECKO_W10M_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if gecko_w10m_frame_noted(frame) {
++                gecko_w10m_note(&format!("wr: device frame {} begins", frame));
++            }
++        }
+         #[cfg(debug_assertions)]
+         {
+             self.shader_is_ready = false;
+@@ -2431,6 +2514,9 @@ impl Device {
+         };
+ 
+         self.depth_available = depth_available;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_TARGETS, 40) {
++            gecko_w10m_note(&format!("wr: draw target {} -- fbo {:?} rect {:?}", n, fbo_id, rect));
++        }
+         self.bind_draw_target_impl(fbo_id);
+         self.gl.viewport(
+             rect.min.x,
+@@ -2486,6 +2572,10 @@ impl Device {
+         assert!(!program.is_initialized());
+         let mut build_program = true;
+         let info = &program.source_info;
++        let gecko_w10m_link_started = std::time::Instant::now();
++        let gecko_w10m_link_n = GECKO_W10M_LINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        gecko_w10m_where(2);
++        gecko_w10m_note(&format!("wr: link {} -- {} begins", gecko_w10m_link_n, info.full_name()));
+ 
+         // See if we hit the binary shader cache
+         if let Some(ref cached_programs) = self.cached_programs {
+@@ -2522,6 +2612,11 @@ impl Device {
+             }
+         }
+ 
++        gecko_w10m_note(&format!(
++            "wr: link {} -- {}: {}",
++            gecko_w10m_link_n, info.full_name(),
++            if build_program { "compiling from source" } else { "loaded from a program binary" }
++        ));
+         // If not, we need to do a normal compile + link pass.
+         if build_program {
+             // Compile the vertex shader
+@@ -2570,6 +2665,12 @@ impl Device {
+ 
+             // Link!
+             self.gl.link_program(program.id);
++            gecko_w10m_note(&format!(
++                "wr: link {} -- {} linked in {} ms",
++                gecko_w10m_link_n, info.full_name(),
++                gecko_w10m_link_started.elapsed().as_millis()
++            ));
++            gecko_w10m_where(0);
+ 
+             // GL recommends detaching and deleting shaders once the link
+             // is complete (whether successful or not). This allows the driver
+@@ -2609,6 +2710,10 @@ impl Device {
+         program.is_initialized = true;
+         program.u_transform = self.gl.get_uniform_location(program.id, "uTransform");
+         program.u_texture_size = self.gl.get_uniform_location(program.id, "uTextureSize");
++        gecko_w10m_note(&format!(
++            "wr: link {} -- {}: uTransform at {}, uTextureSize at {}",
++            gecko_w10m_link_n, info.full_name(), program.u_transform, program.u_texture_size
++        ));
+ 
+         Ok(())
+     }
+@@ -2625,9 +2730,15 @@ impl Device {
+         }
+ 
+         if self.bound_program != program.id {
++            gecko_w10m_where(4);
+             self.gl.use_program(program.id);
++            gecko_w10m_where(0);
+             self.bound_program = program.id;
+             self.bound_program_name = program.source_info.full_name_cstr.clone();
++            static USES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            if let Some(n) = gecko_w10m_count(&USES, 40) {
++                gecko_w10m_note(&format!("wr: use program {} -- {:?}", n, self.bound_program_name));
++            }
+         }
+         true
+     }
+@@ -2649,6 +2760,17 @@ impl Device {
+             height = height.min(self.max_texture_size);
+         }
+ 
++        {
++            let n = GECKO_W10M_TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if n <= 40 || n % 50 == 0 {
++                gecko_w10m_note(&format!(
++                    "wr: texture {} -- {}x{} {:?} {:?}{}",
++                    n, width, height, format, target,
++                    if render_target.is_some() { ", render target" } else { "" }
++                ));
++            }
++        }
++
+         // Set up the texture book-keeping.
+         let mut texture = Texture {
+             id: self.gl.gen_textures(1)[0],
+@@ -2965,6 +3087,9 @@ impl Device {
+ 
+         let src_x0 = src_rect.min.x + self.bound_read_fbo.1.x;
+         let src_y0 = src_rect.min.y + self.bound_read_fbo.1.y;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_BLITS, 30) {
++            gecko_w10m_note(&format!("wr: blit {} -- {:?} -> {:?}", n, src_rect, dest_rect));
++        }
+ 
+         self.gl.blit_framebuffer(
+             src_x0,
+@@ -3159,6 +3284,19 @@ impl Device {
+         #[cfg(debug_assertions)]
+         debug_assert!(self.shader_is_ready);
+ 
++        // The renderer thread died inside ANGLE's GL_UniformMatrix4fv on the
++        // phone: with validation off (EGL_CONTEXT_OPENGL_NO_ERROR_KHR) a
++        // location of -1 goes straight into a bounds-checked vector index and
++        // the STL check ends in __fastfail, which no handler ever sees. GL says
++        // -1 is to be ignored, so ignore it here, as set_shader_texture_size
++        // already does for its own uniform.
++        if program.u_transform == -1 {
++            gecko_w10m_note(&format!(
++                "wr: {} has no uTransform location -- not setting it",
++                program.source_info.full_name()
++            ));
++            return;
++        }
+         self.gl
+             .uniform_matrix_4fv(program.u_transform, false, &transform.to_array());
+     }
+@@ -3535,6 +3673,17 @@ impl Device {
+     ) {
+         debug_assert_eq!(self.bound_vao, vao.id);
+         debug_assert_eq!(vao.instance_stride as usize, mem::size_of::<V>());
++        static INSTANCE_UPLOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        if let Some(n) = gecko_w10m_count(&INSTANCE_UPLOADS, 40) {
++            gecko_w10m_note(&format!(
++                "wr: instances {} -- {} x {} bytes, repeat {:?}",
++                n, instances.len(), mem::size_of::<V>(), repeat
++            ));
++        }
++        gecko_w10m_where(3);
++        struct WhereGuard;
++        impl Drop for WhereGuard { fn drop(&mut self) { gecko_w10m_where(0); } }
++        let _where_guard = WhereGuard;
+ 
+         match repeat {
+             Some(count) => {
+@@ -3711,12 +3860,22 @@ impl Device {
+             None
+         };
+ 
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices", n, self.bound_program_name, index_count));
++        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
+         self.gl.draw_elements(
+             gl::TRIANGLES,
+             index_count,
+             gl::UNSIGNED_SHORT,
+             0,
+         );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
+     }
+ 
+     pub fn draw_indexed_triangles_instanced_u16(&mut self, index_count: i32, instance_count: i32) {
+@@ -3734,6 +3893,12 @@ impl Device {
+             None
+         };
+ 
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} -- {:?}, {} indices x {} instances", n, self.bound_program_name, index_count, instance_count));
++        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
+         self.gl.draw_elements_instanced(
+             gl::TRIANGLES,
+             index_count,
+@@ -3741,6 +3906,10 @@ impl Device {
+             0,
+             instance_count,
+         );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
+     }
+ 
+     pub fn draw_indexed_triangles_instanced_base_instance_u16(
+@@ -3763,6 +3932,15 @@ impl Device {
+             None
+         };
+ 
++        let noted = gecko_w10m_count(&GECKO_W10M_DRAWS, 40);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!(
++                "wr: draw {} -- {:?}, {} indices x {} instances from base {}",
++                n, self.bound_program_name, index_count, instance_count, base_instance
++            ));
++        }
++        let started = std::time::Instant::now();
++        gecko_w10m_where(1);
+         self.gl.draw_elements_instanced_base_instance(
+             gl::TRIANGLES,
+             index_count,
+@@ -3771,11 +3949,24 @@ impl Device {
+             instance_count,
+             base_instance,
+         );
++        gecko_w10m_where(0);
++        if let Some(n) = noted {
++            gecko_w10m_note(&format!("wr: draw {} returned in {} ms", n, started.elapsed().as_millis()));
++        }
+     }
+ 
+     pub fn end_frame(&mut self) {
+         self.reset_draw_target();
+         self.reset_read_target();
++        {
++            let frame = GECKO_W10M_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
++            if gecko_w10m_frame_noted(frame) {
++                gecko_w10m_note(&format!(
++                    "wr: device frame {} ends -- {} textures made, {} deleted",
++                    frame, self.textures_created, self.textures_deleted
++                ));
++            }
++        }
+ 
+         debug_assert!(self.inside_frame);
+         self.inside_frame = false;
+@@ -3807,6 +3998,9 @@ impl Device {
+         rect: Option<FramebufferIntRect>,
+     ) {
+         let mut clear_bits = 0;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_CLEARS, 40) {
++            gecko_w10m_note(&format!("wr: clear {} -- color {:?} depth {:?} rect {:?}", n, color, depth, rect));
++        }
+ 
+         if let Some(color) = color {
+             self.gl.clear_color(color[0], color[1], color[2], color[3]);
+@@ -4641,6 +4835,12 @@ impl<'a> TextureUploader<'a> {
+ 
+         let bytes_pp = texture.format.bytes_per_pixel() as usize;
+         let width_bytes = rect.width() as usize * bytes_pp;
++        if let Some(n) = gecko_w10m_count(&GECKO_W10M_UPLOADS, 40) {
++            gecko_w10m_note(&format!(
++                "wr: upload {} -- {:?} into {:?} {:?} via {:?}",
++                n, rect, texture.get_dimensions(), texture.format, device.upload_method
++            ));
++        }
+ 
+         let src_stride = stride.map_or(width_bytes, |stride| {
+             assert!(stride >= 0);
+diff --git a/gfx/wr/webrender/src/device/query_gl.rs b/gfx/wr/webrender/src/device/query_gl.rs
+index db3dfcd6cf..dcbf722044 100644
+--- a/gfx/wr/webrender/src/device/query_gl.rs
++++ b/gfx/wr/webrender/src/device/query_gl.rs
+@@ -277,6 +277,13 @@ pub struct GpuMarker {
+ 
+ impl GpuMarker {
+     fn new(gl: &Rc<dyn gl::Gl>, message: &str, debug_method: GpuDebugMethod) -> Self {
++        {
++            static MARKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            let n = MARKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if n <= 30 {
++                crate::device::gecko_w10m_note(&format!("wr: marker {} -- {} via {:?}", n, message, debug_method));
++            }
++        }
+         let gl = match debug_method {
+             GpuDebugMethod::KHR => {
+               gl.push_debug_group_khr(gl::DEBUG_SOURCE_APPLICATION, 0, message);
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index 024e1b63c4..4a8d5ea011 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -3713,6 +3713,7 @@ impl Renderer {
+             frame.has_been_rendered = true;
+             return;
+         }
++        crate::device::gecko_w10m_note(&format!("wr: draw_frame -- {} passes, device size {:?}", frame.passes.len(), device_size));
+ 
+         {
+             let _gm = self.gpu_profiler.start_marker("gpu buffer update");
+@@ -3731,11 +3732,13 @@ impl Renderer {
+             );
+         }
+ 
++        crate::device::gecko_w10m_note("wr: gpu buffers updated");
+         self.device.disable_depth_write();
+         self.set_blend(false, FramebufferKind::Other);
+         self.device.disable_stencil();
+ 
+         self.bind_frame_data(frame);
++        crate::device::gecko_w10m_note("wr: frame data bound");
+ 
+         let bytes_to_mb = 1.0 / 1000000.0;
+         let gpu_buffer_bytes_f = frame.gpu_buffer_f.size.to_f32().area() * 16.0;
+@@ -3808,6 +3811,13 @@ impl Renderer {
+         }
+ 
+         for (_pass_index, pass) in frame.passes.iter_mut().enumerate() {
++            {
++                static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                let n = PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++                if n <= 60 {
++                    crate::device::gecko_w10m_note(&format!("wr: pass {} (index {} of this frame) begins", n, _pass_index));
++                }
++            }
+             #[cfg(not(target_os = "android"))]
+             let _gm = self.gpu_profiler.start_marker(&format!("pass {}", _pass_index));
+ 
+@@ -3939,6 +3949,7 @@ impl Renderer {
+             present_mode,
+         );
+ 
++        crate::device::gecko_w10m_note("wr: draw_frame done");
+         frame.has_been_rendered = true;
+ 
+         Self::maybe_evict_gpu_buffer_texture(
+diff --git a/gfx/ycbcr/moz.build b/gfx/ycbcr/moz.build
+index af79c8e59c..44b0bae9bc 100644
+--- a/gfx/ycbcr/moz.build
++++ b/gfx/ycbcr/moz.build
+@@ -62,7 +62,10 @@ else:
+         'yuv_row_other.cpp',
+     ]
+ 
+-if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['HAVE_ARM_NEON']:
++# yuv_row_arm.s is A32 (ARM mode) assembly; Windows on ARM32 is Thumb-2 only,
++# so the generic C row converters are used there instead.
++if (CONFIG['TARGET_CPU'] == 'arm' and CONFIG['HAVE_ARM_NEON']
++        and CONFIG['OS_TARGET'] != 'WINNT'):
+     SOURCES += [
+         'yuv_row_arm.s',
+     ]
+diff --git a/gfx/ycbcr/ycbcr_to_rgb565.h b/gfx/ycbcr/ycbcr_to_rgb565.h
+index 7793962b5c..69349839b4 100644
+--- a/gfx/ycbcr/ycbcr_to_rgb565.h
++++ b/gfx/ycbcr/ycbcr_to_rgb565.h
+@@ -7,7 +7,9 @@
+ #include "mozilla/arm.h"
+ 
+ // It's currently only worth including this if we have NEON support.
+-#if defined(__arm__) && defined(MOZILLA_MAY_SUPPORT_NEON)
++// The row converters behind this are NEON assembly in A32 (ARM mode);
++// Windows on ARM32 is Thumb-2 only and cannot assemble them.
++#if defined(__arm__) && defined(MOZILLA_MAY_SUPPORT_NEON) && !defined(_M_ARM)
+ #define HAVE_YCBCR_TO_RGB565 1
+ #endif
+ 
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index d073433aa9..2776ef06b1 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -8810,6 +8810,19 @@
+   mirror: once
+ 
+ # Enable dithering in hardware WebRender
++# GeckoW10m: 1024-pixel shared cache textures for the main window instead of
++# 2048. On a phone the GPU's memory is the phone's memory: ANGLE's accounting
++# showed 145-160 MB of D3D11 textures with a blank tab, fourteen of them the
++# 16 MB pages of this cache, and that is the write-combined block that the
++# engine's own memory tree could not name. A quarter-size page holds a
++# quarter as much, so more pages get allocated under load, but the idle
++# footprint and the waste in a half-empty page drop fourfold.
++- name: gfx.webrender.texture-cache.small
++  type: bool
++  value: false
++  mirror: once
++  rust: true
++
+ - name: gfx.webrender.dithering
+   type: bool
+   rust: true
+diff --git a/third_party/angle/angle_d3d_format_tables_gn/moz.build b/third_party/angle/angle_d3d_format_tables_gn/moz.build
+index 7b5ea2627f..e03c4ec975 100644
+--- a/third_party/angle/angle_d3d_format_tables_gn/moz.build
++++ b/third_party/angle/angle_d3d_format_tables_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -85,3 +85,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d_format_tables_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/angle_gpu_info_util_gn/moz.build b/third_party/angle/angle_gpu_info_util_gn/moz.build
+index 280ffaf09f..f792532c67 100644
+--- a/third_party/angle/angle_gpu_info_util_gn/moz.build
++++ b/third_party/angle/angle_gpu_info_util_gn/moz.build
+@@ -74,7 +74,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+     DEFINES["NOMINMAX"] = True
+@@ -123,3 +123,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("angle_gpu_info_util_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libANGLE_gn/moz.build b/third_party/angle/libANGLE_gn/moz.build
+index f2404f0df1..d4f37df38a 100644
+--- a/third_party/angle/libANGLE_gn/moz.build
++++ b/third_party/angle/libANGLE_gn/moz.build
+@@ -72,7 +72,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -100,7 +100,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["__STD_C"] = True
+ 
+     OS_LIBS += [
+-        "d3d9",
+         "delayimp",
+         "dxgi",
+         "dxguid",
+@@ -123,3 +122,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("ANGLE_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libANGLE_no_vulkan_gn/moz.build b/third_party/angle/libANGLE_no_vulkan_gn/moz.build
+index 9c9b022535..e8a5b0a7e2 100644
+--- a/third_party/angle/libANGLE_no_vulkan_gn/moz.build
++++ b/third_party/angle/libANGLE_no_vulkan_gn/moz.build
+@@ -182,7 +182,7 @@ if CONFIG["OS_TARGET"] == "Darwin":
+ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -210,7 +210,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["__STD_C"] = True
+ 
+     OS_LIBS += [
+-        "d3d9",
+         "delayimp",
+         "dxgi",
+         "dxguid",
+@@ -222,7 +221,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+     USE_LIBS += [
+         "angle_d3d11_backend_gn",
+-        "angle_d3d9_backend_gn"
+     ]
+ 
+ if CONFIG["TARGET_CPU"] == "aarch64":
+@@ -238,3 +236,10 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ Library("ANGLE_no_vulkan_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/libEGL_gn/moz.build b/third_party/angle/libEGL_gn/moz.build
+index 7ee46b3571..4d26ebcd2e 100644
+--- a/third_party/angle/libEGL_gn/moz.build
++++ b/third_party/angle/libEGL_gn/moz.build
+@@ -159,3 +159,12 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ GeckoSharedLibrary("EGL_gn")
++
++# GeckoW10m: clang's 32-bit ARM virtual-call thunks destroy r1 (see
++# tools/patch-vcall-thunks.py); the patcher finds them through the linker map,
++# and without one this DLL went unpatched. ANGLE dispatches every uniform set
++# through a pointer-to-member virtual call, so the uniform location arrived as
++# the thunk's own address and the STL bounds check ended the renderer thread
++# with a fast fail. Same map as xul.dll gets.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:libEGL.map"]
+diff --git a/third_party/angle/libGLESv2_gn/moz.build b/third_party/angle/libGLESv2_gn/moz.build
+index 74622ae58e..38a268932b 100644
+--- a/third_party/angle/libGLESv2_gn/moz.build
++++ b/third_party/angle/libGLESv2_gn/moz.build
+@@ -97,7 +97,7 @@ if CONFIG["OS_TARGET"] == "WINNT":
+ 
+ 
+     DEFINES["ANGLE_ENABLE_D3D11"] = True
+-    DEFINES["ANGLE_ENABLE_D3D9"] = True
++    DEFINES["ANGLE_ENABLE_D3D9"] = False
+     DEFINES["ANGLE_IS_WIN"] = True
+     DEFINES["ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES"] = "{ \"d3dcompiler_47.dll\", \"d3dcompiler_46.dll\", \"d3dcompiler_43.dll\" }"
+     DEFINES["CERT_CHAIN_PARA_HAS_EXTRA_FIELDS"] = True
+@@ -129,7 +129,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+     OS_LIBS += [
+         "advapi32",
+         "comdlg32",
+-        "d3d9",
+         "dbghelp",
+         "delayimp",
+         "dnsapi",
+@@ -179,3 +178,28 @@ if CONFIG["MOZ_DEBUG"] == "1" and CONFIG["OS_TARGET"] == "WINNT":
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+ GeckoSharedLibrary("GLESv2_gn")
++
++# GeckoW10m: clang's 32-bit ARM virtual-call thunks destroy r1 (see
++# tools/patch-vcall-thunks.py); the patcher finds them through the linker map,
++# and without one this DLL went unpatched. ANGLE dispatches every uniform set
++# through a pointer-to-member virtual call, so the uniform location arrived as
++# the thunk's own address and the STL bounds check ended the renderer thread
++# with a fast fail. Same map as xul.dll gets.
++if CONFIG["MOZ_UWP"]:
++    LDFLAGS += ["-MAP:libGLESv2.map"]
++
++# GeckoW10m: with the UWP paths on, ANGLE calls D3D11CreateDevice and the shader
++# compiler directly rather than reaching for them with LoadLibrary, so the
++# import libraries have to be named. Both exist on the phone -- the whole system
++# UI is D3D11, and d3dcompiler_47.dll is already loaded at runtime today.
++OS_LIBS += [
++    "d3d11",
++    "d3dcompiler"
++]
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/moz.build b/third_party/angle/moz.build
+index d2c7208f4d..ea6b05a901 100644
+--- a/third_party/angle/moz.build
++++ b/third_party/angle/moz.build
+@@ -54,7 +54,6 @@ if CONFIG["OS_TARGET"] == "WINNT":
+         "/third_party/angle/libEGL_gn",
+         "/third_party/angle/libGLESv2_gn",
+         "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn",
+-        "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn",
+         "/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn",
+         "/third_party/angle/third_party/zlib/google/compression_utils_portable_gn",
+         "/third_party/angle/third_party/zlib/zlib_gn"
+diff --git a/third_party/angle/src/libANGLE/Program.cpp b/third_party/angle/src/libANGLE/Program.cpp
+index bbd2f4c392..ce80236f32 100644
+--- a/third_party/angle/src/libANGLE/Program.cpp
++++ b/third_party/angle/src/libANGLE/Program.cpp
+@@ -44,6 +44,11 @@
+ #include "platform/PlatformMethods.h"
+ #include "platform/autogen/FrontendFeatures_autogen.h"
+ 
++namespace rx
++{
++void AngleUwpNote(const char *text);
++}
++
+ namespace gl
+ {
+ 
+@@ -986,6 +991,14 @@ angle::Result Program::link(const Context *context, angle::JobResultExpectancy r
+         egl::CacheGetResult result = egl::CacheGetResult::NotFound;
+         ANGLE_TRY(cache->getProgram(context, this, &mProgramHash, &result));
+ 
++        {
++            char note[128];
++            snprintf(note, sizeof(note), "angle: program %p link: cache %s", this,
++                     result == egl::CacheGetResult::Success    ? "HIT"
++                     : result == egl::CacheGetResult::Rejected ? "REJECTED"
++                                                               : "miss");
++            rx::AngleUwpNote(note);
++        }
+         switch (result)
+         {
+             case egl::CacheGetResult::Success:
+@@ -1242,6 +1255,13 @@ void Program::resolveLinkImpl(const Context *context)
+ 
+     angle::Result result                       = mLinkingState->linkEvent->wait(context);
+     mLinked                                    = result == angle::Result::Continue;
++    {
++        char note[160];
++        snprintf(note, sizeof(note), "angle: program %p link resolved: %s, from binary %d, executable %p",
++                 this, mLinked ? "linked" : "FAILED", mLinkingState->linkingFromBinary ? 1 : 0,
++                 mState.mExecutable.get());
++        rx::AngleUwpNote(note);
++    }
+     std::unique_ptr<LinkingState> linkingState = std::move(mLinkingState);
+     if (!mLinked)
+     {
+diff --git a/third_party/angle/src/libANGLE/ProgramExecutable.cpp b/third_party/angle/src/libANGLE/ProgramExecutable.cpp
+index bcef653ee2..c77355548e 100644
+--- a/third_party/angle/src/libANGLE/ProgramExecutable.cpp
++++ b/third_party/angle/src/libANGLE/ProgramExecutable.cpp
+@@ -22,6 +22,12 @@
+ #include "libANGLE/renderer/ProgramExecutableImpl.h"
+ #include "libANGLE/renderer/ProgramImpl.h"
+ 
++#include <cstdio>
++namespace rx
++{
++void AngleUwpNote(const char *text);
++}
++
+ namespace gl
+ {
+ namespace
+@@ -2756,6 +2762,22 @@ void ProgramExecutable::setUniformMatrixGeneric(UniformLocation location,
+         return;
+     }
+ 
++    {
++        static int geckoW10mNotes = 0;
++        if (geckoW10mNotes++ < 8)
++        {
++            char note[240];
++            snprintf(note, sizeof(note),
++                     "angle-gl: exec %p, locations at %p size %u, uniforms %u, sizeof exec %u, sizeof vector %u, impl %p, location %d",
++                     this, static_cast<const void *>(&mUniformLocations),
++                     static_cast<unsigned>(mUniformLocations.size()),
++                     static_cast<unsigned>(mUniforms.size()),
++                     static_cast<unsigned>(sizeof(ProgramExecutable)),
++                     static_cast<unsigned>(sizeof(std::vector<VariableLocation>)), mImplementation,
++                     location.value);
++            rx::AngleUwpNote(note);
++        }
++    }
+     GLsizei clampedCount = clampMatrixUniformCount<MatrixC, MatrixR>(location, count, transpose, v);
+     (mImplementation->*SetUniformMatrixFunc)(location.value, clampedCount, transpose, v);
+ }
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+index 5d545a61bf..66d550e395 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+@@ -12,6 +12,26 @@
+ 
+ #include "libANGLE/renderer/d3d/ProgramExecutableD3D.h"
+ 
++#include <cstdarg>
++#include <cstdio>
++// GeckoW10m: on the phone the renderer thread fast-fails inside
++// setUniformMatrix4fv because mD3DUniforms is shorter than the GL layer's
++// uniform table. These notes say how the table was filled, and the lookup
++// refuses to index past the end instead of dying.
++namespace rx
++{
++void AngleUwpNote(const char *text);
++}
++static void GeckoW10mAngleNote(const char *fmt, ...)
++{
++    char buf[256];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    rx::AngleUwpNote(buf);
++}
++
+ #include "common/bitset_utils.h"
+ #include "common/span.h"
+ #include "common/string_utils.h"
+@@ -427,6 +447,8 @@ void ProgramExecutableD3D::destroy(const gl::Context *context) {}
+ 
+ void ProgramExecutableD3D::reset()
+ {
++    GeckoW10mAngleNote("angle: executable %p (gl %p) reset, had %u d3d uniforms", this,
++                     mExecutable, static_cast<unsigned>(mD3DUniforms.size()));
+     mVertexExecutables.clear();
+     mPixelExecutables.clear();
+ 
+@@ -612,6 +634,8 @@ bool ProgramExecutableD3D::load(const gl::Context *context,
+ 
+         mD3DUniforms.push_back(d3dUniform);
+     }
++    GeckoW10mAngleNote("angle: executable %p (gl %p) loaded %u d3d uniforms from a binary", this,
++                     mExecutable, static_cast<unsigned>(mD3DUniforms.size()));
+ 
+     size_t blockCount = stream->readInt<size_t>();
+     if (stream->error())
+@@ -1764,6 +1788,10 @@ void ProgramExecutableD3D::defineUniformsAndAssignRegisters(
+     }
+     assignAllImageRegisters();
+     initializeUniformStorage(renderer, attachedShaders);
++    GeckoW10mAngleNote("angle: executable %p (gl %p) defined %u d3d uniforms of %u gl uniforms, %u locations",
++                     this, mExecutable, static_cast<unsigned>(mD3DUniforms.size()),
++                     static_cast<unsigned>(mExecutable->getUniforms().size()),
++                     static_cast<unsigned>(mExecutable->getUniformLocations().size()));
+ }
+ 
+ void ProgramExecutableD3D::defineUniformBase(gl::ShaderType shaderType,
+@@ -2023,12 +2051,24 @@ void ProgramExecutableD3D::gatherTransformFeedbackVaryings(
+ D3DUniform *ProgramExecutableD3D::getD3DUniformFromLocation(
+     const gl::VariableLocation &locationInfo)
+ {
++    if (locationInfo.index >= mD3DUniforms.size())
++    {
++        GeckoW10mAngleNote("angle: uniform index %u is beyond the %u d3d uniforms of executable %p (gl %p, %u gl uniforms, %u locations) -- ignoring the set",
++                         locationInfo.index, static_cast<unsigned>(mD3DUniforms.size()), this,
++                         mExecutable, static_cast<unsigned>(mExecutable->getUniforms().size()),
++                         static_cast<unsigned>(mExecutable->getUniformLocations().size()));
++        return nullptr;
++    }
+     return mD3DUniforms[locationInfo.index];
+ }
+ 
+ const D3DUniform *ProgramExecutableD3D::getD3DUniformFromLocation(
+     const gl::VariableLocation &locationInfo) const
+ {
++    if (locationInfo.index >= mD3DUniforms.size())
++    {
++        return nullptr;
++    }
+     return mD3DUniforms[locationInfo.index];
+ }
+ 
+@@ -2225,8 +2265,18 @@ void ProgramExecutableD3D::setUniformInternal(GLint location,
+                                               const T *v,
+                                               GLenum uniformType)
+ {
++    if (static_cast<size_t>(location) >= mExecutable->getUniformLocations().size())
++    {
++        GeckoW10mAngleNote("angle-d3d: (setUniformInternal) location %d is beyond the %u locations this side can see -- ignoring the set",
++                         location, static_cast<unsigned>(mExecutable->getUniformLocations().size()));
++        return;
++    }
+     const gl::VariableLocation &locationInfo = mExecutable->getUniformLocations()[location];
+-    D3DUniform *targetUniform                = mD3DUniforms[locationInfo.index];
++    D3DUniform *targetUniform                = getD3DUniformFromLocation(locationInfo);
++    if (!targetUniform)
++    {
++        return;
++    }
+ 
+     if (targetUniform->typeInfo.isSampler)
+     {
+@@ -2258,8 +2308,32 @@ void ProgramExecutableD3D::setUniformMatrixfvInternal(GLint location,
+                                                       GLboolean transpose,
+                                                       const GLfloat *value)
+ {
++    {
++        static int geckoW10mNotes = 0;
++        if (geckoW10mNotes++ < 8)
++        {
++            GeckoW10mAngleNote(
++                "angle-d3d: this %p, exec %p, locations at %p size %u, uniforms %u, sizeof exec %u, sizeof vector %u, location %d, d3d uniforms %u",
++                this, mExecutable, static_cast<const void *>(&mExecutable->getUniformLocations()),
++                static_cast<unsigned>(mExecutable->getUniformLocations().size()),
++                static_cast<unsigned>(mExecutable->getUniforms().size()),
++                static_cast<unsigned>(sizeof(gl::ProgramExecutable)),
++                static_cast<unsigned>(sizeof(std::vector<gl::VariableLocation>)), location,
++                static_cast<unsigned>(mD3DUniforms.size()));
++        }
++        if (static_cast<size_t>(location) >= mExecutable->getUniformLocations().size())
++        {
++            GeckoW10mAngleNote("angle-d3d: location %d is beyond the %u locations this side can see -- ignoring the set",
++                             location, static_cast<unsigned>(mExecutable->getUniformLocations().size()));
++            return;
++        }
++    }
+     const gl::VariableLocation &uniformLocation = mExecutable->getUniformLocations()[location];
+     D3DUniform *targetUniform                   = getD3DUniformFromLocation(uniformLocation);
++    if (!targetUniform)
++    {
++        return;
++    }
+     unsigned int arrayElementOffset             = uniformLocation.arrayIndex;
+     unsigned int elementCount                   = targetUniform->getArraySizeProduct();
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
+index 6b3ee46089..9e769fac6e 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d11_backend_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -63,7 +63,7 @@ OS_LIBS += [
+ ]
+ 
+ SOURCES += [
+-    "/third_party/angle/src/libANGLE/renderer/d3d/d3d11/win32/NativeWindow11Win32.cpp"
++    "/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp"
+ ]
+ 
+ UNIFIED_SOURCES += [
+@@ -124,3 +124,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d11_backend_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
+index 10ed39bf55..8dfcd10195 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d9_backend_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -56,7 +56,6 @@ LOCAL_INCLUDES += [
+ ]
+ 
+ OS_LIBS += [
+-    "d3d9",
+     "delayimp",
+     "dxgi",
+     "setupapi",
+@@ -108,3 +107,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d9_backend_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
+index fbce4d57e4..254ba45aa1 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
++++ b/third_party/angle/src/libANGLE/renderer/d3d/angle_d3d_shared_gn/moz.build
+@@ -12,7 +12,7 @@ AllowCompilerWarnings()
+ DEFINES["ANGLE_DISABLE_POOL_ALLOC"] = True
+ DEFINES["ANGLE_ENABLE_CONTEXT_MUTEX"] = "1"
+ DEFINES["ANGLE_ENABLE_D3D11"] = True
+-DEFINES["ANGLE_ENABLE_D3D9"] = True
++DEFINES["ANGLE_ENABLE_D3D9"] = False
+ DEFINES["ANGLE_ENABLE_DEBUG_ANNOTATIONS"] = False
+ DEFINES["ANGLE_ENABLE_KEYEDMUTEX"] = True
+ DEFINES["ANGLE_ENABLE_SHARE_CONTEXT_LOCK"] = "1"
+@@ -113,3 +113,10 @@ if CONFIG["TARGET_CPU"] == "aarch64":
+     DEFINES["__ARM_NEON__"] = "1"
+ 
+ Library("angle_d3d_shared_gn")
++
++# GeckoW10m: this build claims the desktop API family so that the rest of
++# Gecko keeps its Win32 APIs, so ANGLE cannot derive this for itself --
++# but the process really is an app container, and these are the paths
++# that work in one: emulated thread-local storage, no file writing, and
++# the SwapChainPanel window instead of the HWND one.
++DEFINES["ANGLE_ENABLE_WINDOWS_UWP"] = True
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/ResourceManager11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/ResourceManager11.cpp
+index d13aa40345..2a80b5383c 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/ResourceManager11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/ResourceManager11.cpp
+@@ -13,6 +13,70 @@
+ #include "libANGLE/renderer/d3d/d3d11/Renderer11.h"
+ #include "libANGLE/renderer/d3d/d3d11/formatutils11.h"
+ 
++// GeckoW10m: the process carries 125 MB of write-combined private memory with
++// a blank tab, which is what D3D11 dynamic and staging resources look like
++// from outside, and nothing in the engine's own accounting names them. ANGLE
++// keeps a per-type total; every step of 16 MB up or down is written down,
++// and each single resource of a megabyte or more says its usage and size.
++namespace rx
++{
++void AngleUwpNote(const char *text);
++}
++static void GeckoW10mAngleStep(const char *type, uint64_t before, uint64_t after)
++{
++    const uint64_t step = 16u * 1024u * 1024u;
++    if (before / step != after / step)
++    {
++        char buf[160];
++        snprintf(buf, sizeof(buf), "angle: %s total now %u MB (%s)", type,
++                 static_cast<unsigned>(after / (1024u * 1024u)),
++                 after > before ? "up" : "down");
++        rx::AngleUwpNote(buf);
++    }
++}
++static const char *GeckoW10mUsageName(D3D11_USAGE usage)
++{
++    switch (usage)
++    {
++        case D3D11_USAGE_DEFAULT:
++            return "default";
++        case D3D11_USAGE_IMMUTABLE:
++            return "immutable";
++        case D3D11_USAGE_DYNAMIC:
++            return "dynamic";
++        case D3D11_USAGE_STAGING:
++            return "staging";
++    }
++    return "?";
++}
++static void GeckoW10mAngleBig(const D3D11_TEXTURE2D_DESC *desc, uint64_t bytes)
++{
++    if (bytes >= 1024u * 1024u)
++    {
++        char buf[160];
++        snprintf(buf, sizeof(buf), "angle: texture %ux%u x%u, %u MB, %s%s",
++                 static_cast<unsigned>(desc->Width), static_cast<unsigned>(desc->Height),
++                 static_cast<unsigned>(desc->ArraySize),
++                 static_cast<unsigned>(bytes / (1024u * 1024u)), GeckoW10mUsageName(desc->Usage),
++                 (desc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) ? ", cpu-writable" : "");
++        rx::AngleUwpNote(buf);
++    }
++}
++static void GeckoW10mAngleBig(const D3D11_BUFFER_DESC *desc, uint64_t bytes)
++{
++    if (bytes >= 1024u * 1024u)
++    {
++        char buf[160];
++        snprintf(buf, sizeof(buf), "angle: buffer %u MB, %s%s",
++                 static_cast<unsigned>(bytes / (1024u * 1024u)), GeckoW10mUsageName(desc->Usage),
++                 (desc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) ? ", cpu-writable" : "");
++        rx::AngleUwpNote(buf);
++    }
++}
++template <typename T>
++static void GeckoW10mAngleBig(const T *, uint64_t)
++{}
++
+ namespace rx
+ {
+ 
+@@ -496,6 +560,7 @@ angle::Result ResourceManager11::allocate(d3d::Context *context,
+     }
+ 
+     ASSERT(resource);
++    GeckoW10mAngleBig(desc, ComputeMemoryUsage(desc));
+     incrResource(GetResourceTypeFromD3D11<T>(), ComputeMemoryUsage(desc));
+     *resourceOut = std::move(Resource11<T>(resource, this));
+     return angle::Result::Continue;
+@@ -506,7 +571,13 @@ void ResourceManager11::incrResource(ResourceType resourceType, uint64_t memoryS
+     size_t typeIndex = ResourceTypeIndex(resourceType);
+ 
+     mAllocatedResourceCounts[typeIndex]++;
++    const uint64_t before = mAllocatedResourceDeviceMemory[typeIndex];
+     mAllocatedResourceDeviceMemory[typeIndex] += memorySize;
++    if (resourceType == ResourceType::Texture2D || resourceType == ResourceType::Buffer)
++    {
++        GeckoW10mAngleStep(resourceType == ResourceType::Texture2D ? "textures" : "buffers",
++                         before, mAllocatedResourceDeviceMemory[typeIndex]);
++    }
+ 
+     // This checks for integer overflow.
+     ASSERT(mAllocatedResourceCounts[typeIndex] > 0);
+@@ -520,7 +591,13 @@ void ResourceManager11::decrResource(ResourceType resourceType, uint64_t memoryS
+     ASSERT(mAllocatedResourceCounts[typeIndex] > 0);
+     mAllocatedResourceCounts[typeIndex]--;
+     ASSERT(mAllocatedResourceDeviceMemory[typeIndex] >= memorySize);
++    const uint64_t before = mAllocatedResourceDeviceMemory[typeIndex];
+     mAllocatedResourceDeviceMemory[typeIndex] -= memorySize;
++    if (resourceType == ResourceType::Texture2D || resourceType == ResourceType::Buffer)
++    {
++        GeckoW10mAngleStep(resourceType == ResourceType::Texture2D ? "textures" : "buffers",
++                         before, mAllocatedResourceDeviceMemory[typeIndex]);
++    }
+ }
+ 
+ void ResourceManager11::onReleaseGeneric(ResourceType resourceType, ID3D11DeviceChild *resource)
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+index 517e6fde6f..52417feb3f 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+@@ -12,6 +12,12 @@
+ 
+ #include "libANGLE/renderer/d3d/d3d11/SwapChain11.h"
+ 
++#include <cstdio>
++
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++#    include "libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h"
++#endif
++
+ #include <EGL/eglext.h>
+ 
+ #include "libANGLE/features.h"
+@@ -514,6 +520,12 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+ 
+     hr = mSwapChain->ResizeBuffers(desc.BufferCount, backbufferWidth, backbufferHeight,
+                                    getSwapChainNativeFormat(), 0);
++    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: swap chain resized to %dx%d -> 0x%08lx", backbufferWidth,
++                 backbufferHeight, static_cast<unsigned long>(hr));
++        AngleUwpNote(note);
++    }
+ 
+     if (FAILED(hr))
+     {
+@@ -907,6 +919,27 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+ 
+     HRESULT result = S_OK;
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // Nobody has ever confirmed that a frame reaches this swap chain. The log
++    // says the chain was made and the panel took it, and then the window is
++    // hidden -- and whether a single Present happened in between has been
++    // assumed both ways. Said once, the first time, and every time it fails.
++    if (mFirstSwap)
++    {
++        AngleUwpNote("angle: first present");
++    }
++    if (AngleUwpMode() == 2)
++    {
++        if (mFirstSwap)
++        {
++            AngleUwpNote("angle: mode 2 -- NOT presenting, this frame or any other");
++        }
++        mFirstSwap = false;
++        mRenderer->getStateManager()->invalidateRenderTarget();
++        return EGL_SUCCESS;
++    }
++#endif
++
+     // Use IDXGISwapChain1::Present1 with a dirty rect if DXGI 1.2 is available.
+     // Dirty rect present is not supported with a multisampled swapchain.
+     if (mSwapChain1 != nullptr && mEGLSamples <= 1)
+@@ -952,6 +985,19 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+         ERR() << "Present failed with " << gl::FmtHR(result);
+     }
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    if (result != S_OK)
++    {
++        // Including the S_ statuses -- DXGI_STATUS_OCCLUDED is 0x087A0001 and
++        // would mean the compositor considers this chain hidden, which is the
++        // very thing being asked about.
++        char note[96];
++        snprintf(note, sizeof(note), "angle: present returned 0x%08lx",
++                 static_cast<unsigned long>(result));
++        AngleUwpNote(note);
++    }
++#endif
++
+     mNativeWindow->commitChange();
+ 
+     return EGL_SUCCESS;
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+new file mode 100644
+index 0000000000..17a54726f5
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+@@ -0,0 +1,402 @@
++//
++// Copyright 2016 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++
++// NativeWindow11WinRT.cpp: Implementation of NativeWindow11 for a XAML
++// SwapChainPanel.
++
++#include "libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h"
++
++#include "libANGLE/renderer/d3d/d3d11/renderer11_utils.h"
++
++#include "common/debug.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdint>
++
++#include <dxgi1_3.h>
++#include <windows.ui.core.h>
++#include <windows.ui.xaml.h>
++#include <windows.ui.xaml.media.dxinterop.h>
++#include <wrl.h>
++#include <wrl/wrappers/corewrappers.h>
++
++namespace
++{
++// The size of the panel, which belongs to the UI thread while everything here
++// runs on the renderer's. So it is handed over rather than asked for: the shell
++// already measures the room it has and tells the engine, and this is the same
++// number arriving by a shorter road. Written rarely, read every resize.
++std::atomic<LONG> sPanelWidth{0};
++std::atomic<LONG> sPanelHeight{0};
++// The panel's composition scale, times 1000. XAML shows a swap chain's pixels
++// as logical units unless told otherwise; on a 350% phone that is a picture
++// three and a half times too big. The shell reads the scale from the panel
++// and it goes onto the chain as an inverse matrix transform.
++std::atomic<int> sPanelScaleX{1000};
++std::atomic<int> sPanelScaleY{1000};
++
++// Where this says what it did. The notes Gecko writes live in xul, which this
++// library is not linked against, so the shell hands over somewhere to write --
++// its own log, which is also where the crash trace goes, so the two can be
++// read against each other.
++std::atomic<void (*)(const char *)> sLogger{nullptr};
++std::atomic<int> sMode{0};
++
++void Note(const char *text)
++{
++    auto logger = sLogger.load();
++    if (logger)
++    {
++        logger(text);
++    }
++}
++
++// A SwapChainPanel may only be touched from the thread that owns it. Calling
++// SetSwapChain from the render thread does not fail -- it corrupts the system
++// compositor, and the process dies a moment later writing to address zero
++// inside CoreUIComponents, several frames below dcomp. So the call is handed
++// to the panel's own dispatcher and waited on.
++HRESULT RunOnUIThread(std::function<HRESULT()> &&work,
++                      ABI::Windows::UI::Core::ICoreDispatcher *dispatcher)
++{
++    if (!dispatcher)
++    {
++        return E_INVALIDARG;
++    }
++
++    boolean hasAccess = FALSE;
++    HRESULT result    = dispatcher->get_HasThreadAccess(&hasAccess);
++    if (FAILED(result))
++    {
++        return result;
++    }
++    if (hasAccess)
++    {
++        return work();
++    }
++
++    Microsoft::WRL::Wrappers::Event done(
++        CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS));
++    if (!done.IsValid())
++    {
++        return E_FAIL;
++    }
++
++    HRESULT inner = E_FAIL;
++    Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IAsyncAction> action;
++    result = dispatcher->RunAsync(
++        ABI::Windows::UI::Core::CoreDispatcherPriority_Normal,
++        Microsoft::WRL::Callback<Microsoft::WRL::Implements<
++            Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
++            ABI::Windows::UI::Core::IDispatchedHandler, Microsoft::WRL::FtmBase>>(
++            [&work, &inner, &done]() -> HRESULT {
++                inner = work();
++                SetEvent(done.Get());
++                return S_OK;
++            })
++            .Get(),
++        &action);
++    if (FAILED(result))
++    {
++        return result;
++    }
++
++    WaitForSingleObjectEx(done.Get(), INFINITE, FALSE);
++    return inner;
++}
++}  // namespace
++
++// Called by the shell, which owns the panel and is the only thing that knows
++// how big it is. Exported because it is called from outside this library --
++// xul cannot forward it, since xul does not link against ANGLE at all: EGL
++// loads it at run time.
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_size(int32_t width,
++                                                               int32_t height)
++{
++    sPanelWidth  = width;
++    sPanelHeight = height;
++}
++
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_scale(float x, float y)
++{
++    sPanelScaleX = static_cast<int>((x > 0 ? x : 1.0f) * 1000.0f + 0.5f);
++    sPanelScaleY = static_cast<int>((y > 0 ? y : 1.0f) * 1000.0f + 0.5f);
++}
++
++extern "C" __declspec(dllexport) void angle_uwp_set_mode(int32_t mode)
++{
++    sMode = mode;
++    char note[96];
++    snprintf(note, sizeof(note), "angle: mode %d -- %s", mode,
++             mode == 1   ? "the swap chain will never be handed to the panel"
++             : mode == 2 ? "the swap chain will never be presented"
++                         : "the real thing");
++    Note(note);
++}
++
++extern "C" __declspec(dllexport) void angle_uwp_set_logger(void (*logger)(const char *))
++{
++    sLogger = logger;
++    // Proof the channel works. Everything else this file says has failed to
++    // appear, and there are two reasons that could be: the code did not run,
++    // or it cannot be heard. This line separates them.
++    Note("angle: logging is on");
++}
++
++namespace rx
++{
++
++int AngleUwpMode()
++{
++    return sMode.load();
++}
++
++void AngleUwpNote(const char *text)
++{
++    Note(text);
++}
++
++NativeWindow11WinRT::NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha)
++    : NativeWindow11(window),
++      mPanel(nullptr),
++      mDispatcher(nullptr),
++      mHasAlpha(hasAlpha),
++      mWidth(0),
++      mHeight(0)
++{}
++
++NativeWindow11WinRT::~NativeWindow11WinRT()
++{
++    SafeRelease(mPanel);
++    SafeRelease(mDispatcher);
++}
++
++bool NativeWindow11WinRT::initialize()
++{
++    if (mPanel)
++    {
++        return true;
++    }
++    IInspectable *window = reinterpret_cast<IInspectable *>(getNativeWindow());
++    if (!window)
++    {
++        return false;
++    }
++    // A SwapChainPanel presents through this one interface and nothing else;
++    // if the object handed over does not have it, it is not a panel and there
++    // is nothing this class can do with it.
++    if (FAILED(window->QueryInterface(__uuidof(ISwapChainPanelNative),
++                                      reinterpret_cast<void **>(&mPanel))))
++    {
++        Note("angle: what was handed over is not a SwapChainPanel");
++        return false;
++    }
++
++    // Every XAML object knows the thread it belongs to, and that is the only
++    // thread allowed to give it a swap chain.
++    Microsoft::WRL::ComPtr<ABI::Windows::UI::Xaml::IDependencyObject> dependency;
++    if (FAILED(window->QueryInterface(
++            __uuidof(ABI::Windows::UI::Xaml::IDependencyObject),
++            reinterpret_cast<void **>(dependency.GetAddressOf()))))
++    {
++        SafeRelease(mPanel);
++        return false;
++    }
++    if (FAILED(dependency->get_Dispatcher(&mDispatcher)) || !mDispatcher)
++    {
++        Note("angle: the panel would not say which thread it belongs to");
++        SafeRelease(mPanel);
++        return false;
++    }
++    Note("angle: the panel is ready");
++    return true;
++}
++
++bool NativeWindow11WinRT::getClientRect(LPRECT rect) const
++{
++    if (!rect)
++    {
++        return false;
++    }
++    const LONG width  = sPanelWidth.load();
++    const LONG height = sPanelHeight.load();
++    if (width <= 0 || height <= 0)
++    {
++        return false;
++    }
++    rect->left   = 0;
++    rect->top    = 0;
++    rect->right  = width;
++    rect->bottom = height;
++    return true;
++}
++
++bool NativeWindow11WinRT::isIconic() const
++{
++    // A phone has no minimised window. It has a suspended app, which stops
++    // drawing altogether rather than drawing into a hidden surface.
++    return false;
++}
++
++HRESULT NativeWindow11WinRT::createSwapChain(ID3D11Device *device,
++                                             IDXGIFactory *factory,
++                                             DXGI_FORMAT format,
++                                             UINT width,
++                                             UINT height,
++                                             UINT samples,
++                                             IDXGISwapChain **swapChain)
++{
++    if (device == nullptr || factory == nullptr || swapChain == nullptr || width == 0 ||
++        height == 0)
++    {
++        return E_INVALIDARG;
++    }
++    if (!mPanel && !initialize())
++    {
++        return E_INVALIDARG;
++    }
++
++    // There is no window to present to, so the chain is made for composition
++    // and then given to the panel, which is what puts it on the screen. This is
++    // the whole point of the exercise: the frame stops being copied through
++    // main memory and is handed to the compositor as a texture.
++    IDXGIFactory2 *factory2 = d3d11::DynamicCastComObject<IDXGIFactory2>(factory);
++    if (factory2 == nullptr)
++    {
++        return E_INVALIDARG;
++    }
++
++    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
++    swapChainDesc.Width                 = width;
++    swapChainDesc.Height                = height;
++    swapChainDesc.Format                = format;
++    swapChainDesc.Stereo                = FALSE;
++    // Composition swap chains take no multisampling; the renderer resolves
++    // before presenting.
++    swapChainDesc.SampleDesc.Count   = 1;
++    swapChainDesc.SampleDesc.Quality = 0;
++    swapChainDesc.BufferUsage =
++        DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHADER_INPUT;
++    swapChainDesc.BufferCount = 2;
++    swapChainDesc.Scaling     = DXGI_SCALING_STRETCH;
++    swapChainDesc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++    swapChainDesc.AlphaMode = mHasAlpha ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE;
++    swapChainDesc.Flags     = 0;
++
++    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: making a %ux%u swap chain for the panel", width,
++                 height);
++        Note(note);
++    }
++
++    IDXGISwapChain1 *swapChain1 = nullptr;
++    HRESULT result =
++        factory2->CreateSwapChainForComposition(device, &swapChainDesc, nullptr, &swapChain1);
++    SafeRelease(factory2);
++    if (FAILED(result))
++    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: the swap chain was refused, 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
++        return result;
++    }
++    Note("angle: the swap chain exists, giving it to the panel");
++
++    if (sMode.load() == 1)
++    {
++        // The experiment: everything but the hand-over. The chain exists and
++        // will be presented to; the panel never hears of it.
++        Note("angle: mode 1 -- NOT giving it to the panel");
++        mWidth     = static_cast<LONG>(width);
++        mHeight    = static_cast<LONG>(height);
++        *swapChain = static_cast<IDXGISwapChain *>(swapChain1);
++        return S_OK;
++    }
++
++    ISwapChainPanelNative *panel = mPanel;
++    result                       = RunOnUIThread(
++        [panel, swapChain1]() -> HRESULT { return panel->SetSwapChain(swapChain1); },
++        mDispatcher);
++    if (FAILED(result))
++    {
++        char note[128];
++        snprintf(note, sizeof(note), "angle: the panel would not take it, 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
++        SafeRelease(swapChain1);
++        return result;
++    }
++    Note("angle: the panel took the swap chain");
++
++    {
++        const float scaleX = sPanelScaleX.load() / 1000.0f;
++        const float scaleY = sPanelScaleY.load() / 1000.0f;
++        IDXGISwapChain2 *swapChain2 = nullptr;
++        if (SUCCEEDED(swapChain1->QueryInterface(__uuidof(IDXGISwapChain2),
++                                                 reinterpret_cast<void **>(&swapChain2))) &&
++            swapChain2)
++        {
++            DXGI_MATRIX_3X2_F inverse = {};
++            inverse._11               = 1.0f / scaleX;
++            inverse._22               = 1.0f / scaleY;
++            const HRESULT scaled      = swapChain2->SetMatrixTransform(&inverse);
++            char note[160];
++            snprintf(note, sizeof(note),
++                     "angle: composition scale %.3fx%.3f, inverse transform set -> 0x%08lx", scaleX,
++                     scaleY, static_cast<unsigned long>(scaled));
++            Note(note);
++            swapChain2->Release();
++        }
++        else
++        {
++            Note("angle: no IDXGISwapChain2 -- the composition scale cannot be undone");
++        }
++    }
++
++    mWidth     = static_cast<LONG>(width);
++    mHeight    = static_cast<LONG>(height);
++    *swapChain = static_cast<IDXGISwapChain *>(swapChain1);
++    return S_OK;
++}
++
++void NativeWindow11WinRT::commitChange() {}
++
++// static
++bool NativeWindow11WinRT::IsValidNativeWindow(EGLNativeWindowType window)
++{
++    // This is where the refusal happens, and until now it happened in silence:
++    // eglCreateWindowSurface asks this first, and if it says no the surface is
++    // never attempted and nothing else in this file runs. It says why now.
++    IInspectable *inspectable = reinterpret_cast<IInspectable *>(window);
++    if (!inspectable)
++    {
++        Note("angle: there is no panel to make a surface for");
++        return false;
++    }
++    ISwapChainPanelNative *panel = nullptr;
++    const HRESULT result = inspectable->QueryInterface(
++        __uuidof(ISwapChainPanelNative), reinterpret_cast<void **>(&panel));
++    if (FAILED(result))
++    {
++        // RPC_E_WRONG_THREAD (0x8001010e) here would mean the panel is bound
++        // to the UI thread's apartment and this is not that thread -- which is
++        // a marshalling problem, not a bad pointer.
++        char note[128];
++        snprintf(note, sizeof(note),
++                 "angle: the panel refused ISwapChainPanelNative, hr 0x%08lx",
++                 static_cast<unsigned long>(result));
++        Note(note);
++        return false;
++    }
++    SafeRelease(panel);
++    Note("angle: the panel is a real SwapChainPanel");
++    return true;
++}
++
++}  // namespace rx
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+new file mode 100644
+index 0000000000..3eb2789726
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+@@ -0,0 +1,96 @@
++//
++// Copyright 2016 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++
++// NativeWindow11WinRT.h: Implementation of NativeWindow11 for a XAML
++// SwapChainPanel.
++//
++// Renderer11 already asks for this class when ANGLE_ENABLE_WINDOWS_UWP is set;
++// only the files were missing, because the vendored copy of ANGLE carries just
++// the win32 window -- Firefox is not shipped as a store app. This is the other
++// half, cut down to the one case that exists on a phone.
++//
++// Upstream's version also handles an ICoreWindow and picks between the two at
++// runtime. There is no CoreWindow to draw into here: an app container hands out
++// no HWND, the browser has always been drawn into a XAML element, and that
++// element is what this presents to.
++
++#ifndef LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_
++#define LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_
++
++#include "libANGLE/renderer/d3d/d3d11/NativeWindow11.h"
++
++struct ISwapChainPanelNative;
++struct IInspectable;
++
++namespace ABI
++{
++namespace Windows
++{
++namespace UI
++{
++namespace Core
++{
++struct ICoreDispatcher;
++}
++}  // namespace UI
++}  // namespace Windows
++}  // namespace ABI
++
++namespace rx
++{
++
++// What the shell asked this build to do with the swap chain, and where to say
++// what happened. Both live in NativeWindow11WinRT.cpp; SwapChain11 needs them
++// too, and it is generic code that knows nothing of panels.
++//
++//   0  make the swap chain, hand it to the panel, present -- the real thing
++//   1  make it, present, but never hand it to the panel
++//   2  make it, hand it over, but never present
++//
++// The window is hidden by the system six tenths of a second after the swap
++// chain exists, every time, and with nothing raised in between. These two
++// halves are the only two things that happen in that gap.
++int AngleUwpMode();
++void AngleUwpNote(const char *text);
++
++class NativeWindow11WinRT : public NativeWindow11
++{
++  public:
++    NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha);
++    ~NativeWindow11WinRT() override;
++
++    bool initialize() override;
++    bool getClientRect(LPRECT rect) const override;
++    bool isIconic() const override;
++
++    HRESULT createSwapChain(ID3D11Device *device,
++                            IDXGIFactory *factory,
++                            DXGI_FORMAT format,
++                            UINT width,
++                            UINT height,
++                            UINT samples,
++                            IDXGISwapChain **swapChain) override;
++
++    void commitChange() override;
++
++    static bool IsValidNativeWindow(EGLNativeWindowType window);
++
++  private:
++    // The panel this presents to, and the size it was last given. The size is
++    // remembered rather than asked for because it belongs to the UI thread and
++    // this is called from the renderer's.
++    ISwapChainPanelNative *mPanel;
++  // The thread the panel belongs to. Giving it a swap chain from any other
++  // thread takes the system compositor down with it.
++  ABI::Windows::UI::Core::ICoreDispatcher *mDispatcher;
++    bool mHasAlpha;
++    LONG mWidth;
++    LONG mHeight;
++};
++
++}  // namespace rx
++
++#endif  // LIBANGLE_RENDERER_D3D_D3D11_WINRT_NATIVEWINDOW11WINRT_H_

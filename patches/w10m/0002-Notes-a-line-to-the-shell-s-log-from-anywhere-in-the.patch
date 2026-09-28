@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] Notes: a line to the shell's log from anywhere in the engine
+
+GeckoW10mNote(): the engine reports to the log the UWP shell keeps, which is
+the only log there is on the phone -- and the out-of-memory paths and the
+console say so there too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ memory/mozalloc/GeckoW10mNote.h    | 201 +++++++++++++++++++++++++++++
+ memory/mozalloc/mozalloc.cpp       |  13 ++
+ memory/mozalloc/mozalloc_abort.cpp |   5 +
+ memory/mozalloc/mozalloc_oom.cpp   |  12 ++
+ xpcom/base/nsConsoleService.cpp    |  22 ++++
+ 5 files changed, 253 insertions(+)
+ create mode 100644 memory/mozalloc/GeckoW10mNote.h
+
+diff --git a/memory/mozalloc/GeckoW10mNote.h b/memory/mozalloc/GeckoW10mNote.h
+new file mode 100644
+index 0000000000..36dca95db3
+--- /dev/null
++++ b/memory/mozalloc/GeckoW10mNote.h
+@@ -0,0 +1,201 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_GeckoW10mNote_h
++#define mozilla_GeckoW10mNote_h
++
++// A packaged app has no console, and ucrtbase bound stderr to a handle that
++// goes nowhere, so anything an allocation failure has to say is lost before it
++// can be read off the device.  This writes it to a file instead.
++//
++// It is deliberately a copy of what toolkit/xre/Bootstrap.cpp does rather than
++// a call to it: mozglue sits underneath xul and cannot reach up into it.  It
++// also avoids the CRT entirely -- by the time it runs, the allocator has
++// already said no.
++
++#if defined(GECKO_W10M)
++
++#  include <windows.h>
++#  include <stddef.h>
++
++namespace gecko_w10m {
++
++inline void NoteAppend(char*& out, const char* end, const char* text) {
++  while (*text && out < end) *out++ = *text++;
++}
++
++inline void NoteAppendHex(char*& out, const char* end, size_t value) {
++  static const char kDigits[] = "0123456789abcdef";
++  NoteAppend(out, end, "0x");
++  bool leading = true;
++  for (int shift = (sizeof(size_t) * 8) - 4; shift >= 0; shift -= 4) {
++    unsigned digit = (value >> shift) & 0xf;
++    if (digit == 0 && leading && shift > 0) continue;
++    leading = false;
++    if (out < end) *out++ = kDigits[digit];
++  }
++}
++
++// Names the module an address belongs to, as "xul.dll+0x1234", so the line can
++// be symbolized without having to match it against a particular launch's
++// module bases.
++inline void NoteAppendAddress(char*& out, const char* end, const void* address) {
++  HMODULE module = nullptr;
++  if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           reinterpret_cast<LPCWSTR>(address), &module) &&
++      module) {
++    wchar_t path[MAX_PATH] = {};
++    DWORD length = ::GetModuleFileNameW(module, path, MAX_PATH);
++    const wchar_t* name = path;
++    for (DWORD i = 0; i < length; ++i) {
++      if (path[i] == L'\\' || path[i] == L'/') name = path + i + 1;
++    }
++    while (*name && out < end) *out++ = static_cast<char>(*name++);
++    NoteAppend(out, end, "+");
++    NoteAppendHex(out, end,
++                  reinterpret_cast<size_t>(address) -
++                      reinterpret_cast<size_t>(module));
++    return;
++  }
++  NoteAppendHex(out, end, reinterpret_cast<size_t>(address));
++}
++
++inline void Note(const char* text) {
++  wchar_t path[MAX_PATH] = {};
++  if (!::GetEnvironmentVariableW(L"GECKO_W10M_NOTE_LOG", path, MAX_PATH)) return;
++
++  CREATEFILE2_EXTENDED_PARAMETERS params{};
++  params.dwSize = sizeof(params);
++  params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++  HANDLE file = ::CreateFile2(path, FILE_APPEND_DATA, FILE_SHARE_READ,
++                              OPEN_ALWAYS, &params);
++  if (file == INVALID_HANDLE_VALUE) return;
++
++  ::SetFilePointer(file, 0, nullptr, FILE_END);
++  DWORD written = 0;
++  ::WriteFile(file, "mozalloc: ", 10, &written, nullptr);
++  size_t length = 0;
++  while (text[length]) ++length;
++  ::WriteFile(file, text, static_cast<DWORD>(length), &written, nullptr);
++  ::WriteFile(file, "\r\n", 2, &written, nullptr);
++  ::FlushFileBuffers(file);
++  ::CloseHandle(file);
++}
++
++// RtlCaptureStackBackTrace returns a single frame on 32-bit ARM Windows, which
++// unwinds from tables rather than a frame pointer chain.  Walking those tables
++// by hand gives a real trace.  This is the same walk the shell's CrashProbe
++// does; mozglue sits underneath xul and cannot reach the shell's copy.
++using GeckoW10mCaptureContextFn = void(WINAPI*)(PCONTEXT);
++using GeckoW10mLookupFunctionEntryFn = PVOID(WINAPI*)(DWORD, PDWORD, PVOID);
++using GeckoW10mVirtualUnwindFn = PVOID(WINAPI*)(DWORD, DWORD, DWORD, PVOID,
++                                              PCONTEXT, PVOID*, PDWORD, PVOID);
++
++inline int NoteStack() {
++  HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++  if (!ntdll) return 0;
++  auto capture = reinterpret_cast<GeckoW10mCaptureContextFn>(
++      ::GetProcAddress(ntdll, "RtlCaptureContext"));
++  auto lookup = reinterpret_cast<GeckoW10mLookupFunctionEntryFn>(
++      ::GetProcAddress(ntdll, "RtlLookupFunctionEntry"));
++  auto unwind = reinterpret_cast<GeckoW10mVirtualUnwindFn>(
++      ::GetProcAddress(ntdll, "RtlVirtualUnwind"));
++  if (!capture || !lookup || !unwind) return 0;
++
++  CONTEXT context{};
++  capture(&context);
++
++  int depth = 0;
++  for (; depth < 24; ++depth) {
++    if (!context.Pc) return depth;
++
++    char line[160];
++    char* out = line;
++    const char* end = line + sizeof(line) - 1;
++    NoteAppend(out, end, "  at ");
++    NoteAppendAddress(out, end, reinterpret_cast<const void*>(context.Pc));
++    *out = '\0';
++    Note(line);
++
++    DWORD imageBase = 0;
++    PVOID entry = lookup(context.Pc, &imageBase, nullptr);
++    if (!entry) return depth + 1;
++
++    PVOID handlerData = nullptr;
++    DWORD establisher = 0;
++    DWORD previous = context.Pc;
++    unwind(0 /*UNW_FLAG_NHANDLER*/, imageBase, context.Pc, entry, &context,
++           &handlerData, &establisher, nullptr);
++    // A frame that does not move is a frame that will not move again.
++    if (context.Pc == previous) return depth + 1;
++  }
++  return depth;
++}
++
++// Rust here is built with -Cpanic=abort, so its frames may carry no unwind
++// data at all and the walk above stops early.  This is the crude fallback:
++// read the raw stack and keep the words that RtlLookupFunctionEntry
++// recognizes as belonging to a function.  That filter is what makes it
++// useful rather than noise -- a plausible-looking integer is not a return
++// address unless something claims to be able to unwind it.  Stale frames do
++// survive on the stack, so this lists candidates, not a call chain.
++inline void NoteStackScan() {
++  HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++  if (!ntdll) return;
++  auto lookup = reinterpret_cast<GeckoW10mLookupFunctionEntryFn>(
++      ::GetProcAddress(ntdll, "RtlLookupFunctionEntry"));
++  if (!lookup) return;
++
++  int anchor = 0;
++  const uintptr_t* sp = reinterpret_cast<const uintptr_t*>(&anchor);
++
++  MEMORY_BASIC_INFORMATION region{};
++  if (!::VirtualQuery(sp, &region, sizeof(region))) return;
++  const uintptr_t* limit = reinterpret_cast<const uintptr_t*>(
++      reinterpret_cast<const char*>(region.BaseAddress) + region.RegionSize);
++
++  Note("  -- stack scan (candidates, not a call chain) --");
++
++  int printed = 0;
++  for (const uintptr_t* word = sp; word < limit && printed < 32; ++word) {
++    uintptr_t value = *word;
++    if (value < 0x10000) continue;
++    DWORD imageBase = 0;
++    if (!lookup(static_cast<DWORD>(value), &imageBase, nullptr)) continue;
++
++    char line[160];
++    char* out = line;
++    const char* end = line + sizeof(line) - 1;
++    NoteAppend(out, end, "  ?? ");
++    NoteAppendAddress(out, end, reinterpret_cast<const void*>(value));
++    *out = '\0';
++    Note(line);
++    ++printed;
++  }
++}
++
++// The product of nmemb and size is all mozalloc_handle_oom ever sees, and a
++// product tells you nothing about which of the two was wrong.
++inline void NoteFailedAllocation(const char* what, size_t first, size_t second,
++                                 const void* caller) {
++  char line[256];
++  char* out = line;
++  const char* end = line + sizeof(line) - 1;
++  NoteAppend(out, end, what);
++  NoteAppend(out, end, " failed: ");
++  NoteAppendHex(out, end, first);
++  NoteAppend(out, end, " x ");
++  NoteAppendHex(out, end, second);
++  NoteAppend(out, end, " called from ");
++  NoteAppendAddress(out, end, caller);
++  *out = '\0';
++  Note(line);
++  if (NoteStack() < 4) NoteStackScan();
++}
++
++}  // namespace gecko_w10m
++
++#endif  // defined(GECKO_W10M)
++#endif  // mozilla_GeckoW10mNote_h
+diff --git a/memory/mozalloc/mozalloc.cpp b/memory/mozalloc/mozalloc.cpp
+index f8e01fe7f4..ff22d0cf11 100644
+--- a/memory/mozalloc/mozalloc.cpp
++++ b/memory/mozalloc/mozalloc.cpp
+@@ -38,6 +38,7 @@
+ #include "mozilla/Likely.h"
+ #include "mozilla/mozalloc.h"
+ #include "mozilla/mozalloc_oom.h"  // for mozalloc_handle_oom
++#include "GeckoW10mNote.h"
+ 
+ #if defined(MOZ_MEMORY)
+ MOZ_MEMORY_API char* strdup_impl(const char*);
+@@ -47,6 +48,10 @@ MOZ_MEMORY_API char* strndup_impl(const char*, size_t);
+ void* moz_xmalloc(size_t size) {
+   void* ptr = malloc_impl(size);
+   if (MOZ_UNLIKELY(!ptr && size)) {
++#if defined(GECKO_W10M)
++    gecko_w10m::NoteFailedAllocation("xmalloc", size, 1,
++                                  __builtin_return_address(0));
++#endif
+     mozalloc_handle_oom(size);
+     return moz_xmalloc(size);
+   }
+@@ -58,6 +63,10 @@ void* moz_xcalloc(size_t nmemb, size_t size) {
+   if (MOZ_UNLIKELY(!ptr && nmemb && size)) {
+     mozilla::CheckedInt<size_t> totalSize =
+         mozilla::CheckedInt<size_t>(nmemb) * size;
++#if defined(GECKO_W10M)
++    gecko_w10m::NoteFailedAllocation("xcalloc", nmemb, size,
++                                  __builtin_return_address(0));
++#endif
+     mozalloc_handle_oom(totalSize.isValid() ? totalSize.value() : SIZE_MAX);
+     return moz_xcalloc(nmemb, size);
+   }
+@@ -67,6 +76,10 @@ void* moz_xcalloc(size_t nmemb, size_t size) {
+ void* moz_xrealloc(void* ptr, size_t size) {
+   void* newptr = realloc_impl(ptr, size);
+   if (MOZ_UNLIKELY(!newptr && size)) {
++#if defined(GECKO_W10M)
++    gecko_w10m::NoteFailedAllocation("xrealloc", size, 1,
++                                  __builtin_return_address(0));
++#endif
+     mozalloc_handle_oom(size);
+     return moz_xrealloc(ptr, size);
+   }
+diff --git a/memory/mozalloc/mozalloc_abort.cpp b/memory/mozalloc/mozalloc_abort.cpp
+index 23c581f416..fa0eae514f 100644
+--- a/memory/mozalloc/mozalloc_abort.cpp
++++ b/memory/mozalloc/mozalloc_abort.cpp
+@@ -17,7 +17,12 @@
+ #include "mozilla/Assertions.h"
+ #include "mozilla/Sprintf.h"
+ 
++#include "GeckoW10mNote.h"
++
+ void mozalloc_abort(const char* const msg) {
++#if defined(GECKO_W10M)
++  gecko_w10m::Note(msg);
++#endif
+ #ifndef ANDROID
+   fputs(msg, stderr);
+   fputs("\n", stderr);
+diff --git a/memory/mozalloc/mozalloc_oom.cpp b/memory/mozalloc/mozalloc_oom.cpp
+index 83e0da5764..38bec98064 100644
+--- a/memory/mozalloc/mozalloc_oom.cpp
++++ b/memory/mozalloc/mozalloc_oom.cpp
+@@ -5,6 +5,8 @@
+ #include "mozilla/mozalloc_abort.h"
+ #include "mozilla/mozalloc_oom.h"
+ 
++#include "GeckoW10mNote.h"
++
+ #define OOM_MSG_LEADER "out of memory: 0x"
+ #define OOM_MSG_DIGITS "0000000000000000"  // large enough for 2^64
+ #define OOM_MSG_TRAILER " bytes requested"
+@@ -20,6 +22,16 @@ void mozalloc_handle_oom(size_t size) {
+   char oomMsg[] = OOM_MSG_LEADER OOM_MSG_DIGITS OOM_MSG_TRAILER;
+   size_t i;
+ 
++#if defined(GECKO_W10M)
++  // Every infallible allocation funnels through here, from mozglue and from
++  // xul alike, and the backtrace does not survive the crash: the last
++  // instruction of this function is the call to mozalloc_abort, so its return
++  // address lands one byte past the end of this symbol and a linker map
++  // attributes it to whatever function comes next.  Ask the compiler instead.
++  gecko_w10m::NoteFailedAllocation("handle_oom", size, 0,
++                                __builtin_return_address(0));
++#endif
++
+   // NB: this is handle_oom() stage 1, which simply aborts on OOM.
+   // we might proceed to a stage 2 in which an attempt is made to
+   // reclaim memory
+diff --git a/xpcom/base/nsConsoleService.cpp b/xpcom/base/nsConsoleService.cpp
+index e049d1e623..1f1591558d 100644
+--- a/xpcom/base/nsConsoleService.cpp
++++ b/xpcom/base/nsConsoleService.cpp
+@@ -29,6 +29,13 @@
+ #include "nsProxyRelease.h"
+ #include "nsThreadUtils.h"
+ 
++#if defined(GECKO_W10M)
++// Gecko puts console messages on stderr, and a packaged app has no stderr
++// worth the name -- so a JS exception during startup leaves no trace at all.
++// This is the only way to read them off the device.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ #if defined(ANDROID)
+ #  include <android/log.h>
+ 
+@@ -277,6 +284,21 @@ nsresult nsConsoleService::LogMessageWithMode(
+     return NS_OK;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    // Errors and chrome messages go to the device log. Warnings do not:
++    // they are CSP and deprecation notices, dozens per page, and each was
++    // a write.
++    nsCString text;
++    aMessage->ToString(text);
++    if (text.Find("[JavaScript Warning:") == kNotFound) {
++      nsCString note("console: ");
++      note.Append(text);
++      GeckoW10mNote(note.get());
++    }
++  }
++#endif
++
+   if (NS_IsMainThread() && mDeliveringMessage) {
+     nsCString msg;
+     aMessage->ToString(msg);

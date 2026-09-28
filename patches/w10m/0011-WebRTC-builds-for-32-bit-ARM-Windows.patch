@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] WebRTC: builds for 32-bit ARM Windows
+
+nrappkit's Windows port types, and the two libwebrtc sources that assume
+32-bit ARM means Linux or Android.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/webrtc/transport/build/moz.build    |  7 ++++
+ .../transport/gecko_w10m_nrappkit_win_types.h | 36 +++++++++++++++++++
+ .../src/port/win32/include/csi_platform.h     |  7 ++++
+ .../rtc_base/platform_thread_types.cc         |  8 +++++
+ .../libwebrtc/rtc_base/system/asm_defines.h   | 15 ++++++++
+ 5 files changed, 73 insertions(+)
+ create mode 100644 dom/media/webrtc/transport/gecko_w10m_nrappkit_win_types.h
+
+diff --git a/dom/media/webrtc/transport/build/moz.build b/dom/media/webrtc/transport/build/moz.build
+index b85d03a786..3b93fcf83e 100644
+--- a/dom/media/webrtc/transport/build/moz.build
++++ b/dom/media/webrtc/transport/build/moz.build
+@@ -40,3 +40,10 @@ include("/tools/fuzzing/libfuzzer-config.mozbuild")
+ SOURCES += transport_cppsrcs
+ 
+ FINAL_LIBRARY = "xul"
++
++if CONFIG["OS_TARGET"] == "WINNT":
++    # See gecko_w10m_nrappkit_win_types.h: nrappkit's INT8/UINT8 (8 byte) collide
++    # with the Windows SDK's (1 byte) unless the Windows spellings are renamed
++    # out of the way before <basetsd.h> is first parsed. Forcing that header in
++    # ahead of everything else makes the order deterministic.
++    CXXFLAGS += ["-FI", "gecko_w10m_nrappkit_win_types.h"]
+diff --git a/dom/media/webrtc/transport/gecko_w10m_nrappkit_win_types.h b/dom/media/webrtc/transport/gecko_w10m_nrappkit_win_types.h
+new file mode 100644
+index 0000000000..7dff86b96b
+--- /dev/null
++++ b/dom/media/webrtc/transport/gecko_w10m_nrappkit_win_types.h
+@@ -0,0 +1,36 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef gecko_w10m_nrappkit_win_types_h
++#define gecko_w10m_nrappkit_win_types_h
++
++/* nrappkit uses INT8/UINT8 to mean *eight byte* integers, while the Windows SDK
++ * uses the same names for one-byte ones. nrappkit copes by renaming the Windows
++ * spellings out of the way while the Windows headers are parsed (see
++ * csi_platform.h and transport_addr.h), then defining its own afterwards.
++ *
++ * That only works if nothing has already parsed <basetsd.h> under the real
++ * names, and in this directory the include order does not guarantee it: several
++ * translation units reach Gecko headers -- and through them <windows.h> --
++ * before the first nrappkit header. Force-including this file makes the rename
++ * happen first in every translation unit, which is both less fragile and less
++ * invasive than reordering includes one file at a time.
++ *
++ * The sentinel names must be real types: since Windows SDK 10.0.22621,
++ * winsock2.h uses UINT8 as a struct field type, not only in a typedef.
++ */
++#ifdef _WIN32
++
++typedef unsigned char UBLAH_IGNORE_ME_PLEASE;
++typedef signed char BLAH_IGNORE_ME_PLEASE;
++
++#  define UINT8 UBLAH_IGNORE_ME_PLEASE
++#  define INT8 BLAH_IGNORE_ME_PLEASE
++#  include <winsock2.h>
++#  undef UINT8
++#  undef INT8
++
++#endif /* _WIN32 */
++
++#endif /* gecko_w10m_nrappkit_win_types_h */
+diff --git a/dom/media/webrtc/transport/third_party/nrappkit/src/port/win32/include/csi_platform.h b/dom/media/webrtc/transport/third_party/nrappkit/src/port/win32/include/csi_platform.h
+index 1e083a817e..aa9725598a 100644
+--- a/dom/media/webrtc/transport/third_party/nrappkit/src/port/win32/include/csi_platform.h
++++ b/dom/media/webrtc/transport/third_party/nrappkit/src/port/win32/include/csi_platform.h
+@@ -45,6 +45,13 @@
+                              // compiler errors when poco/win32_mutex.h is included
+ #endif
+ 
++// nrappkit uses UINT8/INT8 for 8-byte types while Windows uses them for
++// 1-byte ones, so the Windows ones are renamed out of the way for the duration
++// of this include. The sentinel names have to be real types: since Windows SDK
++// 10.0.22621 winsock2.h uses UINT8 as a struct field type, not just in a
++// typedef. transport_addr.h does the same thing for the same reason.
++typedef unsigned char UBLAH_IGNORE_ME_PLEASE;
++typedef signed char BLAH_IGNORE_ME_PLEASE;
+ #define UINT8 UBLAH_IGNORE_ME_PLEASE
+ #define INT8 BLAH_IGNORE_ME_PLEASE
+ #include <winsock2.h>
+diff --git a/third_party/libwebrtc/rtc_base/platform_thread_types.cc b/third_party/libwebrtc/rtc_base/platform_thread_types.cc
+index 697bedadb9..a950f10a60 100644
+--- a/third_party/libwebrtc/rtc_base/platform_thread_types.cc
++++ b/third_party/libwebrtc/rtc_base/platform_thread_types.cc
+@@ -114,11 +114,19 @@ void SetCurrentThreadName(const char* name) {
+ 
+ #pragma warning(push)
+ #pragma warning(disable : 6320 6322)
++#if defined(_M_ARM) && defined(__clang__)
++  // clang implements no structured exception handling on 32-bit ARM
++  // Windows. Raising the exception without a handler would terminate the
++  // process when no debugger is attached, and the thread name is only a
++  // debugger convenience, so skip it.
++  (void)threadname_info;
++#else
+   __try {
+     ::RaiseException(0x406D1388, 0, sizeof(threadname_info) / sizeof(ULONG_PTR),
+                      reinterpret_cast<ULONG_PTR*>(&threadname_info));
+   } __except (EXCEPTION_EXECUTE_HANDLER) {  // NOLINT
+   }
++#endif
+ #pragma warning(pop)
+ #elif defined(WEBRTC_LINUX) || defined(WEBRTC_ANDROID)
+   prctl(PR_SET_NAME, reinterpret_cast<unsigned long>(name));  // NOLINT
+diff --git a/third_party/libwebrtc/rtc_base/system/asm_defines.h b/third_party/libwebrtc/rtc_base/system/asm_defines.h
+index 681c61233f..c453258f69 100644
+--- a/third_party/libwebrtc/rtc_base/system/asm_defines.h
++++ b/third_party/libwebrtc/rtc_base/system/asm_defines.h
+@@ -38,6 +38,21 @@ bl _\name
+ .global _\name
+ .private_extern _\name
+ .endm
++#elif defined(_WIN32)
++// COFF has neither .hidden nor .type: symbol visibility in a Windows
++// object file is decided by the linker, not the assembler.
++.macro GLOBAL_FUNCTION name
++.global \name
++.endm
++.macro DEFINE_FUNCTION name
++\name:
++.endm
++.macro CALL_FUNCTION name
++bl \name
++.endm
++.macro GLOBAL_LABEL name
++.global \name
++.endm
+ #else
+ .macro GLOBAL_FUNCTION name
+ .global \name

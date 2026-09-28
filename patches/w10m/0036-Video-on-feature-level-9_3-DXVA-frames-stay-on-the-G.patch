@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  6 files changed, 144 insertions(+), 35 deletions(-)
 
 diff --git a/dom/media/platforms/wmf/DXVA2Manager.cpp b/dom/media/platforms/wmf/DXVA2Manager.cpp
-index fdb985ada8..d81aaa281f 100644
+index 8109861b5d..ea82da4f94 100644
 --- a/dom/media/platforms/wmf/DXVA2Manager.cpp
 +++ b/dom/media/platforms/wmf/DXVA2Manager.cpp
 @@ -682,6 +682,13 @@ D3D11DXVA2Manager::InitInternal(layers::KnowsCompositor* aKnowsCompositor,
@@ -45,7 +45,7 @@ index fdb985ada8..d81aaa281f 100644
      if (!mDevice) {
        aFailureReason.AssignLiteral("Failed to create D3D11 device for decoder");
 diff --git a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
-index e3cca0e8c6..14f1cc6dc9 100644
+index 0db0f8c6a9..7137ef90f2 100644
 --- a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
 +++ b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
 @@ -303,7 +303,13 @@ MediaResult WMFVideoMFTManager::InitInternal() {
@@ -327,7 +327,7 @@ index 1c0bc0054c..e20a8046d8 100644
      return;
    }
 diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
-index 2575432397..a4e87b1711 100644
+index a892c5ff9d..6b9e70ed31 100644
 --- a/gfx/thebes/gfxPlatform.cpp
 +++ b/gfx/thebes/gfxPlatform.cpp
 @@ -81,6 +81,7 @@ extern "C" void GeckoW10mNote(const char* text);

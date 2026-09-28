@@ -1,0 +1,789 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] mfbt, mozglue, NSPR, XPCOM, IPC: 32-bit ARM Windows in an app
+ container
+
+The platform layer where the desktop API is missing or different in a UWP
+app: stack walking and interception on ARM32, the Windows version checks,
+thread naming, COM runtime set-up, file associations and the startup cache
+in the app's own folders.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/nsChromeRegistryChrome.cpp             |  8 ++++
+ ipc/mscom/ProcessRuntime.cpp                  | 21 +++++++++
+ mfbt/ResultExtensions.h                       |  4 +-
+ mfbt/WindowsVersion.h                         |  6 +++
+ mozglue/misc/StackWalk.cpp                    | 45 ++++++++++++++++++-
+ mozglue/misc/StackWalk_windows.h              |  4 +-
+ nsprpub/pr/src/md/windows/w95thred.c          |  6 +++
+ startupcache/StartupCache.cpp                 | 41 ++++++++++++++++-
+ .../chromium/base/functional/bind_internal.h  | 16 +++++--
+ .../zucchini/chromium/base/immediate_crash.h  |  6 +++
+ .../zucchini/chromium/base/time/time_win.cc   | 10 ++---
+ .../zucchini/chromium/build/build_config.h    |  3 +-
+ .../zucchini/zucchini_integration.cc          | 12 ++++-
+ .../windows/common/minidump_callback.h        |  2 +
+ .../dllservices/mozglue/WindowsDllBlocklist.h |  2 +-
+ .../mozglue/interceptor/PatcherDetour.h       | 35 +++++++++++++++
+ .../mozglue/interceptor/TargetFunction.h      |  6 ++-
+ tools/profiler/public/ETWTools.h              |  6 ++-
+ uriloader/exthandler/win/nsMIMEInfoWin.cpp    | 15 +++++++
+ .../exthandler/win/nsOSHelperAppService.cpp   | 15 +++++++
+ xpcom/base/nscore.h                           |  7 +--
+ xpcom/components/ManifestParser.cpp           |  7 +++
+ 22 files changed, 254 insertions(+), 23 deletions(-)
+
+diff --git a/chrome/nsChromeRegistryChrome.cpp b/chrome/nsChromeRegistryChrome.cpp
+index b28f2b7ff8..c1ab147f8d 100644
+--- a/chrome/nsChromeRegistryChrome.cpp
++++ b/chrome/nsChromeRegistryChrome.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "nsChromeRegistryChrome.h"
+ 
++#include "nsPrintfCString.h"
++
+ #if defined(XP_WIN)
+ #  include <windows.h>
+ #elif defined(XP_MACOSX)
+@@ -414,6 +416,12 @@ void nsChromeRegistryChrome::nsProviderArray::EnumerateToArray(
+   }
+ }
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ nsIURI* nsChromeRegistry::ManifestProcessingContext::GetManifestURI() {
+   if (!mManifestURI) {
+     nsCString uri;
+diff --git a/ipc/mscom/ProcessRuntime.cpp b/ipc/mscom/ProcessRuntime.cpp
+index 5faafce15f..be8b17d1db 100644
+--- a/ipc/mscom/ProcessRuntime.cpp
++++ b/ipc/mscom/ProcessRuntime.cpp
+@@ -255,6 +255,27 @@ void ProcessRuntime::InitInsideApartment() {
+     return;
+   }
+ 
++#if defined(GECKO_W10M)
++  // Gecko is a guest in this process. A packaged app is already running XAML
++  // by the time the runtime starts, and its dispatcher and cross-apartment
++  // marshalling stand on the COM configuration the app host installed before
++  // any of this existed.
++  //
++  // Everything below is process-wide, not ours to change. CoInitializeSecurity
++  // takes effect once for the whole process; COMGLB_EXCEPTION_DONOT_HANDLE_ANY
++  // changes how every COM call in the process treats an exception, so a fault
++  // the host used to absorb becomes fatal; SetOaNoCache turns the BSTR cache
++  // off for everyone. Reconfiguring COM underneath the host is how the UI
++  // thread ended up faulting inside CoreUIComponents with not one Gecko frame
++  // on its stack.
++  //
++  // The apartment this thread joined is still real, so COM works for Gecko --
++  // it simply stops rewriting the host's settings.
++  mInitResult = S_OK;
++  lock.SetInitState(ProcessInitState::FullyInitialized);
++  return;
++#endif
++
+   if (prevInitState < ProcessInitState::PartialSecurityInitialized) {
+     // We are required to initialize security prior to configuring global
+     // options.
+diff --git a/mfbt/ResultExtensions.h b/mfbt/ResultExtensions.h
+index c7c2543888..c44afa26c7 100644
+--- a/mfbt/ResultExtensions.h
++++ b/mfbt/ResultExtensions.h
+@@ -279,7 +279,9 @@ auto ToResultInvokeMember(const SmartPtr<const T>& aObj,
+   return ToResultInvokeMember<E>(*aObj, aFunc, std::forward<Args>(aArgs)...);
+ }
+ 
+-#if defined(XP_WIN) && !defined(_WIN64)
++// 32-bit ARM Windows, like Win64, has a single calling convention: __stdcall
++// is ignored there, so these overloads would redeclare the plain ones.
++#if defined(XP_WIN) && !defined(_WIN64) && !defined(_M_ARM)
+ template <typename E = nsresult, typename T, typename U, typename... XArgs,
+           typename... Args,
+           typename = std::enable_if_t<std::is_base_of_v<U, T>>>
+diff --git a/mfbt/WindowsVersion.h b/mfbt/WindowsVersion.h
+index 28c5e782c4..7f3ff6bbe9 100644
+--- a/mfbt/WindowsVersion.h
++++ b/mfbt/WindowsVersion.h
+@@ -14,6 +14,11 @@
+ namespace mozilla {
+ 
+ inline bool IsWindows10BuildOrLater(uint32_t aBuild) {
++#if defined(GECKO_W10M)
++  // VerifyVersionInfoW is desktop-partition only. Windows 10 Mobile tops out at
++  // build 15254, so report that as the running build.
++  return aBuild <= 15254;
++#else
+   static Atomic<uint32_t> minBuild(0);
+   static Atomic<uint32_t> maxBuild(UINT32_MAX);
+ 
+@@ -48,6 +53,7 @@ inline bool IsWindows10BuildOrLater(uint32_t aBuild) {
+ 
+   maxBuild = aBuild;
+   return false;
++#endif  // !GECKO_W10M
+ }
+ 
+ MOZ_ALWAYS_INLINE bool IsWin10AnniversaryUpdateOrLater() {
+diff --git a/mozglue/misc/StackWalk.cpp b/mozglue/misc/StackWalk.cpp
+index c04908f945..a0b17add90 100644
+--- a/mozglue/misc/StackWalk.cpp
++++ b/mozglue/misc/StackWalk.cpp
+@@ -116,7 +116,7 @@ class FrameSkipper {
+ #    error Too old imagehlp.h
+ #  endif
+ 
+-#  if defined(_M_AMD64) || defined(_M_ARM64)
++#  if defined(_M_AMD64) || defined(_M_ARM64) || defined(_M_ARM)
+ // We must use RtlLookupFunctionEntry to do stack walking on x86-64 and arm64,
+ // but internally this function does a blocking shared acquire of SRW locks
+ // that live in ntdll and are not exported. This is problematic when we want to
+@@ -471,6 +471,8 @@ class CONTEXTGenericAccessors {
+     return mCONTEXT.Rip;
+ #  elif defined(_M_ARM64)
+     return mCONTEXT.Pc;
++#  elif defined(_M_ARM)
++    return mCONTEXT.Pc;
+ #  elif defined(_M_IX86)
+     return mCONTEXT.Eip;
+ #  else
+@@ -483,6 +485,8 @@ class CONTEXTGenericAccessors {
+     return mCONTEXT.Rsp;
+ #  elif defined(_M_ARM64)
+     return mCONTEXT.Sp;
++#  elif defined(_M_ARM)
++    return mCONTEXT.Sp;
+ #  elif defined(_M_IX86)
+     return mCONTEXT.Esp;
+ #  else
+@@ -495,6 +499,9 @@ class CONTEXTGenericAccessors {
+     return mCONTEXT.Rbp;
+ #  elif defined(_M_ARM64)
+     return mCONTEXT.Fp;
++#  elif defined(_M_ARM)
++    // Windows on ARM32 uses r11 as the frame pointer.
++    return mCONTEXT.R11;
+ #  elif defined(_M_IX86)
+     return mCONTEXT.Ebp;
+ #  else
+@@ -562,7 +569,7 @@ static void DoMozStackWalkThread(MozWalkStackCallback aCallback,
+   frame64.AddrReturn.Mode = AddrModeFlat;
+ #  endif
+ 
+-#  if defined(_M_AMD64) || defined(_M_ARM64)
++#  if defined(_M_AMD64) || defined(_M_ARM64) || defined(_M_ARM)
+   // If at least one thread (we don't know which) may be holding a lock that
+   // can deadlock RtlLookupFunctionEntry, we can't proceed because that thread
+   // may be the one that we're trying to walk the stack of.
+@@ -656,6 +663,40 @@ static void DoMozStackWalkThread(MozWalkStackCallback aCallback,
+       break;
+     }
+ 
++    addr = context.PC();
++    spaddr = context.SP();
++    firstFrame = false;
++
++#  elif defined(_M_ARM)
++
++    // Windows on ARM32 has table-driven unwinding just like the 64-bit
++    // targets, but its Rtl* entry points are declared in terms of ULONG_PTR
++    // rather than ULONG64.
++    auto currentInstr = context.PC();
++
++    if (sJitCodeRegionStart && (uint8_t*)currentInstr >= sJitCodeRegionStart &&
++        (uint8_t*)currentInstr < sJitCodeRegionStart + sJitCodeRegionSize) {
++      break;
++    }
++
++    ULONG_PTR imageBase;
++    PRUNTIME_FUNCTION runtimeFunction =
++        RtlLookupFunctionEntry(currentInstr, &imageBase, NULL);
++
++    if (runtimeFunction) {
++      PVOID dummyHandlerData;
++      ULONG_PTR dummyEstablisherFrame;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, currentInstr,
++                       runtimeFunction, context.CONTEXTPtr(), &dummyHandlerData,
++                       &dummyEstablisherFrame, nullptr);
++    } else if (firstFrame) {
++      // Leaf functions can be unwound by hand.
++      context.PC() = *reinterpret_cast<DWORD*>(context.SP());
++      context.SP() += sizeof(void*);
++    } else {
++      break;
++    }
++
+     addr = context.PC();
+     spaddr = context.SP();
+     firstFrame = false;
+diff --git a/mozglue/misc/StackWalk_windows.h b/mozglue/misc/StackWalk_windows.h
+index 5e5105ddf4..5dc215fbb0 100644
+--- a/mozglue/misc/StackWalk_windows.h
++++ b/mozglue/misc/StackWalk_windows.h
+@@ -8,7 +8,7 @@
+ #include "mozilla/Array.h"
+ #include "mozilla/Types.h"
+ 
+-#if defined(_M_AMD64) || defined(_M_ARM64)
++#if defined(_M_AMD64) || defined(_M_ARM64) || defined(_M_ARM)
+ /**
+  * This function enables strategy (1) for avoiding deadlocks between the stack
+  * walking thread and the suspended thread. In aStackWalkLocks the caller must
+@@ -45,6 +45,6 @@ void DesuppressStackWalking();
+ MFBT_API void RegisterJitCodeRegion(uint8_t* aStart, size_t size);
+ 
+ MFBT_API void UnregisterJitCodeRegion(uint8_t* aStart, size_t size);
+-#endif  // _M_AMD64 || _M_ARM64
++#endif  // _M_AMD64 || _M_ARM64 || _M_ARM
+ 
+ #endif  // mozilla_StackWalk_windows_h
+diff --git a/nsprpub/pr/src/md/windows/w95thred.c b/nsprpub/pr/src/md/windows/w95thred.c
+index 76636d9546..e0a74b9e4c 100644
+--- a/nsprpub/pr/src/md/windows/w95thred.c
++++ b/nsprpub/pr/src/md/windows/w95thred.c
+@@ -260,12 +260,18 @@ _PR_MD_SET_CURRENT_THREAD_NAME(const char* name)
+     info.dwThreadID = -1;
+     info.dwFlags = 0;
+ 
++#if defined(_M_ARM) && defined(__clang__)
++    /* clang implements no SEH on 32-bit ARM Windows, and this exception is
++       purely a debugger thread-naming convention, so skip it. */
++    (void)info;
++#else
+     __try {
+         RaiseException(MS_VC_EXCEPTION, 0, sizeof(info) / sizeof(ULONG_PTR),
+                        (ULONG_PTR*)&info);
+     } __except (EXCEPTION_CONTINUE_EXECUTION) {
+     }
+ #endif
++#endif
+ }
+ 
+ void
+diff --git a/startupcache/StartupCache.cpp b/startupcache/StartupCache.cpp
+index d365f7ec1b..ac4e10d822 100644
+--- a/startupcache/StartupCache.cpp
++++ b/startupcache/StartupCache.cpp
+@@ -97,6 +97,11 @@ static const size_t STARTUP_CACHE_MAX_CAPACITY = 5000;
+ // Not const because we change it for gtests.
+ static uint8_t STARTUP_CACHE_WRITE_TIMEOUT = 60;
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ #define STARTUP_CACHE_NAME "startupCache." SC_WORDSIZE "." SC_ENDIAN
+ 
+ #define INITIAL_WRITE_TOPIC "browser-idle-startup-tasks-finished"
+@@ -186,6 +191,13 @@ nsresult StartupCache::Init() {
+   if (mozilla::RunningGTest()) {
+     STARTUP_CACHE_WRITE_TIMEOUT = 3;
+   }
++#if defined(GECKO_W10M)
++  // Sixty seconds after the last script is put in, on a phone, is sixty
++  // seconds in which the user may well have closed the app -- and the app is
++  // never closed here, it is ended. Two launches in one device log ended
++  // before this fired, and the third compiled everything from source again.
++  STARTUP_CACHE_WRITE_TIMEOUT = 5;
++#endif
+ 
+   // This allows to override the startup cache filename
+   // which is useful from xpcshell, when there is no ProfLDS directory to keep
+@@ -525,8 +537,22 @@ Result<Ok, nsresult> StartupCache::WriteToDisk(WriteType aWriteType) {
+   }
+ 
+   AutoFDClose raiiFd;
++#if defined(GECKO_W10M)
++  {
++    nsresult openRv = mFile->OpenNSPRFileDesc(
++        PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE, 0644,
++        getter_Transfers(raiiFd));
++    if (NS_FAILED(openRv)) {
++      nsPrintfCString note("startup cache: could not open the file for writing, rv=%x",
++                           static_cast<unsigned>(openRv));
++      GeckoW10mNote(note.get());
++      return Err(openRv);
++    }
++  }
++#else
+   MOZ_TRY(mFile->OpenNSPRFileDesc(PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE,
+                                   0644, getter_Transfers(raiiFd)));
++#endif
+   const auto fd = raiiFd.get();
+ 
+   nsTArray<StartupCacheEntry::KeyValuePair> entries(mTable.count());
+@@ -539,8 +565,17 @@ Result<Ok, nsresult> StartupCache::WriteToDisk(WriteType aWriteType) {
+   }
+ 
+   if (entries.IsEmpty()) {
++#if defined(GECKO_W10M)
++    GeckoW10mNote("startup cache: nothing was requested this run, nothing to write");
++#endif
+     return Ok();
+   }
++#if defined(GECKO_W10M)
++  {
++    nsPrintfCString note("startup cache: writing %d entries", (int)entries.Length());
++    GeckoW10mNote(note.get());
++  }
++#endif
+ 
+   entries.Sort(StartupCacheEntry::Comparator());
+   loader::OutputBuffer buf;
+@@ -779,10 +814,14 @@ void StartupCache::MaybeWriteOffMainThread(WriteType aWriteType,
+     MutexAutoLock lock(mTableLock);
+     if (mRegularWriteDone ||
+         (mCacheData.initialized() && !ShouldCompactCache())) {
++#if defined(GECKO_W10M)
++      GeckoW10mNote(mRegularWriteDone
++                      ? "startup cache: not writing, the regular write is done"
++                      : "startup cache: not writing, the file on disk is good enough");
++#endif
+       return;
+     }
+   }
+-  // Keep this code in sync with EnsureShutdownWriteComplete.
+   WaitOnPrefetch();
+   {
+     MutexAutoLock lock(mTableLock);
+diff --git a/third_party/zucchini/chromium/base/functional/bind_internal.h b/third_party/zucchini/chromium/base/functional/bind_internal.h
+index 8fea91eb2f..a7d33fb2bb 100644
+--- a/third_party/zucchini/chromium/base/functional/bind_internal.h
++++ b/third_party/zucchini/chromium/base/functional/bind_internal.h
+@@ -633,7 +633,11 @@ struct FunctorTraits<R (*)(Args...)> {
+   }
+ };
+ 
+-#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++// On 32-bit ARM Windows there is a single calling convention: __stdcall and
++// __fastcall are ignored there, so these specializations would redeclare
++// the plain ones.
++#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS) && \
++    !defined(ARCH_CPU_ARMEL)
+ 
+ // For functions.
+ template <typename R, typename... Args>
+@@ -665,7 +669,7 @@ struct FunctorTraits<R(__fastcall*)(Args...)> {
+   }
+ };
+ 
+-#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS) && !ARCH_CPU_ARMEL
+ 
+ #if __OBJC__
+ 
+@@ -732,7 +736,11 @@ struct FunctorTraits<R (Receiver::*)(Args...) const> {
+   }
+ };
+ 
+-#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++// On 32-bit ARM Windows there is a single calling convention: __stdcall and
++// __fastcall are ignored there, so these specializations would redeclare
++// the plain ones.
++#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS) && \
++    !defined(ARCH_CPU_ARMEL)
+ 
+ // For __stdcall methods.
+ template <typename R, typename Receiver, typename... Args>
+@@ -768,7 +776,7 @@ struct FunctorTraits<R (__stdcall Receiver::*)(Args...) const> {
+   }
+ };
+ 
+-#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS) && !ARCH_CPU_ARMEL
+ 
+ #ifdef __cpp_noexcept_function_type
+ // noexcept makes a distinct function type in C++17.
+diff --git a/third_party/zucchini/chromium/base/immediate_crash.h b/third_party/zucchini/chromium/base/immediate_crash.h
+index 049c9eef22..948e7659c7 100644
+--- a/third_party/zucchini/chromium/base/immediate_crash.h
++++ b/third_party/zucchini/chromium/base/immediate_crash.h
+@@ -109,6 +109,12 @@
+ // https://crbug.com/958373
+ #define TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif defined(ARCH_CPU_ARMEL)
++
++// Same sequence as the GCC/Arm32 path above: int3/ud2 are x86 opcodes.
++#define TRAP_SEQUENCE1_() asm volatile("bkpt #0")
++#define TRAP_SEQUENCE2_() asm volatile("udf #0")
++
+ #else
+ 
+ #define TRAP_SEQUENCE1_() asm volatile("int3")
+diff --git a/third_party/zucchini/chromium/base/time/time_win.cc b/third_party/zucchini/chromium/base/time/time_win.cc
+index 2d93834555..6b4f322dba 100644
+--- a/third_party/zucchini/chromium/base/time/time_win.cc
++++ b/third_party/zucchini/chromium/base/time/time_win.cc
+@@ -670,7 +670,7 @@ ThreadTicks ThreadTicks::GetForThread(
+     const PlatformThreadHandle& thread_handle) {
+   DCHECK(IsSupported());
+ 
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // QueryThreadCycleTime versus TSCTicksPerSecond doesn't have much relation to
+   // actual elapsed time on Windows on Arm, because QueryThreadCycleTime is
+   // backed by the actual number of CPU cycles executed, rather than a
+@@ -704,7 +704,7 @@ ThreadTicks ThreadTicks::GetForThread(
+ 
+ // static
+ bool ThreadTicks::IsSupportedWin() {
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // The Arm implementation does not use QueryThreadCycleTime and therefore does
+   // not care about the time stamp counter.
+   return true;
+@@ -715,7 +715,7 @@ bool ThreadTicks::IsSupportedWin() {
+ 
+ // static
+ void ThreadTicks::WaitUntilInitializedWin() {
+-#if !defined(ARCH_CPU_ARM64)
++#if !defined(ARCH_CPU_ARM_FAMILY)
+   while (time_internal::TSCTicksPerSecond() == 0)
+     ::Sleep(10);
+ #endif
+@@ -762,7 +762,7 @@ ABI::Windows::Foundation::TimeSpan TimeDelta::ToWinrtTimeSpan() const {
+   return time_span;
+ }
+ 
+-#if !defined(ARCH_CPU_ARM64)
++#if !defined(ARCH_CPU_ARM_FAMILY)
+ namespace time_internal {
+ 
+ bool HasConstantRateTSC() {
+@@ -829,6 +829,6 @@ double TSCTicksPerSecond() {
+ }
+ 
+ }  // namespace time_internal
+-#endif  // defined(ARCH_CPU_ARM64)
++#endif  // defined(ARCH_CPU_ARM_FAMILY)
+ 
+ }  // namespace base
+diff --git a/third_party/zucchini/chromium/build/build_config.h b/third_party/zucchini/chromium/build/build_config.h
+index 2484703699..14cc4c86ff 100644
+--- a/third_party/zucchini/chromium/build/build_config.h
++++ b/third_party/zucchini/chromium/build/build_config.h
+@@ -298,7 +298,8 @@
+ #define ARCH_CPU_PPC64 1
+ #define ARCH_CPU_64_BITS 1
+ #define ARCH_CPU_LITTLE_ENDIAN 1
+-#elif defined(__ARMEL__)
++// clang-cl targeting 32-bit ARM Windows defines _M_ARM, not __ARMEL__.
++#elif defined(__ARMEL__) || defined(_M_ARM)
+ #define ARCH_CPU_ARM_FAMILY 1
+ #define ARCH_CPU_ARMEL 1
+ #define ARCH_CPU_32_BITS 1
+diff --git a/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc b/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
+index d70e85a620..7c8dfd5d5b 100644
+--- a/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
++++ b/third_party/zucchini/chromium/components/zucchini/zucchini_integration.cc
+@@ -105,6 +105,14 @@ status::Code GenerateCommon(base::File old_file,
+   return status::kStatusSuccess;
+ }
+ 
++#if BUILDFLAG(IS_WIN) && defined(_M_ARM) && defined(__clang__)
++// clang implements no structured exception handling on 32-bit ARM
++// Windows. Without it an EXCEPTION_IN_PAGE_ERROR on one of the mapped
++// files terminates the process instead of being reported as
++// kStatusIoError; patching itself is unaffected.
++#  define ZUCCHINI_NO_SEH 1
++#endif
++
+ status::Code ApplyCommon(base::File old_file,
+                          base::File patch_file,
+                          base::File new_file,
+@@ -112,7 +120,9 @@ status::Code ApplyCommon(base::File old_file,
+                          bool force_keep) {
+ #if BUILDFLAG(IS_WIN)
+   ExceptionFilterHelper exception_filter_helper;
++#  if !defined(ZUCCHINI_NO_SEH)
+   __try {
++#  endif
+ #endif
+     MappedFileReader mapped_patch(std::move(patch_file));
+     if (mapped_patch.HasError()) {
+@@ -168,7 +178,7 @@ status::Code ApplyCommon(base::File old_file,
+     // Successfully patch |mapped_new|. Explicitly request file to be kept.
+     return mapped_new.Keep() ? status::kStatusSuccess
+                              : status::kStatusFileWriteError;
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) && !defined(ZUCCHINI_NO_SEH)
+   } __except (exception_filter_helper.FilterPageError(
+       GetExceptionInformation()->ExceptionRecord)) {
+     LOG(ERROR) << "EXCEPTION_IN_PAGE_ERROR while "
+diff --git a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h b/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
+index 78afb068c4..5ad6bf23a5 100644
+--- a/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
++++ b/toolkit/crashreporter/breakpad-client/windows/common/minidump_callback.h
+@@ -49,6 +49,8 @@ static const size_t kExceptionAppMemoryRegions = 33;
+ using RegisterValueType = DWORD;
+ #elif defined(_M_AMD64) || defined(_M_ARM64)
+ using RegisterValueType = DWORD64;
++#elif defined(_M_ARM)
++using RegisterValueType = DWORD;
+ #else
+ #error Unsupported platform
+ #endif
+diff --git a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h b/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
+index 8702b227d2..173176c637 100644
+--- a/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
++++ b/toolkit/xre/dllservices/mozglue/WindowsDllBlocklist.h
+@@ -6,7 +6,7 @@
+ #define mozilla_windowsdllblocklist_h
+ 
+ #if (defined(_MSC_VER) || defined(__MINGW32__)) && \
+-    (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64))
++    (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64) || defined(_M_ARM))
+ 
+ #  include <windows.h>
+ #  include "mozilla/ProcessType.h"
+diff --git a/toolkit/xre/dllservices/mozglue/interceptor/PatcherDetour.h b/toolkit/xre/dllservices/mozglue/interceptor/PatcherDetour.h
+index 069fdf8ba6..edb1535c3a 100644
+--- a/toolkit/xre/dllservices/mozglue/interceptor/PatcherDetour.h
++++ b/toolkit/xre/dllservices/mozglue/interceptor/PatcherDetour.h
+@@ -49,6 +49,13 @@ class WindowsDllDetourPatcherPrimitive {
+   // LDR x16, .+8
+   static const uint32_t kLdrX16Plus8 = 0x58000050U;
+ #endif  // defined(_M_ARM64)
++#if defined(_M_ARM)
++  // Thumb-2: LDR.W pc, [pc, #0]. Encoded as the halfword pair F8DF F000, which
++  // in little-endian memory order is the word 0xF000F8DF. It loads the 32-bit
++  // word placed immediately after the instruction into pc, so the veneer is
++  // eight bytes and reaches the entire address space.
++  static const uint32_t kThumbLdrPcPcPlus0 = 0xF000F8DFU;
++#endif  // defined(_M_ARM)
+ 
+   static void ApplyDefaultPatch(WritableTargetFunction<MMPolicyT>& target,
+                                 intptr_t aDest) {
+@@ -82,6 +89,10 @@ class WindowsDllDetourPatcherPrimitive {
+     // BR x16
+     target.WriteLong(arm64::BuildUnconditionalBranchToRegister(16));
+     target.WritePointer(aDest);
++#elif defined(_M_ARM)
++    target.WriteLong(kThumbLdrPcPcPlus0);
++    // ARM32 code pointers carry the Thumb state in bit 0.
++    target.WritePointer(aDest | 1);
+ #else
+ #  error "Unsupported processor architecture"
+ #endif
+@@ -95,6 +106,8 @@ class WindowsDllDetourPatcherPrimitive {
+     return 13;
+ #elif defined(_M_ARM64)
+     return 16;
++#elif defined(_M_ARM)
++    return 8;
+ #else
+ #  error "Unsupported processor architecture"
+ #endif
+@@ -158,6 +171,8 @@ class WindowsDllDetourPatcher final
+     size_t nBytes = 2 + sizeof(intptr_t);
+ #elif defined(_M_ARM64)
+     size_t nBytes = 2 * sizeof(uint32_t) + sizeof(uintptr_t);
++#elif defined(_M_ARM)
++    size_t nBytes = sizeof(uint32_t) + sizeof(uintptr_t);
+ #else
+ #  error "Unknown processor type"
+ #endif
+@@ -265,6 +280,12 @@ class WindowsDllDetourPatcher final
+         continue;
+       }
+ 
++#elif defined(_M_ARM)
++
++      // Detours are never installed on ARM32 (see CreateTrampoline), so there
++      // is never a patch to undo.
++      continue;
++
+ #else
+ #  error "Unknown processor type"
+ #endif
+@@ -494,6 +515,10 @@ class WindowsDllDetourPatcher final
+     // For these ISAs, our distance will assume the use of an unconditional jmp
+     // with a 32-bit signed displacement.
+     return 0x80000000U;
++#elif defined(_M_ARM)
++    // The ARM32 veneer is an absolute indirect load, so any distance works;
++    // keep it within the Thumb-2 B.W range anyway.
++    return 0x00800000U;
+ #else
+ #  error "Not defined for this processor arch"
+ #endif
+@@ -1714,6 +1739,14 @@ class WindowsDllDetourPatcher final
+                              pcRelInfo.inspect().mDestReg);
+     }
+ 
++#elif defined(_M_ARM)
++
++    // Relocating the overwritten instructions into a trampoline needs a
++    // Thumb-2 decoder, which this patcher does not have. Refuse the detour
++    // instead of producing one that cannot be unwound: aOutTramp is left
++    // unset, which the caller reads as "not intercepted".
++    return;
++
+ #else
+ #  error "Unknown processor type"
+ #endif
+@@ -1788,6 +1821,8 @@ class WindowsDllDetourPatcher final
+ 
+     tramp.WriteLoadLiteral(origBytes.GetAddress(), 16);
+     tramp.WriteInstruction(arm64::BuildUnconditionalBranchToRegister(16));
++#elif defined(_M_ARM)
++    return;  // unreachable: the ARM32 path above already returned
+ #else
+ #  error "Unsupported processor architecture"
+ #endif
+diff --git a/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h b/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
+index 0513edfdf1..ba3f093d42 100644
+--- a/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
++++ b/toolkit/xre/dllservices/mozglue/interceptor/TargetFunction.h
+@@ -318,7 +318,7 @@ class MOZ_STACK_CLASS WritableTargetFunction final {
+     mOffset += sizeof(int32_t);
+   }
+ 
+-#if defined(_M_X64) || defined(_M_ARM64)
++#if defined(_M_X64) || defined(_M_ARM64) || defined(_M_ARM)
+   void WriteLong(const uint32_t aValue) {
+     if (!mLocalBytes.append(reinterpret_cast<const uint8_t*>(&aValue),
+                             sizeof(uint32_t))) {
+@@ -391,6 +391,8 @@ class MOZ_STACK_CLASS WritableTargetFunction final {
+   static const size_t kInlineStorage = 16;
+ #elif defined(_M_X64) || defined(_M_ARM64)
+   static const size_t kInlineStorage = 32;
++#elif defined(_M_ARM)
++  static const size_t kInlineStorage = 16;
+ #endif
+   Vector<uint8_t, kInlineStorage> mLocalBytes;
+   bool mAccumulatedStatus;
+@@ -610,6 +612,8 @@ class ReadOnlyTargetBytes<MMPolicyOutOfProcess> {
+   static const size_t kInlineStorage = 16;
+ #elif defined(_M_X64) || defined(_M_ARM64)
+   static const size_t kInlineStorage = 32;
++#elif defined(_M_ARM)
++  static const size_t kInlineStorage = 16;
+ #endif
+ 
+   const MMPolicyOutOfProcess& mMMPolicy;
+diff --git a/tools/profiler/public/ETWTools.h b/tools/profiler/public/ETWTools.h
+index 2e0f09cbfd..f6217dfe47 100644
+--- a/tools/profiler/public/ETWTools.h
++++ b/tools/profiler/public/ETWTools.h
+@@ -21,7 +21,11 @@ struct MarkerSupportsETW<T, std::void_t<decltype(T::Name)>> : std::true_type {};
+ 
+ }  // namespace ETW
+ 
+-#if defined(XP_WIN) && !defined(RUST_BINDGEN) && !defined(__MINGW32__)
++// clang crashes compiling the TraceLogging macros for 32-bit ARM Windows,
++// and Windows 10 Mobile has no ETW consumer to feed anyway, so take the
++// no-op path there.
++#if defined(XP_WIN) && !defined(RUST_BINDGEN) && !defined(__MINGW32__) && \
++    !defined(_M_ARM)
+ #  include "mozilla/ProfilerState.h"
+ 
+ #  include <windows.h>
+diff --git a/uriloader/exthandler/win/nsMIMEInfoWin.cpp b/uriloader/exthandler/win/nsMIMEInfoWin.cpp
+index 1a0e710c5c..a540bf8a39 100644
+--- a/uriloader/exthandler/win/nsMIMEInfoWin.cpp
++++ b/uriloader/exthandler/win/nsMIMEInfoWin.cpp
+@@ -286,8 +286,23 @@ nsMIMEInfoWin::GetProperty(const nsAString& aName, nsIVariant** _retval) {
+ 
+ // this implementation was pretty much copied verbatime from
+ // Tony Robinson's code in nsExternalProtocolWin.cpp
++#if defined(GECKO_W10M)
++extern "C" bool gecko_w10m_launch_uri(const char* aUri);
++#endif
++
+ nsresult nsMIMEInfoWin::LoadUriInternal(nsIURI* aURL) {
+   nsresult rv = NS_OK;
++#if defined(GECKO_W10M)
++  // ShellExecute is not available to an app container, and the phone opens
++  // URIs through the shell's Launcher instead. mailto:, tel:, ms-settings:
++  // and the like all arrive here.
++  if (aURL) {
++    nsAutoCString spec;
++    if (NS_SUCCEEDED(aURL->GetSpec(spec)) && gecko_w10m_launch_uri(spec.get())) {
++      return NS_OK;
++    }
++  }
++#endif
+ 
+   // 1. Find the default app for this protocol
+   // 2. Set up the command line
+diff --git a/uriloader/exthandler/win/nsOSHelperAppService.cpp b/uriloader/exthandler/win/nsOSHelperAppService.cpp
+index b3049c3999..a2bff2b338 100644
+--- a/uriloader/exthandler/win/nsOSHelperAppService.cpp
++++ b/uriloader/exthandler/win/nsOSHelperAppService.cpp
+@@ -63,8 +63,23 @@ static nsresult GetExtensionFromWindowsMimeDatabase(const nsACString& aMimeType,
+   return NS_OK;
+ }
+ 
++#if defined(GECKO_W10M)
++extern "C" bool gecko_w10m_has_uri_launcher();
++#endif
++
+ nsresult nsOSHelperAppService::OSProtocolHandlerExists(
+     const char* aProtocolScheme, bool* aHandlerExists) {
++#if defined(GECKO_W10M)
++  // The registry this would read is closed to an app container, so it always
++  // said "no handler" and Gecko refused every external link. The shell's
++  // launcher knows better: let the system decide whether it can open the
++  // scheme.
++  if (gecko_w10m_has_uri_launcher()) {
++    *aHandlerExists = true;
++    return NS_OK;
++  }
++#endif
++
+   // look up the protocol scheme in the windows registry....if we find a match
+   // then we have a handler for it...
+   *aHandlerExists = false;
+diff --git a/xpcom/base/nscore.h b/xpcom/base/nscore.h
+index 48cdfdf774..2fdf14dfd0 100644
+--- a/xpcom/base/nscore.h
++++ b/xpcom/base/nscore.h
+@@ -96,9 +96,10 @@
+ #  define NS_IMETHODIMP_(type) type __stdcall
+ #  define NS_METHOD_(type) type __stdcall
+ #  define NS_CALLBACK_(_type, _name) _type(__stdcall* _name)
+-#  ifndef _WIN64
+-// Win64 has only one calling convention.  __stdcall will be ignored by the
+-// compiler.
++#  if !defined(_WIN64) && !defined(_M_ARM)
++// Win64 and 32-bit ARM Windows each have only one calling convention, so
++// __stdcall is ignored by the compiler and the __stdcall specializations of
++// FunctionTypeTraits etc. would collide with the plain ones.
+ #    define NS_STDCALL __stdcall
+ #    define NS_HAVE_STDCALL
+ #  else
+diff --git a/xpcom/components/ManifestParser.cpp b/xpcom/components/ManifestParser.cpp
+index 170e6b3683..3fd8fa4f86 100644
+--- a/xpcom/components/ManifestParser.cpp
++++ b/xpcom/components/ManifestParser.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "mozilla/Services.h"
+ #include "nsCRT.h"
++#include "nsPrintfCString.h"
+ #include "nsConsoleMessage.h"
+ #include "nsIConsoleService.h"
+ #include "nsIScriptError.h"
+@@ -369,6 +370,12 @@ struct CachedDirective {
+ 
+ }  // namespace
+ 
++#if defined(GECKO_W10M)
++// Defined in toolkit/xre/Bootstrap.cpp: one line to a file the shell names,
++// for when there is no debugger, no console and no MOZ_LOG yet.
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ void ParseManifest(NSLocationType aType, FileLocation& aFile, char* aBuf,
+                    bool aChromeOnly) {
+   nsComponentManagerImpl::ManifestProcessingContext mgrcx(aType, aFile,

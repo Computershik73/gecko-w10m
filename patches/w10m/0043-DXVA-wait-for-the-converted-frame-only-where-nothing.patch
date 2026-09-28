@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 28 Sep 2026 14:33:02 +0400
+Subject: [PATCH] DXVA: wait for the converted frame only where nothing else
+ synchronizes it
+
+Where textures are shared the frame carries a D3D11 fence the compositor
+waits on; the extra wait there only held the decoder behind the GPU on every
+frame (12 ms on average on an Adreno 530).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/platforms/wmf/DXVA2Manager.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/dom/media/platforms/wmf/DXVA2Manager.cpp b/dom/media/platforms/wmf/DXVA2Manager.cpp
+index 2fb124bc97..41c41e04a6 100644
+--- a/dom/media/platforms/wmf/DXVA2Manager.cpp
++++ b/dom/media/platforms/wmf/DXVA2Manager.cpp
+@@ -1387,7 +1387,16 @@ HRESULT D3D11DXVA2Manager::CopyTextureToImage(
+     // finished converting yet -- what it showed was the frame that texture
+     // held before, several frames old. The decoder's thread waits here for
+     // the conversion, not the compositor's.
+-    if (!mutex && mDevice == DeviceManagerDx::Get()->GetCompositorDevice()) {
++    //
++    // Only there. Where textures are shared (feature level 11, hardware
++    // WebRender through ANGLE) the frame carries a D3D11 fence the compositor
++    // waits on, signalled below; waiting here as well only held the decoder
++    // behind the GPU on every frame.
++    auto* waitData = client->GetInternalData()->AsD3D11TextureData();
++    const bool fenced = waitData && waitData->mFencesHolderId.isSome() &&
++                        CompositeProcessD3D11FencesHolderMap::Get();
++    if (!mutex && !fenced &&
++        mDevice == DeviceManagerDx::Get()->GetCompositorDevice()) {
+       WaitForConvertedFrame();
+     }
+ #endif

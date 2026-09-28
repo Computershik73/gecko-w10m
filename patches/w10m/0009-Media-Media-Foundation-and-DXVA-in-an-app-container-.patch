@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] Media: Media Foundation and DXVA in an app container; codecs
+ on 32-bit ARM Windows
+
+Hardware video decoding through DXVA on the compositor's device, and the
+codec libraries' ARM32 Windows CPU detection and build lists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/platforms/wmf/DXVA2Manager.cpp      | 13 +++++
+ dom/media/platforms/wmf/WMFUtils.cpp          | 49 +++++++++++++++++++
+ .../platforms/wmf/WMFVideoMFTManager.cpp      | 37 ++++++++++++++
+ media/ffvpx/config.h                          |  7 +++
+ media/ffvpx/libavcodec/moz.build              | 11 ++++-
+ media/ffvpx/libavutil/avutil.symbols          |  2 +-
+ media/ffvpx/libavutil/moz.build               |  4 +-
+ media/libpng/moz.build                        |  4 +-
+ .../libvpx/vpx_ports/aarch32_cpudetect.c      |  7 +++
+ media/libvpx/moz.build                        | 32 +++++++++++-
+ media/libwebp/sharpyuv/moz.build              |  4 +-
+ media/libwebp/src/dsp/moz.build               |  4 +-
+ third_party/aom/aom_ports/aarch32_cpudetect.c |  7 +++
+ 13 files changed, 172 insertions(+), 9 deletions(-)
+
+diff --git a/dom/media/platforms/wmf/DXVA2Manager.cpp b/dom/media/platforms/wmf/DXVA2Manager.cpp
+index 9d5d8dffc7..8109861b5d 100644
+--- a/dom/media/platforms/wmf/DXVA2Manager.cpp
++++ b/dom/media/platforms/wmf/DXVA2Manager.cpp
+@@ -790,8 +790,21 @@ D3D11DXVA2Manager::InitInternal(layers::KnowsCompositor* aKnowsCompositor,
+     }
+   }
+ 
++  // Zero copy means the decoder's own NV12 texture goes to the compositor as
++  // it is, instead of being run through the video processor MFT into a fresh
++  // one for every frame. Upstream asks for the GPU process because that is
++  // where the texture has to end up; here the compositor is in this process
++  // and, with the decoder device reused, on the same D3D11 device the
++  // compositor draws with -- which is the condition that actually matters, and
++  // it is still checked. The copy costs a full frame of fill per frame, which
++  // 1080p30 has room for on this GPU and 1080p60 does not.
++#if defined(GECKO_W10M)
++  if (!IsD3D11() ||
++      (mDevice != DeviceManagerDx::Get()->GetCompositorDevice())) {
++#else
+   if (!IsD3D11() || !XRE_IsGPUProcess() ||
+       (mDevice != DeviceManagerDx::Get()->GetCompositorDevice())) {
++#endif
+     mZeroCopyUsageInfo->DisableZeroCopyNV12Texture();
+   }
+ 
+diff --git a/dom/media/platforms/wmf/WMFUtils.cpp b/dom/media/platforms/wmf/WMFUtils.cpp
+index c8abb3ec92..51b08ba5d5 100644
+--- a/dom/media/platforms/wmf/WMFUtils.cpp
++++ b/dom/media/platforms/wmf/WMFUtils.cpp
+@@ -426,6 +426,20 @@ void AACAudioSpecificConfigToUserData(uint8_t aAACProfileLevelIndication,
+ 
+ namespace wmf {
+ 
++#if defined(GECKO_W10M)
++#  define GECKO_W10M_FOURCC(a, b, c, d) \
++    (DWORD(a) | (DWORD(b) << 8) | (DWORD(c) << 16) | (DWORD(d) << 24))
++static constexpr DWORD FOURCC_NV12 = GECKO_W10M_FOURCC('N', 'V', '1', '2');
++static constexpr DWORD FOURCC_NV21 = GECKO_W10M_FOURCC('N', 'V', '2', '1');
++static constexpr DWORD FOURCC_YV12 = GECKO_W10M_FOURCC('Y', 'V', '1', '2');
++static constexpr DWORD FOURCC_I420 = GECKO_W10M_FOURCC('I', '4', '2', '0');
++static constexpr DWORD FOURCC_IYUV = GECKO_W10M_FOURCC('I', 'Y', 'U', 'V');
++static constexpr DWORD FOURCC_P010 = GECKO_W10M_FOURCC('P', '0', '1', '0');
++static constexpr DWORD FOURCC_P016 = GECKO_W10M_FOURCC('P', '0', '1', '6');
++static constexpr DWORD FOURCC_YUY2 = GECKO_W10M_FOURCC('Y', 'U', 'Y', '2');
++static constexpr DWORD FOURCC_UYVY = GECKO_W10M_FOURCC('U', 'Y', 'V', 'Y');
++#endif
++
+ static const wchar_t* sDLLs[] = {
+     L"mfplat.dll",
+     L"mf.dll",
+@@ -450,6 +464,15 @@ LoadDLLs() {
+   nsTArray<const wchar_t*> loadedDlls;
+   for (const wchar_t* dll : sDLLs) {
+     if (!LoadLibrarySystem32(dll)) {
++#if defined(GECKO_W10M)
++      // Windows 10 Mobile has no evr.dll for an app container to load, and
++      // the one thing wanted from it -- the stride of a bitmap format -- is
++      // arithmetic. Without this the whole of WMF was refused, and with it
++      // every H.264 and AAC stream: FFVPX carries neither.
++      if (wcscmp(dll, L"evr.dll") == 0) {
++        continue;
++      }
++#endif
+       NS_WARNING("Failed to load WMF DLLs");
+       for (const wchar_t* loadedDll : loadedDlls) {
+         FreeLibrary(GetModuleHandleW(loadedDll));
+@@ -523,6 +546,32 @@ MFCreateMediaType(IMFMediaType** aOutMFType) {
+ 
+ HRESULT
+ MFGetStrideForBitmapInfoHeader(DWORD aFormat, DWORD aWidth, LONG* aOutStride) {
++#if defined(GECKO_W10M)
++  if (!GetModuleHandleW(L"evr.dll")) {
++    // The formats the decoder hands out here. Planar 4:2:0 and NV12 have one
++    // byte per pixel on the top plane; the packed ones are as listed.
++    switch (aFormat) {
++      case FOURCC_NV12: case FOURCC_YV12: case FOURCC_I420: case FOURCC_IYUV:
++      case FOURCC_NV21: case FOURCC_P010: case FOURCC_P016:
++        *aOutStride = (aFormat == FOURCC_P010 || aFormat == FOURCC_P016)
++                          ? LONG(aWidth) * 2
++                          : LONG(aWidth);
++        return S_OK;
++      case FOURCC_YUY2: case FOURCC_UYVY:
++        *aOutStride = LONG(aWidth) * 2;
++        return S_OK;
++      case 22 /* D3DFMT_A8R8G8B8, MFVideoFormat_ARGB32 */:
++      case 21 /* D3DFMT_X8R8G8B8, MFVideoFormat_RGB32 */:
++        *aOutStride = LONG(aWidth) * 4;
++        return S_OK;
++      case 20 /* MFVideoFormat_RGB24 */:
++        *aOutStride = LONG(aWidth) * 3;
++        return S_OK;
++      default:
++        return E_FAIL;
++    }
++  }
++#endif
+   ENSURE_FUNCTION_PTR(MFGetStrideForBitmapInfoHeader, evr.dll)
+   return (MFGetStrideForBitmapInfoHeaderPtr)(aFormat, aWidth, aOutStride);
+ }
+diff --git a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
+index 5ea50b1664..1a91301cff 100644
+--- a/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
++++ b/dom/media/platforms/wmf/WMFVideoMFTManager.cpp
+@@ -47,6 +47,11 @@ using mozilla::layers::LayerManager;
+ using mozilla::layers::LayersBackend;
+ using mozilla::media::TimeUnit;
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ 
+ LayersBackend GetCompositorBackendType(
+@@ -133,11 +138,18 @@ bool WMFVideoMFTManager::InitializeDXVA() {
+     return false;
+   }
+ 
++  // Upstream keeps DXVA in the RDD or GPU process so a decoded texture never
++  // has to be carried back to the parent. This port has neither process: the
++  // browser, the compositor and the decoder are one process, and the texture
++  // is handed straight to WebRender. The reason for the restriction does not
++  // apply here, and obeying it would mean decoding every frame on the CPU.
++#if !defined(GECKO_W10M)
+   if (!XRE_IsRDDProcess() && !XRE_IsGPUProcess()) {
+     mDXVAFailureReason.AssignLiteral(
+         "DXVA only supported in RDD or GPU process");
+     return false;
+   }
++#endif
+ 
+   bool d3d11 = true;
+   if (!StaticPrefs::media_wmf_dxva_d3d11_enabled()) {
+@@ -364,6 +376,31 @@ MediaResult WMFVideoMFTManager::InitInternal() {
+   LOG("Video Decoder initialized, Using DXVA: {}",
+       (mUseHwAccel ? "Yes" : "No"));
+ 
++#if defined(GECKO_W10M)
++  {
++    // Into the note log, which survives a restart -- the MOZ_LOG file does not,
++    // and a video that only misbehaves at 60 fps is hard to catch in the one
++    // session that happens to still have its log.
++    UINT32 numerator = 0;
++    UINT32 denominator = 1;
++    int fps = 0;
++    if (SUCCEEDED(MFGetAttributeRatio(inputType, MF_MT_FRAME_RATE,
++                                           &numerator, &denominator)) &&
++        denominator) {
++      fps = int((numerator + denominator / 2) / denominator);
++    }
++    // No %f here either; see the note in APZEventState.
++    nsPrintfCString note("media: %s %dx%d at %d fps, DXVA %s%s%s",
++                         EnumValueToString(mStreamType),
++                         mVideoInfo.ImageRect().width,
++                         mVideoInfo.ImageRect().height, fps,
++                         mUseHwAccel ? "YES" : "no",
++                         mUseHwAccel || mDXVAFailureReason.IsEmpty() ? "" : " -- ",
++                         mUseHwAccel ? "" : mDXVAFailureReason.get());
++    GeckoW10mNote(note.get());
++  }
++#endif
++
+   // Now we need to convert the video decode output to a display format.
+   if (mUseHwAccel) {
+     RETURN_PARAM_IF_FAILED(
+diff --git a/media/ffvpx/config.h b/media/ffvpx/config.h
+index baf1fa959a..696a05163b 100644
+--- a/media/ffvpx/config.h
++++ b/media/ffvpx/config.h
+@@ -27,6 +27,13 @@
+ #    endif
+ #    if defined(_ARM64_)
+ #      include "config_win64_aarch64.h"
++#    elif defined(_ARM_)
++// 32-bit ARM Windows: ffvpx ships no configuration for it. config_win32.h
++// is an x86 configuration, and config_generic.h assumes pthreads, so this
++// is the Windows configuration with every x86 (and ARM) assembly switch
++// turned off -- ffvpx's 32-bit ARM assembly is A32, and this platform is
++// Thumb-2 only. Regenerate with tools/gen-ffvpx-win32-arm-config.py.
++#      include "config_win32_arm.h"
+ #    else
+ #      if defined(HAVE_64BIT_BUILD)
+ #        include "config_win64.h"
+diff --git a/media/ffvpx/libavcodec/moz.build b/media/ffvpx/libavcodec/moz.build
+index f9b65533fb..3ecf06fbeb 100644
+--- a/media/ffvpx/libavcodec/moz.build
++++ b/media/ffvpx/libavcodec/moz.build
+@@ -7,7 +7,9 @@
+ if CONFIG['FFVPX_ASFLAGS']:
+     if CONFIG['TARGET_CPU'] == 'x86' or CONFIG['TARGET_CPU'] == 'x86_64':
+         DIRS += ['x86']
+-    elif CONFIG['TARGET_CPU'] == 'arm':
++    elif CONFIG['TARGET_CPU'] == 'arm' and CONFIG['OS_TARGET'] != 'WINNT':
++        # ffvpx's 32-bit ARM assembly is A32 (ARM mode); Windows on ARM32
++        # is Thumb-2 only. See media/ffvpx/config.h.
+         DIRS += ['arm']
+ 
+ if CONFIG['TARGET_CPU'] == 'aarch64':
+@@ -131,8 +133,13 @@ if not CONFIG['MOZ_FFVPX_AUDIOONLY']:
+     else:
+         USE_LIBS += [
+             'dav1d',
+-            'media_libdav1d_asm',
+         ]
++        # The assembly half of dav1d is not built on every target (see
++        # MOZ_DAV1D_ASM in toolkit/moz.configure).
++        if CONFIG['MOZ_DAV1D_ASM']:
++            USE_LIBS += [
++                'media_libdav1d_asm',
++            ]
+ 
+     if CONFIG["MOZ_WIDGET_TOOLKIT"] == "gtk":
+         LOCAL_INCLUDES += ['/media/mozva']
+diff --git a/media/ffvpx/libavutil/avutil.symbols b/media/ffvpx/libavutil/avutil.symbols
+index b5d7c8e5d9..c24ea080ab 100644
+--- a/media/ffvpx/libavutil/avutil.symbols
++++ b/media/ffvpx/libavutil/avutil.symbols
+@@ -312,7 +312,7 @@ avpriv_float_dsp_alloc
+ avpriv_report_missing_feature
+ avpriv_request_sample
+ avpriv_set_systematic_pal2
+-#if defined(XP_WIN) && !defined(_ARM64_)
++#if defined(XP_WIN) && !defined(_ARM64_) && !defined(_ARM_)
+ avpriv_emms_asm
+ #endif
+ avpriv_slicethread_create
+diff --git a/media/ffvpx/libavutil/moz.build b/media/ffvpx/libavutil/moz.build
+index 4174ec4cb3..b947d81a4e 100644
+--- a/media/ffvpx/libavutil/moz.build
++++ b/media/ffvpx/libavutil/moz.build
+@@ -7,7 +7,9 @@
+ if CONFIG['FFVPX_ASFLAGS']:
+     if CONFIG['TARGET_CPU'] == 'x86' or CONFIG['TARGET_CPU'] == 'x86_64':
+         DIRS += ['x86']
+-    elif CONFIG['TARGET_CPU'] == 'arm':
++    elif CONFIG['TARGET_CPU'] == 'arm' and CONFIG['OS_TARGET'] != 'WINNT':
++        # ffvpx's 32-bit ARM assembly is A32 (ARM mode); Windows on ARM32
++        # is Thumb-2 only. See media/ffvpx/config.h.
+         DIRS += ['arm']
+ 
+ if CONFIG['TARGET_CPU'] == 'aarch64':
+diff --git a/media/libpng/moz.build b/media/libpng/moz.build
+index 7aec6c98ec..80817f8691 100644
+--- a/media/libpng/moz.build
++++ b/media/libpng/moz.build
+@@ -47,7 +47,9 @@ if CONFIG['TARGET_CPU'] == 'arm' or CONFIG['TARGET_CPU'] == 'aarch64':
+         'arm/palette_neon_intrinsics.c'
+     ]
+ 
+-    if CONFIG['TARGET_CPU'] == 'arm':
++    # filter_neon.S is A32 (ARM mode) gas assembly; Windows on ARM32 is
++    # Thumb-2 only. filter_neon_intrinsics.c above covers the same filters.
++    if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['OS_TARGET'] != 'WINNT':
+         SOURCES += [
+             'arm/filter_neon.S'
+         ]
+diff --git a/media/libvpx/libvpx/vpx_ports/aarch32_cpudetect.c b/media/libvpx/libvpx/vpx_ports/aarch32_cpudetect.c
+index 20f688e179..058cc391ca 100644
+--- a/media/libvpx/libvpx/vpx_ports/aarch32_cpudetect.c
++++ b/media/libvpx/libvpx/vpx_ports/aarch32_cpudetect.c
+@@ -33,6 +33,12 @@ static int arm_get_cpu_caps(void) {
+   // MSVC has no inline __asm support for Arm, but it does let you __emit
+   // instructions via their assembled hex code.
+   // All of these instructions should be essentially nops.
++#if defined(__clang__)
++  // clang implements no structured exception handling on 32-bit ARM Windows,
++  // and it has no __emit either. Every Windows-on-ARM32 device is ARMv7 with
++  // mandatory NEON, so the probe has only one possible answer.
++  flags |= HAS_NEON;
++#else
+   __try {
+     // VORR q0,q0,q0
+     __emit(0xF2200150);
+@@ -40,6 +46,7 @@ static int arm_get_cpu_caps(void) {
+   } __except (GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION) {
+     // Ignore exception.
+   }
++#endif
+ #endif  // HAVE_NEON || HAVE_NEON_ASM
+   return flags;
+ }
+diff --git a/media/libvpx/moz.build b/media/libvpx/moz.build
+index 76685b5fcc..6bdfe5a9f8 100644
+--- a/media/libvpx/moz.build
++++ b/media/libvpx/moz.build
+@@ -45,14 +45,42 @@ elif CONFIG['TARGET_CPU'] == 'x86':
+         LOCAL_INCLUDES += [ '/media/libvpx/config/linux/ia32/' ]
+ elif CONFIG['TARGET_CPU'] == 'arm':
+     EXPORTS.vpx += files['LINUX_ARM_EXPORTS']
++    # Windows on ARM32 uses the same sources as Linux/arm, but has no
++    # <pthread.h>: vpx_pthread.h falls back to the Win32 SRW/condition-variable
++    # implementation when HAVE_PTHREAD_H is 0.
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        arm_config_dir = 'win/arm'
++    else:
++        arm_config_dir = 'linux/arm'
+     ASFLAGS += [
+-        '-I%s/media/libvpx/config/linux/arm/' % TOPSRCDIR,
++        '-I%s/media/libvpx/config/%s/' % (TOPSRCDIR, arm_config_dir),
+         '-I%s/libvpx' % OBJDIR,
+     ]
+-    LOCAL_INCLUDES += [ '/media/libvpx/config/linux/arm/' ]
++    LOCAL_INCLUDES += [ '/media/libvpx/config/%s/' % arm_config_dir ]
+ 
+     arm_asm_files = files['LINUX_ARM_SOURCES']
+ 
++    if CONFIG['OS_TARGET'] == 'WINNT':
++        # libvpx's hand-written 32-bit ARM assembly is A32 (ARM mode) and
++        # Windows on ARM32 is Thumb-2 only, so it cannot be built here.
++        # config/win/arm is generated with HAVE_NEON_ASM=0 (see
++        # tools/gen-libvpx-win-arm-rtcd.sh), and the routines that exist only
++        # in assembly for arm32 are taken from the NEON-intrinsics sources
++        # libvpx uses on arm64. vpx_convolve8_neon_asm.c goes too: it is the
++        # C shim that calls the assembly filter_type entry points.
++        _drop = ('.asm', 'vpx_dsp/arm/vpx_convolve8_neon_asm.c')
++        arm_asm_files = [
++            f for f in arm_asm_files if not f.endswith(_drop)
++        ]
++        arm_asm_files += [
++            'libvpx/vpx_dsp/arm/idct4x4_1_add_neon.c',
++            'libvpx/vpx_dsp/arm/idct4x4_add_neon.c',
++            'libvpx/vpx_dsp/arm/loopfilter_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve8_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve_avg_neon.c',
++            'libvpx/vpx_dsp/arm/vpx_convolve_copy_neon.c',
++        ]
++
+     if CONFIG['GNU_AS']:
+         for f in arm_asm_files:
+             if not f.endswith('.asm'):
+diff --git a/media/libwebp/sharpyuv/moz.build b/media/libwebp/sharpyuv/moz.build
+index 6ae00382d1..a7c043973c 100644
+--- a/media/libwebp/sharpyuv/moz.build
++++ b/media/libwebp/sharpyuv/moz.build
+@@ -19,7 +19,9 @@ include('/media/libwebp/libwebp-config.mozbuild')
+ # and enabled by what src/dsp/cpu.h does. So just removing the defines here may do
+ # nothing.
+ 
+-if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['BUILD_ARM_NEON']:
++if CONFIG['TARGET_CPU'] == 'arm' and (
++    CONFIG['BUILD_ARM_NEON'] or CONFIG['OS_TARGET'] == 'WINNT'
++):
+     SOURCES += [
+         'sharpyuv_neon.c',
+     ]
+diff --git a/media/libwebp/src/dsp/moz.build b/media/libwebp/src/dsp/moz.build
+index f924eb3402..110543db8d 100644
+--- a/media/libwebp/src/dsp/moz.build
++++ b/media/libwebp/src/dsp/moz.build
+@@ -27,7 +27,9 @@ include('/media/libwebp/libwebp-config.mozbuild')
+ # and enabled by what src/dsp/cpu.h does. So just removing the defines here may do
+ # nothing.
+ 
+-if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['BUILD_ARM_NEON']:
++if CONFIG['TARGET_CPU'] == 'arm' and (
++    CONFIG['BUILD_ARM_NEON'] or CONFIG['OS_TARGET'] == 'WINNT'
++):
+     SOURCES += [
+         'alpha_processing_neon.c',
+         'cost_neon.c',
+diff --git a/third_party/aom/aom_ports/aarch32_cpudetect.c b/third_party/aom/aom_ports/aarch32_cpudetect.c
+index af6774c5d2..5181d43db2 100644
+--- a/third_party/aom/aom_ports/aarch32_cpudetect.c
++++ b/third_party/aom/aom_ports/aarch32_cpudetect.c
+@@ -33,6 +33,12 @@ static int arm_get_cpu_caps(void) {
+   // MSVC has no inline __asm support for Arm, but it does let you __emit
+   // instructions via their assembled hex code.
+   // All of these instructions should be essentially nops.
++#if defined(__clang__)
++  // clang implements no structured exception handling on 32-bit ARM Windows,
++  // and it has no __emit either. Every Windows-on-ARM32 device is ARMv7 with
++  // mandatory NEON, so the probe has only one possible answer.
++  flags |= HAS_NEON;
++#else
+   __try {
+     // VORR q0,q0,q0
+     __emit(0xF2200150);
+@@ -40,6 +46,7 @@ static int arm_get_cpu_caps(void) {
+   } __except (GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION) {
+     // Ignore exception.
+   }
++#endif
+ #endif  // HAVE_NEON
+   return flags;
+ }

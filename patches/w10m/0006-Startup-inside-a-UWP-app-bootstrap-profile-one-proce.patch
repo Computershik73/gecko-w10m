@@ -1,0 +1,1159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 24 Sep 2026 07:00:34 +0400
+Subject: [PATCH] Startup inside a UWP app: bootstrap, profile, one process
+
+XRE started by the shell rather than by firefox.exe, the profile in the
+app's LocalState, no content processes, and the browser UI pieces that
+assumed either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser/app/nsBrowserApp.cpp                  |  11 +-
+ .../preferences/config/about-firefox.mjs      | 109 +++++-
+ browser/components/preferences/preferences.js |   2 +-
+ .../shell/nsWindowsShellService.cpp           |   6 +-
+ .../tabbrowser/content/tabbrowser.js          |  23 +-
+ .../en-US/browser/preferences/preferences.ftl |  32 ++
+ dom/base/ScreenOrientation.cpp                |   9 +-
+ dom/base/nsFrameLoader.cpp                    |  14 +
+ dom/ipc/WindowGlobalParent.cpp                |  39 +-
+ .../RemoteWebNavigation.sys.mjs               |   5 +-
+ toolkit/components/startup/nsAppStartup.cpp   |  24 ++
+ .../widgets/browser-custom-element.mjs        |   9 +-
+ toolkit/profile/nsToolkitProfileService.cpp   |  22 ++
+ toolkit/xre/Bootstrap.cpp                     | 335 ++++++++++++++++++
+ toolkit/xre/nsAppRunner.cpp                   | 100 ++++++
+ xpfe/appshell/AppWindow.cpp                   |  27 ++
+ 16 files changed, 750 insertions(+), 17 deletions(-)
+
+diff --git a/browser/app/nsBrowserApp.cpp b/browser/app/nsBrowserApp.cpp
+index 36e7517b4a..9d4ef3bc9f 100644
+--- a/browser/app/nsBrowserApp.cpp
++++ b/browser/app/nsBrowserApp.cpp
+@@ -29,8 +29,10 @@
+ 
+ #ifdef XP_WIN
+ #  include "mozilla/PreXULSkeletonUI.h"
+-#  include "freestanding/SharedSection.h"
+-#  include "LauncherProcessWin.h"
++#  if !defined(MOZ_UWP)
++#    include "freestanding/SharedSection.h"
++#    include "LauncherProcessWin.h"
++#  endif
+ #  include "mozilla/GeckoArgs.h"
+ #  include "mozilla/mscom/ProcessRuntime.h"
+ #  include "mozilla/WindowsDllBlocklist.h"
+@@ -514,10 +516,13 @@ int main(int argc, char* argv[], char* envp[]) {
+     (void)result;  // Ignore errors since some tools block DPI calls
+   }
+ 
++#if !defined(MOZ_UWP)
+   // Once the browser process hits the main function, we no longer need
+   // a writable section handle because all dependent modules have been
+-  // loaded.
++  // loaded. The shared section belongs to the launcher process, which the
++  // app-container build does not have.
+   mozilla::freestanding::gSharedSection.ConvertToReadOnly();
++#endif
+ 
+   mozilla::CreateAndStorePreXULSkeletonUI(GetModuleHandle(nullptr), argc, argv);
+ 
+diff --git a/browser/components/preferences/config/about-firefox.mjs b/browser/components/preferences/config/about-firefox.mjs
+index 18124ddaa2..7c041871e9 100644
+--- a/browser/components/preferences/config/about-firefox.mjs
++++ b/browser/components/preferences/config/about-firefox.mjs
+@@ -195,9 +195,7 @@ Preferences.addSetting(
+   })
+ );
+ 
+-Preferences.addSetting({
+-  id: "updateAppInfo",
+-  getControlConfig(config) {
++function geckoVersionControlConfig(config) {
+     let version = AppConstants.MOZ_APP_VERSION_DISPLAY;
+     let distribution;
+     let distributionId;
+@@ -257,6 +255,41 @@ Preferences.addSetting({
+       ".releaseNotesURL": releaseNotesURL,
+     };
+ 
++    return config;
++}
++
++Preferences.addSetting({
++  id: "updateAppInfo",
++  getControlConfig: geckoVersionControlConfig,
++});
++
++// Port: the version used to live only inside the updates card, and that
++// card is hidden when updates are the operating system's business -- which
++// on a Store-style package they always are. So the page never said which
++// engine it was. The same widget, shown whenever the card is not.
++Preferences.addSetting({
++  id: "geckoVersionGroup",
++  visible: () => !UpdatesHelpers.showUpdatesSettings,
++});
++Preferences.addSetting({
++  id: "geckoVersionInfo",
++  getControlConfig: geckoVersionControlConfig,
++});
++
++// Port: who made the port, and where to find them.
++Preferences.addSetting({ id: "geckoPortGroup" });
++Preferences.addSetting({ id: "geckoPortAuthor" });
++Preferences.addSetting({ id: "geckoPort4pda" });
++Preferences.addSetting({ id: "geckoPortTelegram" });
++Preferences.addSetting({ id: "geckoPortDonate" });
++Preferences.addSetting({ id: "geckoPortDonateAbroad" });
++Preferences.addSetting({ id: "geckoDefaultBrowser" });
++Preferences.addSetting({
++  id: "geckoPortVersion",
++  getControlConfig(config) {
++    config.l10nArgs = {
++      version: Services.prefs.getStringPref("gecko.port.version", "?"),
++    };
+     return config;
+   },
+ });
+@@ -487,6 +520,16 @@ SettingGroupManager.registerGroups({
+           role: "status",
+         },
+       },
++      {
++        id: "geckoVersionGroup",
++        control: "moz-box-group",
++        items: [
++          {
++            id: "geckoVersionInfo",
++            control: "update-information",
++          },
++        ],
++      },
+       {
+         id: "updateApp",
+         control: "moz-box-group",
+@@ -559,6 +602,66 @@ SettingGroupManager.registerGroups({
+       },
+     ],
+   },
++  port: {
++    l10nId: "gecko-port-heading",
++    iconSrc: "chrome://browser/skin/preferences/category-general.svg",
++    headingLevel: 2,
++    items: [
++      {
++        id: "geckoPortGroup",
++        control: "moz-box-group",
++        items: [
++          {
++            id: "geckoPortVersion",
++            l10nId: "gecko-port-version",
++            control: "moz-box-item",
++          },
++          {
++            id: "geckoDefaultBrowser",
++            l10nId: "gecko-default-browser",
++            control: "moz-box-link",
++            controlAttrs: {
++              href: "ms-settings:defaultapps",
++            },
++          },
++          {
++            id: "geckoPortAuthor",
++            l10nId: "gecko-port-author",
++            control: "moz-box-item",
++          },
++          {
++            id: "geckoPort4pda",
++            l10nId: "gecko-port-4pda",
++            control: "moz-box-link",
++            controlAttrs: {
++              href: "https://4pda.to/forum/index.php?showuser=4458524",
++            },
++          },
++          {
++            id: "geckoPortTelegram",
++            l10nId: "gecko-port-telegram",
++            control: "moz-box-link",
++            controlAttrs: {
++              href: "https://t.me/cmplog",
++            },
++          },
++          {
++            id: "geckoPortDonate",
++            l10nId: "gecko-port-donate",
++            control: "moz-box-link",
++            controlAttrs: {
++              href: "https://pay.cloudtips.ru/p/83821e32",
++            },
++          },
++          {
++            id: "geckoPortDonateAbroad",
++            l10nId: "gecko-port-donate-abroad",
++            control: "moz-box-item",
++          },
++        ],
++      },
++    ],
++  },
+   support: {
+     inProgress: true,
+     l10nId: "support-application-heading",
+diff --git a/browser/components/preferences/preferences.js b/browser/components/preferences/preferences.js
+index 94612d8e28..cf5f450719 100644
+--- a/browser/components/preferences/preferences.js
++++ b/browser/components/preferences/preferences.js
+@@ -244,7 +244,7 @@ const CONFIG_PANES = Object.freeze({
+   about: {
+     l10nId: "about-firefox-header",
+     iconSrc: "chrome://browser/skin/sidebar/firefox.svg",
+-    groupIds: ["updates", "support"],
++    groupIds: ["updates", "port", "support"],
+     module: "chrome://browser/content/preferences/config/about-firefox.mjs",
+     visible: () => srdSectionPrefs.all,
+   },
+diff --git a/browser/components/shell/nsWindowsShellService.cpp b/browser/components/shell/nsWindowsShellService.cpp
+index 9a3da29023..5318768c58 100644
+--- a/browser/components/shell/nsWindowsShellService.cpp
++++ b/browser/components/shell/nsWindowsShellService.cpp
+@@ -2,9 +2,13 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "mozilla/StaticPrefs_browser.h"
++// UNICODE has to be set before anything can pull in <windows.h>, otherwise
++// LPCTSTR is already typedefd to the narrow form while the A/W forwarders
++// below resolve to the wide entry points.
+ #define UNICODE
+ 
++#include "mozilla/StaticPrefs_browser.h"
++
+ #include "nsWindowsShellService.h"
+ #include "nsWindowsShellServiceInternal.h"
+ #include "WindowsShellServiceRust.h"
+diff --git a/browser/components/tabbrowser/content/tabbrowser.js b/browser/components/tabbrowser/content/tabbrowser.js
+index 43180487a2..8248365db4 100644
+--- a/browser/components/tabbrowser/content/tabbrowser.js
++++ b/browser/components/tabbrowser/content/tabbrowser.js
+@@ -2814,6 +2814,20 @@
+         b.setAttribute(attribute, defaultBrowserAttributes[attribute]);
+       }
+ 
++      // With no content processes there is nothing to be remote in, and
++      // saying otherwise does not merely fail quietly: a browser carrying
++      // remote="true" takes the cross-process document path, so the start page
++      // came back 200 OK, went to ParentChannelListener to be handed to a
++      // content process, and stopped there. The tab sat on about:blank
++      // reporting a load forever, and closing it fixed nothing except that its
++      // replacement was built without the attribute.
++      //
++      // remoteType is predicted from the URI without anyone asking whether
++      // e10s is on, so the question is asked here.
++      if (!gMultiProcessBrowser) {
++        remoteType = E10SUtils.NOT_REMOTE;
++      }
++
+       if (gMultiProcessBrowser || remoteType) {
+         b.setAttribute("maychangeremoteness", "true");
+       }
+@@ -6083,8 +6097,13 @@
+ 
+       if (aTab.linkedPanel) {
+         if (!adoptedByTab && !gMultiProcessBrowser) {
+-          // Prevent this tab from showing further dialogs, since we're closing it
+-          browser.contentWindow.windowUtils.disableDialogs();
++          // Prevent this tab from showing further dialogs, since we're closing it.
++          // A tab can have a linkedPanel and still no content window -- a tab
++          // restored but never selected, for one -- and throwing here abandons
++          // the rest of _endRemoveTab, leaving the progress listener attached
++          // and the tab half removed, after which nothing in this window
++          // navigates again.
++          browser.contentWindow?.windowUtils.disableDialogs();
+         }
+ 
+         // Remove the tab's filter and progress listener.
+diff --git a/browser/locales/en-US/browser/preferences/preferences.ftl b/browser/locales/en-US/browser/preferences/preferences.ftl
+index 8227dc4b84..3bbd1ffe5e 100644
+--- a/browser/locales/en-US/browser/preferences/preferences.ftl
++++ b/browser/locales/en-US/browser/preferences/preferences.ftl
+@@ -813,6 +813,38 @@ update-in-progress-ok-button = &Discard
+ # method of closing the UI will not discard the update.
+ update-in-progress-cancel-button = &Continue
+ 
++## The port and its author
++
++gecko-port-heading =
++    .label = About the Windows 10 Mobile port
++    .description = Gecko is Firefox — the { -brand-short-name } engine — running on Windows 10 Mobile.
++
++# $version (string) - the port's own version, e.g. 155.1.0.42
++gecko-port-version =
++    .label = Port version: { $version }
++    .description = The first number is the Gecko engine version, the last is the build number.
++
++gecko-default-browser =
++    .label = Make this the default browser
++    .description = Opens the system settings: Default apps → Web browser.
++
++gecko-port-author =
++    .label = Ported by Computershik
++    .description = Porting, building and debugging on the device.
++
++gecko-port-4pda =
++    .label = Profile on 4pda
++
++gecko-port-telegram =
++    .label = Telegram channel @cmplog
++
++gecko-port-donate =
++    .label = Donate (within the CIS for now)
++
++gecko-port-donate-abroad =
++    .label = Outside the CIS and would like to help?
++    .description = Send a message to the Telegram channel.
++
+ ## Firefox support
+ 
+ support-application-heading =
+diff --git a/dom/base/ScreenOrientation.cpp b/dom/base/ScreenOrientation.cpp
+index 79895643ec..964c357995 100644
+--- a/dom/base/ScreenOrientation.cpp
++++ b/dom/base/ScreenOrientation.cpp
+@@ -577,8 +577,13 @@ already_AddRefed<Promise> ScreenOrientation::LockInternal(
+   }
+ 
+   AbortInProcessOrientationPromises(bc);
+-  dom::ContentChild::GetSingleton()->SendAbortOtherOrientationPendingPromises(
+-      bc);
++  // Only a content process has anyone else to tell. Without this check the
++  // send dereferences a null ContentChild and takes the browser down, which is
++  // what happened every time a video player asked to lock the orientation on
++  // its way into fullscreen.
++  if (dom::ContentChild* contentChild = dom::ContentChild::GetSingleton()) {
++    contentChild->SendAbortOtherOrientationPendingPromises(bc);
++  }
+ 
+   if (!doc->SetOrientationPendingPromise(p)) {
+     p->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+diff --git a/dom/base/nsFrameLoader.cpp b/dom/base/nsFrameLoader.cpp
+index 1fa7822fe6..206c1f4efc 100644
+--- a/dom/base/nsFrameLoader.cpp
++++ b/dom/base/nsFrameLoader.cpp
+@@ -346,6 +346,20 @@ static bool InitialLoadIsRemote(Element* aOwner) {
+     return false;
+   }
+ 
++#if defined(GECKO_W10M)
++  // Nothing is remote when there are no content processes. Chrome code sets
++  // remote="true" in a dozen places without asking whether e10s is on --
++  // BackgroundPageThumbs and the printing preview among them -- and a frame
++  // loader that believes it is remote here ends up with a null remoteTab,
++  // which is how a restored tab came back dead: RemoteWebNavigation.loadURI
++  // threw on the first line and nothing was ever loaded into it. Closing that
++  // tab got a live one because the replacement was built without the
++  // attribute.
++  if (!mozilla::BrowserTabsRemoteAutostart()) {
++    return false;
++  }
++#endif
++
+   // Otherwise, we're remote if we have "remote=true" and we're a XUL element.
+   return aOwner->IsXULElement() && aOwner->GetBoolAttr(nsGkAtoms::remote);
+ }
+diff --git a/dom/ipc/WindowGlobalParent.cpp b/dom/ipc/WindowGlobalParent.cpp
+index 9174e1f2ed..27daa12335 100644
+--- a/dom/ipc/WindowGlobalParent.cpp
++++ b/dom/ipc/WindowGlobalParent.cpp
+@@ -1046,12 +1046,45 @@ class CheckPermitUnloadRequest final : public PromiseNativeHandler,
+       // but we still need to handle the traversable navigate handler.
+       mozilla::NotNull<RefPtr<nsDocShellLoadState>> loadState =
+           WrapNotNull(aDocShellLoadState);
++      // GetContentParent() is null when the top-level window global lives in
++      // this process, which is every window when the browser runs without
++      // content processes. Sending to it crashes in ParamTraits while it
++      // serialises the load state -- pressing Back was enough, by way of
++      // nsDocShell::GoBack, nsSHistory::LoadURIs and
++      // MaybeCheckUnloadingIsCanceled. The walk below already handles the same
++      // case by running the child-side code here instead; this branch had been
++      // left out.
+       if (mAction ==
+           nsIDocumentViewer::PermitUnloadAction::eDontPromptAndUnload) {
+-        cp->SendDispatchNavigateToTraversable(bc, loadState, resolve, reject);
++        if (cp) {
++          cp->SendDispatchNavigateToTraversable(bc, loadState, resolve, reject);
++        } else {
++          NS_DispatchToMainThread(NS_NewRunnableFunction(
++              "DispatchNavigateToTraversable",
++              [bc = RefPtr{bc}, loadState, resolve]()
++                  MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
++                    if (!bc || !bc->GetDocShell()) {
++                      resolve(nsIDocumentViewer::eContinue);
++                      return;
++                    }
++                    RefPtr<nsDocShell> docShell =
++                        nsDocShell::Cast(bc->GetDocShell());
++                    resolve(docShell->MaybeFireTraversableTraverseHistory(
++                        MOZ_KnownLive(loadState.get()), Nothing()));
++                  }));
++        }
+       } else {
+-        cp->SendDispatchBeforeUnloadToSubtree(bc, Some(loadState), resolve,
+-                                              reject);
++        if (cp) {
++          cp->SendDispatchBeforeUnloadToSubtree(bc, Some(loadState), resolve,
++                                                reject);
++        } else {
++          NS_DispatchToMainThread(NS_NewRunnableFunction(
++              "DispatchBeforeUnloadToSubtree",
++              [bc = RefPtr{bc}, loadState, resolve]() {
++                ContentChild::DispatchBeforeUnloadToSubtree(
++                    bc, Some(loadState), resolve);
++              }));
++        }
+       }
+     } else {
+       bc->PreOrderWalk([&](dom::BrowsingContext* aBC) {
+diff --git a/toolkit/components/remotebrowserutils/RemoteWebNavigation.sys.mjs b/toolkit/components/remotebrowserutils/RemoteWebNavigation.sys.mjs
+index 9a77c96e99..75ebf85168 100644
+--- a/toolkit/components/remotebrowserutils/RemoteWebNavigation.sys.mjs
++++ b/toolkit/components/remotebrowserutils/RemoteWebNavigation.sys.mjs
+@@ -38,7 +38,10 @@ export class RemoteWebNavigation {
+ 
+   maybeCancelContentJSExecution(aNavigationType, aOptions = {}) {
+     const epoch = this._cancelContentJSEpoch++;
+-    this._browser.frameLoader.remoteTab.maybeCancelContentJSExecution(
++    // No remoteTab means the frame loader never went remote, which can happen
++    // whatever the element's attribute says. Nothing to cancel, and throwing
++    // here would abandon the navigation that asked.
++    this._browser.frameLoader.remoteTab?.maybeCancelContentJSExecution(
+       aNavigationType,
+       { ...aOptions, epoch }
+     );
+diff --git a/toolkit/components/startup/nsAppStartup.cpp b/toolkit/components/startup/nsAppStartup.cpp
+index b0f1e285ad..d15f8ad373 100644
+--- a/toolkit/components/startup/nsAppStartup.cpp
++++ b/toolkit/components/startup/nsAppStartup.cpp
+@@ -3,6 +3,13 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsAppStartup.h"
++#include "xpcpublic.h"
++#include "nsContentUtils.h"
++
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
+ 
+ #include "nsComponentManagerUtils.h"
+ #include "nsIAppShellService.h"
+@@ -324,6 +331,23 @@ nsAppStartup::Run(void) {
+ 
+ NS_IMETHODIMP
+ nsAppStartup::Quit(uint32_t aMode, int aExitCode, bool* aUserAllowedQuit) {
++#if defined(GECKO_W10M)
++  // Startup reaches final-ui-startup and then quits without ever opening a
++  // window. Whoever calls this is the reason, and the return address names
++  // them -- the caller is JS more often than not, in which case the console
++  // notes above say which script.
++  {
++    nsPrintfCString note("quit: mode=0x%x exit=%d from %p", aMode, aExitCode,
++                         __builtin_return_address(0));
++    GeckoW10mNote(note.get());
++    if (JSContext* cx = nsContentUtils::GetCurrentJSContext()) {
++      if (JS::UniqueChars stack = xpc_PrintJSStack(cx, false, false, false)) {
++        nsPrintfCString js("quit: JS stack: %s", stack.get());
++        GeckoW10mNote(js.get());
++      }
++    }
++  }
++#endif
+   if ((aMode & eSilently) != 0 && (aMode & eRestart) == 0) {
+     // eSilently is only valid when combined with eRestart.
+     return NS_ERROR_INVALID_ARG;
+diff --git a/toolkit/content/widgets/browser-custom-element.mjs b/toolkit/content/widgets/browser-custom-element.mjs
+index 4bf6ca5f58..690d0df035 100644
+--- a/toolkit/content/widgets/browser-custom-element.mjs
++++ b/toolkit/content/widgets/browser-custom-element.mjs
+@@ -547,7 +547,14 @@ export class MozBrowser extends MozElements.MozElementMixin(XULFrameElement) {
+   }
+ 
+   get isRemoteBrowser() {
+-    return this.hasAttribute("remote");
++    // The attribute alone is not enough. Chrome code sets remote="true" in a
++    // dozen places without asking whether e10s is on, and when it is off the
++    // frame loader stays in-process -- so a browser that answered yes here got
++    // a RemoteWebNavigation whose every method dereferences a remoteTab that
++    // does not exist. Ask the runtime as well, and the two sides agree.
++    return (
++      this.hasAttribute("remote") && Services.appinfo.browserTabsRemoteAutostart
++    );
+   }
+ 
+   get remoteType() {
+diff --git a/toolkit/profile/nsToolkitProfileService.cpp b/toolkit/profile/nsToolkitProfileService.cpp
+index f624b97e48..806b5b2923 100644
+--- a/toolkit/profile/nsToolkitProfileService.cpp
++++ b/toolkit/profile/nsToolkitProfileService.cpp
+@@ -3,6 +3,12 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/glean/GleanPings.h"
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/HelperMacros.h"
+@@ -610,6 +616,10 @@ nsresult nsToolkitProfileLock::Init(nsIFile* aDirectory,
+   nsresult rv;
+ 
+   rv = mLock.Lock(aDirectory, aUnlocker);
++#if defined(GECKO_W10M)
++  GeckoW10mNote(NS_SUCCEEDED(rv) ? "startup: profile lock taken"
++                               : "startup: profile lock REFUSED");
++#endif
+ 
+   if (NS_SUCCEEDED(rv)) {
+     mDirectory = aDirectory;
+@@ -1041,6 +1051,9 @@ nsresult nsToolkitProfileService::Init() {
+   nsresult rv;
+ 
+   rv = nsXREDirProvider::GetUserAppDataDirectory(getter_AddRefs(mAppData));
++#if defined(GECKO_W10M)
++  GeckoW10mNote("startup: profile service -- app data directory resolved");
++#endif
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = nsXREDirProvider::GetUserLocalDataDirectory(getter_AddRefs(mTempData));
+@@ -1065,6 +1078,9 @@ nsresult nsToolkitProfileService::Init() {
+   if (NS_SUCCEEDED(rv) && mProfileDBExists) {
+     bool iniContainedErrors = false;
+     rv = mProfileDB.Init(mProfileDBFile, &iniContainedErrors);
++#if defined(GECKO_W10M)
++    GeckoW10mNote("startup: profile service -- profiles.ini parsed");
++#endif
+     // Init does not fail on parsing errors, only on OOM/really unexpected
+     // conditions.
+     if (NS_FAILED(rv)) {
+@@ -1127,6 +1143,9 @@ nsresult nsToolkitProfileService::Init() {
+   if (mUseDedicatedProfile) {
+     nsString installHash;
+     rv = gDirServiceProvider->GetInstallHash(installHash);
++#if defined(GECKO_W10M)
++    GeckoW10mNote("startup: profile service -- install hash computed");
++#endif
+     NS_ENSURE_SUCCESS(rv, rv);
+     CopyUTF16toUTF8(installHash, mInstallSection);
+     mInstallSection.Insert(INSTALL_PREFIX, 0);
+@@ -1169,6 +1188,9 @@ nsresult nsToolkitProfileService::Init() {
+   bool shouldIgnoreSeparateProfile;
+   rv = ignoreDevEditionProfile->Exists(&shouldIgnoreSeparateProfile);
+   if (NS_FAILED(rv)) return rv;
++#if defined(GECKO_W10M)
++  GeckoW10mNote("startup: profile service -- reading the profile list");
++#endif
+ 
+   mUseDevEditionProfile = !shouldIgnoreSeparateProfile;
+ #endif
+diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
+index fe113c825c..43f4258883 100644
+--- a/toolkit/xre/Bootstrap.cpp
++++ b/toolkit/xre/Bootstrap.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+@@ -18,6 +19,335 @@ extern "C" int __llvm_profile_dump(void);
+ #  endif
+ #endif
+ 
++#if defined(GECKO_W10M)
++#  include <windows.h>
++
++#  include <cstring>
++
++#  include <delayimp.h>
++
++namespace {
++
++// Windows 10 Mobile ships a reduced version of the desktop libraries: a
++// library may be absent entirely, or present and missing most of its
++// functions. Of the 470 functions Gecko delay-loads, this device has 221 of
++// them missing. Gecko reaches them through delay-load thunks, and a thunk that
++// cannot resolve reports it by raising -- which on 32-bit ARM, where clang
++// emits no exception handling at all, nothing catches. One absent function
++// ends the thread and takes the process with it.
++//
++// The delay-load machinery offers a failure hook for exactly this. Answering
++// with a stub is only safe because of the architecture: 32-bit ARM has one
++// calling convention and the caller removes its own arguments, so a single
++// nullary function can stand in for any signature at all. The same trick on
++// x86 would corrupt the stack on the first call, every stdcall stub having to
++// match its victim's argument count exactly.
++//
++// What a stub cannot do is be correct. Returning zero reads as failure to most
++// callers and as "none" to the rest, which is the truth here -- there is no
++// window to find, no theme to open, no MIDI device to enumerate -- but a
++// caller that expected success will misbehave rather than crash. So every
++// substitution is written down, and GECKO_W10M_DELAYLOAD_LOG says where.
++
++// One open handle per log, and the flush on a leash.
++//
++// Every line used to cost a CreateFile2, a seek, two writes, a
++// FlushFileBuffers -- which makes the eMMC commit, and on this phone that is
++// milliseconds -- and a CloseHandle. Notes are written from the renderer
++// thread between frames and from the main thread on every console message, so
++// the log was quietly setting the frame rate: compositing sat at about thirty
++// frames a second, which a sixty-frame video notices as every second frame
++// dropped. The handle stays open now and the flush happens at most four times
++// a second. A quarter second of notes is what a hard hang can lose; anything
++// short of that the kernel still has when the process dies.
++struct GeckoW10mLogFile {
++  const wchar_t* variable = nullptr;
++  HANDLE handle = INVALID_HANDLE_VALUE;
++  ULONGLONG flushed = 0;
++  ULONGLONG lastTry = 0;
++  unsigned attempts = 0;
++  unsigned lost = 0;
++};
++
++static GeckoW10mLogFile gGeckoW10mLogs[4];
++static CRITICAL_SECTION gGeckoW10mLogLock;
++static INIT_ONCE gGeckoW10mLogLockOnce = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK GeckoW10mInitLogLock(PINIT_ONCE, PVOID, PVOID*) {
++  ::InitializeCriticalSectionEx(&gGeckoW10mLogLock, 0, 0);
++  return TRUE;
++}
++
++void AppendLine(const wchar_t* variable, const char* text) {
++  ::InitOnceExecuteOnce(&gGeckoW10mLogLockOnce, GeckoW10mInitLogLock, nullptr,
++                        nullptr);
++  ::EnterCriticalSection(&gGeckoW10mLogLock);
++
++  GeckoW10mLogFile* slot = nullptr;
++  for (auto& candidate : gGeckoW10mLogs) {
++    if (candidate.variable == variable) {
++      slot = &candidate;
++      break;
++    }
++    if (!candidate.variable) {
++      candidate.variable = variable;
++      slot = &candidate;
++      break;
++    }
++  }
++
++  // The open used to be tried once, with the file shared for reading only,
++  // and every device log had exactly one launch in it. The launch before is
++  // why: a closed app on this platform is suspended first and ended some
++  // time later, and until then its handle is still on the file. The next
++  // process got a sharing violation, gave up for good, and the second launch
++  // -- the one every startup question hinged on -- never left a line.
++  // Shared for everything now, and tried again every two seconds until it
++  // opens; the lines lost meanwhile are counted, and the count is the first
++  // thing written.
++  if (slot && slot->handle == INVALID_HANDLE_VALUE) {
++    const ULONGLONG now = ::GetTickCount64();
++    if (!slot->attempts || now - slot->lastTry >= 2000) {
++      slot->lastTry = now;
++      ++slot->attempts;
++      wchar_t path[MAX_PATH] = {};
++      if (::GetEnvironmentVariableW(variable, path, MAX_PATH)) {
++        CREATEFILE2_EXTENDED_PARAMETERS params{};
++        params.dwSize = sizeof(params);
++        params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++        slot->handle = ::CreateFile2(
++            path, FILE_APPEND_DATA,
++            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++            OPEN_ALWAYS, &params);
++        if (slot->handle != INVALID_HANDLE_VALUE && slot->attempts > 1) {
++          char opened[128];
++          ::snprintf(opened, sizeof(opened),
++                     "note log: opened on attempt %u, %u lines lost before it",
++                     slot->attempts, slot->lost);
++          DWORD written = 0;
++          ::SetFilePointer(slot->handle, 0, nullptr, FILE_END);
++          ::WriteFile(slot->handle, opened,
++                      static_cast<DWORD>(std::strlen(opened)), &written,
++                      nullptr);
++          ::WriteFile(slot->handle, "\r\n", 2, &written, nullptr);
++        }
++      }
++    }
++    if (slot->handle == INVALID_HANDLE_VALUE) {
++      ++slot->lost;
++    }
++  }
++
++  if (slot && slot->handle != INVALID_HANDLE_VALUE) {
++    DWORD written = 0;
++    ::SetFilePointer(slot->handle, 0, nullptr, FILE_END);
++    ::WriteFile(slot->handle, text, static_cast<DWORD>(std::strlen(text)),
++                &written, nullptr);
++    ::WriteFile(slot->handle, "\r\n", 2, &written, nullptr);
++    const ULONGLONG now = ::GetTickCount64();
++    if (now - slot->flushed >= 250) {
++      slot->flushed = now;
++      ::FlushFileBuffers(slot->handle);
++    }
++  }
++
++  ::LeaveCriticalSection(&gGeckoW10mLogLock);
++}
++
++void RecordSubstitution(const char* dll, const char* proc) {
++  char line[256];
++  int length = 0;
++  auto append = [&](const char* text) {
++    while (*text && length < static_cast<int>(sizeof(line)) - 1) {
++      line[length++] = *text++;
++    }
++  };
++  append(dll ? dll : "?");
++  append("!");
++  append(proc ? proc : "(ordinal)");
++  line[length] = 0;
++  AppendLine(L"GECKO_W10M_DELAYLOAD_LOG", line);
++}
++
++// Zero in r0. Any caller's arguments are its own to clean up, so this is a
++// valid body for every signature the thunks can ask for.
++int WINAPI GeckoW10mMissingProc() { return 0; }
++
++// Zero is the wrong answer for some of them, and the substitution log says
++// which -- it records what the engine actually reached for rather than what it
++// might. Two of those were being answered with something worse than nothing.
++//
++// MsgWaitForMultipleObjectsEx was returning zero, which reads as "the first
++// handle is signalled", so the event loop stopped waiting and spun at full
++// speed: hundreds of consecutive calls in the log. There is no message queue
++// here to wait on, but the handles are real, and waiting on those is the whole
++// of what this call means on a device with no messages.
++DWORD WINAPI GeckoW10mMsgWaitForMultipleObjectsEx(DWORD aCount,
++                                                const HANDLE* aHandles,
++                                                DWORD aMilliseconds,
++                                                DWORD aWakeMask, DWORD aFlags) {
++  constexpr DWORD kWaitAll = 0x0001;    // MWMO_WAITALL
++  constexpr DWORD kAlertable = 0x0002;  // MWMO_ALERTABLE
++
++  if (!aCount) {
++    // WaitForMultipleObjectsEx rejects an empty set, and a caller with no
++    // handles was only ever waiting for messages.
++    ::SleepEx(aMilliseconds, (aFlags & kAlertable) != 0);
++    return WAIT_TIMEOUT;
++  }
++  return ::WaitForMultipleObjectsEx(aCount, aHandles, (aFlags & kWaitAll) != 0,
++                                    aMilliseconds, (aFlags & kAlertable) != 0);
++}
++
++// And zero is S_OK. A function returning an HRESULT that claims success while
++// leaving its out parameter untouched hands the caller whatever was already
++// there -- for DwmGetCompositionTimingInfo, a composition clock made of noise,
++// feeding the refresh driver. Failing is both true and useful: Gecko has a
++// fallback for a machine with no compositor, and this is one.
++HRESULT WINAPI GeckoW10mFailingHresult() { return E_FAIL; }
++
++// And zero is "it worked" for the raw input calls, which report failure as
++// (UINT)-1 and their result through an out parameter they never wrote. The
++// gamepad service asked GetRawInputDeviceList how many devices there are,
++// was told "none of my business went wrong", read an uninitialised count of
++// several hundred million, and tried to allocate an array for it -- which
++// ends in NS_ABORT_OOM and takes the browser with it. A page that touches
++// the Gamepad API, such as the player on vkvideo.ru, was enough.
++UINT WINAPI GeckoW10mFailingUint() { return static_cast<UINT>(-1); }
++
++// GetSysColor is not on the phone either, and a stub answering zero paints
++// every system colour black: the menus, the address bar's drop-down and the
++// autocomplete panel over a page all came out as solid black rectangles,
++// because their backgrounds are -moz-Dialog, Menu and Window, which the
++// Windows look-and-feel reads straight from here. These are the Windows 10
++// light-theme defaults, COLORREF byte order (0x00BBGGRR).
++DWORD WINAPI GeckoW10mGetSysColor(int aIndex) {
++  static const DWORD kColors[] = {
++      0x00C8C8C8,  // 0  COLOR_SCROLLBAR
++      0x00000000,  // 1  COLOR_BACKGROUND
++      0x00D1B499,  // 2  COLOR_ACTIVECAPTION
++      0x00DBCDBF,  // 3  COLOR_INACTIVECAPTION
++      0x00F0F0F0,  // 4  COLOR_MENU
++      0x00FFFFFF,  // 5  COLOR_WINDOW
++      0x00646464,  // 6  COLOR_WINDOWFRAME
++      0x00000000,  // 7  COLOR_MENUTEXT
++      0x00000000,  // 8  COLOR_WINDOWTEXT
++      0x00000000,  // 9  COLOR_CAPTIONTEXT
++      0x00B4B4B4,  // 10 COLOR_ACTIVEBORDER
++      0x00FCF7F4,  // 11 COLOR_INACTIVEBORDER
++      0x00ABABAB,  // 12 COLOR_APPWORKSPACE
++      0x00D77800,  // 13 COLOR_HIGHLIGHT
++      0x00FFFFFF,  // 14 COLOR_HIGHLIGHTTEXT
++      0x00F0F0F0,  // 15 COLOR_BTNFACE
++      0x00A0A0A0,  // 16 COLOR_BTNSHADOW
++      0x006D6D6D,  // 17 COLOR_GRAYTEXT
++      0x00000000,  // 18 COLOR_BTNTEXT
++      0x00000000,  // 19 COLOR_INACTIVECAPTIONTEXT
++      0x00FFFFFF,  // 20 COLOR_BTNHIGHLIGHT
++      0x00696969,  // 21 COLOR_3DDKSHADOW
++      0x00E3E3E3,  // 22 COLOR_3DLIGHT
++      0x00000000,  // 23 COLOR_INFOTEXT
++      0x00E1FFFF,  // 24 COLOR_INFOBK
++      0x00000000,  // 25 (unused)
++      0x00CC6600,  // 26 COLOR_HOTLIGHT
++      0x00EAD1B9,  // 27 COLOR_GRADIENTACTIVECAPTION
++      0x00F2E4D7,  // 28 COLOR_GRADIENTINACTIVECAPTION
++      0x00D77800,  // 29 COLOR_MENUHILIGHT
++      0x00F0F0F0,  // 30 COLOR_MENUBAR
++  };
++  if (aIndex < 0 || aIndex >= int(sizeof(kColors) / sizeof(kColors[0]))) {
++    return 0;
++  }
++  return kColors[aIndex];
++}
++
++// A caret that blinks every half second, as on the desktop; zero here means
++// "never blink", which reads as a dead field.
++UINT WINAPI GeckoW10mGetCaretBlinkTime() { return 530; }
++
++struct Substitute {
++  const char* name;
++  FARPROC stub;
++};
++
++const Substitute kSubstitutes[] = {
++    {"MsgWaitForMultipleObjectsEx",
++     reinterpret_cast<FARPROC>(&GeckoW10mMsgWaitForMultipleObjectsEx)},
++    {"DwmGetCompositionTimingInfo",
++     reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"DwmIsCompositionEnabled",
++     reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"DwmFlush", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeColor", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeMetric", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemePartSize", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetThemeSysFont", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"CloseThemeData", reinterpret_cast<FARPROC>(&GeckoW10mFailingHresult)},
++    {"GetRawInputDeviceList", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputDeviceInfoW", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputDeviceInfoA", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputData", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetRawInputBuffer", reinterpret_cast<FARPROC>(&GeckoW10mFailingUint)},
++    {"GetSysColor", reinterpret_cast<FARPROC>(&GeckoW10mGetSysColor)},
++    {"GetCaretBlinkTime", reinterpret_cast<FARPROC>(&GeckoW10mGetCaretBlinkTime)},
++};
++
++FARPROC WINAPI GeckoW10mDelayLoadFailure(unsigned notification,
++                                       PDelayLoadInfo info) {
++  if (!info) return nullptr;
++
++  if (notification == dliFailLoadLib) {
++    // The library is not on the device at all. Handing back a module that is
++    // -- this executable will do -- sends every function in it down the path
++    // below, where each gets a stub of its own, rather than failing the whole
++    // group here.
++    RecordSubstitution(info->szDll, "(entire library)");
++    return reinterpret_cast<FARPROC>(::GetModuleHandleW(nullptr));
++  }
++
++  if (notification != dliFailGetProc) return nullptr;
++
++  RecordSubstitution(info->szDll, info->dlp.fImportByName ? info->dlp.szProcName
++                                                          : nullptr);
++
++  if (info->dlp.fImportByName) {
++    for (const Substitute& substitute : kSubstitutes) {
++      if (std::strcmp(info->dlp.szProcName, substitute.name) == 0) {
++        return substitute.stub;
++      }
++    }
++  }
++  return reinterpret_cast<FARPROC>(&GeckoW10mMissingProc);
++}
++
++}  // namespace
++
++// Bringing an engine up on a device with no debugger means the engine has to
++// be able to say things. printf_stderr goes nowhere in a packaged app -- the
++// process has no console, and ucrtbase captured the standard handles long
++// before anything could redirect them -- and MOZ_LOG is not up yet during the
++// startup this port keeps dying in. This writes one line to a file the shell
++// names, immediately and flushed, which is enough to instrument a suspect
++// function and read the answer off the device afterwards.
++extern "C" void GeckoW10mNote(const char* text) {
++  // Stamped with the wall clock to the millisecond, in the same form as the
++  // shell's log, so the two can be laid side by side. The notes have said
++  // "the EGL compositor is up" for a month without ever saying when.
++  SYSTEMTIME now;
++  ::GetLocalTime(&now);
++  char line[512];
++  snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u  %s", now.wHour, now.wMinute,
++           now.wSecond, now.wMilliseconds, text ? text : "");
++  AppendLine(L"GECKO_W10M_NOTE_LOG", line);
++}
++
++// The hook is const -- it was made so deliberately, a writable global function
++// pointer being an obvious thing to attack -- so it is defined here rather than
++// assigned at run time. delayimp.lib supplies a null default only when nothing
++// else defines it.
++extern "C" const PfnDliHook __pfnDliFailureHook2 = &GeckoW10mDelayLoadFailure;
++#endif  // GECKO_W10M
++
+ namespace mozilla {
+ 
+ class BootstrapImpl final : public Bootstrap {
+@@ -42,6 +372,11 @@ class BootstrapImpl final : public Bootstrap {
+ 
+   virtual int XRE_main(int argc, char* argv[],
+                        const BootstrapConfig& aConfig) override {
++#if defined(GECKO_W10M)
++    // First line in the file, so its absence means the channel is broken
++    // rather than the code being instrumented never running.
++    GeckoW10mNote("XRE_main entered");
++#endif
+     return ::XRE_main(argc, argv, aConfig);
+   }
+ 
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index cd9485c344..04f81c8be8 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -44,6 +44,34 @@
+ #include "mozJSModuleLoader.h"
+ 
+ #include "nsAppRunner.h"
++#if defined(GECKO_W10M)
++// One line to the device log. Nine seconds pass between XRE_main and the
++// first chrome manifest with nothing in between to say where; these marks
++// split them by phase.
++extern "C" void GeckoW10mNote(const char* aText);
++#  include "nsPrintfCString.h"
++// A mark with the CPU time spent so far, by this thread and by the process.
++// The second launch of 155.12 took seventy seconds to restore its session
++// while the shell's UI thread drew sixty frames a second beside it, and the
++// marks alone could not say whether the engine thread was working slowly or
++// not working at all. With the CPU time beside the wall time they can: a
++// mark whose CPU barely moved since the last one was waiting.
++static void GeckoW10mStartupMark(const char* aWhat) {
++  FILETIME c, e, k, u;
++  uint64_t threadMs = 0, processMs = 0;
++  if (::GetThreadTimes(::GetCurrentThread(), &c, &e, &k, &u)) {
++    threadMs = ((uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) +
++                (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime)) / 10000;
++  }
++  if (::GetProcessTimes(::GetCurrentProcess(), &c, &e, &k, &u)) {
++    processMs = ((uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) +
++                 (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime)) / 10000;
++  }
++  nsPrintfCString note("%s -- cpu: this thread %u ms, process %u ms", aWhat,
++                       unsigned(threadMs), unsigned(processMs));
++  GeckoW10mNote(note.get());
++}
++#endif
+ #include "mozilla/XREAppData.h"
+ #include "mozilla/Bootstrap.h"
+ #if defined(MOZ_UPDATER) && !defined(MOZ_WIDGET_ANDROID)
+@@ -2338,7 +2366,23 @@ static void RegisterApplicationRestartChanged(const char* aPref, void* aData) {
+                                    RESTART_NO_CRASH | RESTART_NO_HANG);
+     }
+   } else if (wasRegistered) {
++#  ifdef GECKO_W10M
++    // Windows 10 Mobile's kernel32 exports RegisterApplicationRestart and
++    // GetApplicationRestartSettings but not UnregisterApplicationRestart, and
++    // one unresolvable import is enough to stop the whole 132 MB xul.dll from
++    // loading -- the loader answers ERROR_PROC_NOT_FOUND and names nothing.
++    // Resolving it at run time costs nothing where it exists and lets the
++    // engine load where it does not.
++    if (HMODULE kernel32 = ::GetModuleHandleW(L"kernel32.dll")) {
++      using UnregisterFn = HRESULT(WINAPI*)();
++      if (auto unregister = reinterpret_cast<UnregisterFn>(::GetProcAddress(
++              kernel32, "UnregisterApplicationRestart"))) {
++        unregister();
++      }
++    }
++#  else
+     ::UnregisterApplicationRestart();
++#  endif
+   }
+ }
+ 
+@@ -4552,6 +4596,9 @@ int XREMain::XRE_mainInit(bool* aExitFlag,
+   }
+ 
+   rv = mDirProvider.Initialize(mAppData->directory, mAppData->xreDirectory);
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: directory provider up");
++#endif
+   if (NS_FAILED(rv)) return 1;
+ 
+   if (EnvHasValue("MOZ_CRASHREPORTER")) {
+@@ -4829,6 +4876,9 @@ int XREMain::XRE_mainInit(bool* aExitFlag,
+ #endif
+ 
+   rv = XRE_InitCommandLine(gArgc, gArgv);
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: command line parsed");
++#endif
+   NS_ENSURE_SUCCESS(rv, 1);
+ 
+   return 0;
+@@ -5327,6 +5377,12 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
+     if (!gStartupLock) {
+       NS_WARNING("Failed to lock for startup, continuing anyway.");
+     }
++#if defined(GECKO_W10M)
++    // Waits up to five seconds for a lock file in the temp directory; if
++    // the previous instance still holds it, this is where those seconds go.
++    GeckoW10mStartupMark(gStartupLock ? "startup: startup lock taken"
++                                    : "startup: startup lock NOT taken after the wait");
++#endif
+   }
+ #endif
+ #if defined(MOZ_WIDGET_GTK)
+@@ -5340,6 +5396,12 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
+ 
+   bool canRun = false;
+   rv = mNativeApp->Start(&canRun);
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: native app support started");
++#endif
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: native app support started");
++#endif
+   if (NS_FAILED(rv) || !canRun) {
+     return 1;
+   }
+@@ -5370,12 +5432,18 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
+     ProfileMissingDialog(mNativeApp);
+     return 1;
+   }
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: profile service up -- profiles.ini and installs.ini read");
++#endif
+ 
+   bool wasDefaultSelection;
+   nsCOMPtr<nsIToolkitProfile> profile;
+   rv = SelectProfile(mProfileSvc, mNativeApp, getter_AddRefs(mProfD),
+                      getter_AddRefs(mProfLD), getter_AddRefs(profile),
+                      &wasDefaultSelection);
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: profile selected");
++#endif
+   if (rv == NS_ERROR_LAUNCHED_CHILD_PROCESS || rv == NS_ERROR_ABORT) {
+     *aExitFlag = true;
+     return 0;
+@@ -5673,6 +5741,14 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
+ 
+   MOZ_RELEASE_ASSERT(!cachesOK || lastVersion.Equals(version),
+                      "Caches cannot be good if the version has changed.");
++#if defined(GECKO_W10M)
++  {
++    nsPrintfCString note("startup: compatibility checked -- version %s, caches %s",
++                         versionOK ? "same" : "CHANGED",
++                         cachesOK ? "kept" : "PURGED");
++    GeckoW10mStartupMark(note.get());
++  }
++#endif
+ 
+   // Refuse to launch if the profile's on-disk encryption state and the
+   // launching build's pref disagree: silently opening encrypted DBs with
+@@ -6563,6 +6639,9 @@ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
+   bool exit = false;
+   int result = XRE_mainInit(&exit, appRunnerTelemFlags);
+   if (result != 0 || exit) return result;
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: XRE_mainInit done");
++#endif
+ 
+   // If we exit gracefully, remove the startup crash canary file.
+   auto cleanup = MakeScopeExit([&]() -> nsresult {
+@@ -6576,6 +6655,9 @@ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
+   // startup
+   result = XRE_mainStartup(&exit, appRunnerTelemFlags);
+   if (result != 0 || exit) return result;
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: XRE_mainStartup done -- profile chosen and locked");
++#endif
+ 
+   // Start the real application. We use |aInitJSContext = false| because
+   // XRE_mainRun wants to initialize the JSContext after reading user prefs.
+@@ -6597,6 +6679,9 @@ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
+     MOZ_CRASH("NS_ERROR_OMNIJAR_CORRUPT");
+   }
+   NS_ENSURE_SUCCESS(rv, 1);
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark("startup: XPCOM up -- omni.ja opened, components registered");
++#endif
+ 
+   // run!
+   rv = XRE_mainRun();
+@@ -6768,6 +6853,21 @@ bool XRE_IsE10sParentProcess() {
+ #undef GECKO_PROCESS_TYPE
+ 
+ bool XRE_UseNativeEventProcessing() {
++#if defined(GECKO_W10M)
++  // A packaged app has a CoreWindow, not a desktop window station. The Windows
++  // app shell builds its event loop around a message-only window, and neither
++  // RegisterClassW nor CreateWindowW exists on this device -- nsAppShell::Init
++  // reaches StaticCreateEventWindow and dies on the release assert that the
++  // window class registered.
++  //
++  // Gecko already supports running without any of that: it is the same path
++  // win32k lockdown takes. nsBaseAppShell then never installs itself as a
++  // thread observer, ScheduleNativeEventCallback is never reached, and the
++  // runtime drives its own event queue -- which is what an engine embedded in
++  // someone else's message loop should be doing regardless.
++  return false;
++#endif
++
+ #if defined(XP_WIN)
+   // If win32k is locked down we can't use native event processing.
+   if (IsWin32kLockedDown()) {
+diff --git a/xpfe/appshell/AppWindow.cpp b/xpfe/appshell/AppWindow.cpp
+index 1bf6ebd7a1..14567eb7ab 100644
+--- a/xpfe/appshell/AppWindow.cpp
++++ b/xpfe/appshell/AppWindow.cpp
+@@ -7,6 +7,11 @@
+ 
+ // Local includes
+ #include "AppWindow.h"
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++#include "xpcpublic.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
+ #include <algorithm>
+ 
+ // Helper classes
+@@ -485,6 +490,28 @@ NS_IMETHODIMP AppWindow::RollupAllPopups() {
+ 
+ NS_IMETHODIMP AppWindow::Destroy() {
+   nsCOMPtr<nsIAppWindow> kungFuDeathGrip(this);
++#if defined(GECKO_W10M)
++  {
++    // The browser quit twice within a minute of starting, from a window
++    // close nobody asked for. Name the window on its way out.
++    nsAutoCString spec("(no document)");
++    if (mDocShell) {
++      if (nsCOMPtr<dom::Document> doc = mDocShell->GetDocument()) {
++        if (nsIURI* uri = doc->GetDocumentURI()) {
++          uri->GetSpec(spec);
++        }
++      }
++    }
++    nsPrintfCString note("window: destroying %s", spec.get());
++    GeckoW10mNote(note.get());
++    if (JSContext* cx = nsContentUtils::GetCurrentJSContext()) {
++      if (JS::UniqueChars stack = xpc_PrintJSStack(cx, false, false, false)) {
++        nsPrintfCString js("window: closed from JS: %s", stack.get());
++        GeckoW10mNote(js.get());
++      }
++    }
++  }
++#endif
+ 
+   if (mDocShell) {
+     mDocShell->RemoveProgressListener(this);
