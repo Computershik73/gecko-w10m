@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <utility>
+#include <vector>
 
 #include "winrt/Windows.UI.Xaml.Controls.h"
 #include "winrt/Windows.UI.Xaml.Media.Imaging.h"
@@ -106,9 +107,13 @@ class EngineView {
   // A drag scrolls and a tap clicks, which is what a phone means by touch. The
   // engine is told in the pixels of the frame it drew, so every point has to
   // come back through the letterbox the image is shown in.
-  void OnPressed(winrt::Windows::Foundation::Point const& point);
-  void OnMoved(winrt::Windows::Foundation::Point const& point);
-  void OnReleased(winrt::Windows::Foundation::Point const& point);
+  //
+  // Every finger is its own touch point, named by its pointer id, so two of
+  // them make a pinch. A finger that loses its capture is cancelled.
+  void OnPressed(uint32_t id, winrt::Windows::Foundation::Point const& point);
+  void OnMoved(uint32_t id, winrt::Windows::Foundation::Point const& point);
+  void OnReleased(uint32_t id, winrt::Windows::Foundation::Point const& point);
+  void OnCaptureLost(uint32_t id);
   bool ToFrame(winrt::Windows::Foundation::Point const& point, int32_t* x,
                int32_t* y) const;
 
@@ -171,10 +176,15 @@ class EngineView {
   // window to put it in.
   std::string pendingUrl_;
   unsigned long long lastOpenAttempt_ = 0;
-  // Where the last touch move we actually sent was, so a finger resting on the
-  // glass stops producing them.
-  int32_t lastSentTouchX_ = 0;
-  int32_t lastSentTouchY_ = 0;
+  // The fingers on the glass, and where the last touch move actually sent for
+  // each was, so a finger resting on the glass stops producing them.
+  struct Finger {
+    uint32_t id;
+    int32_t x;
+    int32_t y;
+  };
+  std::vector<Finger> fingers_;
+  Finger* FindFinger(uint32_t id);
   int32_t screenWidth_ = 0;
   int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;
@@ -203,7 +213,10 @@ class EngineView {
   unsigned long long lastResolveAttempt_ = 0;
   std::function<void()> firstFrame_;
 
+  // Without the engine's touch entry point, one finger only -- the first --
+  // scrolls with the wheel and taps with the mouse.
   bool pressed_ = false;
+  uint32_t pressedId_ = 0;
   double lastX_ = 0;
   double lastY_ = 0;
   double travelled_ = 0;

@@ -85,21 +85,23 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
   image_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                Input::PointerRoutedEventArgs const& args) {
     touched_ = true;
-    OnPressed(args.GetCurrentPoint(image_).Position());
+    OnPressed(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
     image_.CapturePointer(args.Pointer());
   });
   image_.PointerMoved([this](winrt::Windows::Foundation::IInspectable const&,
                              Input::PointerRoutedEventArgs const& args) {
-    OnMoved(args.GetCurrentPoint(image_).Position());
+    OnMoved(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
   });
   image_.PointerReleased([this](winrt::Windows::Foundation::IInspectable const&,
                                 Input::PointerRoutedEventArgs const& args) {
-    OnReleased(args.GetCurrentPoint(image_).Position());
+    OnReleased(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
     image_.ReleasePointerCapture(args.Pointer());
   });
   image_.PointerCaptureLost(
       [this](winrt::Windows::Foundation::IInspectable const&,
-             Input::PointerRoutedEventArgs const&) { pressed_ = false; });
+             Input::PointerRoutedEventArgs const& args) {
+        OnCaptureLost(args.Pointer().PointerId());
+      });
 
   // On the hardware path the picture is the panel, not the image -- the image
   // never gets a source, so it has no size and no taps land on it. The panel
@@ -108,21 +110,23 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     panel_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                  Input::PointerRoutedEventArgs const& args) {
       touched_ = true;
-      OnPressed(args.GetCurrentPoint(panel_).Position());
+      OnPressed(args.Pointer().PointerId(), args.GetCurrentPoint(panel_).Position());
       panel_.CapturePointer(args.Pointer());
     });
     panel_.PointerMoved([this](winrt::Windows::Foundation::IInspectable const&,
                                Input::PointerRoutedEventArgs const& args) {
-      OnMoved(args.GetCurrentPoint(panel_).Position());
+      OnMoved(args.Pointer().PointerId(), args.GetCurrentPoint(panel_).Position());
     });
     panel_.PointerReleased([this](winrt::Windows::Foundation::IInspectable const&,
                                   Input::PointerRoutedEventArgs const& args) {
-      OnReleased(args.GetCurrentPoint(panel_).Position());
+      OnReleased(args.Pointer().PointerId(), args.GetCurrentPoint(panel_).Position());
       panel_.ReleasePointerCapture(args.Pointer());
     });
     panel_.PointerCaptureLost(
         [this](winrt::Windows::Foundation::IInspectable const&,
-               Input::PointerRoutedEventArgs const&) { pressed_ = false; });
+               Input::PointerRoutedEventArgs const& args) {
+          OnCaptureLost(args.Pointer().PointerId());
+        });
   }
 
 
@@ -862,40 +866,58 @@ bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
   return true;
 }
 
-void EngineView::OnPressed(winrt::Windows::Foundation::Point const& point) {
+EngineView::Finger* EngineView::FindFinger(uint32_t id) {
+  for (auto& f : fingers_) {
+    if (f.id == id) {
+      return &f;
+    }
+  }
+  return nullptr;
+}
+
+void EngineView::OnPressed(uint32_t id,
+                           winrt::Windows::Foundation::Point const& point) {
   int32_t x = 0;
   int32_t y = 0;
   if (!ToFrame(point, &x, &y)) {
     return;
   }
+  if (touch_) {
+    // A second finger is a second touch point, not the first one jumping:
+    // the engine collects them by id into one touch event, and APZ makes a
+    // pinch of two.
+    if (Finger* f = FindFinger(id)) {
+      f->x = x;
+      f->y = y;
+    } else {
+      fingers_.push_back({id, x, y});
+    }
+    touch_(static_cast<int32_t>(id), 0, x, y);
+    return;
+  }
+  if (pressed_) {
+    return;  // the wheel-and-mouse fallback follows one finger only
+  }
   pressed_ = true;
+  pressedId_ = id;
   travelled_ = 0;
   lastX_ = point.X;
   lastY_ = point.Y;
-  lastSentTouchX_ = x;
-  lastSentTouchY_ = y;
-  if (touch_) {
-    touch_(0, 0, x, y);
-  }
 }
 
-void EngineView::OnMoved(winrt::Windows::Foundation::Point const& point) {
-  if (!pressed_ || !wheel_) {
-    return;
-  }
+void EngineView::OnMoved(uint32_t id,
+                         winrt::Windows::Foundation::Point const& point) {
   int32_t x = 0;
   int32_t y = 0;
   if (!ToFrame(point, &x, &y)) {
     return;
   }
 
-  const double dx = point.X - lastX_;
-  const double dy = point.Y - lastY_;
-  lastX_ = point.X;
-  lastY_ = point.Y;
-  travelled_ += std::abs(dx) + std::abs(dy);
-
   if (touch_) {
+    Finger* f = FindFinger(id);
+    if (!f) {
+      return;
+    }
     // The finger itself; APZ turns its path into a pan, a fling or a pinch.
     //
     // Only when it has actually gone somewhere. A digitizer reports a finger
@@ -906,37 +928,57 @@ void EngineView::OnMoved(winrt::Windows::Foundation::Point const& point) {
     // why swipes work there and taps do not -- takes any touchmove as "this is
     // a drag, not a tap". Three device pixels is a little over one CSS pixel
     // here, far below anything a person means as a movement.
-    const int32_t movedX = x - lastSentTouchX_;
-    const int32_t movedY = y - lastSentTouchY_;
-    if (std::abs(movedX) + std::abs(movedY) < 3) {
+    if (std::abs(x - f->x) + std::abs(y - f->y) < 3) {
       return;
     }
-    lastSentTouchX_ = x;
-    lastSentTouchY_ = y;
-    touch_(0, 1, x, y);
+    f->x = x;
+    f->y = y;
+    touch_(static_cast<int32_t>(id), 1, x, y);
     return;
   }
+
+  if (!pressed_ || id != pressedId_ || !wheel_) {
+    return;
+  }
+  const double dx = point.X - lastX_;
+  const double dy = point.Y - lastY_;
+  lastX_ = point.X;
+  lastY_ = point.Y;
+  travelled_ += std::abs(dx) + std::abs(dy);
   // HeadlessWidget negates what it is given, so a finger moving up -- a
   // negative delta -- becomes a positive wheel delta, which is scrolling down.
   wheel_(x, y, dx, dy);
 }
 
-void EngineView::OnReleased(winrt::Windows::Foundation::Point const& point) {
-  const bool wasPressed = pressed_;
+void EngineView::OnReleased(uint32_t id,
+                            winrt::Windows::Foundation::Point const& point) {
+  if (touch_) {
+    Finger* f = FindFinger(id);
+    if (!f) {
+      return;
+    }
+    const Finger last = *f;
+    fingers_.erase(fingers_.begin() + (f - fingers_.data()));
+    int32_t x = 0;
+    int32_t y = 0;
+    if (!ToFrame(point, &x, &y)) {
+      touch_(static_cast<int32_t>(id), 3, last.x, last.y);  // off the picture
+      return;
+    }
+    touch_(static_cast<int32_t>(id), 2, x, y);
+    return;
+  }
+
+  if (!pressed_ || id != pressedId_) {
+    return;
+  }
   pressed_ = false;
-  if (!wasPressed || !mouse_) {
+  if (!mouse_) {
     return;
   }
   int32_t x = 0;
   int32_t y = 0;
   if (!ToFrame(point, &x, &y)) {
-    if (touch_) {
-      touch_(0, 3, x, y);  // off the picture: cancelled
-    }
-    return;
-  }
-  if (touch_) {
-    touch_(0, 2, x, y);
     return;
   }
   // A finger never holds still; anything under a few pixels was meant as a tap.
@@ -946,6 +988,22 @@ void EngineView::OnReleased(winrt::Windows::Foundation::Point const& point) {
   mouse_(0, x, y);
   mouse_(1, x, y);
   mouse_(2, x, y);
+}
+
+void EngineView::OnCaptureLost(uint32_t id) {
+  // After a release this finger is already gone. Otherwise something took the
+  // pointer away mid-gesture, and the engine must hear that the touch ended,
+  // or it keeps a finger on the glass that no longer exists.
+  if (Finger* f = FindFinger(id)) {
+    const Finger last = *f;
+    fingers_.erase(fingers_.begin() + (f - fingers_.data()));
+    if (touch_) {
+      touch_(static_cast<int32_t>(id), 3, last.x, last.y);
+    }
+  }
+  if (pressed_ && id == pressedId_) {
+    pressed_ = false;
+  }
 }
 
 void EngineView::SetScreen(double viewWidth, double viewHeight) {

@@ -1060,6 +1060,49 @@ function gecko_h264ify() {
     Services.obs.addObserver(observer, "document-element-inserted");
 }
 
+// Firefox's own pages -- about:preferences, about:addons, about:support and
+// the rest -- carry no viewport meta tag: on the desktop they never needed
+// one. With mobile viewport handling on, a page without one is laid out 980
+// pixels wide and shrunk to the screen, which here is 540 CSS pixels -- every
+// control at half size, and the settings unusable. They get the phone's own
+// width instead, which is what mobile-config-firefox's stylesheets for them
+// are written for. gecko.about.viewport=false turns it off.
+function gecko_about_viewport() {
+    if (!Services.prefs.getBoolPref("gecko.about.viewport", true)) {
+        return;
+    }
+    const XHTML = "http://www.w3.org/1999/xhtml";
+    const fit = doc => {
+        try {
+            if (doc.querySelector("meta[name=viewport]")) {
+                return;
+            }
+            const meta = doc.createElementNS(XHTML, "meta");
+            meta.setAttribute("name", "viewport");
+            meta.setAttribute("content", "width=device-width, initial-scale=1");
+            (doc.head || doc.documentElement).appendChild(meta);
+        } catch (e) {}
+    };
+    Services.obs.addObserver({
+        observe(doc) {
+            try {
+                const win = doc && doc.defaultView;
+                // Top-level pages only: a frame's viewport is its parent's.
+                if (!win || win.top !== win || doc.documentURIObject.scheme !== "about") {
+                    return;
+                }
+                const path = doc.documentURIObject.pathQueryRef.toLowerCase();
+                if (path.startsWith("blank") || path.startsWith("srcdoc")) {
+                    return;
+                }
+                // The parser has not reached <head> yet; wait for the page
+                // to be read, and leave a page alone that has a tag of its own.
+                win.addEventListener("DOMContentLoaded", () => fit(doc), { once: true });
+            } catch (e) {}
+        }
+    }, "document-element-inserted");
+}
+
 // DOM fullscreen without content processes: the chrome half that the actor
 // chain never reaches is run here, and the page is nudged to re-measure once
 // the window has settled. One line per transition.
@@ -1156,6 +1199,7 @@ try {
     gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_h264ify();
+    gecko_about_viewport();
     gecko_spotify();
     delete_old_mcf_files();
 

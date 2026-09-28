@@ -446,6 +446,17 @@ pref("dom.meta-viewport.enabled", true);
 pref("apz.allow_zooming", true);
 pref("apz.allow_double_tap_zooming", true);
 pref("ui.touch.radius.enabled", true);
+// The same for the click a tap becomes: without it a tap must land inside the
+// element, and desktop-sized controls -- a menu item, the buttons of a dialog
+// in the settings -- are a few millimetres tall at this density. These are
+// Firefox for Android's values; the desktop ones reach 12 mm and pick the
+// wrong neighbour.
+pref("ui.mouse.radius.enabled", true);
+pref("ui.mouse.radius.topmm", 2);
+pref("ui.mouse.radius.rightmm", 3);
+pref("ui.mouse.radius.bottommm", 2);
+pref("ui.mouse.radius.leftmm", 3);
+pref("ui.mouse.radius.reposition", true);
 
 // The XAML compositor dies about two and a half seconds after these load, and
 // the last thing in the log before it is always the same run: mozavcodec,
