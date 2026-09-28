@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Tue, 29 Sep 2026 03:12:51 +0400
+Subject: [PATCH] mozjemalloc: hold 32 MiB of chunks for recycling on the
+ phone, not 128
+
+Recycled chunks are decommitted, so they cost address space rather than
+memory, and on 32-bit ARM the address space is what runs out: a YouTube
+session left 633 MB free in 400 pieces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ memory/build/Constants.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/memory/build/Constants.h b/memory/build/Constants.h
+index 9f79d8ac05..6e84b9fa0c 100644
+--- a/memory/build/Constants.h
++++ b/memory/build/Constants.h
+@@ -121,6 +121,15 @@ constexpr size_t kCacheLineMask = kCacheLineSize - 1;
+ 
+ // Recycle at most 128 MiB of chunks. This means we retain at most
+ // 6.25% of the process address space on a 32-bit OS for later use.
++#if defined(GECKO_W10M)
++// On a 32-bit ARM phone the address space runs out before the memory does:
++// graphics drivers, the 132 MB engine and the JIT reservation share two
++// gigabytes, and a busy YouTube session left 633 MB free in 400 pieces, the
++// largest 143 MB. Chunks held for recycling are decommitted -- no memory,
++// only address space -- so keep a quarter as many and give the rest back.
++static constexpr size_t gRecycleLimit = 32_MiB;
++#else
+ static constexpr size_t gRecycleLimit = 128_MiB;
++#endif
+ 
+ #endif /* ! CONSTANTS_H */
