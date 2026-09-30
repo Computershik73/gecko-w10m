@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 02:05:11 +0400
+Subject: [PATCH] Tell the shell which keyboard a field wants; note where taps
+ land
+
+gecko_w10m_text_input_state gives the focused field's kind (text, password,
+e-mail, URL, telephone, number, search -- from inputmode, the input type and
+enterkeyhint) and a serial that goes up whenever a field takes the focus or is
+clicked while it has it, so the shell can raise the right keyboard, and raise
+it again for a field tapped after the keyboard was put away.
+
+And every tap is noted at its mousedown: its point in the page, the device
+scale, resolution and scroll, the element under the finger and the one the
+tap radius gave the click to -- taps were reported landing well above the
+finger.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ layout/base/PositionedEventTargeting.cpp     | 84 ++++++++++++++++++++
+ widget/headless/HeadlessCompositorWidget.cpp |  8 ++
+ widget/headless/HeadlessWidget.cpp           | 61 +++++++++++++-
+ widget/headless/HeadlessWidget.h             |  6 ++
+ 4 files changed, 158 insertions(+), 1 deletion(-)
+
+diff --git a/layout/base/PositionedEventTargeting.cpp b/layout/base/PositionedEventTargeting.cpp
+index b76da7c37b..2026ab9880 100644
+--- a/layout/base/PositionedEventTargeting.cpp
++++ b/layout/base/PositionedEventTargeting.cpp
+@@ -34,6 +34,11 @@
+ #include "nsLayoutUtils.h"
+ #include "nsPresContext.h"
+ #include "nsPrintfCString.h"
++
++#if defined(GECKO_W10M)
++#  include "mozilla/ScrollContainerFrame.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
+ #include "nsRect.h"
+ #include "nsRegion.h"
+ 
+@@ -740,9 +745,88 @@ static const nsIFrame* FindZIndexAncestor(const nsIFrame* aTarget,
+   return aRoot;
+ }
+ 
++#if defined(GECKO_W10M)
++// Where a tap lands: the note below wraps the real function, which is this.
++static nsIFrame* FindFrameTargetedByInputEventUnnoted(
++    WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
++    const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags);
++
++static nsCString GeckoW10mDescribe(nsIFrame* aFrame) {
++  if (!aFrame) {
++    return "nothing"_ns;
++  }
++  nsIContent* content = aFrame->GetContent();
++  while (content && !content->IsElement()) {
++    content = content->GetParent();
++  }
++  if (!content) {
++    return "a frame with no element"_ns;
++  }
++  dom::Element* element = content->AsElement();
++  nsAutoCString out;
++  out.Append('<');
++  AppendUTF16toUTF8(element->LocalName(), out);
++  nsAutoString value;
++  if (element->GetAttr(nsGkAtoms::id, value) && !value.IsEmpty()) {
++    out.Append('#');
++    AppendUTF16toUTF8(Substring(value, 0, 40), out);
++  }
++  if (element->GetAttr(nsGkAtoms::_class, value) && !value.IsEmpty()) {
++    int32_t space = value.FindChar(' ');
++    out.Append('.');
++    AppendUTF16toUTF8(Substring(value, 0, space < 0 ? 40 : std::min(space, 40)),
++                      out);
++  }
++  out.Append('>');
++  return std::move(out);
++}
++
++// Every tap, once, at its mousedown: where in the page it landed, what was
++// under the finger and what got the click after the tap radius had its say.
++// Taps were reported landing well above the finger; this says whether the
++// point is already wrong when it gets here or the radius moved it.
++nsIFrame* FindFrameTargetedByInputEvent(
++    WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
++    const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags) {
++  nsIFrame* result = FindFrameTargetedByInputEventUnnoted(
++      aEvent, aRootFrame, aPointRelativeToRootFrame, aFlags);
++  if (aEvent->mMessage == eMouseDown && aEvent->mClass == eMouseEventClass &&
++      aEvent->AsMouseEvent()->mInputSource ==
++          dom::MouseEvent_Binding::MOZ_SOURCE_TOUCH) {
++    nsIFrame* exact =
++        nsLayoutUtils::GetFrameForPoint(aRootFrame, aPointRelativeToRootFrame);
++    const CSSPoint css = CSSPoint::FromAppUnits(aPointRelativeToRootFrame);
++    nsPresContext* pc = aRootFrame.mFrame->PresContext();
++    PresShell* shell = pc->PresShell();
++    const nsPoint scroll =
++        shell->GetRootScrollContainerFrame()
++            ? shell->GetRootScrollContainerFrame()->GetScrollPosition()
++            : nsPoint();
++    nsPrintfCString note(
++        "tap: at %.0f,%.0f CSS px from the %s's top left (widget point %d,%d, "
++        "%.3f device px a CSS px, resolution %.3f, scrolled to %.0f,%.0f); "
++        "under the finger %s, clicked %s",
++        css.x, css.y,
++        aRootFrame.mViewportType == ViewportType::Visual ? "visual viewport"
++                                                         : "layout viewport",
++        int(aEvent->mRefPoint.x), int(aEvent->mRefPoint.y),
++        float(pc->CSSToDevPixelScale().scale), shell->GetResolution(),
++        CSSPixel::FromAppUnits(scroll.x), CSSPixel::FromAppUnits(scroll.y),
++        GeckoW10mDescribe(exact).get(),
++        result == exact ? "the same" : GeckoW10mDescribe(result).get());
++    GeckoW10mNote(note.get());
++  }
++  return result;
++}
++
++static nsIFrame* FindFrameTargetedByInputEventUnnoted(
++    WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
++    const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags) {
++#else
+ nsIFrame* FindFrameTargetedByInputEvent(
+     WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
+     const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags) {
++#endif
+   using FrameForPointOption = nsLayoutUtils::FrameForPointOption;
+   EnumSet<FrameForPointOption> options;
+   if (aFlags & INPUT_IGNORE_ROOT_SCROLL_FRAME) {
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 4d8a0e3078..2cfaccc597 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -910,6 +910,14 @@ extern "C" __declspec(dllexport) int32_t gecko_w10m_text_input_wanted() {
+   return mozilla::widget::HeadlessWidget::TextInputWanted() ? 1 : 0;
+ }
+ 
++// The focused field's kind (see HeadlessWidget::TextInputKind) in the low
++// byte, and the focus serial above it, so one call tells the shell both which
++// keyboard to raise and whether a field has just been focused or tapped.
++extern "C" __declspec(dllexport) uint32_t gecko_w10m_text_input_state() {
++  return (mozilla::widget::HeadlessWidget::TextInputSerial() << 8) |
++         (uint32_t(mozilla::widget::HeadlessWidget::TextInputKind()) & 0xff);
++}
++
+ extern "C" __declspec(dllexport) void gecko_w10m_input_text(
+     const uint16_t* aText, int32_t aLength) {
+   if (!aText || aLength <= 0) {
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index 83ef91bd66..288e0a82f7 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -128,18 +128,77 @@ namespace {
+ // Written on the main thread when focus moves, read by the shell from its own.
+ // A bool either side of a torn read is still a bool.
+ mozilla::Atomic<bool> sTextInputWanted{false};
++mozilla::Atomic<int32_t> sTextInputKind{0};
++mozilla::Atomic<uint32_t> sTextInputSerial{0};
++
++int32_t KindOf(const InputContext& aContext) {
++  if (aContext.mIMEState.mEnabled == IMEEnabled::Password ||
++      aContext.IsPasswordEditor()) {
++    return 1;
++  }
++  // inputmode says what the page wants typed, whatever the element is.
++  const nsString& mode = aContext.mHTMLInputMode;
++  if (mode.EqualsLiteral("numeric") || mode.EqualsLiteral("decimal")) {
++    return 5;
++  }
++  if (mode.EqualsLiteral("tel")) {
++    return 4;
++  }
++  if (mode.EqualsLiteral("email")) {
++    return 2;
++  }
++  if (mode.EqualsLiteral("url")) {
++    return 3;
++  }
++  if (mode.EqualsLiteral("search")) {
++    return 6;
++  }
++  if (!mode.IsEmpty()) {
++    return 0;
++  }
++  const nsString& type = aContext.mHTMLInputType;
++  if (type.EqualsLiteral("email")) {
++    return 2;
++  }
++  if (type.EqualsLiteral("url")) {
++    return 3;
++  }
++  if (type.EqualsLiteral("tel")) {
++    return 4;
++  }
++  if (type.EqualsLiteral("number")) {
++    return 5;
++  }
++  if (type.EqualsLiteral("search") || aContext.mActionHint.EqualsLiteral("search")) {
++    return 6;
++  }
++  return 0;
++}
+ }  // namespace
+ 
+ bool HeadlessWidget::TextInputWanted() { return sTextInputWanted; }
++int32_t HeadlessWidget::TextInputKind() { return sTextInputKind; }
++uint32_t HeadlessWidget::TextInputSerial() { return sTextInputSerial; }
+ 
+ void HeadlessWidget::SetInputContext(const InputContext& aContext,
+                                      const InputContextAction& aAction) {
+   mInputContext = aContext;
+   // Gecko says this whenever focus moves onto or off an editable field, which
+   // is exactly when a phone should raise or drop its keyboard.
+-  sTextInputWanted =
++  const bool wanted =
+       aContext.mIMEState.mEnabled == IMEEnabled::Enabled ||
+       aContext.mIMEState.mEnabled == IMEEnabled::Password;
++  if (wanted) {
++    sTextInputKind = KindOf(aContext);
++    // Focus moving onto a field, or a field being clicked while it has the
++    // focus: both are someone about to type.
++    if (aAction.mFocusChange != InputContextAction::FOCUS_NOT_CHANGED ||
++        aAction.mCause == InputContextAction::CAUSE_MOUSE ||
++        aAction.mCause == InputContextAction::CAUSE_TOUCH) {
++      ++sTextInputSerial;
++    }
++  }
++  sTextInputWanted = wanted;
+ }
+ #endif
+ 
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+index c386f956c7..f7c25ea4be 100644
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -69,6 +69,12 @@ class HeadlessWidget final : public nsIWidget {
+   // True while focus is on something that takes text. It is the only
+   // signal a phone has that it should raise its keyboard.
+   static bool TextInputWanted();
++  // What kind of field has the focus, for the keyboard the shell raises:
++  // 0 text, 1 password, 2 e-mail, 3 URL, 4 telephone, 5 number, 6 search.
++  static int32_t TextInputKind();
++  // Goes up each time an editable field takes the focus, so the shell can
++  // tell a new field -- or the same one tapped again -- from no change.
++  static uint32_t TextInputSerial();
+ #endif
+ 
+   nsresult Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,

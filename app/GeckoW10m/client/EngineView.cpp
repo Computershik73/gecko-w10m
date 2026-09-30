@@ -268,6 +268,11 @@ void EngineView::WireKeyboard() {
       return;
     }
     const double covered = args.OccludedRect().Height;
+    // The room is made smaller below, so the focused field is ours to keep in
+    // view. Without this XAML also slid the whole app up to keep the sink --
+    // which covers the page -- visible: the picture moved under the finger,
+    // and on the way back the slide ran after the resize.
+    args.EnsuredFocusedElementInView(true);
     Log::Write(L"view: keyboard covers " +
                std::to_wstring(static_cast<int>(covered)) +
                L" view px, taking it off the bottom of the room");
@@ -280,7 +285,8 @@ void EngineView::WireKeyboard() {
   });
   pane.Hiding([this](InputPane const&,
                      winrt::Windows::UI::ViewManagement::
-                         InputPaneVisibilityEventArgs const&) {
+                         InputPaneVisibilityEventArgs const& args) {
+    args.EnsuredFocusedElementInView(true);
     if (!host_) {
       return;
     }
@@ -347,6 +353,8 @@ bool EngineView::Resolve() {
       reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
   wanted_ = reinterpret_cast<WantedFn>(
       ::GetProcAddress(xul, "gecko_w10m_text_input_wanted"));
+  text_state_ = reinterpret_cast<TextStateFn>(
+      ::GetProcAddress(xul, "gecko_w10m_text_input_state"));
   overlay_ = reinterpret_cast<OverlayFn>(
       ::GetProcAddress(xul, "gecko_w10m_overlay_open"));
   text_ = reinterpret_cast<TextFn>(::GetProcAddress(xul, "gecko_w10m_input_text"));
@@ -550,14 +558,51 @@ void EngineView::PushSize() {
   resize_(width, height);
 }
 
+void EngineView::ApplyInputKind(int32_t kind) {
+  if (kind == sinkKind_) {
+    return;
+  }
+  sinkKind_ = kind;
+  using winrt::Windows::UI::Xaml::Input::InputScope;
+  using winrt::Windows::UI::Xaml::Input::InputScopeName;
+  using winrt::Windows::UI::Xaml::Input::InputScopeNameValue;
+  InputScopeNameValue value = InputScopeNameValue::Default;
+  const wchar_t* name = L"text";
+  switch (kind) {
+    case 1: value = InputScopeNameValue::Password; name = L"password"; break;
+    case 2: value = InputScopeNameValue::EmailSmtpAddress; name = L"e-mail"; break;
+    case 3: value = InputScopeNameValue::Url; name = L"URL"; break;
+    case 4: value = InputScopeNameValue::TelephoneNumber; name = L"telephone"; break;
+    case 5: value = InputScopeNameValue::Number; name = L"number"; break;
+    case 6: value = InputScopeNameValue::Search; name = L"search"; break;
+    default: break;
+  }
+  InputScope scope;
+  InputScopeName scopeName;
+  scopeName.NameValue(value);
+  scope.Names().Append(scopeName);
+  sink_.InputScope(scope);
+  Log::Write(std::wstring(L"view: the field is ") + name +
+             L", the keyboard follows");
+}
+
 void EngineView::FollowTextInput() {
   if (!wanted_) {
     return;
   }
   const bool wants = wanted_() == 1;
-  if (wants == typing_) {
+  const uint32_t state = text_state_ ? text_state_() : 0;
+  const uint32_t serial = state >> 8;
+  // A field newly focused, or tapped while it has the focus, is someone about
+  // to type -- even when the engine wanted text all along and the keyboard was
+  // put away. Before this the keyboard only came up when "wanted" changed, so
+  // a field tapped a second time after the keyboard was dismissed got none.
+  const bool again = wants && (serial != lastTextSerial_ || forceKeyboard_);
+  forceKeyboard_ = false;
+  if (wants == typing_ && !again) {
     return;
   }
+  lastTextSerial_ = serial;
   typing_ = wants;
 
   auto pane = InputPane::GetForCurrentView();
@@ -579,6 +624,7 @@ void EngineView::FollowTextInput() {
       }
       return;
     }
+    ApplyInputKind(static_cast<int32_t>(state & 0xff));
     const bool focused = sink_.Focus(FocusState::Programmatic);
     // Focus alone raises the keyboard only when the focus came from a touch,
     // and this one came from Gecko, so ask outright as well.
@@ -769,8 +815,27 @@ void EngineView::Tick() {
   // held back, typing_ stays false while the engine goes on wanting text, so
   // the condition below stayed true and posted to the dispatcher on every
   // single frame -- sixty queued turns a second, for ever.
-  if (wanted_ && (wanted_() == 1) != typing_ && !textInputPending_ &&
-      !(declinedUntilTouch_ && !touched_)) {
+  if (tapKeyboardCheckAt_ && ::GetTickCount64() >= tapKeyboardCheckAt_) {
+    // A tap a moment ago; if it left a field focused and no keyboard up,
+    // the keyboard comes up now. The pause lets a tap elsewhere blur the field
+    // first, so it does not flash up for a tap that moved the focus away.
+    tapKeyboardCheckAt_ = 0;
+    if (wanted_ && wanted_() == 1) {
+      bool visible = false;
+      try {
+        visible = InputPane::GetForCurrentView().Visible();
+      } catch (winrt::hresult_error const&) {
+      }
+      if (!visible) {
+        forceKeyboard_ = true;
+      }
+    }
+  }
+  const bool newField = text_state_ && wanted_ && wanted_() == 1 &&
+                        (text_state_() >> 8) != lastTextSerial_;
+  if (wanted_ &&
+      ((wanted_() == 1) != typing_ || newField || forceKeyboard_) &&
+      !textInputPending_ && !(declinedUntilTouch_ && !touched_)) {
     textInputPending_ = true;
     PostToUi([this]() {
       textInputPending_ = false;
@@ -890,7 +955,7 @@ void EngineView::OnPressed(uint32_t id,
       f->x = x;
       f->y = y;
     } else {
-      fingers_.push_back({id, x, y});
+      fingers_.push_back({id, x, y, x, y});
     }
     touch_(static_cast<int32_t>(id), 0, x, y);
     return;
@@ -966,6 +1031,15 @@ void EngineView::OnReleased(uint32_t id,
       return;
     }
     touch_(static_cast<int32_t>(id), 2, x, y);
+    if (std::abs(x - last.startX) + std::abs(y - last.startY) < 20) {
+      // A tap. Where the finger was, in the frame's pixels -- the engine's
+      // "tap:" line says where the page took it.
+      Log::Write(L"touch: tap at " + std::to_wstring(x) + L"," +
+                 std::to_wstring(y) + L" frame px (" +
+                 std::to_wstring(static_cast<int>(point.X)) + L"," +
+                 std::to_wstring(static_cast<int>(point.Y)) + L" view px)");
+      tapKeyboardCheckAt_ = ::GetTickCount64() + 300;
+    }
     return;
   }
 

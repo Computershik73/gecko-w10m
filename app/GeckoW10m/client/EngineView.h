@@ -130,6 +130,7 @@ class EngineView {
   using MouseFn = void (*)(int32_t message, int32_t x, int32_t y);
   using WheelFn = void (*)(int32_t x, int32_t y, double dx, double dy);
   using WantedFn = int32_t (*)();
+  using TextStateFn = uint32_t (*)();
   using OverlayFn = int32_t (*)();
   using TextFn = void (*)(const uint16_t* text, int32_t length);
   using KeyFn = void (*)(int32_t keyCode);
@@ -153,6 +154,9 @@ class EngineView {
   MouseFn mouse_ = nullptr;
   WheelFn wheel_ = nullptr;
   WantedFn wanted_ = nullptr;
+  // The focused field's kind and the engine's focus serial (see
+  // gecko_w10m_text_input_state); null with an engine that has no such export.
+  TextStateFn text_state_ = nullptr;
   OverlayFn overlay_ = nullptr;
   TextFn text_ = nullptr;
   KeyFn key_ = nullptr;
@@ -182,6 +186,8 @@ class EngineView {
     uint32_t id;
     int32_t x;
     int32_t y;
+    int32_t startX;
+    int32_t startY;
   };
   std::vector<Finger> fingers_;
   Finger* FindFinger(uint32_t id);
@@ -222,6 +228,14 @@ class EngineView {
   double travelled_ = 0;
 
   bool typing_ = false;    // text input is wanted right now
+  // The engine's focus serial at the last raise, the keyboard the sink was
+  // last given, and when to check after a tap whether the keyboard should be
+  // up again (0: no check pending).
+  uint32_t lastTextSerial_ = 0;
+  int32_t sinkKind_ = -1;
+  unsigned long long tapKeyboardCheckAt_ = 0;
+  bool forceKeyboard_ = false;
+  void ApplyInputKind(int32_t kind);
   bool clearing_ = false;  // emptying the sink, so ignore its own change
   int32_t fullWidth_ = 0;
   int32_t fullHeight_ = 0;
