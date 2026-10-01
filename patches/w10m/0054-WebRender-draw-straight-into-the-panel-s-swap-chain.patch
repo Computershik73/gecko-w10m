@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 23:36:16 +0400
+Subject: [PATCH] WebRender: draw straight into the panel's swap chain
+
+ANGLE drew into an offscreen texture and copied it into the swap chain's
+back buffer on every present, turning it the right way up on the way. In
+fullscreen that is a whole extra pass over 2560x1440 pixels a frame, on a GPU
+that already spends 30-40 ms on one. Ask for a surface whose rows run top
+down (EGL_ANGLE_surface_orientation): ANGLE then leaves the texture out, and
+WebRender draws into the back buffer, flipping its own picture
+(SurfaceOriginIsTopLeft). Partial present keeps working: a flip-model present
+with a dirty rect carries the rest of the previous frame over, as Firefox's
+ANGLE compositor relies on. gfx.webrender.gecko-w10m.direct-back-buffer =
+false goes back to the copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorEGL.cpp                   | 37 +++++++++++++++++--
+ gfx/webrender_bindings/RenderCompositorEGL.h  |  7 ++++
+ modules/libpref/init/StaticPrefList.yaml      | 10 +++++
+ 3 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index a18a53e050..be518a148c 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -80,7 +80,35 @@ EGLSurface RenderCompositorEGL::CreateEGLSurface() {
+       GeckoW10mNote("gfx: no panel to make a surface for");
+       return EGL_NO_SURFACE;
+     }
+-    surface = gle->CreateCompatibleSurface(window);
++    // ANGLE draws into an offscreen texture of its own and, on every
++    // present, copies it into the swap chain's back buffer -- turning it the
++    // right way up on the way, since GL counts rows from the bottom and
++    // Direct3D from the top. In fullscreen that copy is a whole extra pass
++    // over 2560x1440 pixels a frame. Asked for a surface whose rows run top
++    // down, ANGLE leaves the texture out and WebRender draws straight into
++    // the back buffer, turning its own picture the right way up instead
++    // (SurfaceOriginIsTopLeft).
++    const auto& egl = gle->mEgl;
++    const char* extensions =
++        egl->mLib->fQueryString(egl->mDisplay, LOCAL_EGL_EXTENSIONS);
++    if (StaticPrefs::gfx_webrender_gecko_w10m_direct_back_buffer_AtStartup() &&
++        extensions && strstr(extensions, "EGL_ANGLE_surface_orientation")) {
++      const EGLint attribs[] = {0x33A8 /* EGL_SURFACE_ORIENTATION_ANGLE */,
++                                0x0002 /* ..._INVERT_Y_ANGLE */,
++                                LOCAL_EGL_NONE};
++      surface = egl->fCreateWindowSurface(
++          gle->mSurfaceConfig, reinterpret_cast<EGLNativeWindowType>(window),
++          attribs);
++      mTopLeftOrigin = surface != EGL_NO_SURFACE;
++      GeckoW10mNote(mTopLeftOrigin
++                        ? "gfx: drawing straight into the swap chain, no "
++                          "offscreen copy"
++                        : "gfx: a top-down surface was refused, back to the "
++                          "offscreen copy");
++    }
++    if (surface == EGL_NO_SURFACE) {
++      surface = gle->CreateCompatibleSurface(window);
++    }
+     GeckoW10mNote(surface == EGL_NO_SURFACE
+                     ? "gfx: the context's own display refused the panel too"
+                     : "gfx: the panel has a surface on the context's display");
+@@ -488,8 +516,11 @@ uint32_t RenderCompositorEGL::GetMaxPartialPresentRects() {
+ 
+ bool RenderCompositorEGL::ShouldDrawPreviousPartialPresentRegions() {
+ #if defined(GECKO_W10M)
+-  // ANGLE's offscreen texture is the buffer WebRender draws into, and it is
+-  // the same one every frame: what was drawn before is still there.
++  // What was drawn before is still there: either in ANGLE's offscreen
++  // texture, which is the same one every frame, or -- drawing straight into
++  // the swap chain -- because a flip-model present with a dirty rect has
++  // DXGI carry the rest of the previous frame into the next back buffer,
++  // which is what Firefox's own ANGLE compositor relies on too.
+   if (mPostSubBuffer) {
+     return false;
+   }
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 5a02e4f436..2bd380ded5 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -47,6 +47,10 @@ class RenderCompositorEGL : public RenderCompositor {
+ 
+   LayoutDeviceIntSize GetBufferSize() override;
+ 
++#if defined(GECKO_W10M)
++  bool SurfaceOriginIsTopLeft() override { return mTopLeftOrigin; }
++#endif
++
+   // Interface for partial present
+   bool UsePartialPresent() override;
+   bool RequestFullRender() override;
+@@ -92,6 +96,9 @@ class RenderCompositorEGL : public RenderCompositor {
+   gfx::IntSize mPresentedSurfaceSize;
+   // What RequestFullRender decided for the frame being drawn.
+   bool mWholeFrame = true;
++  // The surface's rows run top down: WebRender draws into the swap chain's
++  // back buffer directly, with no ANGLE offscreen texture in between.
++  bool mTopLeftOrigin = false;
+   // For the note every ten seconds: what presenting cost.
+   TimeStamp mPresentStatsStart;
+   uint32_t mPresentFrames = 0;
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index c4522d5fc2..ba22fff975 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -8724,6 +8724,16 @@
+   mirror: once
+ #endif
+ 
++#if defined(GECKO_W10M)
++# Hardware WebRender draws straight into the panel's swap chain instead of an
++# ANGLE offscreen texture that is copied to it on every present -- one whole
++# pass over the screen less a frame. False goes back to the copy.
++- name: gfx.webrender.gecko-w10m.direct-back-buffer
++  type: bool
++  value: true
++  mirror: once
++#endif
++
+ #if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
+ - name: gfx.webrender.software.opengl
+   type: bool
