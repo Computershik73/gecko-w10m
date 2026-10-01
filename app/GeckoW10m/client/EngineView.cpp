@@ -440,7 +440,8 @@ bool EngineView::Resolve() {
             g_panelPresenting.store(true);
           } else if (!Log::Verbose() && !strstr(text, "fail") &&
                      !strstr(text, "FAIL") && !strstr(text, "error") &&
-                     !strstr(text, "lost") && !strstr(text, "reset")) {
+                     !strstr(text, "lost") && !strstr(text, "reset") &&
+                     !strstr(text, "resized")) {
             // Quiet logs: ANGLE reports every texture and program it makes,
             // dozens a second while a page draws. Only trouble gets through.
             return;

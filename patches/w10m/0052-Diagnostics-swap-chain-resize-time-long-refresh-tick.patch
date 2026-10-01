@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 22:09:02 +0400
+Subject: [PATCH] Diagnostics: swap chain resize time, long refresh ticks, how
+ WebRender composes
+
+For the slow return after the keyboard closes and the slow fullscreen video:
+ANGLE says how long remaking the swap chain and offscreen buffers took, the
+refresh driver notes ticks of 150 ms or more (at most one a second), and
+WebRender sums up every 300 composites whether a video went to the screen as
+a surface of its own and how many tiles were redrawn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/webrender/src/device/gl.rs             | 10 +++++
+ gfx/wr/webrender/src/renderer/mod.rs          | 42 +++++++++++++++++++
+ layout/base/nsRefreshDriver.cpp               | 24 +++++++++++
+ .../renderer/d3d/d3d11/SwapChain11.cpp        | 30 ++++++++++++-
+ 4 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
+index 3928dbd1e2..cdadce86ae 100644
+--- a/gfx/wr/webrender/src/device/gl.rs
++++ b/gfx/wr/webrender/src/device/gl.rs
+@@ -34,6 +34,16 @@ pub fn gecko_w10m_note(text: &str) {
+ }
+ #[cfg(not(windows))]
+ pub fn gecko_w10m_note(_text: &str) {}
++// A note that is always written. For summaries a few times a minute, never
++// for anything per frame (see GECKO_W10M_TRACE above for why).
++#[cfg(windows)]
++pub fn gecko_w10m_note_always(text: &str) {
++    if let Ok(c) = std::ffi::CString::new(text) {
++        unsafe { GeckoW10mNote(c.as_ptr()) }
++    }
++}
++#[cfg(not(windows))]
++pub fn gecko_w10m_note_always(_text: &str) {}
+ static GECKO_W10M_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+ static GECKO_W10M_TEXTURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+ static GECKO_W10M_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index 4a8d5ea011..b49905cc77 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -661,6 +661,45 @@ pub(crate) struct BufferDamageTracker {
+     current_offset: usize,
+ }
+ 
++/// GeckoW10m: every 300 composites, how the frame was put together -- whether
++/// a video went straight to the screen as a surface of its own, or had to be
++/// drawn into the page's tiles first, and how many tiles were redrawn. A
++/// fullscreen video that is drawn into tiles is drawn twice a frame.
++fn gecko_w10m_composite_stats(state: &CompositeState) {
++    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
++    static FRAMES: AtomicU32 = AtomicU32::new(0);
++    static WITH_SURFACE: AtomicU32 = AtomicU32::new(0);
++    static TILES: AtomicU32 = AtomicU32::new(0);
++    static REDRAWN: AtomicU32 = AtomicU32::new(0);
++
++    let mut tiles = 0u32;
++    let mut redrawn = 0u32;
++    for tile in state.tiles.iter() {
++        if let CompositeTileSurface::Texture { .. } = tile.surface {
++            tiles += 1;
++            if !tile.local_dirty_rect.is_empty() {
++                redrawn += 1;
++            }
++        }
++    }
++    if !state.external_surfaces.is_empty() {
++        WITH_SURFACE.fetch_add(1, Relaxed);
++    }
++    TILES.fetch_add(tiles, Relaxed);
++    REDRAWN.fetch_add(redrawn, Relaxed);
++    let frames = FRAMES.fetch_add(1, Relaxed) + 1;
++    if frames >= 300 {
++        crate::device::gecko_w10m_note_always(&format!(
++            "wr: last {} composites -- {} with a video as a surface of its own; {:.1} tiles a frame, {:.1} of them redrawn",
++            frames,
++            WITH_SURFACE.swap(0, Relaxed),
++            TILES.swap(0, Relaxed) as f32 / frames as f32,
++            REDRAWN.swap(0, Relaxed) as f32 / frames as f32,
++        ));
++        FRAMES.store(0, Relaxed);
++    }
++}
++
+ impl BufferDamageTracker {
+     /// Sets the damage rect for the current frame. Should only be called *after*
+     /// get_damage_rect() has been called to get the current backbuffer's damage rect.
+@@ -3759,6 +3798,9 @@ impl Renderer {
+                 results,
+             )
+         });
++        if device_size.is_some() {
++            gecko_w10m_composite_stats(&frame.composite_state);
++        }
+ 
+         // If we have a native OS compositor, then make use of that interface to
+         // specify how to composite each of the picture cache surfaces. First, we
+diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
+index ed95790541..44517718bc 100644
+--- a/layout/base/nsRefreshDriver.cpp
++++ b/layout/base/nsRefreshDriver.cpp
+@@ -101,6 +101,11 @@
+ 
+ #include "nsXULPopupManager.h"
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ using namespace mozilla;
+ using namespace mozilla::widget;
+ using namespace mozilla::ipc;
+@@ -2301,6 +2306,25 @@ void nsRefreshDriver::Tick(VsyncId aId, TimeStamp aNowTime,
+   }
+   auto cleanupInExtraTick = MakeScopeExit([&] { mInNormalTick = false; });
+   mInNormalTick = aIsExtraTick != IsExtraTick::Yes;
++#if defined(GECKO_W10M)
++  // A tick is where the page answers a resize: its resize handlers, the
++  // reflow, the paint. When the keyboard closes and the browser "thinks",
++  // this says whether it is thinking here. Only the long ones, at most one
++  // a second.
++  const TimeStamp geckoW10mTickStart = TimeStamp::Now();
++  auto geckoW10mTickNote = MakeScopeExit([geckoW10mTickStart] {
++    static TimeStamp sLastNote;
++    const TimeStamp end = TimeStamp::Now();
++    const double ms = (end - geckoW10mTickStart).ToMilliseconds();
++    if (ms >= 150 &&
++        (sLastNote.IsNull() || (end - sLastNote).ToSeconds() >= 1)) {
++      sLastNote = end;
++      char note[96];
++      SprintfLiteral(note, "main thread: a refresh tick took %.0f ms", ms);
++      GeckoW10mNote(note);
++    }
++  });
++#endif
+ 
+   if (!IsPresentingInVR() && IsWaitingForPaint(aNowTime)) {
+     // In immersive VR mode, we do not get notifications when frames are
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+index 363ff1987b..e56ffed070 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+@@ -504,6 +504,13 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+     ASSERT(mSwapChain && mBackBufferTexture.valid() && mBackBufferRTView.valid() &&
+            mBackBufferSRView.valid());
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // How long the keyboard costs here: every time it opens or closes, the
++    // panel changes size and the swap chain and offscreen buffers are made
++    // again.
++    const ULONGLONG resizeStart = ::GetTickCount64();
++#endif
++
+     mBackBufferTexture.reset();
+     mBackBufferRTView.reset();
+     mBackBufferSRView.reset();
+@@ -520,12 +527,16 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+ 
+     hr = mSwapChain->ResizeBuffers(desc.BufferCount, backbufferWidth, backbufferHeight,
+                                    getSwapChainNativeFormat(), 0);
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    const ULONGLONG resizeBuffersMs = ::GetTickCount64() - resizeStart;
++    if (FAILED(hr))
+     {
+         char note[128];
+-        snprintf(note, sizeof(note), "angle: swap chain resized to %dx%d -> 0x%08lx", backbufferWidth,
+-                 backbufferHeight, static_cast<unsigned long>(hr));
++        snprintf(note, sizeof(note), "angle: swap chain resize to %dx%d failed -> 0x%08lx",
++                 backbufferWidth, backbufferHeight, static_cast<unsigned long>(hr));
+         AngleUwpNote(note);
+     }
++#endif
+ 
+     if (FAILED(hr))
+     {
+@@ -569,7 +580,22 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+ 
+     mFirstSwap = true;
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    const EGLint offscreenResult =
++        resetOffscreenBuffers(displayD3D, backbufferWidth, backbufferHeight);
++    {
++        char note[160];
++        snprintf(note, sizeof(note),
++                 "angle: swap chain resized to %dx%d in %llu ms (ResizeBuffers %llu ms)",
++                 backbufferWidth, backbufferHeight,
++                 static_cast<unsigned long long>(::GetTickCount64() - resizeStart),
++                 static_cast<unsigned long long>(resizeBuffersMs));
++        AngleUwpNote(note);
++    }
++    return offscreenResult;
++#else
+     return resetOffscreenBuffers(displayD3D, backbufferWidth, backbufferHeight);
++#endif
+ }
+ 
+ DXGI_FORMAT SwapChain11::getSwapChainNativeFormat() const
