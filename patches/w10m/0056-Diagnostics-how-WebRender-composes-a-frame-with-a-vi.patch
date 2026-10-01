@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 2 Oct 2026 00:48:19 +0400
+Subject: [PATCH] Diagnostics: how WebRender composes a frame with a video in
+ it
+
+Every 300 composites: whether the video was an underlay (drawn first, with
+every tile over it blended on top through a cut-out) or an overlay (drawn
+over the page, occluding what is behind it), why it was refused as an
+overlay, and how much of the screen a frame clears, draws opaque and draws
+blended -- the overdraw a fullscreen video pays for.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/wr/webrender/src/composite.rs          |  5 ++
+ gfx/wr/webrender/src/renderer/composite.rs | 21 ++++++
+ gfx/wr/webrender/src/renderer/mod.rs       | 75 ++++++++++++++++++++--
+ gfx/wr/webrender/src/tile_cache/mod.rs     |  6 ++
+ 4 files changed, 101 insertions(+), 6 deletions(-)
+
+diff --git a/gfx/wr/webrender/src/composite.rs b/gfx/wr/webrender/src/composite.rs
+index 66baf766e1..bd015af805 100644
+--- a/gfx/wr/webrender/src/composite.rs
++++ b/gfx/wr/webrender/src/composite.rs
+@@ -1031,6 +1031,11 @@ impl CompositeState {
+             );
+         }
+ 
++        crate::renderer::gecko_w10m_count_surfaces(
++            tile_cache.underlays.len() as u32,
++            tile_cache.sub_slices.iter().map(|s| s.compositor_surfaces.len() as u32).sum(),
++        );
++
+         // Add any underlay surfaces to the compositing tree
+         for underlay in &tile_cache.underlays {
+             self.push_compositor_surface(
+diff --git a/gfx/wr/webrender/src/renderer/composite.rs b/gfx/wr/webrender/src/renderer/composite.rs
+index 032a0e1acd..038877e4ae 100644
+--- a/gfx/wr/webrender/src/renderer/composite.rs
++++ b/gfx/wr/webrender/src/renderer/composite.rs
+@@ -462,6 +462,27 @@ impl Renderer {
+             }
+         }
+ 
++        // GeckoW10m: how many times over the screen this pass draws -- the
++        // clear, the opaque tiles, the blended ones -- summed up every 300
++        // composites with the rest of the composite stats.
++        {
++            let fb = draw_target.dimensions();
++            let fb_area = (fb.width.max(1) as f32) * (fb.height.max(1) as f32);
++            let cleared = match partial_present_mode {
++                Some(PartialPresentMode::Single { dirty_rect }) => {
++                    if !dirty_rect.is_empty() && layer.occlusion.test(&dirty_rect) {
++                        dirty_rect.area()
++                    } else {
++                        0.0
++                    }
++                }
++                None => fb_area,
++            };
++            let opaque: f32 = layer.occlusion.opaque_items().iter().map(|i| i.rectangle.area()).sum();
++            let alpha: f32 = layer.occlusion.alpha_items().iter().map(|i| i.rectangle.area()).sum();
++            super::gecko_w10m_note_pass(cleared / fb_area, opaque / fb_area, alpha / fb_area);
++        }
++
+         // Clear the framebuffer
+         let clear_color = Some(clear_color.to_array());
+ 
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index b49905cc77..90de36a001 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -53,7 +53,7 @@ use crate::batch::{AlphaBatchContainer, BatchKind, BatchFeatures, BatchTextures,
+ use crate::batch::ClipMaskInstanceList;
+ #[cfg(any(feature = "capture", feature = "replay"))]
+ use crate::capture::{CaptureConfig, ExternalCaptureImage, PlainExternalImage};
+-use crate::composite::{CompositeState, CompositeTileSurface};
++use crate::composite::{CompositeState, CompositeTileSurface, TileKind};
+ use crate::composite::{CompositorKind, Compositor, NativeTileId};
+ use crate::composite::{CompositorConfig, NativeSurfaceOperationDetails, NativeSurfaceId, NativeSurfaceOperation};
+ #[cfg(feature = "debugger")]
+@@ -671,15 +671,26 @@ fn gecko_w10m_composite_stats(state: &CompositeState) {
+     static WITH_SURFACE: AtomicU32 = AtomicU32::new(0);
+     static TILES: AtomicU32 = AtomicU32::new(0);
+     static REDRAWN: AtomicU32 = AtomicU32::new(0);
++    static VIDEO_BLENDED: AtomicU32 = AtomicU32::new(0);
+ 
+     let mut tiles = 0u32;
+     let mut redrawn = 0u32;
+     for tile in state.tiles.iter() {
+-        if let CompositeTileSurface::Texture { .. } = tile.surface {
+-            tiles += 1;
+-            if !tile.local_dirty_rect.is_empty() {
+-                redrawn += 1;
++        match tile.surface {
++            CompositeTileSurface::Texture { .. } => {
++                tiles += 1;
++                if !tile.local_dirty_rect.is_empty() {
++                    redrawn += 1;
++                }
++            }
++            // A video that is not opaque occludes nothing: what is behind it
++            // is drawn, and then it is blended on top.
++            CompositeTileSurface::ExternalSurface { .. } => {
++                if tile.kind != TileKind::Opaque {
++                    VIDEO_BLENDED.fetch_add(1, Relaxed);
++                }
+             }
++            _ => {}
+         }
+     }
+     if !state.external_surfaces.is_empty() {
+@@ -689,17 +700,69 @@ fn gecko_w10m_composite_stats(state: &CompositeState) {
+     REDRAWN.fetch_add(redrawn, Relaxed);
+     let frames = FRAMES.fetch_add(1, Relaxed) + 1;
+     if frames >= 300 {
++        let (passes, cleared, opaque, alpha) = {
++            let mut pass = GECKO_W10M_PASS.lock().unwrap();
++            let taken = *pass;
++            *pass = (0, 0.0, 0.0, 0.0);
++            taken
++        };
++        let per = |v: f64| if passes > 0 { v / passes as f64 } else { 0.0 };
++        let refusal = GECKO_W10M_OVERLAY_REFUSAL
++            .lock()
++            .map(|r| r.clone())
++            .unwrap_or_default();
+         crate::device::gecko_w10m_note_always(&format!(
+-            "wr: last {} composites -- {} with a video as a surface of its own; {:.1} tiles a frame, {:.1} of them redrawn",
++            "wr: last {} composites -- {} with a video as a surface of its own, {} of those blended; video as underlay {} times, as overlay {} times{}; {:.1} tiles a frame, {:.1} of them redrawn; a frame clears {:.2} of the screen, draws {:.2} opaque and {:.2} blended",
+             frames,
+             WITH_SURFACE.swap(0, Relaxed),
++            VIDEO_BLENDED.swap(0, Relaxed),
++            GECKO_W10M_UNDERLAYS.swap(0, Relaxed),
++            GECKO_W10M_OVERLAYS.swap(0, Relaxed),
++            if refusal.is_empty() { String::new() } else { format!(" (last overlay refusal: {})", refusal) },
+             TILES.swap(0, Relaxed) as f32 / frames as f32,
+             REDRAWN.swap(0, Relaxed) as f32 / frames as f32,
++            per(cleared),
++            per(opaque),
++            per(alpha),
+         ));
+         FRAMES.store(0, Relaxed);
+     }
+ }
+ 
++/// GeckoW10m: compositor surfaces per frame by kind, and the last reason a
++/// video was refused as an overlay.
++static GECKO_W10M_UNDERLAYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_OVERLAYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GECKO_W10M_OVERLAY_REFUSAL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
++
++pub(crate) fn gecko_w10m_count_surfaces(underlays: u32, overlays: u32) {
++    use std::sync::atomic::Ordering::Relaxed;
++    GECKO_W10M_UNDERLAYS.fetch_add(underlays, Relaxed);
++    GECKO_W10M_OVERLAYS.fetch_add(overlays, Relaxed);
++}
++
++pub(crate) fn gecko_w10m_note_overlay_refusal(reason: &str) {
++    if let Ok(mut last) = GECKO_W10M_OVERLAY_REFUSAL.lock() {
++        if last.as_str() != reason {
++            *last = reason.to_string();
++        }
++    }
++}
++
++/// GeckoW10m: per composite pass, the share of the screen cleared, drawn
++/// opaque and drawn blended (see composite_pass).
++static GECKO_W10M_PASS: std::sync::Mutex<(u32, f64, f64, f64)> =
++    std::sync::Mutex::new((0, 0.0, 0.0, 0.0));
++
++pub(crate) fn gecko_w10m_note_pass(cleared: f32, opaque: f32, alpha: f32) {
++    if let Ok(mut pass) = GECKO_W10M_PASS.lock() {
++        pass.0 += 1;
++        pass.1 += cleared as f64;
++        pass.2 += opaque as f64;
++        pass.3 += alpha as f64;
++    }
++}
++
+ impl BufferDamageTracker {
+     /// Sets the damage rect for the current frame. Should only be called *after*
+     /// get_damage_rect() has been called to get the current backbuffer's damage rect.
+diff --git a/gfx/wr/webrender/src/tile_cache/mod.rs b/gfx/wr/webrender/src/tile_cache/mod.rs
+index 731be26cb1..dbb183d4f0 100644
+--- a/gfx/wr/webrender/src/tile_cache/mod.rs
++++ b/gfx/wr/webrender/src/tile_cache/mod.rs
+@@ -2497,6 +2497,12 @@ impl TileCacheInstance {
+                             break;
+                         }
+ 
++                        // GeckoW10m: why a video could not be drawn over the
++                        // page as an overlay, for the composite stats.
++                        if let (CompositorSurfaceKind::Overlay, Err(failure)) = (kind, &promotion_result) {
++                            crate::renderer::gecko_w10m_note_overlay_refusal(&format!("{}", failure));
++                        }
++
+                         // We couldn't promote, but did we give up because the slice is marked
+                         // atomic? If that was the reason, and the YuvImage is wide color,
+                         // failing to promote will flatten the colors and look terrible. Let's
