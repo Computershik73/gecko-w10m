@@ -55,6 +55,13 @@ class Log {
   // there even if this one dies at once -- and on suspend. Blocking; call
   // it off the UI thread.
   static void Mirror();
+
+  // Whether the user asked for the verbose diagnostics (Settings > About the
+  // Windows 10 Mobile port > Verbose logs for debugging). Read once, by Init,
+  // from the profile's prefs.js -- the shell starts before the engine and
+  // cannot ask Gecko -- so a change takes effect at the next launch. Off by
+  // default: the browser then writes what a crash needs and little else.
+  static bool Verbose();
 };
 
 }  // namespace gecko_w10m::client

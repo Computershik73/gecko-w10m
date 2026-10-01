@@ -438,6 +438,12 @@ bool EngineView::Resolve() {
           // have covered a working GPU path for ever.
           if (strstr(text, "took the swap chain")) {
             g_panelPresenting.store(true);
+          } else if (!Log::Verbose() && !strstr(text, "fail") &&
+                     !strstr(text, "FAIL") && !strstr(text, "error") &&
+                     !strstr(text, "lost") && !strstr(text, "reset")) {
+            // Quiet logs: ANGLE reports every texture and program it makes,
+            // dozens a second while a page draws. Only trouble gets through.
+            return;
           }
           std::wstring wide;
           wide.reserve(strlen(text));

@@ -393,6 +393,11 @@ HRESULT GeckoDeviceRemovedReason() {
 DWORD WINAPI HeartbeatThread(LPVOID) {
   unsigned last = 0;
   unsigned beat = 0;
+  // Quiet (the default): every two seconds, and it speaks only when a device
+  // was reset or the process was frozen -- no line per beat, no flush, no
+  // survey of the address space, no renderer autopsy.
+  const bool verbose = Log::Verbose();
+  const DWORD interval = verbose ? 250 : 2000;
   while (true) {
     // Quarter-second, and carrying how long ago the last frame was. At half a
     // second with only a count, a beat that lands sixteen milliseconds after a
@@ -400,7 +405,7 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
     // fault or drew straight through it -- which is exactly the reading I got
     // wrong.
     const ULONGLONG before = ::GetTickCount64();
-    ::Sleep(250);
+    ::Sleep(interval);
     const ULONGLONG slept = ::GetTickCount64() - before;
     const unsigned frames = gUiFrames.load();
     const ULONGLONG age = ::GetTickCount64() - gLastFrameAt.load();
@@ -409,7 +414,7 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
     // past the mended fault and then everything, this thread included, went
     // quiet at once. That is a suspend or a kill, not a fault, and the two
     // should not look alike in the log.
-    if (slept > 1000) {
+    if (slept > interval + 750) {
       Log::WriteFromFault(L"alive: the whole process was frozen for " +
                           std::to_wstring(slept) +
                           L" ms -- nothing ran, not even this");
@@ -441,6 +446,9 @@ DWORD WINAPI HeartbeatThread(LPVOID) {
                             (removed == S_OK ? L" (alive)"
                                              : L" -- THE ENGINE'S DEVICE WAS RESET"));
       }
+    }
+    if (!verbose) {
+      continue;
     }
     if (gWrPulseFn && gWrWhereFn) {
       const uint32_t pulse = gWrPulseFn();

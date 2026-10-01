@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 16:43:55 +0400
+Subject: [PATCH] Preferences: a verbose-logs toggle in the port's About
+ section
+
+gecko.debug.verbose_logs, off by default. The shell reads it from prefs.js
+at launch and turns on Gecko's own logging and its probes only when it is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../preferences/config/about-firefox.mjs           | 14 ++++++++++++++
+ .../en-US/browser/preferences/preferences.ftl      |  4 ++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/browser/components/preferences/config/about-firefox.mjs b/browser/components/preferences/config/about-firefox.mjs
+index 7c041871e9..052149fd3b 100644
+--- a/browser/components/preferences/config/about-firefox.mjs
++++ b/browser/components/preferences/config/about-firefox.mjs
+@@ -284,6 +284,16 @@ Preferences.addSetting({ id: "geckoPortTelegram" });
+ Preferences.addSetting({ id: "geckoPortDonate" });
+ Preferences.addSetting({ id: "geckoPortDonateAbroad" });
+ Preferences.addSetting({ id: "geckoDefaultBrowser" });
++
++// Port: the shell's diagnostics. Off, the browser writes only what a crash
++// needs; on, the shell turns on Gecko's own logging and its probes at the
++// next launch. The shell reads this pref out of prefs.js before the engine
++// starts, so a change here takes effect after a restart.
++Preferences.addAll([{ id: "gecko.debug.verbose_logs", type: "bool" }]);
++Preferences.addSetting({
++  id: "geckoVerboseLogs",
++  pref: "gecko.debug.verbose_logs",
++});
+ Preferences.addSetting({
+   id: "geckoPortVersion",
+   getControlConfig(config) {
+@@ -660,6 +670,10 @@ SettingGroupManager.registerGroups({
+           },
+         ],
+       },
++      {
++        id: "geckoVerboseLogs",
++        l10nId: "gecko-verbose-logs",
++      },
+     ],
+   },
+   support: {
+diff --git a/browser/locales/en-US/browser/preferences/preferences.ftl b/browser/locales/en-US/browser/preferences/preferences.ftl
+index 3bbd1ffe5e..280896855f 100644
+--- a/browser/locales/en-US/browser/preferences/preferences.ftl
++++ b/browser/locales/en-US/browser/preferences/preferences.ftl
+@@ -845,6 +845,10 @@ gecko-port-donate-abroad =
+     .label = Outside the CIS and would like to help?
+     .description = Send a message to the Telegram channel.
+ 
++gecko-verbose-logs =
++    .label = Verbose logs for debugging
++    .description = Writes detailed engine logs to the app's folder. Slows the browser down; takes effect after a restart.
++
+ ## Firefox support
+ 
+ support-application-heading =

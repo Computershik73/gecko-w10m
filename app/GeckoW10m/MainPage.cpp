@@ -93,6 +93,10 @@ MainPage::MainPage() {
     Log::Write(line);
   }
   Log::Write(L"LocalState", std::wstring(localState));
+  Log::Write(Log::Verbose()
+                 ? L"logs: verbose -- the engine's logging and the probes are on"
+                 : L"logs: quiet (Settings > About > Verbose logs for debugging "
+                   L"turns the diagnostics on at the next launch)");
   std::thread([] { Log::Mirror(); }).detach();
 
   // The number every memory question on this platform comes down to. A phone
@@ -192,7 +196,7 @@ MainPage::MainPage() {
           Log::Write(line);
           // Every other sample -- every minute once past the first two --
           // what that memory is made of.
-          if (++samples % 2 == 0) {
+          if (++samples % 2 == 0 && Log::Verbose()) {
             gecko_w10m::engine::LogMemoryMap();
           }
         } catch (...) {
@@ -213,7 +217,9 @@ MainPage::MainPage() {
   // it, and so is pushing work through it beside the compositor -- and leaving
   // it on would put its own textures in the address space that is now the
   // thing being measured.
-  engine::MakeSecondD3DDevice();  // a witness device: the heartbeat asks it whether the GPU was reset
+  if (Log::Verbose()) {
+    engine::MakeSecondD3DDevice();  // a witness device: the heartbeat asks it whether the GPU was reset
+  }
 
   // The compositor telling us it has lost its surfaces is the one warning a
   // GPU reset gives an application. If the phone's driver is being knocked

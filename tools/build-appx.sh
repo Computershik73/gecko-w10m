@@ -344,6 +344,10 @@ pref("browser.startup.homepage", "https://google.com");
 // The port's own version, for Settings > About. The engine's version is
 // Firefox's and is displayed beside it.
 pref("gecko.port.version", "$VERSION");
+// Settings > About > Verbose logs for debugging. Off: the shell writes what a
+// crash needs and Gecko's own logging stays off. The shell reads the user's
+// choice out of prefs.js at launch, so it takes effect after a restart.
+pref("gecko.debug.verbose_logs", false);
 // 0: the first tab is blank. Every launch used to begin with google.com,
 // and on a network where it does not answer the handshake sat in front of the
 // whole startup with the browser deaf to taps until it gave up. The home

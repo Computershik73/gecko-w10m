@@ -188,8 +188,13 @@ bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
     return false;
   }
   // The sampler takes the handle: it is the only thing that will know where
-  // the thread was if the process goes without a word.
-  StartLastLocationSampler(thread);
+  // the thread was if the process goes without a word. It suspends the UI
+  // thread every millisecond once the engine is up, so only on request.
+  if (Log::Verbose()) {
+    StartLastLocationSampler(thread);
+  } else {
+    ::CloseHandle(thread);
+  }
   return true;
 }
 

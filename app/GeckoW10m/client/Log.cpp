@@ -17,6 +17,25 @@ HANDLE g_file = INVALID_HANDLE_VALUE;
 std::wstring g_path;
 std::vector<std::wstring> g_ring;
 std::function<void(std::wstring)> g_handler;
+bool g_verbose = false;
+
+// Gecko writes a pref the user changed as
+//   user_pref("gecko.debug.verbose_logs", true);
+// and drops the line again when it goes back to its default, false.
+bool ReadVerbosePref(const std::wstring& localState) {
+  const std::wstring prefs = localState + L"profile\\prefs.js";
+  FILE* f = _wfopen(prefs.c_str(), L"rb");
+  if (!f) return false;
+  bool verbose = false;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    if (strstr(line, "\"gecko.debug.verbose_logs\"")) {
+      verbose = strstr(line, "true") != nullptr;
+    }
+  }
+  fclose(f);
+  return verbose;
+}
 
 std::wstring Timestamp() {
   SYSTEMTIME st{};
@@ -80,12 +99,19 @@ void Log::Mirror() {
   }
 }
 
+bool Log::Verbose() { return g_verbose; }
+
 void Log::Init(std::wstring_view localStatePath) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_file != INVALID_HANDLE_VALUE) return;
 
   g_path.assign(localStatePath);
   if (!g_path.empty() && g_path.back() != L'\\') g_path += L'\\';
+  g_verbose = ReadVerbosePref(g_path);
+  // For the engine bootstrap, which does not link this file: it decides from
+  // this whether Gecko's own logging goes on.
+  ::SetEnvironmentVariableW(L"GECKO_W10M_VERBOSE_LOGS",
+                            g_verbose ? L"1" : nullptr);
   g_path += L"gecko.log";
 
   // CreateFile2 is the app-container form of CreateFile; the app's own
