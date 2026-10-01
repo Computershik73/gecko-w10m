@@ -65,7 +65,21 @@ COUNTER="$APP/build-number.txt"
 BUILD="$(( $(tr -cd '0-9' < "$COUNTER") + 1 ))"
 echo "$BUILD" > "$COUNTER"
 
-BASE="$(grep -oE 'Version="[0-9]+\.[0-9]+\.[0-9]+' "$APP/Package.appxmanifest" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+# The first three fields are the engine's own version, from the Firefox tree
+# the package carries (browser/config/version.txt: "155.0.1" -> 155.0.1, and
+# a pre-release such as "156.0a1" -> 156.0.0); the fourth is the build number.
+BASE="$(python - "$(cygpath -w "$ROOT/engine/firefox/browser/config/version.txt")" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read().strip()
+parts = [int(p) for p in re.findall(r"\d+", text.split("a")[0].split("b")[0])][:3]
+parts += [0] * (3 - len(parts))
+print(".".join(str(p) for p in parts))
+PY
+)"
+if ! [[ "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "cannot read the engine's version from engine/firefox/browser/config/version.txt" >&2
+  exit 1
+fi
 VERSION="$BASE.$BUILD"
 # Write it back, so the tree records the package it produced.
 python - "$(cygpath -w "$APP/Package.appxmanifest")" "$VERSION" <<'PY'
