@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 13:35:01 +0400
+Subject: [PATCH] Tap note: pass the coordinates to printf as doubles
+
+CSSCoord is a struct; through the varargs it shifted every argument after it,
+a %s was read from a garbage address, and the first tap took the browser
+down (155.16.0.112).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ layout/base/PositionedEventTargeting.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/layout/base/PositionedEventTargeting.cpp b/layout/base/PositionedEventTargeting.cpp
+index 2026ab9880..fe54924134 100644
+--- a/layout/base/PositionedEventTargeting.cpp
++++ b/layout/base/PositionedEventTargeting.cpp
+@@ -806,12 +806,17 @@ nsIFrame* FindFrameTargetedByInputEvent(
+         "tap: at %.0f,%.0f CSS px from the %s's top left (widget point %d,%d, "
+         "%.3f device px a CSS px, resolution %.3f, scrolled to %.0f,%.0f); "
+         "under the finger %s, clicked %s",
+-        css.x, css.y,
++        // Every number goes through the varargs as a double: CSSCoord is a
++        // struct, and passing one there shifted every argument after it --
++        // the first build of this note read a %s from a garbage address and
++        // took the browser down on the first tap.
++        double(css.x.value), double(css.y.value),
+         aRootFrame.mViewportType == ViewportType::Visual ? "visual viewport"
+                                                          : "layout viewport",
+         int(aEvent->mRefPoint.x), int(aEvent->mRefPoint.y),
+-        float(pc->CSSToDevPixelScale().scale), shell->GetResolution(),
+-        CSSPixel::FromAppUnits(scroll.x), CSSPixel::FromAppUnits(scroll.y),
++        double(pc->CSSToDevPixelScale().scale), double(shell->GetResolution()),
++        double(CSSPixel::FromAppUnits(scroll.x).value),
++        double(CSSPixel::FromAppUnits(scroll.y).value),
+         GeckoW10mDescribe(exact).get(),
+         result == exact ? "the same" : GeckoW10mDescribe(result).get());
+     GeckoW10mNote(note.get());
