@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 1 Oct 2026 22:52:19 +0400
+Subject: [PATCH] Partial present: draw whole frames until ANGLE's surface has
+ the window's size
+
+ANGLE resizes its swap chain and offscreen texture after a present, when it
+notices the panel changed size, and moves the old picture into the new
+texture. The one whole frame drawn at the window's new size went into the
+old buffers; every later frame drew only its dirty tiles into the moved
+picture, and after the keyboard opened or closed a strip of new page stood
+over the old one. Query the surface's size, and draw whole while it differs
+from the window's or has just changed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorEGL.cpp                   | 37 ++++++++++++++++---
+ gfx/webrender_bindings/RenderCompositorEGL.h  |  6 +++
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index 44786a92e0..a18a53e050 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -224,10 +224,9 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+ #if defined(GECKO_W10M)
+   if (mPostSubBuffer && mEGLSurface != EGL_NO_SURFACE) {
+     const auto bufferSize = GetBufferSize();
+-    // WebRender drew this frame whole (RequestFullRender), so the whole of
+-    // it goes out -- after a resize the swap chain's buffers are new and
+-    // hold nothing outside a dirty rect.
+-    const bool whole = mFullRender || bufferSize != mPresentedSize;
++    // WebRender drew this frame whole (RequestFullRender decided it), so
++    // the whole of it goes out.
++    const bool whole = mWholeFrame;
+     gfx::IntRect bounds;
+     for (const DeviceIntRect& rect : aDirtyRects) {
+       const auto left = std::clamp(rect.min.x, 0, bufferSize.width);
+@@ -251,8 +250,15 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+       const auto& egl = gl::GLContextEGL::Cast(gl())->mEgl;
+       if (mPostSubBuffer(egl->mDisplay, mEGLSurface, bounds.X(), bounds.Y(),
+                          bounds.Width(), bounds.Height())) {
+-        mFullRender = false;
+         mPresentedSize = bufferSize;
++        // ANGLE resizes its buffers after a present, when it sees that the
++        // panel changed size -- and moves the old picture into the new
++        // offscreen texture as it does. So the frame after a resize has to
++        // be drawn whole as well, and so does every frame until ANGLE's size
++        // and the window's agree. Drawing only the dirty tiles into the
++        // moved picture is what left a strip of new page over the old one
++        // after the keyboard opened or closed.
++        mFullRender = SurfaceSize() != bufferSize.ToUnknownSize();
+       } else {
+         // Present the next frame whole, whatever went wrong with this one.
+         mFullRender = true;
+@@ -446,12 +452,31 @@ bool RenderCompositorEGL::UsePartialPresent() {
+ bool RenderCompositorEGL::RequestFullRender() {
+ #if defined(GECKO_W10M)
+   if (mPostSubBuffer) {
+-    return mFullRender || GetBufferSize() != mPresentedSize;
++    const auto bufferSize = GetBufferSize();
++    const gfx::IntSize surfaceSize = SurfaceSize();
++    mWholeFrame = mFullRender || bufferSize != mPresentedSize ||
++                  surfaceSize != bufferSize.ToUnknownSize() ||
++                  surfaceSize != mPresentedSurfaceSize;
++    mPresentedSurfaceSize = surfaceSize;
++    return mWholeFrame;
+   }
+ #endif
+   return false;
+ }
+ 
++#if defined(GECKO_W10M)
++gfx::IntSize RenderCompositorEGL::SurfaceSize() const {
++  EGLint width = 0;
++  EGLint height = 0;
++  if (mEGLSurface != EGL_NO_SURFACE) {
++    const auto& egl = gl::GLContextEGL::Cast(gl())->mEgl;
++    egl->fQuerySurface(mEGLSurface, LOCAL_EGL_WIDTH, &width);
++    egl->fQuerySurface(mEGLSurface, LOCAL_EGL_HEIGHT, &height);
++  }
++  return gfx::IntSize(width, height);
++}
++#endif
++
+ uint32_t RenderCompositorEGL::GetMaxPartialPresentRects() {
+ #if defined(GECKO_W10M)
+   if (mPostSubBuffer) {
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 0d14dfd32f..5a02e4f436 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -86,6 +86,12 @@ class RenderCompositorEGL : public RenderCompositor {
+   // and presented whole.
+   LayoutDeviceIntSize mPresentedSize;
+   bool mFullRender = true;
++  // ANGLE's own idea of the surface's size, which follows the panel and
++  // changes a present later than the window's.
++  gfx::IntSize SurfaceSize() const;
++  gfx::IntSize mPresentedSurfaceSize;
++  // What RequestFullRender decided for the frame being drawn.
++  bool mWholeFrame = true;
+   // For the note every ten seconds: what presenting cost.
+   TimeStamp mPresentStatsStart;
+   uint32_t mPresentFrames = 0;
