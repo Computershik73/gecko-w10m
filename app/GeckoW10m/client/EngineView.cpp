@@ -752,43 +752,53 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
           return;
         }
         // Everything arrives in the browser surface's pixels, which are the
-        // display's. The swap chain shows one of its pixels per composition
-        // pixel, so laid out at its own size it is chain / scale view pixels
-        // across; the transform takes it from there to the video's place.
+        // display's. A swap chain given to a SwapChainPanel is shown one of
+        // its pixels per view pixel, whatever the display's density -- the
+        // browser's own panel has ANGLE undo that with a matrix transform --
+        // so laid out at its own size the panel is chain-sized in view
+        // pixels, and the transform takes it to the video's place. Only the
+        // display's density goes into this: the panel's CompositionScale
+        // already includes the transform set here, and computing from it fed
+        // each placement the last one's scale -- the video showed magnified.
         const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
-        double scale = gVideoPanel.CompositionScaleX();
-        if (scale <= 0) {
-          scale = raw;
-        }
-        gVideoPanel.Width(chainWidth / scale);
-        gVideoPanel.Height(chainHeight / scale);
+        gVideoPanel.Width(chainWidth);
+        gVideoPanel.Height(chainHeight);
+        const double scaleX = width / raw / chainWidth;
+        const double scaleY = height / raw / chainHeight;
         CompositeTransform transform;
-        transform.ScaleX(width * scale / (raw * chainWidth));
-        transform.ScaleY(height * scale / (raw * chainHeight));
+        transform.ScaleX(scaleX);
+        transform.ScaleY(scaleY);
         transform.TranslateX(x / raw);
         transform.TranslateY(y / raw);
         gVideoPanel.RenderTransform(transform);
+        // The part of the video the page shows, in the panel's own units
+        // (chain pixels) -- and no clip at all when all of it shows: a
+        // clipped layer may be one the display cannot take as an overlay.
+        const bool whole = clipX == x && clipY == y && clipWidth == width &&
+                           clipHeight == height;
+        if (whole) {
+          gVideoPanel.Clip(nullptr);
+        } else {
+          RectangleGeometry clip;
+          const double perX = double(chainWidth) / width;
+          const double perY = double(chainHeight) / height;
+          clip.Rect({static_cast<float>((clipX - x) * perX),
+                     static_cast<float>((clipY - y) * perY),
+                     static_cast<float>(clipWidth * perX),
+                     static_cast<float>(clipHeight * perY)});
+          gVideoPanel.Clip(clip);
+        }
         static int sPlacementNotes = 0;
         if (sPlacementNotes < 6) {
           ++sPlacementNotes;
           Log::Write(L"video layer: placed " + std::to_wstring(generation) +
-                     L" -- composition scale " + std::to_wstring(scale) +
-                     L", raw " + std::to_wstring(raw) + L", panel " +
-                     std::to_wstring(chainWidth / scale) + L"x" +
-                     std::to_wstring(chainHeight / scale) + L" view px, scaled " +
-                     std::to_wstring(width * scale / (raw * chainWidth)) +
-                     L", at " + std::to_wstring(x / raw) + L"," +
-                     std::to_wstring(y / raw));
+                     L" -- chain " + std::to_wstring(chainWidth) + L"x" +
+                     std::to_wstring(chainHeight) + L" scaled " +
+                     std::to_wstring(scaleX) + L"x" + std::to_wstring(scaleY) +
+                     L" at " + std::to_wstring(x / raw) + L"," +
+                     std::to_wstring(y / raw) + L" view px" +
+                     (whole ? L", no clip" : L", clipped"));
         }
-        // The part of the video the page shows, in the panel's own units.
-        RectangleGeometry clip;
-        const double perX = double(chainWidth) / width / scale;
-        const double perY = double(chainHeight) / height / scale;
-        clip.Rect({static_cast<float>((clipX - x) * perX),
-                   static_cast<float>((clipY - y) * perY),
-                   static_cast<float>(clipWidth * perX),
-                   static_cast<float>(clipHeight * perY)});
-        gVideoPanel.Clip(clip);
         if (auto ack = gVideoAck.load()) {
           ack(generation);
         }
