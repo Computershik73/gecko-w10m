@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 2 Oct 2026 12:32:50 +0400
+Subject: [PATCH] Video layer: pass the external image id with the Draw
+ compositor too
+
+WebRender looked the id up only for images Gecko marks as supporting an
+external compositor surface, which it does only for DirectComposition, so
+the video layer was never offered a frame. With the Draw compositor the id
+goes nowhere else. The layer now also says, once each, why it leaves a video
+to WebRender, and when it first shows one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 42 +++++++++++++++++--
+ gfx/wr/webrender/src/tile_cache/mod.rs        |  8 +++-
+ 2 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 52f7efcde5..13bd9bf258 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -91,9 +91,21 @@ struct VideoLayer {
+ 
+   uint32_t mStatFrames = 0;
+   uint32_t mStatHoles = 0;
++  bool mSaidHole = false;
+ 
+   void Note(const char* aText) { GeckoW10mNote(aText); }
+ 
++  // Each reason a video is left to WebRender, said once.
++  uint32_t mDeclinedReasons = 0;
++  void Decline(uint32_t aReason, const char* aWhy) {
++    if (!(mDeclinedReasons & aReason)) {
++      mDeclinedReasons |= aReason;
++      char note[160];
++      SprintfLiteral(note, "video layer: a video left to WebRender -- %s", aWhy);
++      Note(note);
++    }
++  }
++
+   void Break(const char* aWhy, HRESULT aHr) {
+     char note[160];
+     SprintfLiteral(note, "video layer: %s (0x%08lx) -- WebRender keeps drawing videos",
+@@ -233,21 +245,39 @@ struct VideoLayer {
+   }
+ 
+   bool Offer(const mozilla::wr::ExternalImageId& aId, const float* aRects) {
+-    if (mBroken || !sSink.load() ||
+-        !mozilla::StaticPrefs::gfx_webrender_gecko_w10m_video_overlay_AtStartup()) {
++    if (mBroken) {
++      return false;
++    }
++    if (!mozilla::StaticPrefs::gfx_webrender_gecko_w10m_video_overlay_AtStartup()) {
++      Decline(16, "turned off (gfx.webrender.gecko-w10m.video-overlay)");
++      return false;
++    }
++    if (!sSink.load()) {
++      Decline(32, "the shell has no panel for it");
+       return false;
+     }
+     mOfferedThisFrame = true;
+ 
+     auto* texture = mozilla::wr::RenderThread::Get()->GetRenderTexture(aId);
+     auto* host = texture ? texture->AsRenderDXGITextureHost() : nullptr;
+-    if (!host || host->GetFormat() != mozilla::gfx::SurfaceFormat::NV12 ||
+-        host->mHasKeyedMutex) {
++    if (!host) {
++      Decline(1, texture ? "not a D3D11 texture" : "no texture for its id");
++      Hide();
++      return false;
++    }
++    if (host->GetFormat() != mozilla::gfx::SurfaceFormat::NV12) {
++      Decline(2, "not NV12");
++      Hide();
++      return false;
++    }
++    if (host->mHasKeyedMutex) {
++      Decline(4, "the frame is behind a keyed mutex");
+       Hide();
+       return false;
+     }
+     ID3D11Texture2D* d3dTexture = host->GetD3D11Texture2DWithGL();
+     if (!d3dTexture) {
++      Decline(8, "the frame's texture could not be opened");
+       Hide();
+       return false;
+     }
+@@ -297,6 +327,10 @@ struct VideoLayer {
+     ++mStatFrames;
+     if (hole) {
+       ++mStatHoles;
++      if (!mSaidHole) {
++        mSaidHole = true;
++        Note("video layer: the display shows the video; WebRender leaves a hole");
++      }
+     }
+     return hole;
+   }
+diff --git a/gfx/wr/webrender/src/tile_cache/mod.rs b/gfx/wr/webrender/src/tile_cache/mod.rs
+index dbb183d4f0..3517986400 100644
+--- a/gfx/wr/webrender/src/tile_cache/mod.rs
++++ b/gfx/wr/webrender/src/tile_cache/mod.rs
+@@ -1880,7 +1880,13 @@ impl TileCacheInstance {
+         // If this primitive is an external image, and supports being used
+         // directly by a native compositor, then lookup the external image id
+         // so we can pass that through.
+-        let mut external_image_id = if flags.contains(PrimitiveFlags::SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE)
++        // GeckoW10m: with the Draw compositor too, where the id only travels
++        // to the video layer (GeckoW10mVideoLayer.cpp), which shows the frame
++        // as a display overlay. Gecko marks images as supporting an external
++        // compositor surface only for DirectComposition.
++        let draw_compositor = matches!(composite_state.compositor_kind, CompositorKind::Draw { .. });
++        let mut external_image_id = if (flags.contains(PrimitiveFlags::SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE)
++            || draw_compositor)
+             && image_rendering == ImageRendering::Auto {
+             resource_cache.get_image_properties(api_keys[0])
+                 .and_then(|properties| properties.external_image)
