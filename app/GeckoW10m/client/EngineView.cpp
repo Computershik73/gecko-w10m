@@ -768,6 +768,18 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         transform.TranslateX(x / raw);
         transform.TranslateY(y / raw);
         gVideoPanel.RenderTransform(transform);
+        static int sPlacementNotes = 0;
+        if (sPlacementNotes < 6) {
+          ++sPlacementNotes;
+          Log::Write(L"video layer: placed " + std::to_wstring(generation) +
+                     L" -- composition scale " + std::to_wstring(scale) +
+                     L", raw " + std::to_wstring(raw) + L", panel " +
+                     std::to_wstring(chainWidth / scale) + L"x" +
+                     std::to_wstring(chainHeight / scale) + L" view px, scaled " +
+                     std::to_wstring(width * scale / (raw * chainWidth)) +
+                     L", at " + std::to_wstring(x / raw) + L"," +
+                     std::to_wstring(y / raw));
+        }
         // The part of the video the page shows, in the panel's own units.
         RectangleGeometry clip;
         const double perX = double(chainWidth) / width / scale;

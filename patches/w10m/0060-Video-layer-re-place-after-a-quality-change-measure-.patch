@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 2 Oct 2026 13:42:45 +0400
+Subject: [PATCH] Video layer: re-place after a quality change; measure
+ presents
+
+When YouTube switched quality the video chain was resized but the shell kept
+the old placement, which scales for the old chain size: the new, larger
+picture showed magnified. A resize now forgets the placement, so the next
+frame sends one and the hole stays closed until the shell applies it.
+
+Measurements for presents being slow while the browser's layer updates over
+the overlay: how long eglPostSubBufferNV takes (in the present note), how
+long the video chain's present takes, and how the system really showed the
+video -- overlay or composed by the GPU -- from IDXGISwapChainMedia, with the
+first placements after each chain change noted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 65 +++++++++++++++++--
+ .../RenderCompositorEGL.cpp                   | 24 +++++--
+ gfx/webrender_bindings/RenderCompositorEGL.h  |  2 +
+ 3 files changed, 81 insertions(+), 10 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 33c18e5f81..4991b14a61 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -30,6 +30,7 @@
+ #include <atomic>
+ 
+ #include "mozilla/StaticPrefs_gfx.h"
++#include "mozilla/TimeStamp.h"
+ #include "mozilla/Sprintf.h"
+ #include "mozilla/webrender/RenderD3D11TextureHost.h"
+ #include "mozilla/webrender/RenderThread.h"
+@@ -79,6 +80,7 @@ struct VideoLayer {
+   uint32_t mStableFrames = 0;
+   bool mShown = false;
+   bool mPresented = false;
++  uint32_t mPlacementNotes = 0;
+ 
+   // The last frame copied in, so a composite for another reason does not
+   // present the same picture again.
+@@ -91,6 +93,11 @@ struct VideoLayer {
+ 
+   uint32_t mStatFrames = 0;
+   uint32_t mStatHoles = 0;
++  uint32_t mStatOverlay = 0;
++  uint32_t mStatComposed = 0;
++  uint32_t mStatOther = 0;
++  uint32_t mStatPresents = 0;
++  double mStatPresentMs = 0;
+   bool mSaidHole = false;
+ 
+   void Note(const char* aText) { GeckoW10mNote(aText); }
+@@ -144,8 +151,18 @@ struct VideoLayer {
+       mChainHeight = aHeight;
+       mLastTexture = nullptr;
+       mPresented = false;
+-      ++mGeneration;  // the panel's scale depends on the chain's size
++      // The panel's scale depends on the chain's size: forget the placement
++      // so the next frame sends a new one, and keep the hole closed until
++      // the shell has applied it. Without this a quality change kept the old
++      // scale, and the new, larger picture showed magnified.
++      mRect = Rect();
++      mClip = Rect();
+       mStableFrames = 0;
++      mPlacementNotes = 0;
++      char note[128];
++      SprintfLiteral(note, "video layer: the swap chain is now %dx%d", aWidth,
++                     aHeight);
++      Note(note);
+       return true;
+     }
+ 
+@@ -233,11 +250,33 @@ struct VideoLayer {
+     }
+     D3D11_BOX box = {0, 0, 0, UINT(mChainWidth), UINT(mChainHeight), 1};
+     mContext->CopySubresourceRegion(buffer, 0, 0, 0, 0, aTexture, index, &box);
++    const mozilla::TimeStamp presentStart = mozilla::TimeStamp::Now();
+     hr = mChain->Present(0, 0);
++    mStatPresentMs +=
++        (mozilla::TimeStamp::Now() - presentStart).ToMilliseconds();
++    ++mStatPresents;
+     if (FAILED(hr)) {
+       Break("present failed", hr);
+       return false;
+     }
++    // How the system really showed it: as a hardware overlay, or composed
++    // by the GPU after all. Asked every half second.
++    if (mStatPresents % 30 == 0) {
++      RefPtr<IDXGISwapChainMedia> media;
++      DXGI_FRAME_STATISTICS_MEDIA stats = {};
++      if (SUCCEEDED(mChain->QueryInterface(__uuidof(IDXGISwapChainMedia),
++                                           getter_AddRefs(media))) &&
++          SUCCEEDED(media->GetFrameStatisticsMedia(&stats))) {
++        if (stats.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY) {
++          ++mStatOverlay;
++        } else if (stats.CompositionMode ==
++                   DXGI_FRAME_PRESENTATION_MODE_COMPOSED) {
++          ++mStatComposed;
++        } else {
++          ++mStatOther;
++        }
++      }
++    }
+     mLastTexture = aTexture;
+     mLastIndex = index;
+     mLastHost = aHost;
+@@ -321,6 +360,16 @@ struct VideoLayer {
+       mClip = clip;
+       ++mGeneration;
+       mStableFrames = 0;
++      if (mPlacementNotes < 4) {
++        ++mPlacementNotes;
++        char note[192];
++        SprintfLiteral(note,
++                       "video layer: placed %u -- %dx%d at %d,%d, visible "
++                       "%dx%d at %d,%d, chain %dx%d",
++                       mGeneration, rect.w, rect.h, rect.x, rect.y, clip.w,
++                       clip.h, clip.x, clip.y, mChainWidth, mChainHeight);
++        Note(note);
++      }
+       if (auto* sink = sSink.load()) {
+         sink->place(mGeneration, rect.x, rect.y, rect.w, rect.h, clip.x,
+                     clip.y, clip.w, clip.h, mChainWidth, mChainHeight);
+@@ -356,13 +405,19 @@ struct VideoLayer {
+     }
+     mOfferedThisFrame = false;
+     if (mStatFrames >= 300) {
+-      char note[128];
++      char note[256];
+       SprintfLiteral(note,
+-                     "video layer: %u of the last %u video frames shown by the "
+-                     "display as an overlay",
+-                     mStatHoles, mStatFrames);
++                     "video layer: a hole in %u of the last %u composites; the "
++                     "system says overlay %u, composed by the GPU %u, other "
++                     "%u; a video present took %.1f ms",
++                     mStatHoles, mStatFrames, mStatOverlay, mStatComposed,
++                     mStatOther,
++                     mStatPresents ? mStatPresentMs / mStatPresents : 0.0);
+       Note(note);
+       mStatFrames = mStatHoles = 0;
++      mStatOverlay = mStatComposed = mStatOther = 0;
++      mStatPresents = 0;
++      mStatPresentMs = 0;
+     }
+   }
+ };
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index a9bd210e47..9535700695 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -279,8 +279,18 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+       ++mPresentSkipped;
+     } else {
+       const auto& egl = gl::GLContextEGL::Cast(gl())->mEgl;
+-      if (mPostSubBuffer(egl->mDisplay, mEGLSurface, bounds.X(), bounds.Y(),
+-                         bounds.Width(), bounds.Height())) {
++      // How long handing the frame to the system takes, apart from drawing
++      // it: with a video on the display overlay, small presents were seen
++      // to cost a whole frame.
++      const TimeStamp presentStart = TimeStamp::Now();
++      const bool posted =
++          mPostSubBuffer(egl->mDisplay, mEGLSurface, bounds.X(), bounds.Y(),
++                         bounds.Width(), bounds.Height());
++      const double presentMs =
++          (TimeStamp::Now() - presentStart).ToMilliseconds();
++      mPresentMs += presentMs;
++      mPresentMaxMs = std::max(mPresentMaxMs, presentMs);
++      if (posted) {
+         mPresentedSize = bufferSize;
+         // ANGLE resizes its buffers after a present, when it sees that the
+         // panel changed size -- and moves the old picture into the new
+@@ -312,18 +322,22 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+     if (span >= 10) {
+       if (mPresentFrames >= 100) {
+         const uint32_t presented = mPresentFrames - mPresentSkipped;
+-        char note[200];
++        char note[256];
+         SprintfLiteral(note,
+                        "present: %u frames, %u with nothing changed (not "
+                        "presented), %u whole; a presented frame is %.0f%% of "
+-                       "the screen on average",
++                       "the screen on average and took %.1f ms to hand over "
++                       "(%.1f at most)",
+                        mPresentFrames, mPresentSkipped, mPresentWhole,
+-                       presented ? 100.0 * mPresentArea / presented : 0.0);
++                       presented ? 100.0 * mPresentArea / presented : 0.0,
++                       presented ? mPresentMs / presented : 0.0,
++                       mPresentMaxMs);
+         GeckoW10mNote(note);
+       }
+       mPresentStatsStart = now;
+       mPresentFrames = mPresentSkipped = mPresentWhole = 0;
+       mPresentArea = 0;
++      mPresentMs = mPresentMaxMs = 0;
+     }
+     return frameId;
+   }
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 2bd380ded5..602f77c24b 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -105,6 +105,8 @@ class RenderCompositorEGL : public RenderCompositor {
+   uint32_t mPresentSkipped = 0;
+   uint32_t mPresentWhole = 0;
+   double mPresentArea = 0;
++  double mPresentMs = 0;
++  double mPresentMaxMs = 0;
+ #endif
+ 
+   // FileDescriptor of release fence.
