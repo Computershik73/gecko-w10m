@@ -9,7 +9,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <string>
 
 #include "client/DrmBridge.h"
@@ -50,103 +49,6 @@ std::atomic<bool> g_panelPresenting{false};
 winrt::Windows::UI::Xaml::Controls::SwapChainPanel gVideoPanel{nullptr};
 std::atomic<void (*)(uint32_t)> gVideoAck{nullptr};
 double gRawPerView = 1.0;
-// The browser's panel, which the video layer lies under.
-winrt::Windows::UI::Xaml::Controls::SwapChainPanel gBrowserPanel{nullptr};
-
-// What the display needs before it takes the video layer as a hardware
-// overlay. The overlay test (engine/OverlayProbe.cpp) got one; the video
-// layer, in the page, has always been composed by the GPU. So at the first
-// video of a launch the shell steps through the ways the two differ, eight
-// seconds each, and the engine notes each time the display changes its mind
-// ("video layer: the system shows it ..." in gecko-notes.log). Then
-// everything is put back.
-struct VideoOverlayTest {
-  winrt::Windows::UI::Xaml::DispatcherTimer timer{nullptr};
-  int step = 0;
-  bool started = false;
-  // The panel is laid out at no size of its own, as the test's was: a swap
-  // chain shows from the panel's origin whatever its size.
-  bool unsized = false;
-  winrt::Windows::UI::Xaml::Media::Brush hostBackground{nullptr};
-  winrt::Windows::UI::Xaml::Controls::Border host{nullptr};
-};
-VideoOverlayTest gOverlayTest;
-
-void MoveVideoPanel(bool aboveBrowser) {
-  auto grid = gVideoPanel.Parent()
-                  .try_as<winrt::Windows::UI::Xaml::Controls::Panel>();
-  if (!grid || !gBrowserPanel) {
-    return;
-  }
-  uint32_t index = 0;
-  if (grid.Children().IndexOf(gVideoPanel, index)) {
-    grid.Children().RemoveAt(index);
-  }
-  uint32_t browser = 0;
-  if (grid.Children().IndexOf(gBrowserPanel, browser)) {
-    grid.Children().InsertAt(aboveBrowser ? browser + 1 : browser, gVideoPanel);
-  }
-}
-
-void VideoOverlayTestStep() {
-  auto& t = gOverlayTest;
-  if (!gVideoPanel) {
-    return;
-  }
-  switch (t.step++) {
-    case 0:
-      Log::Write(L"video layer test: A -- as it is");
-      break;
-    case 1:
-      t.unsized = true;
-      gVideoPanel.Width(std::numeric_limits<double>::quiet_NaN());
-      gVideoPanel.Height(std::numeric_limits<double>::quiet_NaN());
-      Log::Write(L"video layer test: B -- the panel has no size of its own");
-      break;
-    case 2:
-      if (auto grid = gVideoPanel.Parent()
-                          .try_as<winrt::Windows::UI::Xaml::FrameworkElement>()) {
-        t.host = grid.Parent()
-                     .try_as<winrt::Windows::UI::Xaml::Controls::Border>();
-      }
-      if (t.host) {
-        t.hostBackground = t.host.Background();
-        t.host.Background(nullptr);
-      }
-      Log::Write(std::wstring(L"video layer test: C -- B, and nothing under "
-                              L"the video") +
-                 (t.host ? L"" : L" (no host found)"));
-      break;
-    case 3:
-      MoveVideoPanel(true);
-      Log::Write(L"video layer test: D -- C, and the video ABOVE the browser "
-                 L"(its controls are hidden)");
-      break;
-    default:
-      MoveVideoPanel(false);
-      if (t.host) {
-        t.host.Background(t.hostBackground);
-      }
-      t.unsized = false;
-      Log::Write(L"video layer test: over, all put back");
-      t.timer.Stop();
-      t.timer = nullptr;
-      return;
-  }
-}
-
-void StartVideoOverlayTest() {
-  auto& t = gOverlayTest;
-  if (t.started) {
-    return;
-  }
-  t.started = true;
-  t.timer = winrt::Windows::UI::Xaml::DispatcherTimer();
-  t.timer.Interval(std::chrono::seconds(8));
-  t.timer.Tick([](auto&&, auto&&) { VideoOverlayTestStep(); });
-  t.timer.Start();
-  Log::Write(L"video layer test: starts in 8 s, four steps of 8 s");
-}
 }  // namespace
 
 
@@ -186,7 +88,6 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     video_panel_.IsHitTestVisible(false);
     video_panel_.Visibility(Visibility::Collapsed);
     gVideoPanel = video_panel_;
-    gBrowserPanel = panel_;
     gRawPerView = rawPerView_;
   } else {
     panelWithheld_ = true;
@@ -514,7 +415,7 @@ bool EngineView::Resolve() {
       gVideoAck.store(reinterpret_cast<void (*)(uint32_t)>(
           ::GetProcAddress(xul, "gecko_w10m_video_layer_ack")));
       static const VideoLayerSink sink{&VideoLayerAttach, &VideoLayerPlace,
-                                       &VideoLayerShow};
+                                       &VideoLayerShow, &VideoLayerStack};
       set_video_layer_(&sink);
       Log::Write(L"view: a playing video can go to the display as an overlay");
     }
@@ -860,10 +761,8 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         // already includes the transform set here, and computing from it fed
         // each placement the last one's scale -- the video showed magnified.
         const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
-        if (!gOverlayTest.unsized) {
-          gVideoPanel.Width(chainWidth);
-          gVideoPanel.Height(chainHeight);
-        }
+        gVideoPanel.Width(chainWidth);
+        gVideoPanel.Height(chainHeight);
         const double scaleX = width / raw / chainWidth;
         const double scaleY = height / raw / chainHeight;
         CompositeTransform transform;
@@ -906,6 +805,24 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
       });
 }
 
+void EngineView::VideoLayerStack(int32_t above) {
+  if (!gUiDispatcher) {
+    return;
+  }
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::High, [above]() {
+        // The display scans the video out as a hardware overlay only while
+        // its panel lies above the browser's (build 132's test); the engine
+        // asks for that while nothing of the page is in front of the video,
+        // and for under the browser again as soon as something is. Raised
+        // over its siblings rather than moved in the tree.
+        if (gVideoPanel) {
+          winrt::Windows::UI::Xaml::Controls::Canvas::SetZIndex(gVideoPanel,
+                                                                above ? 1 : 0);
+        }
+      });
+}
+
 void EngineView::VideoLayerShow(int32_t visible) {
   if (!gUiDispatcher) {
     return;
@@ -916,9 +833,6 @@ void EngineView::VideoLayerShow(int32_t visible) {
           gVideoPanel.Visibility(visible ? Visibility::Visible
                                          : Visibility::Collapsed);
           Log::Write(visible ? L"video layer: shown" : L"video layer: hidden");
-          if (visible) {
-            StartVideoOverlayTest();
-          }
         }
       });
 }
