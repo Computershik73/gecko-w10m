@@ -30,6 +30,9 @@
 #include <windows.ui.xaml.media.dxinterop.h>
 
 #include <cmath>
+#include <functional>
+#include <utility>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -268,7 +271,8 @@ const wchar_t* ModeName(UINT mode) {
 
 void OverlayTestThread(winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel,
                        winrt::Windows::UI::Xaml::Controls::Grid host,
-                       winrt::Windows::UI::Core::CoreDispatcher dispatcher) {
+                       winrt::Windows::UI::Core::CoreDispatcher dispatcher,
+                       double shownWidth, double shownHeight) {
   auto finish = [&](const std::wstring& why) {
     Log::Write(L"overlay test: " + why);
     dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
@@ -421,49 +425,120 @@ void OverlayTestThread(winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel,
   }
 
   auto stats = chain.try_as<IGeckoW10mSwapChainMedia>();
-  Log::Write(std::wstring(L"overlay test: showing ") + used->name +
-             L" for eight seconds over the top of the window" +
-             (stats ? L"" : L" (no media statistics on this chain)"));
-  UINT counts[5] = {};
-  const ULONGLONG start = ::GetTickCount64();
+  if (!stats) {
+    Log::Write(L"overlay test: no media statistics on this chain");
+  }
+
+  // Runs on the UI thread and waits for it.
+  auto onUi = [&](std::function<void()> work) {
+    HANDLE done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::High,
+                        [work, done] {
+                          try {
+                            work();
+                          } catch (...) {
+                          }
+                          ::SetEvent(done);
+                        });
+    ::WaitForSingleObject(done, 5000);
+    ::CloseHandle(done);
+  };
+
+  // Three phases of four seconds. The video's controls are drawn over it, so
+  // the question is not only whether a video layer can be an overlay, but
+  // whether it stays one with something composited above it -- and whether
+  // it can lie under the browser's own layer and show through it.
+  const wchar_t* phases[] = {
+      L"1: on top of everything",
+      L"2: a translucent band over its lower half (like a player's controls)",
+      L"3: UNDER the browser, which is translucent",
+  };
+  winrt::Windows::UI::Xaml::Controls::Border veil{nullptr};
+  std::vector<std::pair<winrt::Windows::UI::Xaml::UIElement, double>> dimmed;
   UINT frame = 0;
-  while (::GetTickCount64() - start < 8000) {
-    const float t = static_cast<float>(frame) / 60.0f;
-    const float y = 0.5f + 0.25f * sinf(t * 1.3f);
-    const float u = 0.5f + 0.2f * sinf(t * 0.7f);
-    const float v = 0.5f + 0.2f * cosf(t * 0.9f);
-    if (luma && chroma) {
-      const float yv[4] = {y, 0, 0, 1};
-      const float uv[4] = {u, v, 0, 1};
-      context->ClearRenderTargetView(luma.get(), yv);
-      context->ClearRenderTargetView(chroma.get(), uv);
-    } else if (bgra) {
-      const float c[4] = {u, y, v, 1};
-      context->ClearRenderTargetView(bgra.get(), c);
+  for (int phase = 0; phase < 3; ++phase) {
+    if (phase == 1) {
+      onUi([&] {
+        using namespace winrt::Windows::UI::Xaml;
+        veil = winrt::Windows::UI::Xaml::Controls::Border();
+        winrt::Windows::UI::Xaml::Media::SolidColorBrush brush;
+        brush.Color(winrt::Windows::UI::ColorHelper::FromArgb(128, 0, 0, 0));
+        veil.Background(brush);
+        veil.HorizontalAlignment(HorizontalAlignment::Left);
+        veil.VerticalAlignment(VerticalAlignment::Top);
+        veil.Width(shownWidth);
+        veil.Height(shownHeight / 2);
+        veil.Margin(ThicknessHelper::FromLengths(0, shownHeight / 2, 0, 0));
+        veil.IsHitTestVisible(false);
+        const int rows = static_cast<int>(host.RowDefinitions().Size());
+        if (rows > 1) {
+          winrt::Windows::UI::Xaml::Controls::Grid::SetRowSpan(veil, rows);
+        }
+        host.Children().Append(veil);
+      });
+    } else if (phase == 2) {
+      onUi([&] {
+        uint32_t index = 0;
+        if (veil && host.Children().IndexOf(veil, index)) {
+          host.Children().RemoveAt(index);
+        }
+        if (host.Children().IndexOf(panel, index)) {
+          host.Children().RemoveAt(index);
+        }
+        for (auto const& child : host.Children()) {
+          dimmed.emplace_back(child, child.Opacity());
+          child.Opacity(0.6);
+        }
+        host.Children().InsertAt(0, panel);
+      });
     }
-    hr = chain->Present(1, 0);
-    if (FAILED(hr)) {
-      Log::Write(L"overlay test: present failed, " + Hex(hr));
-      break;
-    }
-    ++frame;
-    if (stats && frame % 60 == 0) {
-      GeckoW10mFrameStatisticsMedia s = {};
-      hr = stats->GetFrameStatisticsMedia(&s);
-      if (SUCCEEDED(hr)) {
-        counts[s.CompositionMode < 4 ? s.CompositionMode : 4]++;
-        Log::Write(L"overlay test: frame " + std::to_wstring(s.PresentCount) +
-                   L" was " + ModeName(s.CompositionMode));
-      } else {
-        Log::Write(L"overlay test: no statistics yet, " + Hex(hr));
+    Log::Write(std::wstring(L"overlay test: phase ") + phases[phase]);
+    UINT counts[5] = {};
+    const ULONGLONG phaseStart = ::GetTickCount64();
+    UINT phaseFrames = 0;
+    while (::GetTickCount64() - phaseStart < 4000) {
+      const float t = static_cast<float>(frame) / 60.0f;
+      const float y = 0.5f + 0.25f * sinf(t * 1.3f);
+      const float u = 0.5f + 0.2f * sinf(t * 0.7f);
+      const float v = 0.5f + 0.2f * cosf(t * 0.9f);
+      if (luma && chroma) {
+        const float yv[4] = {y, 0, 0, 1};
+        const float uv[4] = {u, v, 0, 1};
+        context->ClearRenderTargetView(luma.get(), yv);
+        context->ClearRenderTargetView(chroma.get(), uv);
+      } else if (bgra) {
+        const float c[4] = {u, y, v, 1};
+        context->ClearRenderTargetView(bgra.get(), c);
+      }
+      hr = chain->Present(1, 0);
+      if (FAILED(hr)) {
+        Log::Write(L"overlay test: present failed, " + Hex(hr));
+        break;
+      }
+      ++frame;
+      ++phaseFrames;
+      // Ask twice a second, skipping the first half second of a phase while
+      // the composition settles.
+      if (stats && phaseFrames % 30 == 0 && phaseFrames > 30) {
+        GeckoW10mFrameStatisticsMedia st = {};
+        if (SUCCEEDED(stats->GetFrameStatisticsMedia(&st))) {
+          counts[st.CompositionMode < 4 ? st.CompositionMode : 4]++;
+        }
       }
     }
+    Log::Write(std::wstring(L"overlay test: phase ") + phases[phase] + L" -- " +
+               std::to_wstring(phaseFrames) + L" frames; asked " +
+               std::to_wstring(counts[0] + counts[1] + counts[2] + counts[3] +
+                               counts[4]) +
+               L" times: HARDWARE OVERLAY " + std::to_wstring(counts[1]) +
+               L", composed by the GPU " + std::to_wstring(counts[0]) +
+               L", other " + std::to_wstring(counts[2] + counts[3] + counts[4]));
   }
-  Log::Write(L"overlay test: " + std::to_wstring(frame) +
-             L" frames presented; seconds as overlay " +
-             std::to_wstring(counts[1]) + L", composed " +
-             std::to_wstring(counts[0]) + L", other " +
-             std::to_wstring(counts[2] + counts[3] + counts[4]));
+  onUi([&] {
+    for (auto& d : dimmed) {
+      d.first.Opacity(d.second);
+    }
+  });
   chain = nullptr;
   ::CloseHandle(surface);
   finish(L"done, panel removed");
@@ -496,13 +571,15 @@ void RunOverlayTest(winrt::Windows::UI::Xaml::Controls::Grid const& host,
   panel.RenderTransform(fit);
   host.Children().Append(panel);
   auto dispatcher = host.Dispatcher();
-  std::thread([panel, host, dispatcher] {
+  const double shownWidth = Window::Current().Bounds().Width;
+  const double shownHeight = shownWidth * 1080.0 / 1920.0;
+  std::thread([panel, host, dispatcher, shownWidth, shownHeight] {
     try {
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
     } catch (...) {
     }
     try {
-      OverlayTestThread(panel, host, dispatcher);
+      OverlayTestThread(panel, host, dispatcher, shownWidth, shownHeight);
     } catch (...) {
       Log::Write(L"overlay test: threw");
     }
