@@ -13,6 +13,7 @@
 #include "client/DrmBridge.h"
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
+#include "engine/OverlayProbe.h"
 #include <winrt/Windows.Foundation.Metadata.h>
 
 #include "winrt/Windows.UI.Core.h"
@@ -64,6 +65,9 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     panel_ = SwapChainPanel();
     panel_.HorizontalAlignment(HorizontalAlignment::Stretch);
     panel_.VerticalAlignment(VerticalAlignment::Stretch);
+    // Whether a video could have a display layer of its own; asks, changes
+    // nothing ("overlay:" lines in the log).
+    engine::ProbeVideoOverlay(panel_);
   } else {
     panelWithheld_ = true;
   }

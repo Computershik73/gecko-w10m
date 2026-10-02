@@ -86,6 +86,7 @@
     <ClCompile Include="client\BrowserPreferences.cpp" />
     <ClCompile Include="client\SearchEngines.cpp" />
     <ClCompile Include="client\TabManager.cpp" />
+    <ClCompile Include="engine\OverlayProbe.cpp" />
     <ClCompile Include="engine\GeckoEngine.cpp" />
     <ClCompile Include="engine\gecko_capi_stub.cpp" Condition="'$(GeckoW10mUseEngineStub)'=='true'" />
   </ItemGroup>

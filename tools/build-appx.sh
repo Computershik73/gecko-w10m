@@ -114,7 +114,7 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/DrmBridge.cpp client/EngineView.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/DrmBridge.cpp client/EngineView.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/OverlayProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
