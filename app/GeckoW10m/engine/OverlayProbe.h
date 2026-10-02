@@ -13,4 +13,12 @@ namespace gecko_w10m::engine {
 void ProbeVideoOverlay(
     winrt::Windows::UI::Xaml::Controls::SwapChainPanel const& panel);
 
+// The decisive experiment, for a test build: lays a panel with an NV12 swap
+// chain over the top of the window for eight seconds, changes its colour
+// sixty times a second, and asks the system every second how each frame was
+// shown -- as a hardware overlay or drawn by the GPU into the composition
+// ("overlay test:" lines). Call on the UI thread once the browser draws.
+void RunOverlayTest(winrt::Windows::UI::Xaml::Controls::Grid const& host,
+                    double rawPerView);
+
 }  // namespace gecko_w10m::engine

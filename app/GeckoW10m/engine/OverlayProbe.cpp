@@ -29,6 +29,7 @@
 #include <dxgi1_3.h>
 #include <windows.ui.xaml.media.dxinterop.h>
 
+#include <cmath>
 #include <string>
 #include <thread>
 
@@ -54,7 +55,30 @@ IGeckoW10mFactoryMedia : public IUnknown {
 };
 
 constexpr DWORD kCompositionObjectAllAccess = 0x0003;  // COMPOSITIONOBJECT_ALL_ACCESS
-constexpr UINT kSwapChainFlagYuvVideo = 64;              // DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO
+// 512, not 64: 64 is FRAME_LATENCY_WAITABLE_OBJECT, which is what the first
+// probe passed, and why its NV12 chain was refused.
+constexpr UINT kSwapChainFlagFullscreenVideo = 256;  // DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO
+constexpr UINT kSwapChainFlagYuvVideo = 512;         // DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO
+
+// IDXGISwapChainMedia and its statistics, desktop-only in the SDK as well.
+struct GeckoW10mFrameStatisticsMedia {
+  UINT PresentCount;
+  UINT PresentRefreshCount;
+  UINT SyncRefreshCount;
+  LARGE_INTEGER SyncQPCTime;
+  LARGE_INTEGER SyncGPUTime;
+  UINT CompositionMode;  // 0 composed, 1 overlay, 2 none, 3 composition failure
+  UINT ApprovedPresentDuration;
+};
+MIDL_INTERFACE("dd95b90b-f05f-4f6a-bd65-25bfb264bd84")
+IGeckoW10mSwapChainMedia : public IUnknown {
+ public:
+  virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsMedia(
+      GeckoW10mFrameStatisticsMedia* stats) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetPresentDuration(UINT duration) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CheckPresentDurationSupport(
+      UINT desired, UINT* lower, UINT* higher) = 0;
+};
 
 std::wstring Hex(uint32_t value) {
   wchar_t text[16];
@@ -232,7 +256,258 @@ void ProbeDevice() {
   }
 }
 
+const wchar_t* ModeName(UINT mode) {
+  switch (mode) {
+    case 0: return L"composed by the GPU";
+    case 1: return L"HARDWARE OVERLAY";
+    case 2: return L"not shown";
+    case 3: return L"composition failure";
+  }
+  return L"unknown";
+}
+
+void OverlayTestThread(winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel,
+                       winrt::Windows::UI::Xaml::Controls::Grid host,
+                       winrt::Windows::UI::Core::CoreDispatcher dispatcher) {
+  auto finish = [&](const std::wstring& why) {
+    Log::Write(L"overlay test: " + why);
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [host, panel] {
+                          uint32_t index = 0;
+                          if (host.Children().IndexOf(panel, index)) {
+                            host.Children().RemoveAt(index);
+                          }
+                        });
+  };
+
+  HMODULE d3d11 = ::LoadLibraryExW(L"d3d11.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using CreateFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE,
+                                    UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                    ID3D11Device**, D3D_FEATURE_LEVEL*,
+                                    ID3D11DeviceContext**);
+  auto create = d3d11 ? reinterpret_cast<CreateFn>(
+                            ::GetProcAddress(d3d11, "D3D11CreateDevice"))
+                      : nullptr;
+  HMODULE dcomp = ::LoadLibraryExW(L"dcomp.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using HandleFn = HRESULT(WINAPI*)(DWORD, SECURITY_ATTRIBUTES*, HANDLE*);
+  auto createHandle =
+      dcomp ? reinterpret_cast<HandleFn>(
+                  ::GetProcAddress(dcomp, "DCompositionCreateSurfaceHandle"))
+            : nullptr;
+  if (!create || !createHandle) {
+    finish(L"missing D3D11CreateDevice or DCompositionCreateSurfaceHandle");
+    return;
+  }
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                      D3D_FEATURE_LEVEL_11_0};
+  winrt::com_ptr<ID3D11Device> device;
+  winrt::com_ptr<ID3D11DeviceContext> context;
+  HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                      D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                          D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                      levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                      device.put(), nullptr, context.put());
+  if (FAILED(hr)) {
+    finish(L"no device, " + Hex(hr));
+    return;
+  }
+  winrt::com_ptr<IDXGIAdapter> adapter;
+  device.as<IDXGIDevice>()->GetAdapter(adapter.put());
+  winrt::com_ptr<IDXGIFactory2> factory;
+  adapter->GetParent(__uuidof(IDXGIFactory2), factory.put_void());
+  winrt::com_ptr<IGeckoW10mFactoryMedia> media;
+  if (factory) {
+    factory->QueryInterface(__uuidof(IGeckoW10mFactoryMedia), media.put_void());
+  }
+  if (!media) {
+    finish(L"no media factory");
+    return;
+  }
+
+  HANDLE surface = nullptr;
+  hr = createHandle(kCompositionObjectAllAccess, nullptr, &surface);
+  if (FAILED(hr) || !surface) {
+    finish(L"no composition surface handle, " + Hex(hr));
+    return;
+  }
+
+  // NV12 first, as a video chain -- the format the display said it can lay
+  // over the picture with scaling -- then as fullscreen video too, then
+  // BGRA for comparison, which the display said it cannot.
+  struct Attempt {
+    DXGI_FORMAT format;
+    UINT flags;
+    const wchar_t* name;
+  };
+  const Attempt attempts[] = {
+      {DXGI_FORMAT_NV12, kSwapChainFlagYuvVideo, L"NV12 (YUV video)"},
+      {DXGI_FORMAT_NV12, kSwapChainFlagYuvVideo | kSwapChainFlagFullscreenVideo,
+       L"NV12 (YUV + fullscreen video)"},
+      {DXGI_FORMAT_NV12, 0, L"NV12 (no flags)"},
+      {DXGI_FORMAT_B8G8R8A8_UNORM, 0, L"BGRA"},
+  };
+  winrt::com_ptr<IDXGISwapChain1> chain;
+  const Attempt* used = nullptr;
+  for (const Attempt& a : attempts) {
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Width = 1920;
+    desc.Height = 1080;
+    desc.Format = a.format;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc.Flags = a.flags;
+    hr = media->CreateSwapChainForCompositionSurfaceHandle(
+        device.get(), surface, &desc, nullptr, chain.put());
+    Log::Write(std::wstring(L"overlay test: ") + a.name + L" swap chain " +
+               (SUCCEEDED(hr) ? std::wstring(L"made") : L"refused, " + Hex(hr)));
+    if (SUCCEEDED(hr)) {
+      used = &a;
+      break;
+    }
+    chain = nullptr;
+  }
+  if (!chain) {
+    ::CloseHandle(surface);
+    finish(L"no swap chain at all");
+    return;
+  }
+
+  // The panel takes the surface on the UI thread.
+  HANDLE given = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HRESULT setHr = E_FAIL;
+  dispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::High,
+      [panel, surface, given, &setHr] {
+        winrt::com_ptr<ISwapChainPanelNative2> native2;
+        HRESULT q = winrt::get_unknown(panel)->QueryInterface(
+            __uuidof(ISwapChainPanelNative2), native2.put_void());
+        setHr = SUCCEEDED(q) ? native2->SetSwapChainHandle(surface) : q;
+        ::SetEvent(given);
+      });
+  ::WaitForSingleObject(given, 5000);
+  ::CloseHandle(given);
+  if (FAILED(setHr)) {
+    ::CloseHandle(surface);
+    finish(L"the panel would not take the surface, " + Hex(setHr));
+    return;
+  }
+
+  // Something to show: the planes cleared to a slowly changing colour.
+  winrt::com_ptr<ID3D11Texture2D> buffer;
+  chain->GetBuffer(0, __uuidof(ID3D11Texture2D), buffer.put_void());
+  winrt::com_ptr<ID3D11RenderTargetView> luma;
+  winrt::com_ptr<ID3D11RenderTargetView> chroma;
+  winrt::com_ptr<ID3D11RenderTargetView> bgra;
+  if (buffer) {
+    D3D11_RENDER_TARGET_VIEW_DESC rtv = {};
+    rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (used->format == DXGI_FORMAT_NV12) {
+      rtv.Format = DXGI_FORMAT_R8_UNORM;
+      device->CreateRenderTargetView(buffer.get(), &rtv, luma.put());
+      rtv.Format = DXGI_FORMAT_R8G8_UNORM;
+      device->CreateRenderTargetView(buffer.get(), &rtv, chroma.put());
+      Log::Write(std::wstring(L"overlay test: drawing into the planes ") +
+                 (luma && chroma ? L"works"
+                                 : L"does NOT work, frames stay as they are"));
+    } else {
+      device->CreateRenderTargetView(buffer.get(), nullptr, bgra.put());
+    }
+  }
+
+  auto stats = chain.try_as<IGeckoW10mSwapChainMedia>();
+  Log::Write(std::wstring(L"overlay test: showing ") + used->name +
+             L" for eight seconds over the top of the window" +
+             (stats ? L"" : L" (no media statistics on this chain)"));
+  UINT counts[5] = {};
+  const ULONGLONG start = ::GetTickCount64();
+  UINT frame = 0;
+  while (::GetTickCount64() - start < 8000) {
+    const float t = static_cast<float>(frame) / 60.0f;
+    const float y = 0.5f + 0.25f * sinf(t * 1.3f);
+    const float u = 0.5f + 0.2f * sinf(t * 0.7f);
+    const float v = 0.5f + 0.2f * cosf(t * 0.9f);
+    if (luma && chroma) {
+      const float yv[4] = {y, 0, 0, 1};
+      const float uv[4] = {u, v, 0, 1};
+      context->ClearRenderTargetView(luma.get(), yv);
+      context->ClearRenderTargetView(chroma.get(), uv);
+    } else if (bgra) {
+      const float c[4] = {u, y, v, 1};
+      context->ClearRenderTargetView(bgra.get(), c);
+    }
+    hr = chain->Present(1, 0);
+    if (FAILED(hr)) {
+      Log::Write(L"overlay test: present failed, " + Hex(hr));
+      break;
+    }
+    ++frame;
+    if (stats && frame % 60 == 0) {
+      GeckoW10mFrameStatisticsMedia s = {};
+      hr = stats->GetFrameStatisticsMedia(&s);
+      if (SUCCEEDED(hr)) {
+        counts[s.CompositionMode < 4 ? s.CompositionMode : 4]++;
+        Log::Write(L"overlay test: frame " + std::to_wstring(s.PresentCount) +
+                   L" was " + ModeName(s.CompositionMode));
+      } else {
+        Log::Write(L"overlay test: no statistics yet, " + Hex(hr));
+      }
+    }
+  }
+  Log::Write(L"overlay test: " + std::to_wstring(frame) +
+             L" frames presented; seconds as overlay " +
+             std::to_wstring(counts[1]) + L", composed " +
+             std::to_wstring(counts[0]) + L", other " +
+             std::to_wstring(counts[2] + counts[3] + counts[4]));
+  chain = nullptr;
+  ::CloseHandle(surface);
+  finish(L"done, panel removed");
+}
+
 }  // namespace
+
+void RunOverlayTest(winrt::Windows::UI::Xaml::Controls::Grid const& host,
+                    double rawPerView) {
+  if (!host) {
+    return;
+  }
+  using namespace winrt::Windows::UI::Xaml;
+  winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel;
+  panel.HorizontalAlignment(HorizontalAlignment::Left);
+  panel.VerticalAlignment(VerticalAlignment::Top);
+  panel.IsHitTestVisible(false);
+  // Over everything, in every row of the page.
+  const int rows = static_cast<int>(host.RowDefinitions().Size());
+  if (rows > 1) {
+    winrt::Windows::UI::Xaml::Controls::Grid::SetRowSpan(panel, rows);
+  }
+  // The 1920-pixel chain is shown one pixel to a pixel, 1920 / rawPerView
+  // view pixels wide; scale it to the width of the screen, as a video is.
+  const double chainViewWidth = 1920.0 / (rawPerView > 0 ? rawPerView : 1.0);
+  const double fitScale = Window::Current().Bounds().Width / chainViewWidth;
+  winrt::Windows::UI::Xaml::Media::ScaleTransform fit;
+  fit.ScaleX(fitScale);
+  fit.ScaleY(fitScale);
+  panel.RenderTransform(fit);
+  host.Children().Append(panel);
+  auto dispatcher = host.Dispatcher();
+  std::thread([panel, host, dispatcher] {
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    try {
+      OverlayTestThread(panel, host, dispatcher);
+    } catch (...) {
+      Log::Write(L"overlay test: threw");
+    }
+  }).detach();
+}
 
 void ProbeVideoOverlay(
     winrt::Windows::UI::Xaml::Controls::SwapChainPanel const& panel) {

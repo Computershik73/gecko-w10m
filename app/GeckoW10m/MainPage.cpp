@@ -13,6 +13,7 @@
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
 #include "engine/GeckoRuntimeHost.h"
+#include "engine/OverlayProbe.h"
 #include "client/SearchEngines.h"
 
 using namespace winrt;
@@ -312,10 +313,12 @@ MainPage::MainPage() {
   // the JIT probe or xul.dll had worked.
   Navigate(L"about:home");
 
-  engineView_->OnFirstFrame([this, state = std::wstring(localState)]() {
+  engineView_->OnFirstFrame([this, raw, state = std::wstring(localState)]() {
     if (splash_) {
       splash_.Visibility(Visibility::Collapsed);
     }
+    // Test build: can a video be a hardware overlay? See OverlayProbe.h.
+    engine::RunOverlayTest(root_, raw);
     // Drawing is the only proof the engine started; anything short of it could
     // be a launch that is about to die.
     engine::MarkGeckoHealthy(state);
