@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 2 Oct 2026 19:09:41 +0400
+Subject: [PATCH] Video layer: presents tied to the refresh, pixel-exact
+ placement
+
+The display composed every video frame on the GPU instead of scanning the
+layer out as a hardware overlay. The overlay test that got an overlay
+presented with a sync interval of one; the layer presented with none. It now
+presents with one, and with DXGI_PRESENT_DO_NOT_WAIT so the render thread is
+never held up: a present turned down while the display is busy is retried at
+the next composite. The rect's edges are rounded each on its own and the clip
+is cut to the rect, so a fullscreen video is no longer a pixel wider than the
+screen and clipped by that pixel. The note every 300 composites tells how
+many presents were turned down and whether the panel is clipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 44 ++++++++++++++-----
+ 1 file changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 4991b14a61..175078f5d7 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -27,7 +27,9 @@
+ #include <d3d11.h>
+ #include <dxgi1_3.h>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <math.h>
+ 
+ #include "mozilla/StaticPrefs_gfx.h"
+ #include "mozilla/TimeStamp.h"
+@@ -97,6 +99,7 @@ struct VideoLayer {
+   uint32_t mStatComposed = 0;
+   uint32_t mStatOther = 0;
+   uint32_t mStatPresents = 0;
++  uint32_t mStatBusy = 0;
+   double mStatPresentMs = 0;
+   bool mSaidHole = false;
+ 
+@@ -251,10 +254,19 @@ struct VideoLayer {
+     D3D11_BOX box = {0, 0, 0, UINT(mChainWidth), UINT(mChainHeight), 1};
+     mContext->CopySubresourceRegion(buffer, 0, 0, 0, 0, aTexture, index, &box);
+     const mozilla::TimeStamp presentStart = mozilla::TimeStamp::Now();
+-    hr = mChain->Present(0, 0);
++    // Tied to the display's refresh, as a video player presents. The overlay
++    // test, which the display took as a hardware overlay, presented this
++    // way; this layer's presents with no sync interval were composed by the
++    // GPU every time. If the display still has frames queued the present is
++    // turned down instead of waiting, and the next composite tries again.
++    hr = mChain->Present(1, DXGI_PRESENT_DO_NOT_WAIT);
+     mStatPresentMs +=
+         (mozilla::TimeStamp::Now() - presentStart).ToMilliseconds();
+     ++mStatPresents;
++    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
++      ++mStatBusy;
++      return true;
++    }
+     if (FAILED(hr)) {
+       Break("present failed", hr);
+       return false;
+@@ -346,13 +358,19 @@ struct VideoLayer {
+ 
+     // Where the video is, and the part of it the page shows, in the
+     // browser surface's pixels.
+-    Rect rect{int32_t(aRects[0] + 0.5f), int32_t(aRects[1] + 0.5f),
+-              int32_t(aRects[2] - aRects[0] + 0.5f),
+-              int32_t(aRects[3] - aRects[1] + 0.5f)};
+-    Rect clip{int32_t(aRects[4] + 0.5f), int32_t(aRects[5] + 0.5f),
+-              int32_t(aRects[6] - aRects[4] + 0.5f),
+-              int32_t(aRects[7] - aRects[5] + 0.5f)};
+-    if (rect.w <= 0 || rect.h <= 0) {
++    // Edges rounded each on its own: a width rounded on its own came out a
++    // pixel wider than the screen in fullscreen, which made a clip of the
++    // pixel and a clipped panel.
++    auto edge = [](float aValue) { return int32_t(floorf(aValue + 0.5f)); };
++    const int32_t x0 = edge(aRects[0]), y0 = edge(aRects[1]);
++    const int32_t x1 = edge(aRects[2]), y1 = edge(aRects[3]);
++    const int32_t cx0 = std::max(x0, edge(aRects[4]));
++    const int32_t cy0 = std::max(y0, edge(aRects[5]));
++    const int32_t cx1 = std::min(x1, edge(aRects[6]));
++    const int32_t cy1 = std::min(y1, edge(aRects[7]));
++    Rect rect{x0, y0, x1 - x0, y1 - y0};
++    Rect clip{cx0, cy0, cx1 - cx0, cy1 - cy0};
++    if (rect.w <= 0 || rect.h <= 0 || clip.w <= 0 || clip.h <= 0) {
+       return false;
+     }
+     if (rect != mRect || clip != mClip) {
+@@ -405,18 +423,22 @@ struct VideoLayer {
+     }
+     mOfferedThisFrame = false;
+     if (mStatFrames >= 300) {
+-      char note[256];
++      char note[384];
+       SprintfLiteral(note,
+                      "video layer: a hole in %u of the last %u composites; the "
+                      "system says overlay %u, composed by the GPU %u, other "
+-                     "%u; a video present took %.1f ms",
++                     "%u; a video present took %.1f ms, %u of %u turned "
++                     "down as the display was still busy%s",
+                      mStatHoles, mStatFrames, mStatOverlay, mStatComposed,
+                      mStatOther,
+-                     mStatPresents ? mStatPresentMs / mStatPresents : 0.0);
++                     mStatPresents ? mStatPresentMs / mStatPresents : 0.0,
++                     mStatBusy, mStatPresents,
++                     mClip == mRect ? "" : "; the panel is clipped");
+       Note(note);
+       mStatFrames = mStatHoles = 0;
+       mStatOverlay = mStatComposed = mStatOther = 0;
+       mStatPresents = 0;
++      mStatBusy = 0;
+       mStatPresentMs = 0;
+     }
+   }
