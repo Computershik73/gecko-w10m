@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 2 Oct 2026 13:03:16 +0400
+Subject: [PATCH] Video layer: a hole that is already there is not dirty
+
+With the video on the display overlay, fullscreen still cost 24 ms a
+composite: the video tile counted as dirty every frame, so 2560x1440 of
+browser layer was presented 40 times a second for a hole that never changed,
+and the system composited it each time. Every opaque video is now offered to
+the video layer once per frame at the start of calculate_dirty_rects, which
+answers: draw the video, a new hole (drawn), or a hole already there -- left
+out of the dirty rect. When only the video changes, nothing of the browser's
+layer is drawn or presented and the display updates the overlay by itself;
+controls or subtitles over the video still redraw their own rects, with the
+hole under them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 18 +++++-
+ gfx/wr/webrender/src/renderer/composite.rs    | 25 ++++++---
+ gfx/wr/webrender/src/renderer/mod.rs          | 55 +++++++++++++++++--
+ 3 files changed, 82 insertions(+), 16 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 13bd9bf258..33c18e5f81 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -116,6 +116,7 @@ struct VideoLayer {
+   }
+ 
+   void Hide() {
++    mLastHole = false;
+     if (mShown) {
+       if (auto* sink = sSink.load()) {
+         sink->show(0);
+@@ -244,7 +245,18 @@ struct VideoLayer {
+     return true;
+   }
+ 
+-  bool Offer(const mozilla::wr::ExternalImageId& aId, const float* aRects) {
++  // 0: WebRender draws the video; 1: a hole, new this frame; 2: a hole that
++  // was already there.
++  int32_t Offer(const mozilla::wr::ExternalImageId& aId, const float* aRects) {
++    const bool hole = OfferForHole(aId, aRects);
++    const int32_t answer = hole ? (mLastHole ? 2 : 1) : 0;
++    mLastHole = hole;
++    return answer;
++  }
++  bool mLastHole = false;
++
++  bool OfferForHole(const mozilla::wr::ExternalImageId& aId,
++                    const float* aRects) {
+     if (mBroken) {
+       return false;
+     }
+@@ -378,8 +390,8 @@ extern "C" __declspec(dllexport) void gecko_w10m_video_layer_ack(
+ // video about to be drawn: aRects is the video's rect and its visible part,
+ // x0 y0 x1 y1 each, in device pixels. True: the display shows it, draw a
+ // transparent hole.
+-extern "C" bool gecko_w10m_video_layer_frame(uint64_t aExternalImageId,
+-                                             const float* aRects) {
++extern "C" int32_t gecko_w10m_video_layer_frame(uint64_t aExternalImageId,
++                                                const float* aRects) {
+   return Layer().Offer(mozilla::wr::ToExternalImageId(aExternalImageId), aRects);
+ }
+ 
+diff --git a/gfx/wr/webrender/src/renderer/composite.rs b/gfx/wr/webrender/src/renderer/composite.rs
+index 5b6db13fb9..45ed196c72 100644
+--- a/gfx/wr/webrender/src/renderer/composite.rs
++++ b/gfx/wr/webrender/src/renderer/composite.rs
+@@ -310,14 +310,10 @@ impl Renderer {
+                     // transparent hole -- opaque tiles go with blending off,
+                     // so this writes 0,0,0,0 -- and whatever lies over the
+                     // video is blended over the hole as before.
+-                    let shown_by_display = match (&surface.color_data, surface.external_image_id) {
+-                        (ResolvedExternalSurfaceColorData::Yuv { .. }, Some(id))
+-                            if tile.kind == TileKind::Opaque && clip.is_none() =>
+-                        {
+-                            super::gecko_w10m_video_layer(id, &tile_rect, &clip_rect)
+-                        }
+-                        _ => false,
+-                    };
++                    // The frame was offered at the start of the frame
++                    // (calculate_dirty_rects); this reads the answer.
++                    let shown_by_display = clip.is_none()
++                        && super::gecko_w10m_video_hole(item.key.tile_index).is_some();
+ 
+                     if shown_by_display {
+                         let dummy = TextureSource::Dummy;
+@@ -1371,6 +1367,14 @@ impl Renderer {
+             return None;
+         }
+ 
++        // GeckoW10m: every opaque video goes to the video layer first, which
++        // presents its frame to the display overlay and says whether the
++        // compositor should leave a hole for it -- and whether that hole is
++        // already there. A hole that is already there is not dirty: when only
++        // the video changes, nothing of the browser's layer is drawn or
++        // presented at all, and the display updates the overlay by itself.
++        super::gecko_w10m_offer_videos(composite_state);
++
+         let mut partial_present_mode = None;
+ 
+         let (max_partial_present_rects, draw_previous_partial_present_regions) =
+@@ -1415,7 +1419,10 @@ impl Renderer {
+ 
+                 // Work out how many dirty rects WR produced, and if that's more than
+                 // what the device supports.
+-                for tile in &composite_state.tiles {
++                for (tile_index, tile) in composite_state.tiles.iter().enumerate() {
++                    if super::gecko_w10m_video_hole(tile_index) == Some(true) {
++                        continue;
++                    }
+                     let dirty_rect = composite_state
+                         .get_device_rect(&tile.local_dirty_rect, tile.transform_index);
+ 
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index 91732d6ba3..015cc289f4 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -54,6 +54,7 @@ use crate::batch::ClipMaskInstanceList;
+ #[cfg(any(feature = "capture", feature = "replay"))]
+ use crate::capture::{CaptureConfig, ExternalCaptureImage, PlainExternalImage};
+ use crate::composite::{CompositeState, CompositeTileSurface, TileKind};
++use crate::composite::ResolvedExternalSurfaceColorData;
+ use crate::composite::{CompositorKind, Compositor, NativeTileId};
+ use crate::composite::{CompositorConfig, NativeSurfaceOperationDetails, NativeSurfaceId, NativeSurfaceOperation};
+ #[cfg(feature = "debugger")]
+@@ -732,16 +733,18 @@ fn gecko_w10m_composite_stats(state: &CompositeState) {
+ /// GeckoW10m: offers an opaque video about to be composited to the display,
+ /// as a hardware overlay of its own (GeckoW10mVideoLayer.cpp). True when the
+ /// display is showing it and the compositor should leave a transparent hole.
++/// 0: the compositor draws the video; 1: leave a hole, which is new this
++/// frame (draw it); 2: leave a hole, already there (not dirty).
+ #[cfg(windows)]
+ extern "C" {
+-    fn gecko_w10m_video_layer_frame(external_image_id: u64, rects: *const f32) -> bool;
++    fn gecko_w10m_video_layer_frame(external_image_id: u64, rects: *const f32) -> i32;
+ }
+ 
+-pub(crate) fn gecko_w10m_video_layer(
++fn gecko_w10m_video_layer(
+     id: api::ExternalImageId,
+     tile_rect: &DeviceRect,
+     clip_rect: &DeviceRect,
+-) -> bool {
++) -> i32 {
+     #[cfg(windows)]
+     {
+         let rects = [
+@@ -753,10 +756,54 @@ pub(crate) fn gecko_w10m_video_layer(
+     #[cfg(not(windows))]
+     {
+         let _ = (id, tile_rect, clip_rect);
+-        false
++        0
+     }
+ }
+ 
++/// This frame's holes: tile index, and whether the hole was already there.
++static GECKO_W10M_HOLES: std::sync::Mutex<Vec<(usize, bool)>> =
++    std::sync::Mutex::new(Vec::new());
++
++/// Offers every opaque YUV video of the frame to the video layer, once per
++/// frame, and remembers which tiles are to be holes.
++pub(crate) fn gecko_w10m_offer_videos(state: &CompositeState) {
++    let mut holes = match GECKO_W10M_HOLES.lock() {
++        Ok(holes) => holes,
++        Err(_) => return,
++    };
++    holes.clear();
++    for (index, tile) in state.tiles.iter().enumerate() {
++        if let CompositeTileSurface::ExternalSurface { external_surface_index } = tile.surface {
++            if tile.kind != TileKind::Opaque || tile.clip_index.is_some() {
++                continue;
++            }
++            let surface = &state.external_surfaces[external_surface_index.0];
++            if let (ResolvedExternalSurfaceColorData::Yuv { .. }, Some(id)) =
++                (&surface.color_data, surface.external_image_id)
++            {
++                let tile_rect = state.get_device_rect(&tile.local_rect, tile.transform_index);
++                let clip_rect = tile_rect
++                    .intersection(&tile.device_clip_rect)
++                    .unwrap_or(DeviceRect::zero());
++                match gecko_w10m_video_layer(id, &tile_rect, &clip_rect) {
++                    1 => holes.push((index, false)),
++                    2 => holes.push((index, true)),
++                    _ => {}
++                }
++            }
++        }
++    }
++}
++
++/// Whether this tile is a hole this frame (Some), and if so whether the hole
++/// was already there (true).
++pub(crate) fn gecko_w10m_video_hole(tile_index: usize) -> Option<bool> {
++    GECKO_W10M_HOLES
++        .lock()
++        .ok()
++        .and_then(|holes| holes.iter().find(|h| h.0 == tile_index).map(|h| h.1))
++}
++
+ /// GeckoW10m: compositor surfaces per frame by kind, and the last reason a
+ /// video was refused as an overlay.
+ static GECKO_W10M_UNDERLAYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
