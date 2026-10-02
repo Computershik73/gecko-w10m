@@ -39,6 +39,13 @@ class EngineView {
   winrt::Windows::UI::Xaml::Controls::SwapChainPanel Panel() const {
     return panel_;
   }
+  // The panel under that one. A playing video is handed to it as a swap
+  // chain of its own, which the display shows as a hardware overlay, and the
+  // browser leaves a transparent hole over it. Collapsed until the engine
+  // asks; goes into the tree directly below Panel().
+  winrt::Windows::UI::Xaml::Controls::SwapChainPanel VideoPanel() const {
+    return video_panel_;
+  }
   // Hands the panel to the engine. Must happen before the engine starts, since
   // EGL asks for it as soon as it makes a surface.
   void GivePanelToEngine();
@@ -68,6 +75,15 @@ class EngineView {
   // through the ordinary resize, so the window and the swap chain change
   // shape together.
   static void FullscreenChanged(int32_t on);
+  // The video layer, driven by the engine's compositor thread (see
+  // gecko_w10m_set_video_layer_sink). All three post to the UI thread.
+  static void VideoLayerAttach(void* surface);
+  static void VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
+                              int32_t width, int32_t height, int32_t clipX,
+                              int32_t clipY, int32_t clipWidth,
+                              int32_t clipHeight, int32_t chainWidth,
+                              int32_t chainHeight);
+  static void VideoLayerShow(int32_t visible);
   // Which half of the swap-chain hand-over this launch leaves out, if any:
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.
@@ -149,6 +165,16 @@ class EngineView {
   using PanelScaleFn = void (*)(float x, float y);
   using AngleLogFn = void (*)(void (*)(const char*));
   using AngleModeFn = void (*)(int32_t);
+  // Same layout as GeckoW10mVideoLayerSink in the engine.
+  struct VideoLayerSink {
+    void (*attach)(void* surface);
+    void (*place)(uint32_t generation, int32_t x, int32_t y, int32_t width,
+                  int32_t height, int32_t clipX, int32_t clipY,
+                  int32_t clipWidth, int32_t clipHeight, int32_t chainWidth,
+                  int32_t chainHeight);
+    void (*show)(int32_t visible);
+  };
+  using SetVideoLayerSinkFn = void (*)(const VideoLayerSink*);
 
   CopyFn copy_ = nullptr;
   MouseFn mouse_ = nullptr;
@@ -168,6 +194,7 @@ class EngineView {
   OpenUrlFn open_url_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
+  SetVideoLayerSinkFn set_video_layer_ = nullptr;
   // The chrome-to-shell message bridge (client/DrmBridge). Armed once the
   // engine's main thread is up, which is later than the exports resolve.
   SetBridgeSinkFn set_bridge_ = nullptr;
@@ -200,6 +227,7 @@ class EngineView {
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
   winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::SwapChainPanel video_panel_{nullptr};
   winrt::Windows::UI::Xaml::FrameworkElement host_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBox sink_{nullptr};
   winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap bitmap_{nullptr};

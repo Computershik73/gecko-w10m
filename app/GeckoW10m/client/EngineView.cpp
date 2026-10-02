@@ -3,6 +3,7 @@
 #include "client/EngineView.h"
 
 #include <robuffer.h>
+#include <windows.ui.xaml.media.dxinterop.h>
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,12 @@ namespace {
 // Set by ANGLE's logger, which is a plain function pointer and can carry no
 // state of its own.
 std::atomic<bool> g_panelPresenting{false};
+
+// The video layer's panel and the engine's acknowledgement entry point, for
+// the static callbacks the engine's compositor thread calls.
+winrt::Windows::UI::Xaml::Controls::SwapChainPanel gVideoPanel{nullptr};
+std::atomic<void (*)(uint32_t)> gVideoAck{nullptr};
+double gRawPerView = 1.0;
 }  // namespace
 
 
@@ -66,8 +73,22 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     panel_.HorizontalAlignment(HorizontalAlignment::Stretch);
     panel_.VerticalAlignment(VerticalAlignment::Stretch);
     // Whether a video could have a display layer of its own; asks, changes
-    // nothing ("overlay:" lines in the log).
-    engine::ProbeVideoOverlay(panel_);
+    // nothing ("overlay:" lines in the log). Only with verbose logs: it makes
+    // a device and two swap chains of its own at launch.
+    if (Log::Verbose()) {
+      engine::ProbeVideoOverlay(panel_);
+    }
+    // Under the browser's panel: where a playing video goes, as a hardware
+    // overlay, seen through a transparent hole the browser leaves for it.
+    // Placed and sized by the engine; top-left, since its transform is
+    // computed from the panel's origin, which is the browser panel's origin.
+    video_panel_ = SwapChainPanel();
+    video_panel_.HorizontalAlignment(HorizontalAlignment::Left);
+    video_panel_.VerticalAlignment(VerticalAlignment::Top);
+    video_panel_.IsHitTestVisible(false);
+    video_panel_.Visibility(Visibility::Collapsed);
+    gVideoPanel = video_panel_;
+    gRawPerView = rawPerView_;
   } else {
     panelWithheld_ = true;
   }
@@ -387,6 +408,18 @@ bool EngineView::Resolve() {
       Log::Write(L"view: the engine can now ask for the whole screen");
     }
   }
+  if (!set_video_layer_ && video_panel_) {
+    set_video_layer_ = reinterpret_cast<SetVideoLayerSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_video_layer_sink"));
+    if (set_video_layer_) {
+      gVideoAck.store(reinterpret_cast<void (*)(uint32_t)>(
+          ::GetProcAddress(xul, "gecko_w10m_video_layer_ack")));
+      static const VideoLayerSink sink{&VideoLayerAttach, &VideoLayerPlace,
+                                       &VideoLayerShow};
+      set_video_layer_(&sink);
+      Log::Write(L"view: a playing video can go to the display as an overlay");
+    }
+  }
   if (screen_fn_ && screenWidth_ > 0) {
     screen_fn_(screenWidth_, screenHeight_);
   }
@@ -676,6 +709,90 @@ void EngineView::LaunchSystemUri(const char* utf8) {
         } catch (winrt::hresult_error const& error) {
           Log::Write(L"open: the system refused " + wide,
                      std::wstring(error.message()));
+        }
+      });
+}
+
+void EngineView::VideoLayerAttach(void* surface) {
+  if (!gUiDispatcher) {
+    return;
+  }
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::High, [surface]() {
+        if (!gVideoPanel) {
+          return;
+        }
+        winrt::com_ptr<ISwapChainPanelNative2> native2;
+        HRESULT hr = winrt::get_unknown(gVideoPanel)
+                         ->QueryInterface(__uuidof(ISwapChainPanelNative2),
+                                          native2.put_void());
+        if (SUCCEEDED(hr)) {
+          hr = native2->SetSwapChainHandle(static_cast<HANDLE>(surface));
+        }
+        Log::Write(std::wstring(L"video layer: the panel ") +
+                   (SUCCEEDED(hr) ? (surface ? L"took the video's surface"
+                                             : L"let the video's surface go")
+                                  : L"REFUSED the video's surface"));
+      });
+}
+
+void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
+                                 int32_t width, int32_t height, int32_t clipX,
+                                 int32_t clipY, int32_t clipWidth,
+                                 int32_t clipHeight, int32_t chainWidth,
+                                 int32_t chainHeight) {
+  if (!gUiDispatcher || width <= 0 || height <= 0 || chainWidth <= 0 ||
+      chainHeight <= 0) {
+    return;
+  }
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::High,
+      [=]() {
+        if (!gVideoPanel) {
+          return;
+        }
+        // Everything arrives in the browser surface's pixels, which are the
+        // display's. The swap chain shows one of its pixels per composition
+        // pixel, so laid out at its own size it is chain / scale view pixels
+        // across; the transform takes it from there to the video's place.
+        const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
+        double scale = gVideoPanel.CompositionScaleX();
+        if (scale <= 0) {
+          scale = raw;
+        }
+        gVideoPanel.Width(chainWidth / scale);
+        gVideoPanel.Height(chainHeight / scale);
+        CompositeTransform transform;
+        transform.ScaleX(width * scale / (raw * chainWidth));
+        transform.ScaleY(height * scale / (raw * chainHeight));
+        transform.TranslateX(x / raw);
+        transform.TranslateY(y / raw);
+        gVideoPanel.RenderTransform(transform);
+        // The part of the video the page shows, in the panel's own units.
+        RectangleGeometry clip;
+        const double perX = double(chainWidth) / width / scale;
+        const double perY = double(chainHeight) / height / scale;
+        clip.Rect({static_cast<float>((clipX - x) * perX),
+                   static_cast<float>((clipY - y) * perY),
+                   static_cast<float>(clipWidth * perX),
+                   static_cast<float>(clipHeight * perY)});
+        gVideoPanel.Clip(clip);
+        if (auto ack = gVideoAck.load()) {
+          ack(generation);
+        }
+      });
+}
+
+void EngineView::VideoLayerShow(int32_t visible) {
+  if (!gUiDispatcher) {
+    return;
+  }
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::High, [visible]() {
+        if (gVideoPanel) {
+          gVideoPanel.Visibility(visible ? Visibility::Visible
+                                         : Visibility::Collapsed);
+          Log::Write(visible ? L"video layer: shown" : L"video layer: hidden");
         }
       });
 }

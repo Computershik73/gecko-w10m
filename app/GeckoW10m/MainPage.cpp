@@ -313,12 +313,10 @@ MainPage::MainPage() {
   // the JIT probe or xul.dll had worked.
   Navigate(L"about:home");
 
-  engineView_->OnFirstFrame([this, raw, state = std::wstring(localState)]() {
+  engineView_->OnFirstFrame([this, state = std::wstring(localState)]() {
     if (splash_) {
       splash_.Visibility(Visibility::Collapsed);
     }
-    // Test build: can a video be a hardware overlay? See OverlayProbe.h.
-    engine::RunOverlayTest(root_, raw);
     // Drawing is the only proof the engine started; anything short of it could
     // be a launch that is about to die.
     engine::MarkGeckoHealthy(state);
@@ -507,6 +505,10 @@ void MainPage::BuildUi() {
   // swap chain made and handed over and never composited -- so what the
   // compositor does with our swap chain is not what kills this process, and
   // there is no reason left to keep the picture off the screen.
+  // The video layer first, so it lies under the browser's panel.
+  if (engineView_->VideoPanel()) {
+    contentStack.Children().Append(engineView_->VideoPanel());
+  }
   if (engineView_->Panel()) {
     contentStack.Children().Append(engineView_->Panel());
   }
