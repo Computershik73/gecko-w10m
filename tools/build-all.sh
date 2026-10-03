@@ -15,7 +15,12 @@ TOOLS="$(cd "$(dirname "$0")" && pwd)"
 # msys runtime (Git Bash's, say) it inherits none of the exported variables --
 # GECKO_W10M_OBJ included, so the step would build into the default objdir.
 SH="$BASH"
-source "$TOOLS/env.sh"
+source "$TOOLS/env.sh" || exit 1
+if [ -n "$GECKO_W10M_ON_VRAM" ]; then
+  echo "objdir on the VRAM disk: $GECKO_W10M_OBJ (kept in $GECKO_W10M_OBJ_SNAPSHOT), $GECKO_W10M_JOBS jobs"
+else
+  echo "objdir: $GECKO_W10M_OBJ, $GECKO_W10M_JOBS jobs"
+fi
 
 if [ ! -f "$GECKO_W10M_ROOT/engine/firefox/mach" ]; then
   echo "No engine in engine/firefox: see README, 'Get the engine'." >&2
@@ -43,3 +48,9 @@ tail -1 "$TMPDIR/package.log"
 
 echo "##### 5/5 appx"
 "$SH" "$TOOLS/build-appx.sh"
+
+if [ -n "$GECKO_W10M_ON_VRAM" ] && [ -f "$GECKO_W10M_OBJ/config.status" ]; then
+  echo "##### objdir saved from the VRAM disk to $GECKO_W10M_OBJ_SNAPSHOT"
+  gecko_w10m_mirror "$GECKO_W10M_OBJ" "$GECKO_W10M_OBJ_SNAPSHOT" ||
+    echo "VRAM disk: saving the objdir failed; the next mount builds from scratch" >&2
+fi

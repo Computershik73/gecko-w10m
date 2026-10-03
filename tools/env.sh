@@ -2,20 +2,44 @@
 # run it. Every location has a default and can be overridden by setting the
 # variable before the script runs:
 #
-#   GECKO_W10M_OBJ          engine object directory      (C:/rw-obj)
+#   GECKO_W10M_OBJ          engine object directory      (C:/rw-obj, or R:/rw-obj on the VRAM disk)
+#   GECKO_W10M_VRAM         drive of the VRAM disk       (R:; "off" to keep everything on C:)
+#   GECKO_W10M_OBJ_SNAPSHOT where the VRAM objdir is kept (C:/rw-obj-vram)
 #   MOZILLABUILD            MozillaBuild                 (C:/mozilla-build)
 #   GECKO_W10M_VC           MSVC toolset with ARM32 tools (newest under VS 2022)
 #   GECKO_W10M_LLVM         LLVM bin (clang-cl, lld-link) (C:/Program Files/LLVM/bin)
 #   GECKO_W10M_SDK          Windows Kits 10              (C:/Program Files (x86)/Windows Kits/10)
 #   GECKO_W10M_SDK_VERSION  SDK for headers and tools    (10.0.22621.0)
 #   GECKO_W10M_SDK_LIB      SDK the shell links against  (same as above; 10.0.14393.0 for 1607 phones)
-#   GECKO_W10M_JOBS         parallel compile jobs        (number of CPUs, less a quarter)
+#   GECKO_W10M_JOBS         parallel compile jobs        (half the CPUs)
 #
 # The object directory's path is short on purpose: the deepest libwebrtc object
 # path otherwise exceeds MAX_PATH and GNU make reports "No rule to make target".
 
 GECKO_W10M_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export GECKO_W10M_ROOT
+
+# The VRAM disk (nvidia-ramdisk's mount-vramdisk.ps1, labelled VRAM): when it
+# is mounted, the objdir and the temp files live on it and the SSD is spared
+# the build's churn. What is on it is gone at unmount, a reboot, a crash of
+# vramdisk.exe or a GPU driver reset, so the objdir is mirrored to
+# GECKO_W10M_OBJ_SNAPSHOT on the SSD after every successful build-all and
+# copied back onto a freshly mounted disk before the next build (timestamps
+# kept, so make and cargo see an up-to-date tree). The path differs from the
+# SSD objdir's, so the first build on the disk is a full one.
+GECKO_W10M_VRAM="${GECKO_W10M_VRAM:-R:}"
+# Decided once, by the first script; the steps it runs inherit the answer.
+if [ "$GECKO_W10M_ON_VRAM" = 1 ]; then
+  :
+elif [ "$GECKO_W10M_VRAM" != "off" ] && [ -z "$GECKO_W10M_OBJ" ] &&
+   [ -d "$(cygpath -u "$GECKO_W10M_VRAM/")" ] &&
+   cmd.exe //c "vol $GECKO_W10M_VRAM" 2> /dev/null | grep -qw VRAM; then
+  export GECKO_W10M_ON_VRAM=1
+  export GECKO_W10M_OBJ="$GECKO_W10M_VRAM/rw-obj"
+  export GECKO_W10M_OBJ_SNAPSHOT="${GECKO_W10M_OBJ_SNAPSHOT:-C:/rw-obj-vram}"
+else
+  export GECKO_W10M_ON_VRAM=
+fi
 export GECKO_W10M_OBJ="${GECKO_W10M_OBJ:-C:/rw-obj}"
 export MOZILLABUILD="${MOZILLABUILD:-C:/mozilla-build}"
 export GECKO_W10M_LLVM="${GECKO_W10M_LLVM:-C:/Program Files/LLVM/bin}"
@@ -43,7 +67,8 @@ export VC_PATH="$GECKO_W10M_VC"
 
 if [ -z "$GECKO_W10M_JOBS" ]; then
   n="$(nproc 2> /dev/null || echo 4)"
-  GECKO_W10M_JOBS=$(( n - n / 4 ))
+  # Half: at three quarters, a build with Rust in it took the whole 31 GB.
+  GECKO_W10M_JOBS=$(( n / 2 ))
 fi
 export GECKO_W10M_JOBS
 
@@ -67,7 +92,11 @@ export MOZBUILD_STATE_PATH="${MOZBUILD_STATE_PATH:-$HOME/.mozbuild}"
 [ -n "$ProgramW6432$PROGRAMW6432" ] || export ProgramW6432="C:/Program Files"
 
 # A writable temp directory: msys2 can leave TMP pointing at C:\Windows.
-_tmp="$(cygpath -u "${LOCALAPPDATA:-$USERPROFILE/AppData/Local}")/Temp/geckow10mbuild"
+if [ -n "$GECKO_W10M_ON_VRAM" ]; then
+  _tmp="$(cygpath -u "$GECKO_W10M_VRAM/")tmp/geckow10mbuild"
+else
+  _tmp="$(cygpath -u "${LOCALAPPDATA:-$USERPROFILE/AppData/Local}")/Temp/geckow10mbuild"
+fi
 mkdir -p "$_tmp"
 TMP="$(cygpath -w "$_tmp")"
 export TMP TEMP="$TMP" TMPDIR="$_tmp"
@@ -116,3 +145,18 @@ gecko_w10m_stage_intrin() {
   mkdir -p "$GECKO_W10M_OBJ/dist/include"
   cp -f "$GECKO_W10M_ROOT/mozconfig/gecko_w10m_arm_intrin.h" "$GECKO_W10M_OBJ/dist/include/"
 }
+
+# robocopy, with msys kept from taking its /SWITCHES for paths. Exit codes
+# under 8 are success.
+gecko_w10m_mirror() {
+  MSYS2_ARG_CONV_EXCL='*' robocopy "$(cygpath -w "$1")" "$(cygpath -w "$2")"     /MIR /COPY:DAT /DCOPY:T /MT:16 /R:1 /W:1 /NFL /NDL /NP /NJH > /dev/null
+  [ $? -lt 8 ]
+}
+
+# A freshly mounted VRAM disk gets the objdir back from the snapshot.
+if [ -n "$GECKO_W10M_ON_VRAM" ] && [ ! -f "$GECKO_W10M_OBJ/config.status" ] &&
+   [ -f "$GECKO_W10M_OBJ_SNAPSHOT/config.status" ]; then
+  echo "VRAM disk: copying the objdir back from $GECKO_W10M_OBJ_SNAPSHOT"
+  gecko_w10m_mirror "$GECKO_W10M_OBJ_SNAPSHOT" "$GECKO_W10M_OBJ" ||
+    { echo "VRAM disk: the copy failed" >&2; return 1 2> /dev/null || exit 1; }
+fi
