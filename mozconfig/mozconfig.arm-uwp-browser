@@ -15,6 +15,11 @@ ac_add_options --enable-project=browser
 # linking xul.dll. GECKO_W10M_OBJ overrides it (tools/env.sh).
 mk_add_options MOZ_OBJDIR=${GECKO_W10M_OBJ:-C:/rw-obj}
 
+# Make only: the Visual Studio and clangd backends write IDE files nothing here
+# uses, and the Visual Studio one cannot work with the objdir on another drive
+# than the source (os.path.relpath from R: to C:) -- as it is on the VRAM disk.
+ac_add_options --build-backends=RecursiveMake,FasterMake
+
 # ---- UWP app container ------------------------------------------------------
 # Adds MOZ_UWP + WINAPI_FAMILY=WINAPI_FAMILY_APP + GECKO_W10M, links the
 # /store CRT, skips ATL/MFC, forces single-process. See build/moz.configure/
