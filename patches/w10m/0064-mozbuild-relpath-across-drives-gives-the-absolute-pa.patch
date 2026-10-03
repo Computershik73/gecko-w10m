@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sat, 3 Oct 2026 21:58:32 +0400
+Subject: [PATCH] mozbuild: relpath across drives gives the absolute path
+
+With the objdir on a VRAM disk (R:) and the source on C:, the build's
+os.path.relpath calls that make a source path relative to the objdir or the
+current directory raise ValueError (gfx/layers/d3d11/genshaders.py was the
+first). There is no relative path between drives; the absolute one names the
+same file. Patched once in the mozbuild package, which mach and the build's
+Python actions all import.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ python/mozbuild/mozbuild/__init__.py | 29 ++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/python/mozbuild/mozbuild/__init__.py b/python/mozbuild/mozbuild/__init__.py
+index e69de29bb2..b8792966e9 100644
+--- a/python/mozbuild/mozbuild/__init__.py
++++ b/python/mozbuild/mozbuild/__init__.py
+@@ -0,0 +1,29 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++import os
++import sys
++
++# GeckoW10m: the objdir may be on another drive than the source tree (a VRAM
++# disk at R:, the source on C:). The build runs in the objdir, and the many
++# os.path.relpath calls that make a source path relative -- to the current
++# directory or to the objdir -- raise ValueError across drives on Windows.
++# There is no relative path between two drives; the absolute one names the
++# same file, so that is what they get. Everything that imports mozbuild, mach
++# and the build's Python actions included, is covered.
++if sys.platform == "win32" and not getattr(os.path, "_gecko_w10m_relpath", None):
++    _relpath = os.path.relpath
++
++    def _gecko_w10m_relpath(path, start=None):
++        try:
++            return _relpath(path, start)
++        except ValueError:
++            if os.path.splitdrive(os.path.abspath(path))[0].lower() == (
++                os.path.splitdrive(os.path.abspath(start or os.curdir))[0].lower()
++            ):
++                raise
++            return os.path.abspath(path)
++
++    os.path.relpath = _gecko_w10m_relpath
++    os.path._gecko_w10m_relpath = _relpath
