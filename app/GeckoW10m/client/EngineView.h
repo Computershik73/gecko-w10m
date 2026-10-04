@@ -84,7 +84,8 @@ class EngineView {
                               int32_t clipHeight, int32_t chainWidth,
                               int32_t chainHeight);
   static void VideoLayerShow(int32_t visible);
-  static void VideoLayerStack(int32_t above);
+  static void VideoLayerStack(int32_t above, int32_t trimTop,
+                              int32_t trimBottom);
   // Which half of the swap-chain hand-over this launch leaves out, if any:
   // 0 nothing, 1 the panel never gets the chain, 2 the chain is never
   // presented. Passed on to ANGLE as soon as it can be reached.
@@ -174,7 +175,7 @@ class EngineView {
                   int32_t clipWidth, int32_t clipHeight, int32_t chainWidth,
                   int32_t chainHeight);
     void (*show)(int32_t visible);
-    void (*stack)(int32_t above);
+    void (*stack)(int32_t above, int32_t trimTop, int32_t trimBottom);
   };
   using SetVideoLayerSinkFn = void (*)(const VideoLayerSink*);
 
