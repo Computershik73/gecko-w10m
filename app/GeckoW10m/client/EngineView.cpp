@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include "client/DrmBridge.h"
@@ -50,31 +51,40 @@ winrt::Windows::UI::Xaml::Controls::SwapChainPanel gVideoPanel{nullptr};
 std::atomic<void (*)(uint32_t)> gVideoAck{nullptr};
 double gRawPerView = 1.0;
 
+// The browser's panel, which the video panel lies under or above.
+winrt::Windows::UI::Xaml::Controls::SwapChainPanel gBrowserPanel{nullptr};
+
 // The video's last placement, in the browser surface's pixels, and the rows
-// cut off the top and the bottom of its visible part while the panel is
-// above the browser's (for a band the page draws over the video's edge).
+// and columns cut off its visible part while the panel is above the
+// browser's (for a band the page draws over the video's edge).
 struct VideoPlacement {
   int32_t x = 0, y = 0, width = 0, height = 0;
   int32_t clipX = 0, clipY = 0, clipWidth = 0, clipHeight = 0;
   int32_t chainWidth = 0, chainHeight = 0;
-  int32_t trimTop = 0, trimBottom = 0;
+  int32_t trimTop = 0, trimBottom = 0, trimLeft = 0, trimRight = 0;
+  bool above = false;
+  // The content host's background, taken away while the video is above.
+  winrt::Windows::UI::Xaml::Controls::Border host{nullptr};
+  winrt::Windows::UI::Xaml::Media::Brush hostBackground{nullptr};
 };
 VideoPlacement gVideoPlacement;
 
-// The part of the video the page shows, less the trimmed rows, as the
-// panel's clip in its own units (chain pixels) -- and no clip at all when
-// all of it shows: a clipped layer may be one the display cannot take as an
-// overlay. True when the panel is clipped.
+// The part of the video the page shows, less the trimmed rows and columns,
+// as the panel's clip in its own units (chain pixels) -- and no clip at all
+// when all of it shows: a clipped layer may be one the display cannot take
+// as an overlay. True when the panel is clipped.
 bool ApplyVideoClip() {
   const VideoPlacement& p = gVideoPlacement;
   if (!gVideoPanel || p.width <= 0 || p.height <= 0) {
     return false;
   }
+  const int32_t clipX = p.clipX + p.trimLeft;
   const int32_t clipY = p.clipY + p.trimTop;
+  const int32_t clipWidth = std::max(0, p.clipWidth - p.trimLeft - p.trimRight);
   const int32_t clipHeight =
       std::max(0, p.clipHeight - p.trimTop - p.trimBottom);
-  const bool whole = p.clipX == p.x && clipY == p.y &&
-                     p.clipWidth == p.width && clipHeight == p.height;
+  const bool whole = clipX == p.x && clipY == p.y && clipWidth == p.width &&
+                     clipHeight == p.height;
   if (whole) {
     gVideoPanel.Clip(nullptr);
     return false;
@@ -82,12 +92,58 @@ bool ApplyVideoClip() {
   RectangleGeometry clip;
   const double perX = double(p.chainWidth) / p.width;
   const double perY = double(p.chainHeight) / p.height;
-  clip.Rect({static_cast<float>((p.clipX - p.x) * perX),
+  clip.Rect({static_cast<float>((clipX - p.x) * perX),
              static_cast<float>((clipY - p.y) * perY),
-             static_cast<float>(p.clipWidth * perX),
+             static_cast<float>(clipWidth * perX),
              static_cast<float>(clipHeight * perY)});
   gVideoPanel.Clip(clip);
   return true;
+}
+
+// The video panel above the browser's or under it, made exactly as in build
+// 132's test, the one arrangement the display took as a hardware overlay:
+// moved in the tree to just after the browser's panel, laid out at no size
+// of its own (a swap chain shows from the panel's origin whatever its size),
+// and nothing under it -- the content host's background taken away. Under
+// the browser everything is put back.
+void StackVideoPanel(bool above) {
+  VideoPlacement& p = gVideoPlacement;
+  if (!gVideoPanel || p.above == above) {
+    return;
+  }
+  p.above = above;
+  auto grid = gVideoPanel.Parent()
+                  .try_as<winrt::Windows::UI::Xaml::Controls::Panel>();
+  if (grid && gBrowserPanel) {
+    uint32_t index = 0;
+    if (grid.Children().IndexOf(gVideoPanel, index)) {
+      grid.Children().RemoveAt(index);
+    }
+    uint32_t browser = 0;
+    if (grid.Children().IndexOf(gBrowserPanel, browser)) {
+      grid.Children().InsertAt(above ? browser + 1 : browser, gVideoPanel);
+    }
+  }
+  if (above) {
+    gVideoPanel.Width(std::numeric_limits<double>::quiet_NaN());
+    gVideoPanel.Height(std::numeric_limits<double>::quiet_NaN());
+    if (!p.host && grid) {
+      p.host = grid.Parent()
+                   .try_as<winrt::Windows::UI::Xaml::Controls::Border>();
+    }
+    if (p.host) {
+      p.hostBackground = p.host.Background();
+      p.host.Background(nullptr);
+    }
+  } else {
+    if (p.chainWidth > 0 && p.chainHeight > 0) {
+      gVideoPanel.Width(p.chainWidth);
+      gVideoPanel.Height(p.chainHeight);
+    }
+    if (p.host && p.hostBackground) {
+      p.host.Background(p.hostBackground);
+    }
+  }
 }
 }  // namespace
 
@@ -128,6 +184,7 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
     video_panel_.IsHitTestVisible(false);
     video_panel_.Visibility(Visibility::Collapsed);
     gVideoPanel = video_panel_;
+    gBrowserPanel = panel_;
     gRawPerView = rawPerView_;
   } else {
     panelWithheld_ = true;
@@ -801,8 +858,10 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         // already includes the transform set here, and computing from it fed
         // each placement the last one's scale -- the video showed magnified.
         const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
-        gVideoPanel.Width(chainWidth);
-        gVideoPanel.Height(chainHeight);
+        if (!gVideoPlacement.above) {
+          gVideoPanel.Width(chainWidth);
+          gVideoPanel.Height(chainHeight);
+        }
         const double scaleX = width / raw / chainWidth;
         const double scaleY = height / raw / chainHeight;
         CompositeTransform transform;
@@ -812,11 +871,16 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         transform.TranslateY(y / raw);
         gVideoPanel.RenderTransform(transform);
         VideoPlacement& placement = gVideoPlacement;
-        const int32_t trimTop = placement.trimTop;
-        const int32_t trimBottom = placement.trimBottom;
-        placement = {x,         y,          width,       height,
-                     clipX,     clipY,      clipWidth,   clipHeight,
-                     chainWidth, chainHeight, trimTop,   trimBottom};
+        placement.x = x;
+        placement.y = y;
+        placement.width = width;
+        placement.height = height;
+        placement.clipX = clipX;
+        placement.clipY = clipY;
+        placement.clipWidth = clipWidth;
+        placement.clipHeight = clipHeight;
+        placement.chainWidth = chainWidth;
+        placement.chainHeight = chainHeight;
         const bool whole = !ApplyVideoClip();
         static int sPlacementNotes = 0;
         if (sPlacementNotes < 40) {
@@ -836,26 +900,28 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
 }
 
 void EngineView::VideoLayerStack(int32_t above, int32_t trimTop,
-                                 int32_t trimBottom) {
+                                 int32_t trimBottom, int32_t trimLeft,
+                                 int32_t trimRight) {
   if (!gUiDispatcher) {
     return;
   }
   gUiDispatcher.RunAsync(
       winrt::Windows::UI::Core::CoreDispatcherPriority::High,
-      [above, trimTop, trimBottom]() {
+      [above, trimTop, trimBottom, trimLeft, trimRight]() {
         // The display scans the video out as a hardware overlay only while
         // its panel lies above the browser's (build 132's test); the engine
-        // asks for that while nothing of the page is in front of the video,
-        // and for under the browser again as soon as something is. Raised
-        // over its siblings rather than moved in the tree.
-        // Above, rows the page draws over at the video's top or bottom edge
-        // (a player's progress bar) are left out of the panel so they show.
+        // asks for that while nothing of the page is in front of the video
+        // but a band along an edge (a player's progress bar), which is left
+        // out of the panel so it shows, and for under the browser again as
+        // soon as more is.
         if (gVideoPanel) {
-          gVideoPlacement.trimTop = above ? trimTop : 0;
-          gVideoPlacement.trimBottom = above ? trimBottom : 0;
+          VideoPlacement& p = gVideoPlacement;
+          p.trimTop = above ? trimTop : 0;
+          p.trimBottom = above ? trimBottom : 0;
+          p.trimLeft = above ? trimLeft : 0;
+          p.trimRight = above ? trimRight : 0;
           ApplyVideoClip();
-          winrt::Windows::UI::Xaml::Controls::Canvas::SetZIndex(gVideoPanel,
-                                                                above ? 1 : 0);
+          StackVideoPanel(above != 0);
         }
       });
 }

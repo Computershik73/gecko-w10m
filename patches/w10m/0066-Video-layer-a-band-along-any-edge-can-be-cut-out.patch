@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 4 Oct 2026 20:31:31 +0400
+Subject: [PATCH] Video layer: a band along any edge can be cut out
+
+In landscape fullscreen YouTube keeps something 84 pixels wide down the left
+edge in front of the video, so the panel never went above the browser. A
+band along the left or right edge, at most a twelfth of the visible width,
+is now cut out of the panel like one along the top or bottom.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 80 ++++++++++++-------
+ 1 file changed, 50 insertions(+), 30 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 22238eb8aa..14107ab86b 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -55,10 +55,11 @@ struct GeckoW10mVideoLayerSink {
+   // a hardware overlay only above (the test in build 132: under the
+   // browser it was composed by the GPU whatever else was done), and above
+   // it hides whatever the page draws over the video.
+-  // aTrimTop/aTrimBottom: rows of the visible part, in the browser surface's
++  // aTrim*: rows and columns of the visible part, in the browser surface's
+   // pixels, cut off the panel while it is above, so that a thin band the page
+   // draws over the video's edge (a player's progress bar) still shows.
+-  void (*stack)(int32_t aAbove, int32_t aTrimTop, int32_t aTrimBottom);
++  void (*stack)(int32_t aAbove, int32_t aTrimTop, int32_t aTrimBottom,
++                int32_t aTrimLeft, int32_t aTrimRight);
+ };
+ 
+ std::atomic<const GeckoW10mVideoLayerSink*> sSink{nullptr};
+@@ -67,6 +68,18 @@ std::atomic<uint32_t> sAckedGeneration{0};
+ constexpr DWORD kCompositionObjectAllAccess = 0x0003;
+ constexpr UINT kSwapChainFlagYuvVideo = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO;
+ 
++// Rows and columns cut off each edge of the video's visible part.
++struct Trim {
++  int32_t top = 0, bottom = 0, left = 0, right = 0;
++  // A band that only moves by a pixel or two is the same band.
++  bool Near(const Trim& aOther) const {
++    return std::abs(top - aOther.top) <= 2 &&
++           std::abs(bottom - aOther.bottom) <= 2 &&
++           std::abs(left - aOther.left) <= 2 &&
++           std::abs(right - aOther.right) <= 2;
++  }
++};
++
+ struct Rect {
+   int32_t x = 0, y = 0, w = 0, h = 0;
+   bool operator==(const Rect& aOther) const {
+@@ -93,8 +106,7 @@ struct VideoLayer {
+   // Whether the panel lies above the browser's, and for how many composites
+   // in a row nothing of the page has been drawn in front of the video.
+   bool mAbove = false;
+-  int32_t mTrimTop = 0;
+-  int32_t mTrimBottom = 0;
++  Trim mTrim;
+   uint32_t mUncoveredFrames = 0;
+   uint32_t mStatAbove = 0;
+   uint32_t mStackNotes = 0;
+@@ -149,29 +161,27 @@ struct VideoLayer {
+     Hide();
+   }
+ 
+-  void Stack(bool aAbove, int32_t aTrimTop = 0, int32_t aTrimBottom = 0) {
++  void Stack(bool aAbove, Trim aTrim = Trim()) {
+     if (!aAbove) {
+-      aTrimTop = aTrimBottom = 0;
++      aTrim = Trim();
+     }
+-    // A band that only moves by a pixel or two is the same band.
+-    if (aAbove == mAbove && std::abs(aTrimTop - mTrimTop) <= 2 &&
+-        std::abs(aTrimBottom - mTrimBottom) <= 2) {
++    if (aAbove == mAbove && aTrim.Near(mTrim)) {
+       return;
+     }
+     mAbove = aAbove;
+-    mTrimTop = aTrimTop;
+-    mTrimBottom = aTrimBottom;
++    mTrim = aTrim;
+     if (auto* sink = sSink.load()) {
+-      sink->stack(aAbove ? 1 : 0, aTrimTop, aTrimBottom);
++      sink->stack(aAbove ? 1 : 0, aTrim.top, aTrim.bottom, aTrim.left,
++                  aTrim.right);
+     }
+     if (mStackNotes < 40) {
+       ++mStackNotes;
+-      char note[192];
++      char note[224];
+       if (aAbove) {
+         SprintfLiteral(note,
+-                       "video layer: above the browser, %d rows cut off the "
+-                       "top and %d off the bottom for what the page draws there",
+-                       aTrimTop, aTrimBottom);
++                       "video layer: above the browser, cut off for what the "
++                       "page draws there: %d top, %d bottom, %d left, %d right",
++                       aTrim.top, aTrim.bottom, aTrim.left, aTrim.right);
+       } else {
+         SprintfLiteral(note,
+                        "video layer: under the browser -- the page draws in "
+@@ -182,23 +192,33 @@ struct VideoLayer {
+   }
+ 
+   // Whether the panel can go above the browser though the page draws over
+-  // the video: only when all of it lies in a band along the top or the
+-  // bottom edge, at most a twelfth of the visible height, which the panel
+-  // then leaves out.
+-  bool Trims(int32_t aTiles, const Rect& aCover, int32_t* aTop,
+-             int32_t* aBottom) const {
+-    *aTop = *aBottom = 0;
++  // the video: only when all of it lies in a band along one edge, at most a
++  // twelfth of the visible height or width, which the panel then leaves out.
++  // (A progress bar along the bottom; in landscape fullscreen YouTube keeps
++  // something 84 pixels wide down the left edge.)
++  bool Trims(int32_t aTiles, const Rect& aCover, Trim* aTrim) const {
++    *aTrim = Trim();
+     if (aTiles <= 0) {
+       return true;
+     }
+-    const int32_t band = std::max(4, mClip.h / 12);
++    const int32_t bandY = std::max(4, mClip.h / 12);
++    const int32_t bandX = std::max(4, mClip.w / 12);
+     const int32_t clipBottom = mClip.y + mClip.h;
+-    if (aCover.y >= clipBottom - band) {
+-      *aBottom = clipBottom - aCover.y;
++    const int32_t clipRight = mClip.x + mClip.w;
++    if (aCover.y >= clipBottom - bandY) {
++      aTrim->bottom = clipBottom - aCover.y;
++      return true;
++    }
++    if (aCover.y + aCover.h <= mClip.y + bandY) {
++      aTrim->top = aCover.y + aCover.h - mClip.y;
++      return true;
++    }
++    if (aCover.x + aCover.w <= mClip.x + bandX) {
++      aTrim->left = aCover.x + aCover.w - mClip.x;
+       return true;
+     }
+-    if (aCover.y + aCover.h <= mClip.y + band) {
+-      *aTop = aCover.y + aCover.h - mClip.y;
++    if (aCover.x >= clipRight - bandX) {
++      aTrim->right = clipRight - aCover.x;
+       return true;
+     }
+     return false;
+@@ -413,10 +433,10 @@ struct VideoLayer {
+     // otherwise. Raised only after a tenth of a second like that, so a
+     // player's controls fading in and out do not make the panel jump back
+     // and forth.
+-    int32_t trimTop = 0, trimBottom = 0;
+-    if (hole && Trims(aCoveredTiles, cover, &trimTop, &trimBottom)) {
++    Trim trim;
++    if (hole && Trims(aCoveredTiles, cover, &trim)) {
+       if (++mUncoveredFrames >= 6) {
+-        Stack(true, trimTop, trimBottom);
++        Stack(true, trim);
+       }
+     } else {
+       mUncoveredFrames = 0;
