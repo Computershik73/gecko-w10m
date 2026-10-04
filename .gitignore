@@ -39,3 +39,6 @@ obj-arm-uwp/
 # Vendored windows-rs, fetched separately and patched by
 # tools/patch-windows-rs-arm32.py.
 /engine/third_party/
+
+# Logs and other files fetched from the phone (tools/phone.py)
+/work/
