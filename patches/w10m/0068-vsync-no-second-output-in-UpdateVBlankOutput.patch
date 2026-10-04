@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 5 Oct 2026 01:21:18 +0400
+Subject: [PATCH] vsync: no second 'output' in UpdateVBlankOutput
+
+The Windows 10 Mobile branch declared a variable the function's own code
+declares again below it, which does not compile.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/thebes/gfxWindowsPlatform.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/gfx/thebes/gfxWindowsPlatform.cpp b/gfx/thebes/gfxWindowsPlatform.cpp
+index df3f1576e5..9abedeb7ef 100644
+--- a/gfx/thebes/gfxWindowsPlatform.cpp
++++ b/gfx/thebes/gfxWindowsPlatform.cpp
+@@ -1766,12 +1766,12 @@ class D3DVsyncSource final : public VsyncSource {
+     }
+     RefPtr<IDXGIDevice> dxgiDevice;
+     RefPtr<IDXGIAdapter> adapter;
+-    RefPtr<IDXGIOutput> output;
++    RefPtr<IDXGIOutput> firstOutput;
+     if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice),
+                                          getter_AddRefs(dxgiDevice))) &&
+         SUCCEEDED(dxgiDevice->GetAdapter(getter_AddRefs(adapter))) &&
+-        SUCCEEDED(adapter->EnumOutputs(0, getter_AddRefs(output)))) {
+-      mWaitVBlankOutput = output;
++        SUCCEEDED(adapter->EnumOutputs(0, getter_AddRefs(firstOutput)))) {
++      mWaitVBlankOutput = firstOutput;
+       GeckoW10mNote(
+           "vsync: waiting on the display's vertical blank (the adapter's "
+           "first output)");
