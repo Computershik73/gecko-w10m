@@ -1,0 +1,278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 5 Oct 2026 03:16:53 +0400
+Subject: [PATCH] Video layer: the band the panel leaves out is drawn by
+ WebRender
+
+When the page draws over a band along the video's edge (YouTube keeps an
+84-pixel-wide element down the left in landscape fullscreen), the panel goes
+above the browser with that band cut out of it -- and the band showed the
+page's background, a grey strip over the video. The layer now tells WR the
+part its panel shows; WR draws the video as usual over the whole tile and
+the transparent hole only over that part, so the band shows the video with
+the page over it. Partial present keeps it cheap: a steady hole's tile is
+dirty only in the band.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 18 +++++-
+ gfx/wr/webrender/src/renderer/composite.rs    | 57 ++++++++++++++++++-
+ gfx/wr/webrender/src/renderer/mod.rs          | 57 +++++++++++++++----
+ 3 files changed, 117 insertions(+), 15 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index c456cdc848..9ca7f31811 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -613,7 +613,7 @@ struct VideoLayer {
+ 
+   // 0: WebRender draws the video; 1: a hole, new this frame; 2: a hole that
+   // was already there.
+-  int32_t Offer(const mozilla::wr::ExternalImageId& aId, const float* aRects,
++  int32_t Offer(const mozilla::wr::ExternalImageId& aId, float* aRects,
+                 int32_t aCoveredTiles) {
+     const bool hole = OfferForHole(aId, aRects);
+     Rect cover;
+@@ -648,6 +648,17 @@ struct VideoLayer {
+     if (mAbove) {
+       ++mStatAbove;
+     }
++    // Where the panel shows the video, when it leaves out a band: there the
++    // page draws over the video, and WebRender draws the video under it --
++    // left a hole, the band showed the page's background, a grey strip.
++    aRects[12] = aRects[13] = aRects[14] = aRects[15] = 0;
++    if (hole && mAbove &&
++        (mTrim.top || mTrim.bottom || mTrim.left || mTrim.right)) {
++      aRects[12] = float(mClip.x + mTrim.left);
++      aRects[13] = float(mClip.y + mTrim.top);
++      aRects[14] = float(mClip.x + mClip.w - mTrim.right);
++      aRects[15] = float(mClip.y + mClip.h - mTrim.bottom);
++    }
+     const int32_t answer = hole ? (mLastHole ? 2 : 1) : 0;
+     mLastHole = hole;
+     return answer;
+@@ -889,9 +900,10 @@ extern "C" __declspec(dllexport) void gecko_w10m_video_layer_ack(
+ // video about to be drawn: aRects is the video's rect and its visible part,
+ // then the box the page draws over in front of it, x0 y0 x1 y1 each, in
+ // device pixels; aCovered, how many of the page's tiles do. True: the display
+-// shows it, draw a transparent hole.
++// shows it, draw a transparent hole -- over aRects[12..16] alone when that is
++// set, the part the panel shows; WebRender draws the video in the rest.
+ extern "C" int32_t gecko_w10m_video_layer_frame(uint64_t aExternalImageId,
+-                                                const float* aRects,
++                                                float* aRects,
+                                                 int32_t aCovered) {
+   return Layer().Offer(mozilla::wr::ToExternalImageId(aExternalImageId), aRects,
+                        aCovered);
+diff --git a/gfx/wr/webrender/src/renderer/composite.rs b/gfx/wr/webrender/src/renderer/composite.rs
+index 45ed196c72..4fc1b00049 100644
+--- a/gfx/wr/webrender/src/renderer/composite.rs
++++ b/gfx/wr/webrender/src/renderer/composite.rs
+@@ -261,6 +261,10 @@ impl Renderer {
+                 None
+             };
+ 
++            // GeckoW10m: a transparent hole drawn right after this tile's
++            // video, over the part of it the video layer's panel shows.
++            let mut gecko_w10m_hole_after: Option<CompositeInstance> = None;
++
+             // Work out the draw params based on the tile surface
+             let (instance, textures, shader_params) = match tile.surface {
+                 CompositeTileSurface::Color { color } => {
+@@ -312,8 +316,29 @@ impl Renderer {
+                     // video is blended over the hole as before.
+                     // The frame was offered at the start of the frame
+                     // (calculate_dirty_rects); this reads the answer.
++                    // When the panel leaves out a band of the video (the
++                    // page draws over the video's edge there), the video is
++                    // drawn here as usual and the hole goes only where the
++                    // panel is, after it (gecko_w10m_hole_after).
++                    let hole_part = if clip.is_none() {
++                        super::gecko_w10m_video_hole_part(item.key.tile_index)
++                    } else {
++                        None
++                    };
+                     let shown_by_display = clip.is_none()
++                        && hole_part.is_none()
+                         && super::gecko_w10m_video_hole(item.key.tile_index).is_some();
++                    if let Some(part) = hole_part {
++                        gecko_w10m_hole_after = clip_rect.intersection(&part).map(|r| {
++                            CompositeInstance::new(
++                                tile_rect,
++                                r,
++                                PremultipliedColorF::TRANSPARENT,
++                                flip,
++                                None,
++                            )
++                        });
++                    }
+ 
+                     if shown_by_display {
+                         let dummy = TextureSource::Dummy;
+@@ -405,6 +430,18 @@ impl Renderer {
+                 }
+             };
+ 
++            let gecko_w10m_hole_after = gecko_w10m_hole_after.map(|hole| {
++                let dummy = TextureSource::Dummy;
++                let features = hole.get_rgb_features();
++                (
++                    hole,
++                    BatchTextures::composite_rgb(dummy),
++                    (CompositeSurfaceFormat::Rgba, dummy.image_buffer_kind(), features, None),
++                )
++            });
++            for (instance, textures, shader_params) in
++                std::iter::once((instance, textures, shader_params)).chain(gecko_w10m_hole_after)
++            {
+             // Flush batch if shader params or textures changed
+             let flush_batch = !current_textures.is_compatible_with(&textures) ||
+                 shader_params != current_shader_params;
+@@ -438,6 +475,7 @@ impl Renderer {
+ 
+             // Add instance to current batch
+             instances.push(instance);
++            }
+         }
+ 
+         // Flush the last batch
+@@ -1420,11 +1458,26 @@ impl Renderer {
+                 // Work out how many dirty rects WR produced, and if that's more than
+                 // what the device supports.
+                 for (tile_index, tile) in composite_state.tiles.iter().enumerate() {
+-                    if super::gecko_w10m_video_hole(tile_index) == Some(true) {
++                    let hole_part = super::gecko_w10m_video_hole_part(tile_index);
++                    if super::gecko_w10m_video_hole(tile_index) == Some(true)
++                        && hole_part.is_none()
++                    {
+                         continue;
+                     }
+-                    let dirty_rect = composite_state
++                    let mut dirty_rect = composite_state
+                         .get_device_rect(&tile.local_dirty_rect, tile.transform_index);
++                    // A steady hole with a band the compositor draws: only
++                    // the band changes with the video.
++                    if let (Some(true), Some(part)) =
++                        (super::gecko_w10m_video_hole(tile_index), hole_part)
++                    {
++                        let whole = composite_state
++                            .get_device_rect(&tile.local_rect, tile.transform_index)
++                            .intersection(&tile.device_clip_rect)
++                            .unwrap_or(DeviceRect::zero());
++                        let band = super::gecko_w10m_band(&whole, &part);
++                        dirty_rect = dirty_rect.intersection(&band).unwrap_or(DeviceRect::zero());
++                    }
+ 
+                     // In pathological cases where a tile is extremely zoomed, it
+                     // may end up with device coords outside the range of an i32,
+diff --git a/gfx/wr/webrender/src/renderer/mod.rs b/gfx/wr/webrender/src/renderer/mod.rs
+index 2073960cc3..4a3759b7dc 100644
+--- a/gfx/wr/webrender/src/renderer/mod.rs
++++ b/gfx/wr/webrender/src/renderer/mod.rs
+@@ -738,12 +738,14 @@ fn gecko_w10m_composite_stats(state: &CompositeState) {
+ /// is how many tiles of the page draw in front of the video this frame, and
+ /// the last four floats of `rects` the box they cover of it: the display
+ /// takes the layer as an overlay only when it lies above the browser's,
+-/// which hides whatever is in front of the video.
++/// which hides whatever is in front of the video. The layer writes the last
++/// four floats of `rects`: where its panel shows the video, when that is
++/// less than all of what shows of it (zero otherwise).
+ #[cfg(windows)]
+ extern "C" {
+     fn gecko_w10m_video_layer_frame(
+         external_image_id: u64,
+-        rects: *const f32,
++        rects: *mut f32,
+         covered: i32,
+     ) -> i32;
+ }
+@@ -753,21 +755,28 @@ fn gecko_w10m_video_layer(
+     tile_rect: &DeviceRect,
+     clip_rect: &DeviceRect,
+     covered: (i32, DeviceRect),
+-) -> i32 {
++) -> (i32, Option<DeviceRect>) {
+     #[cfg(windows)]
+     {
+         let (count, cover) = covered;
+-        let rects = [
++        let mut rects = [
+             tile_rect.min.x, tile_rect.min.y, tile_rect.max.x, tile_rect.max.y,
+             clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y,
+             cover.min.x, cover.min.y, cover.max.x, cover.max.y,
++            0.0, 0.0, 0.0, 0.0,
+         ];
+-        unsafe { gecko_w10m_video_layer_frame(id.0, rects.as_ptr(), count) }
++        let answer =
++            unsafe { gecko_w10m_video_layer_frame(id.0, rects.as_mut_ptr(), count) };
++        let part = DeviceRect::new(
++            api::units::DevicePoint::new(rects[12], rects[13]),
++            api::units::DevicePoint::new(rects[14], rects[15]),
++        );
++        (answer, if part.is_empty() { None } else { Some(part) })
+     }
+     #[cfg(not(windows))]
+     {
+         let _ = (id, tile_rect, clip_rect, covered);
+-        0
++        (0, None)
+     }
+ }
+ 
+@@ -801,8 +810,11 @@ fn gecko_w10m_covered(
+     (count, cover)
+ }
+ 
+-/// This frame's holes: tile index, and whether the hole was already there.
+-static GECKO_W10M_HOLES: std::sync::Mutex<Vec<(usize, bool)>> =
++/// This frame's holes: tile index, whether the hole was already there, and
++/// the part of the video's visible rect that is a hole when it is not all of
++/// it -- the video layer's panel leaves out a band along an edge where the
++/// page draws over the video, and there the compositor draws the video.
++static GECKO_W10M_HOLES: std::sync::Mutex<Vec<(usize, bool, Option<DeviceRect>)>> =
+     std::sync::Mutex::new(Vec::new());
+ 
+ /// Offers every opaque YUV video of the frame to the video layer, once per
+@@ -828,8 +840,8 @@ pub(crate) fn gecko_w10m_offer_videos(state: &CompositeState) {
+                     .unwrap_or(DeviceRect::zero());
+                 let covered = gecko_w10m_covered(state, index, &clip_rect);
+                 match gecko_w10m_video_layer(id, &tile_rect, &clip_rect, covered) {
+-                    1 => holes.push((index, false)),
+-                    2 => holes.push((index, true)),
++                    (1, part) => holes.push((index, false, part)),
++                    (2, part) => holes.push((index, true, part)),
+                     _ => {}
+                 }
+             }
+@@ -846,6 +858,31 @@ pub(crate) fn gecko_w10m_video_hole(tile_index: usize) -> Option<bool> {
+         .and_then(|holes| holes.iter().find(|h| h.0 == tile_index).map(|h| h.1))
+ }
+ 
++/// The part of this tile's video that is a hole, when the hole is not all of
++/// it (see GECKO_W10M_HOLES).
++pub(crate) fn gecko_w10m_video_hole_part(tile_index: usize) -> Option<DeviceRect> {
++    GECKO_W10M_HOLES
++        .lock()
++        .ok()
++        .and_then(|holes| holes.iter().find(|h| h.0 == tile_index).and_then(|h| h.2))
++}
++
++/// What is left of `whole` around `part` when `part` takes all of it but a
++/// band along one edge -- the band, which the compositor draws.
++pub(crate) fn gecko_w10m_band(whole: &DeviceRect, part: &DeviceRect) -> DeviceRect {
++    let mut band = *whole;
++    if part.min.x > whole.min.x {
++        band.max.x = part.min.x;
++    } else if part.max.x < whole.max.x {
++        band.min.x = part.max.x;
++    } else if part.min.y > whole.min.y {
++        band.max.y = part.min.y;
++    } else if part.max.y < whole.max.y {
++        band.min.y = part.max.y;
++    }
++    band
++}
++
+ /// GeckoW10m: compositor surfaces per frame by kind, and the last reason a
+ /// video was refused as an overlay.
+ static GECKO_W10M_UNDERLAYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
