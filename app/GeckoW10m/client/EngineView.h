@@ -82,7 +82,7 @@ class EngineView {
                               int32_t width, int32_t height, int32_t clipX,
                               int32_t clipY, int32_t clipWidth,
                               int32_t clipHeight, int32_t chainWidth,
-                              int32_t chainHeight);
+                              int32_t chainHeight, int32_t rotation);
   static void VideoLayerShow(int32_t visible);
   static void VideoLayerStack(int32_t above, int32_t trimTop,
                               int32_t trimBottom, int32_t trimLeft,
@@ -174,7 +174,7 @@ class EngineView {
     void (*place)(uint32_t generation, int32_t x, int32_t y, int32_t width,
                   int32_t height, int32_t clipX, int32_t clipY,
                   int32_t clipWidth, int32_t clipHeight, int32_t chainWidth,
-                  int32_t chainHeight);
+                  int32_t chainHeight, int32_t rotation);
     void (*show)(int32_t visible);
     void (*stack)(int32_t above, int32_t trimTop, int32_t trimBottom,
                   int32_t trimLeft, int32_t trimRight);

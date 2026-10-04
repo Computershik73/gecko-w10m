@@ -18,6 +18,7 @@
 #include "engine/OverlayProbe.h"
 #include <winrt/Windows.Foundation.Metadata.h>
 
+#include "winrt/Windows.Graphics.Display.h"
 #include "winrt/Windows.UI.Core.h"
 #include "winrt/Windows.UI.Input.h"
 #include "winrt/Windows.UI.Xaml.Input.h"
@@ -61,6 +62,9 @@ struct VideoPlacement {
   int32_t x = 0, y = 0, width = 0, height = 0;
   int32_t clipX = 0, clipY = 0, clipWidth = 0, clipHeight = 0;
   int32_t chainWidth = 0, chainHeight = 0;
+  // How far the engine turned the frames in the chain, clockwise; the panel
+  // turns them back.
+  int32_t rotation = 0;
   int32_t trimTop = 0, trimBottom = 0, trimLeft = 0, trimRight = 0;
   bool above = false;
   // The content host's background, taken away while the video is above.
@@ -69,11 +73,58 @@ struct VideoPlacement {
 };
 VideoPlacement gVideoPlacement;
 
+// The panel's transform: from the chain's pixels to the video's place in
+// view pixels. Everything arrives in the browser surface's pixels, which are
+// the display's. A swap chain given to a SwapChainPanel is shown one of its
+// pixels per view pixel, whatever the display's density -- the browser's own
+// panel has ANGLE undo that with a matrix transform -- so the panel is
+// chain-sized in view pixels, and this takes it to the video's place. Only
+// the display's density goes into it: the panel's CompositionScale already
+// includes the transform set here, and computing from it fed each placement
+// the last one's scale -- the video showed magnified.
+//
+// Frames the engine turned (in landscape, so that the display has nothing
+// left to turn: see Rotator in GeckoW10mVideoLayer.cpp) are turned back
+// here. XAML applies scale, then rotation (clockwise, about the origin),
+// then translation; the translation puts the turned box back on the video.
+CompositeTransform VideoTransform() {
+  const VideoPlacement& p = gVideoPlacement;
+  const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
+  const double left = p.x / raw, top = p.y / raw;
+  const double width = p.width / raw, height = p.height / raw;
+  const int32_t back = (360 - p.rotation) % 360;
+  const bool quarter = back == 90 || back == 270;
+  CompositeTransform t;
+  // The chain is the frame's size, swapped for a quarter turn.
+  t.ScaleX((quarter ? height : width) / p.chainWidth);
+  t.ScaleY((quarter ? width : height) / p.chainHeight);
+  t.Rotation(back);
+  switch (back) {
+    case 90:  // (u, v) -> (-v, u)
+      t.TranslateX(left + width);
+      t.TranslateY(top);
+      break;
+    case 180:  // (u, v) -> (-u, -v)
+      t.TranslateX(left + width);
+      t.TranslateY(top + height);
+      break;
+    case 270:  // (u, v) -> (v, -u)
+      t.TranslateX(left);
+      t.TranslateY(top + height);
+      break;
+    default:
+      t.TranslateX(left);
+      t.TranslateY(top);
+      break;
+  }
+  return t;
+}
+
 // The part of the video the page shows, less the trimmed rows and columns,
-// as the panel's clip in its own units (chain pixels) -- and no clip at all
-// when all of it shows: a clipped layer may be one the display cannot take
-// as an overlay. True when the panel is clipped.
-bool ApplyVideoClip() {
+// as the panel's clip in its own units (chain pixels, before the transform)
+// -- and no clip at all when all of it shows: a clipped layer may be one the
+// display cannot take as an overlay. True when the panel is clipped.
+bool ApplyVideoClip(CompositeTransform const& aTransform) {
   const VideoPlacement& p = gVideoPlacement;
   if (!gVideoPanel || p.width <= 0 || p.height <= 0) {
     return false;
@@ -89,15 +140,63 @@ bool ApplyVideoClip() {
     gVideoPanel.Clip(nullptr);
     return false;
   }
+  const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
+  const winrt::Windows::Foundation::Rect shown{
+      static_cast<float>(clipX / raw), static_cast<float>(clipY / raw),
+      static_cast<float>(clipWidth / raw), static_cast<float>(clipHeight / raw)};
   RectangleGeometry clip;
-  const double perX = double(p.chainWidth) / p.width;
-  const double perY = double(p.chainHeight) / p.height;
-  clip.Rect({static_cast<float>((clipX - p.x) * perX),
-             static_cast<float>((clipY - p.y) * perY),
-             static_cast<float>(clipWidth * perX),
-             static_cast<float>(clipHeight * perY)});
+  clip.Rect(aTransform.Inverse().TransformBounds(shown));
   gVideoPanel.Clip(clip);
   return true;
+}
+
+bool ApplyVideoClip() { return ApplyVideoClip(VideoTransform()); }
+
+// How far the display turns what the app draws, clockwise, for the engine
+// to turn video frames ahead of it (the DirectX samples' display rotation).
+int32_t DisplayRotation() {
+  using winrt::Windows::Graphics::Display::DisplayInformation;
+  using winrt::Windows::Graphics::Display::DisplayOrientations;
+  try {
+    auto info = DisplayInformation::GetForCurrentView();
+    const auto native = info.NativeOrientation();
+    const auto current = info.CurrentOrientation();
+    if (native == DisplayOrientations::Portrait) {
+      switch (current) {
+        case DisplayOrientations::Landscape:
+          return 270;
+        case DisplayOrientations::PortraitFlipped:
+          return 180;
+        case DisplayOrientations::LandscapeFlipped:
+          return 90;
+        default:
+          return 0;
+      }
+    }
+    switch (current) {
+      case DisplayOrientations::Portrait:
+        return 90;
+      case DisplayOrientations::LandscapeFlipped:
+        return 180;
+      case DisplayOrientations::PortraitFlipped:
+        return 270;
+      default:
+        return 0;
+    }
+  } catch (...) {
+    return 0;
+  }
+}
+
+std::atomic<void (*)(int32_t)> gVideoRotation{nullptr};
+
+void TellVideoRotation() {
+  if (auto tell = gVideoRotation.load()) {
+    const int32_t degrees = DisplayRotation();
+    tell(degrees);
+    Log::Write(L"video layer: the display turns the picture " +
+               std::to_wstring(degrees) + L" degrees");
+  }
 }
 
 // The video panel above the browser's or under it, made exactly as in build
@@ -511,6 +610,24 @@ bool EngineView::Resolve() {
     if (set_video_layer_) {
       gVideoAck.store(reinterpret_cast<void (*)(uint32_t)>(
           ::GetProcAddress(xul, "gecko_w10m_video_layer_ack")));
+      gVideoRotation.store(reinterpret_cast<void (*)(int32_t)>(
+          ::GetProcAddress(xul, "gecko_w10m_video_layer_rotation")));
+      // The display's turn now and whenever the phone is turned; asked on
+      // the UI thread, which DisplayInformation belongs to.
+      if (gUiDispatcher) {
+        gUiDispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [] {
+              TellVideoRotation();
+              try {
+                winrt::Windows::Graphics::Display::DisplayInformation::
+                    GetForCurrentView()
+                        .OrientationChanged([](auto const&, auto const&) {
+                          TellVideoRotation();
+                        });
+              } catch (...) {
+              }
+            });
+      }
       static const VideoLayerSink sink{&VideoLayerAttach, &VideoLayerPlace,
                                        &VideoLayerShow, &VideoLayerStack};
       set_video_layer_(&sink);
@@ -837,7 +954,7 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
                                  int32_t width, int32_t height, int32_t clipX,
                                  int32_t clipY, int32_t clipWidth,
                                  int32_t clipHeight, int32_t chainWidth,
-                                 int32_t chainHeight) {
+                                 int32_t chainHeight, int32_t rotation) {
   if (!gUiDispatcher || width <= 0 || height <= 0 || chainWidth <= 0 ||
       chainHeight <= 0) {
     return;
@@ -848,28 +965,11 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         if (!gVideoPanel) {
           return;
         }
-        // Everything arrives in the browser surface's pixels, which are the
-        // display's. A swap chain given to a SwapChainPanel is shown one of
-        // its pixels per view pixel, whatever the display's density -- the
-        // browser's own panel has ANGLE undo that with a matrix transform --
-        // so laid out at its own size the panel is chain-sized in view
-        // pixels, and the transform takes it to the video's place. Only the
-        // display's density goes into this: the panel's CompositionScale
-        // already includes the transform set here, and computing from it fed
-        // each placement the last one's scale -- the video showed magnified.
         const double raw = gRawPerView > 0 ? gRawPerView : 1.0;
         if (!gVideoPlacement.above) {
           gVideoPanel.Width(chainWidth);
           gVideoPanel.Height(chainHeight);
         }
-        const double scaleX = width / raw / chainWidth;
-        const double scaleY = height / raw / chainHeight;
-        CompositeTransform transform;
-        transform.ScaleX(scaleX);
-        transform.ScaleY(scaleY);
-        transform.TranslateX(x / raw);
-        transform.TranslateY(y / raw);
-        gVideoPanel.RenderTransform(transform);
         VideoPlacement& placement = gVideoPlacement;
         placement.x = x;
         placement.y = y;
@@ -881,7 +981,12 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
         placement.clipHeight = clipHeight;
         placement.chainWidth = chainWidth;
         placement.chainHeight = chainHeight;
-        const bool whole = !ApplyVideoClip();
+        placement.rotation = rotation;
+        CompositeTransform transform = VideoTransform();
+        gVideoPanel.RenderTransform(transform);
+        const double scaleX = transform.ScaleX();
+        const double scaleY = transform.ScaleY();
+        const bool whole = !ApplyVideoClip(transform);
         static int sPlacementNotes = 0;
         if (sPlacementNotes < 40) {
           ++sPlacementNotes;
@@ -890,7 +995,8 @@ void EngineView::VideoLayerPlace(uint32_t generation, int32_t x, int32_t y,
                      std::to_wstring(chainHeight) + L" scaled " +
                      std::to_wstring(scaleX) + L"x" + std::to_wstring(scaleY) +
                      L" at " + std::to_wstring(x / raw) + L"," +
-                     std::to_wstring(y / raw) + L" view px" +
+                     std::to_wstring(y / raw) + L" view px, turned back " +
+                     std::to_wstring((360 - rotation) % 360) +
                      (whole ? L", no clip" : L", clipped"));
         }
         if (auto ack = gVideoAck.load()) {

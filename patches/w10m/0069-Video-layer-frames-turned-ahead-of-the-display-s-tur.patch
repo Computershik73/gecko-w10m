@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 5 Oct 2026 02:36:37 +0400
+Subject: [PATCH] Video layer: frames turned ahead of the display's turn in
+ landscape
+
+The display took the video panel as a hardware overlay in portrait and
+composed it on the GPU in landscape, the panel arranged the same way: in
+landscape the system turns the app's picture a quarter turn for the
+natively portrait display. The shell now says how far the display turns
+(gecko_w10m_video_layer_rotation), the layer turns each frame by that much
+on the D3D11 video processor while copying it into a chain of the swapped
+size, and passes the turn with the placement so the shell turns the panel
+back; the system is left nothing to turn. A video processor that cannot
+turn frames leaves them as they come, with a note saying why.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../GeckoW10mVideoLayer.cpp                   | 267 +++++++++++++++++-
+ 1 file changed, 258 insertions(+), 9 deletions(-)
+
+diff --git a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+index 14107ab86b..c456cdc848 100644
+--- a/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
++++ b/gfx/webrender_bindings/GeckoW10mVideoLayer.cpp
+@@ -30,6 +30,7 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <atomic>
++#include <vector>
+ #include <math.h>
+ 
+ #include "mozilla/StaticPrefs_gfx.h"
+@@ -49,7 +50,7 @@ struct GeckoW10mVideoLayerSink {
+   void (*place)(uint32_t aGeneration, int32_t aX, int32_t aY, int32_t aWidth,
+                 int32_t aHeight, int32_t aClipX, int32_t aClipY,
+                 int32_t aClipWidth, int32_t aClipHeight, int32_t aChainWidth,
+-                int32_t aChainHeight);
++                int32_t aChainHeight, int32_t aRotation);
+   void (*show)(int32_t aVisible);
+   // Above the browser's panel, or under it. The display takes the layer as
+   // a hardware overlay only above (the test in build 132: under the
+@@ -64,6 +65,9 @@ struct GeckoW10mVideoLayerSink {
+ 
+ std::atomic<const GeckoW10mVideoLayerSink*> sSink{nullptr};
+ std::atomic<uint32_t> sAckedGeneration{0};
++// How far the display turns what the app draws, clockwise, in degrees (0, 90,
++// 180, 270): set by the shell from the display's orientation.
++std::atomic<int32_t> sDisplayRotation{0};
+ 
+ constexpr DWORD kCompositionObjectAllAccess = 0x0003;
+ constexpr UINT kSwapChainFlagYuvVideo = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO;
+@@ -88,6 +92,190 @@ struct Rect {
+   bool operator!=(const Rect& aOther) const { return !(*this == aOther); }
+ };
+ 
++// Turns a decoded NV12 frame by 90, 180 or 270 degrees into the swap chain,
++// on the GPU's video processor. In landscape the system turns the app's
++// picture a quarter turn for the display, which is natively portrait, and
++// a layer it has to turn is one it composes on the GPU -- only in portrait
++// did the display take the video as a hardware overlay (builds 135-136). So
++// in landscape the frames go in already turned, the shell turns the panel
++// back, and the system has nothing left to turn.
++struct Rotator {
++  RefPtr<ID3D11VideoDevice> mVideoDevice;
++  RefPtr<ID3D11VideoContext> mVideoContext;
++  RefPtr<ID3D11VideoProcessorEnumerator> mEnum;
++  RefPtr<ID3D11VideoProcessor> mProcessor;
++  ID3D11Device* mDevice = nullptr;
++  int32_t mWidth = 0;
++  int32_t mHeight = 0;
++  bool mUnsupported = false;
++  struct InView {
++    ID3D11Texture2D* texture;
++    UINT slice;
++    RefPtr<ID3D11VideoProcessorInputView> view;
++  };
++  struct OutView {
++    ID3D11Texture2D* texture;
++    RefPtr<ID3D11VideoProcessorOutputView> view;
++  };
++  // The views hold their textures, so a texture's address cannot be reused
++  // while its view is here; the decoder's pool is a handful of textures.
++  std::vector<InView> mInViews;
++  std::vector<OutView> mOutViews;
++
++  // The swap chain's buffers cannot be resized while views hold them.
++  void ForgetOutputs() { mOutViews.clear(); }
++
++  void Reset() {
++    mInViews.clear();
++    mOutViews.clear();
++    mProcessor = nullptr;
++    mEnum = nullptr;
++    mWidth = mHeight = 0;
++  }
++
++  // A processor for frames of aWidth x aHeight that can turn them.
++  bool Ensure(ID3D11Device* aDevice, ID3D11DeviceContext* aContext,
++              int32_t aWidth, int32_t aHeight, const char** aWhy) {
++    if (mUnsupported) {
++      *aWhy = "the video processor cannot turn frames";
++      return false;
++    }
++    if (mProcessor && aDevice == mDevice && aWidth == mWidth &&
++        aHeight == mHeight) {
++      return true;
++    }
++    Reset();
++    mDevice = aDevice;
++    if (FAILED(aDevice->QueryInterface(__uuidof(ID3D11VideoDevice),
++                                       getter_AddRefs(mVideoDevice))) ||
++        FAILED(aContext->QueryInterface(__uuidof(ID3D11VideoContext),
++                                        getter_AddRefs(mVideoContext)))) {
++      mUnsupported = true;
++      *aWhy = "no D3D11 video device";
++      return false;
++    }
++    D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc = {};
++    desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
++    desc.InputFrameRate = {60, 1};
++    desc.InputWidth = aWidth;
++    desc.InputHeight = aHeight;
++    desc.OutputFrameRate = {60, 1};
++    desc.OutputWidth = std::max(aWidth, aHeight);
++    desc.OutputHeight = std::max(aWidth, aHeight);
++    desc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
++    if (FAILED(mVideoDevice->CreateVideoProcessorEnumerator(
++            &desc, getter_AddRefs(mEnum)))) {
++      *aWhy = "no video processor for this size";
++      return false;
++    }
++    D3D11_VIDEO_PROCESSOR_CAPS caps = {};
++    UINT formatFlags = 0;
++    if (FAILED(mEnum->GetVideoProcessorCaps(&caps)) ||
++        !(caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION)) {
++      mUnsupported = true;
++      *aWhy = "the video processor cannot turn frames";
++      Reset();
++      return false;
++    }
++    const UINT inAndOut = D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT |
++                          D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT;
++    if (FAILED(mEnum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12,
++                                                &formatFlags)) ||
++        (formatFlags & inAndOut) != inAndOut) {
++      mUnsupported = true;
++      *aWhy = "the video processor cannot write NV12";
++      Reset();
++      return false;
++    }
++    if (FAILED(mVideoDevice->CreateVideoProcessor(mEnum, 0,
++                                                  getter_AddRefs(mProcessor)))) {
++      *aWhy = "no video processor";
++      Reset();
++      return false;
++    }
++    // The same colour space in and out: nothing is converted, only moved.
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE space = {};
++    space.YCbCr_Matrix = 1;  // BT.709
++    space.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
++    mVideoContext->VideoProcessorSetStreamColorSpace(mProcessor, 0, &space);
++    mVideoContext->VideoProcessorSetOutputColorSpace(mProcessor, &space);
++    mVideoContext->VideoProcessorSetStreamFrameFormat(
++        mProcessor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
++    mVideoContext->VideoProcessorSetStreamAutoProcessingMode(mProcessor, 0,
++                                                             FALSE);
++    mWidth = aWidth;
++    mHeight = aHeight;
++    return true;
++  }
++
++  ID3D11VideoProcessorInputView* Input(ID3D11Texture2D* aTexture, UINT aSlice) {
++    for (auto& v : mInViews) {
++      if (v.texture == aTexture && v.slice == aSlice) {
++        return v.view;
++      }
++    }
++    if (mInViews.size() >= 32) {
++      mInViews.clear();
++    }
++    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc = {};
++    desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
++    desc.Texture2D.MipSlice = 0;
++    desc.Texture2D.ArraySlice = aSlice;
++    RefPtr<ID3D11VideoProcessorInputView> view;
++    if (FAILED(mVideoDevice->CreateVideoProcessorInputView(
++            aTexture, mEnum, &desc, getter_AddRefs(view)))) {
++      return nullptr;
++    }
++    mInViews.push_back({aTexture, aSlice, view});
++    return view;
++  }
++
++  ID3D11VideoProcessorOutputView* Output(ID3D11Texture2D* aTexture) {
++    for (auto& v : mOutViews) {
++      if (v.texture == aTexture) {
++        return v.view;
++      }
++    }
++    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC desc = {};
++    desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
++    RefPtr<ID3D11VideoProcessorOutputView> view;
++    if (FAILED(mVideoDevice->CreateVideoProcessorOutputView(
++            aTexture, mEnum, &desc, getter_AddRefs(view)))) {
++      return nullptr;
++    }
++    mOutViews.push_back({aTexture, view});
++    return view;
++  }
++
++  // aRotation: 90, 180 or 270, clockwise. The output is the chain's buffer,
++  // aOutWidth x aOutHeight (the frame's size, swapped for a quarter turn).
++  bool Turn(ID3D11Texture2D* aTexture, UINT aSlice, ID3D11Texture2D* aOut,
++            int32_t aOutWidth, int32_t aOutHeight, int32_t aRotation) {
++    ID3D11VideoProcessorInputView* in = Input(aTexture, aSlice);
++    ID3D11VideoProcessorOutputView* out = Output(aOut);
++    if (!in || !out) {
++      return false;
++    }
++    const RECT source = {0, 0, mWidth, mHeight};
++    const RECT target = {0, 0, aOutWidth, aOutHeight};
++    mVideoContext->VideoProcessorSetStreamSourceRect(mProcessor, 0, TRUE,
++                                                     &source);
++    mVideoContext->VideoProcessorSetStreamDestRect(mProcessor, 0, TRUE,
++                                                   &target);
++    mVideoContext->VideoProcessorSetOutputTargetRect(mProcessor, TRUE, &target);
++    mVideoContext->VideoProcessorSetStreamRotation(
++        mProcessor, 0, TRUE,
++        aRotation == 90    ? D3D11_VIDEO_PROCESSOR_ROTATION_90
++        : aRotation == 180 ? D3D11_VIDEO_PROCESSOR_ROTATION_180
++                           : D3D11_VIDEO_PROCESSOR_ROTATION_270);
++    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
++    stream.Enable = TRUE;
++    stream.pInputSurface = in;
++    return SUCCEEDED(
++        mVideoContext->VideoProcessorBlt(mProcessor, out, 0, 1, &stream));
++  }
++};
++
+ // All of it lives on the render thread.
+ struct VideoLayer {
+   RefPtr<ID3D11Device> mDevice;
+@@ -97,6 +285,11 @@ struct VideoLayer {
+   int32_t mChainWidth = 0;
+   int32_t mChainHeight = 0;
+   bool mBroken = false;  // something refused; WebRender keeps the video
++  // How the frames go into the chain: turned clockwise by this many degrees
++  // to make up for the display's turn (see Rotator).
++  Rotator mRotator;
++  int32_t mRotation = 0;
++  bool mSaidRotation = false;
+ 
+   uint32_t mGeneration = 0;
+   Rect mRect;
+@@ -245,6 +438,7 @@ struct VideoLayer {
+     }
+     if (mChain && mDevice == aDevice) {
+       // A new size, as when YouTube switches quality.
++      mRotator.ForgetOutputs();
+       HRESULT hr = mChain->ResizeBuffers(0, aWidth, aHeight, DXGI_FORMAT_NV12,
+                                          kSwapChainFlagYuvVideo);
+       if (FAILED(hr)) {
+@@ -339,7 +533,7 @@ struct VideoLayer {
+ 
+   // Copies the frame in and presents it, if it is a new one.
+   bool Present(mozilla::wr::RenderDXGITextureHost* aHost,
+-               ID3D11Texture2D* aTexture) {
++               ID3D11Texture2D* aTexture, int32_t aRotation) {
+     const uint32_t index = aHost->ArrayIndex();
+     if (mPresented && aTexture == mLastTexture && index == mLastIndex &&
+         aHost == mLastHost) {
+@@ -352,8 +546,17 @@ struct VideoLayer {
+       Break("no back buffer", hr);
+       return false;
+     }
+-    D3D11_BOX box = {0, 0, 0, UINT(mChainWidth), UINT(mChainHeight), 1};
+-    mContext->CopySubresourceRegion(buffer, 0, 0, 0, 0, aTexture, index, &box);
++    if (aRotation) {
++      if (!mRotator.Turn(aTexture, index, buffer, mChainWidth, mChainHeight,
++                         aRotation)) {
++        Break("the video processor would not turn the frame", E_FAIL);
++        return false;
++      }
++    } else {
++      D3D11_BOX box = {0, 0, 0, UINT(mChainWidth), UINT(mChainHeight), 1};
++      mContext->CopySubresourceRegion(buffer, 0, 0, 0, 0, aTexture, index,
++                                      &box);
++    }
+     const mozilla::TimeStamp presentStart = mozilla::TimeStamp::Now();
+     // Tied to the display's refresh, as a video player presents. The overlay
+     // test, which the display took as a hardware overlay, presented this
+@@ -494,10 +697,45 @@ struct VideoLayer {
+     const mozilla::gfx::IntSize size = host->GetSize(0);
+     const int32_t width = size.width & ~1;
+     const int32_t height = size.height & ~1;
+-    if (width <= 0 || height <= 0 || !EnsureChain(device, width, height)) {
++    if (width <= 0 || height <= 0) {
+       return false;
+     }
+-    if (!Present(host, d3dTexture)) {
++    // Turned to make up for the display's turn, when the video processor
++    // can; as it comes otherwise (composed on the GPU in landscape).
++    int32_t rotation = sDisplayRotation.load();
++    if (rotation) {
++      RefPtr<ID3D11DeviceContext> context;
++      device->GetImmediateContext(getter_AddRefs(context));
++      const char* why = nullptr;
++      if (!mRotator.Ensure(device, context, width, height, &why)) {
++        if (!mSaidRotation) {
++          mSaidRotation = true;
++          char note[160];
++          SprintfLiteral(note, "video layer: frames go in unturned -- %s",
++                         why ? why : "?");
++          Note(note);
++        }
++        rotation = 0;
++      }
++    }
++    const bool quarter = rotation == 90 || rotation == 270;
++    if (rotation != mRotation) {
++      // A new turn is a new placement for the shell.
++      mRotation = rotation;
++      mRect = Rect();
++      mClip = Rect();
++      mLastTexture = nullptr;
++      char note[128];
++      SprintfLiteral(note,
++                     "video layer: frames go in turned %d degrees clockwise",
++                     rotation);
++      Note(note);
++    }
++    if (!EnsureChain(device, quarter ? height : width,
++                     quarter ? width : height)) {
++      return false;
++    }
++    if (!Present(host, d3dTexture, rotation)) {
+       return false;
+     }
+ 
+@@ -535,14 +773,16 @@ struct VideoLayer {
+         char note[192];
+         SprintfLiteral(note,
+                        "video layer: placed %u -- %dx%d at %d,%d, visible "
+-                       "%dx%d at %d,%d, chain %dx%d",
++                       "%dx%d at %d,%d, chain %dx%d turned %d",
+                        mGeneration, rect.w, rect.h, rect.x, rect.y, clip.w,
+-                       clip.h, clip.x, clip.y, mChainWidth, mChainHeight);
++                       clip.h, clip.x, clip.y, mChainWidth, mChainHeight,
++                       mRotation);
+         Note(note);
+       }
+       if (auto* sink = sSink.load()) {
+         sink->place(mGeneration, rect.x, rect.y, rect.w, rect.h, clip.x,
+-                    clip.y, clip.w, clip.h, mChainWidth, mChainHeight);
++                    clip.y, clip.w, clip.h, mChainWidth, mChainHeight,
++                    mRotation);
+         if (!mShown) {
+           sink->show(1);
+           mShown = true;
+@@ -630,6 +870,15 @@ extern "C" __declspec(dllexport) void gecko_w10m_set_video_layer_sink(
+   sSink.store(aSink);
+ }
+ 
++// The shell's word on how far the display turns the app's picture,
++// clockwise: 0, 90, 180 or 270 degrees.
++extern "C" __declspec(dllexport) void gecko_w10m_video_layer_rotation(
++    int32_t aDegrees) {
++  sDisplayRotation.store(aDegrees == 90 || aDegrees == 180 || aDegrees == 270
++                             ? aDegrees
++                             : 0);
++}
++
+ // The shell has applied the placement with this generation.
+ extern "C" __declspec(dllexport) void gecko_w10m_video_layer_ack(
+     uint32_t aGeneration) {
