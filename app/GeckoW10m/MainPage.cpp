@@ -285,10 +285,11 @@ MainPage::MainPage() {
   // Elite X3 (5.96", 494 dpi) it was tuned on. The window's minimum is gone
   // now (themes/shared/chrome/browser.css), so the scale follows the
   // panel's own density instead: as many CSS pixels to the inch as the X3
-  // has at 540 across -- 494 dpi / 2.667 -- so the same things are the same
-  // size on every phone. Never narrower than 360 CSS pixels, which is what
-  // the phone layout is made for, and never larger than Windows' own scale.
-  constexpr double kCssPixelsPerInch = 494.0 / (1440.0 / 540.0);
+  // has at 490 across -- 494 dpi / 2.94, a tenth larger than the 540 it had
+  // -- so the same things are the same size on every phone. Never narrower
+  // than 360 CSS pixels, which is what the phone layout is made for, and
+  // never larger than Windows' own scale.
+  constexpr double kCssPixelsPerInch = 494.0 / (1440.0 / 490.0);
   constexpr double kNarrowestChromeCss = 360.0;
   double dpi = 0;
   try {
