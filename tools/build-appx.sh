@@ -336,6 +336,14 @@ pref("gfx.webrender.software.d3d11.gpu-shading", true);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
+// Every window a page opens is a tab, the sized ones included: sign-in windows
+// (Google, VK and the like) call window.open with a width and a height, and
+// Firefox makes those a window of their own -- which this port never shows, so
+// the sign-in did nothing. As a tab it is selected at once, keeps its opener
+// (the result gets back to the site), and window.close() returns to the tab
+// that opened it.
+pref("browser.link.open_newwindow", 3);
+pref("browser.link.open_newwindow.restriction", 0);
 
 // The start page. A default, so Settings > Home can change it and the change
 // sticks in the profile.
