@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 5 Oct 2026 23:16:38 +0400
+Subject: [PATCH] File dialogs, the Downloads folder and opening files on
+ Windows 10 Mobile
+
+The engine runs headless in an app container: nsFilePicker refused at once
+(no IFileOpenDialog, no utility process, no HWND), so <input type=file>,
+Save As and the Downloads folder's Browse button did nothing; and
+nsLocalFile::Launch/Reveal's ShellExecuteEx and SHOpenFolderAndSelectItems
+are refused by the container.
+
+- nsFilePicker: when the shell has left a sink (gecko_w10m_set_picker_sink),
+  the folder and file pickers ask it for the system's FolderPicker,
+  FileOpenPicker or FileSavePicker; it answers through
+  gecko_w10m_picker_result with the chosen paths, and Open carries on as
+  before (last directory, replace check, callback).
+- nsLocalFile::Launch / Reveal: handed to the shell's launcher
+  (gecko_w10m_set_file_launcher), which uses Windows.System.Launcher.
+- The default download directory is the phone's public Downloads folder,
+  C:\Data\Users\Public\Downloads, the one Files and every app show; the known
+  folder resolves under the account the app runs as.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/windows/nsFilePicker.cpp     | 152 +++++++++++++++++++++++++++-
+ xpcom/io/SpecialSystemDirectory.cpp |  15 +++
+ xpcom/io/nsLocalFileWin.cpp         |  29 ++++++
+ 3 files changed, 194 insertions(+), 2 deletions(-)
+
+diff --git a/widget/windows/nsFilePicker.cpp b/widget/windows/nsFilePicker.cpp
+index c178b35a53..80666cad6a 100644
+--- a/widget/windows/nsFilePicker.cpp
++++ b/widget/windows/nsFilePicker.cpp
+@@ -47,6 +47,94 @@
+ #include "nsToolkit.h"
+ #include "nsWindow.h"
+ 
++#if defined(GECKO_W10M)
++#  include <atomic>
++#  include "nsTHashMap.h"
++#  include "nsThreadUtils.h"
++
++extern "C" void GeckoW10mNote(const char* aText);
++
++// Windows 10 Mobile: the file dialogs belong to the shell. There is no
++// IFileOpenDialog in the app container, no utility process to show one from,
++// and no HWND to parent one to -- the engine runs headless, and every
++// <input type=file>, every Save As and the Downloads folder's Browse button
++// came back NS_ERROR_NOT_AVAILABLE, so tapping them did nothing. The shell
++// leaves a function here, shows the system's FileOpenPicker, FolderPicker or
++// FileSavePicker on its UI thread, and answers through
++// gecko_w10m_picker_result with the paths chosen; integers and UTF-16 strings
++// only across the boundary.
++//   aMode: nsIFilePicker::Mode. aFilters: "title|*.png; *.jpg" lines.
++using GeckoW10mPickerSink = void (*)(uint32_t aId, int32_t aMode,
++                                     const wchar_t* aTitle,
++                                     const wchar_t* aInitialDir,
++                                     const wchar_t* aDefaultName,
++                                     const wchar_t* aDefaultExtension,
++                                     const wchar_t* aFilters);
++static std::atomic<GeckoW10mPickerSink> sGeckoW10mPickerSink{nullptr};
++
++using GeckoW10mPickerPromise =
++    mozilla::MozPromise<nsTArray<nsString>, mozilla::widget::filedialog::Error,
++                        true>;
++// Main thread only.
++static nsTHashMap<uint32_t, RefPtr<GeckoW10mPickerPromise::Private>>&
++GeckoW10mPendingPickers() {
++  static nsTHashMap<uint32_t, RefPtr<GeckoW10mPickerPromise::Private>> sMap;
++  return sMap;
++}
++static uint32_t sGeckoW10mNextPicker = 1;
++
++extern "C" __declspec(dllexport) void gecko_w10m_set_picker_sink(
++    GeckoW10mPickerSink aSink) {
++  sGeckoW10mPickerSink.store(aSink);
++  GeckoW10mNote(aSink ? "picker: the shell shows the file dialogs"
++                      : "picker: sink cleared");
++}
++
++// From the shell, on any thread: the paths the user chose, one after another,
++// each ended by a NUL and the list by another; null or empty for a cancel.
++extern "C" __declspec(dllexport) void gecko_w10m_picker_result(
++    uint32_t aId, const wchar_t* aPaths) {
++  nsTArray<nsString> paths;
++  if (aPaths) {
++    for (const wchar_t* p = aPaths; *p; p += wcslen(p) + 1) {
++      paths.AppendElement(nsDependentString(reinterpret_cast<const char16_t*>(p)));
++    }
++  }
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "gecko_w10m_picker_result", [aId, paths = std::move(paths)]() mutable {
++        auto pending = GeckoW10mPendingPickers().Extract(aId);
++        if (!pending || !*pending) {
++          return;
++        }
++        RefPtr<GeckoW10mPickerPromise::Private> promise = pending.extract();
++        nsPrintfCString note("picker: %u answered with %zu path(s)", aId,
++                             size_t(paths.Length()));
++        GeckoW10mNote(note.get());
++        promise->Resolve(std::move(paths), __func__);
++      }));
++}
++
++static RefPtr<GeckoW10mPickerPromise> GeckoW10mShowPicker(
++    int32_t aMode, const nsString& aTitle, const nsString& aInitialDir,
++    const nsString& aDefaultName, const nsString& aDefaultExtension,
++    const nsString& aFilters) {
++  MOZ_ASSERT(NS_IsMainThread());
++  RefPtr<GeckoW10mPickerPromise::Private> promise =
++      new GeckoW10mPickerPromise::Private(__func__);
++  const uint32_t id = sGeckoW10mNextPicker++;
++  GeckoW10mPendingPickers().InsertOrUpdate(id, promise);
++  nsPrintfCString note("picker: %u asked of the shell, mode %d", id, aMode);
++  GeckoW10mNote(note.get());
++  auto wide = [](const nsString& aText) {
++    return static_cast<const wchar_t*>(aText.get());
++  };
++  sGeckoW10mPickerSink.load()(id, aMode, wide(aTitle), wide(aInitialDir),
++                              wide(aDefaultName), wide(aDefaultExtension),
++                              wide(aFilters));
++  return promise;
++}
++#endif
++
+ using mozilla::LogLevel;
+ using mozilla::UniquePtr;
+ 
+@@ -107,7 +195,11 @@ NS_IMETHODIMP nsFilePicker::Init(
+     mozilla::dom::BrowsingContext* aBrowsingContext, const nsAString& aTitle,
+     nsIFilePicker::Mode aMode, nsISupports* aGlobal) {
+   // Don't attempt to open a real file-picker in headless mode.
+-  if (gfxPlatform::IsHeadless()) {
++  if (gfxPlatform::IsHeadless()
++#if defined(GECKO_W10M)
++      && !sGeckoW10mPickerSink.load()
++#endif
++  ) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+@@ -481,6 +573,20 @@ using fd_async::AsyncExecute;
+  */
+ RefPtr<mozilla::MozPromise<bool, nsFilePicker::Error, true>>
+ nsFilePicker::ShowFolderPicker(const nsString& aInitialDir) {
++#if defined(GECKO_W10M)
++  if (sGeckoW10mPickerSink.load()) {
++    return GeckoW10mShowPicker(int32_t(mMode), mTitle, aInitialDir, u""_ns,
++                               u""_ns, u""_ns)
++        ->Map(mozilla::GetMainThreadSerialEventTarget(), __PRETTY_FUNCTION__,
++              [self = RefPtr(this)](nsTArray<nsString> aPaths) {
++                if (aPaths.IsEmpty()) {
++                  return false;
++                }
++                self->mUnicodeFile = aPaths[0];
++                return true;
++              });
++  }
++#endif
+   namespace fd = ::mozilla::widget::filedialog;
+   nsTArray<fd::Command> commands = {
+       fd::SetOptions(FOS_PICKFOLDERS),
+@@ -586,6 +692,44 @@ nsFilePicker::ShowFilePicker(const nsString& aInitialDir) {
+         return NotOk(MOZ_FD_LOCAL_ERROR(
+             "file-picker opened in directory-picker mode", E_INVALIDARG));
+     }
++#if defined(GECKO_W10M)
++    if (sGeckoW10mPickerSink.load()) {
++      nsAutoString filters;
++      for (auto const& filter : mFilterList) {
++        filters.Append(filter.title);
++        filters.Append(u'|');
++        filters.Append(filter.filter);
++        filters.Append(u'\n');
++      }
++      nsAutoString name(mDefaultFilename);
++      name.ReplaceChar('%', '_');
++      nsAutoString extension(mDefaultExtension);
++      if (extension.IsEmpty() && IsDefaultPathHtml()) {
++        extension.AssignLiteral("html");
++      }
++      return GeckoW10mShowPicker(int32_t(mMode), mTitle, aInitialDir, name,
++                                 extension, filters)
++          ->Map(mozilla::GetMainThreadSerialEventTarget(), __PRETTY_FUNCTION__,
++                [self = RefPtr(this),
++                 mode = mMode](nsTArray<nsString> aPaths) {
++                  if (aPaths.IsEmpty()) {
++                    return false;
++                  }
++                  if (mode != modeOpenMultiple) {
++                    self->mUnicodeFile = aPaths[0];
++                    return true;
++                  }
++                  for (auto const& path : aPaths) {
++                    nsCOMPtr<nsIFile> file;
++                    if (NS_SUCCEEDED(
++                            NS_NewLocalFile(path, getter_AddRefs(file)))) {
++                      self->mFiles.AppendObject(file);
++                    }
++                  }
++                  return true;
++                });
++    }
++#endif
+ 
+     commands.AppendElement(fd::SetOptions(fos));
+   }
+@@ -759,7 +903,11 @@ nsresult nsFilePicker::Open(nsIFilePickerShownCallback* aCallback) {
+   }
+ 
+   // Don't attempt to open a real file-picker in headless mode.
+-  if (gfxPlatform::IsHeadless()) {
++  if (gfxPlatform::IsHeadless()
++#if defined(GECKO_W10M)
++      && !sGeckoW10mPickerSink.load()
++#endif
++  ) {
+     return nsresult::NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+diff --git a/xpcom/io/SpecialSystemDirectory.cpp b/xpcom/io/SpecialSystemDirectory.cpp
+index e502612bca..94bd117311 100644
+--- a/xpcom/io/SpecialSystemDirectory.cpp
++++ b/xpcom/io/SpecialSystemDirectory.cpp
+@@ -566,6 +566,21 @@ nsresult GetSpecialSystemDirectory(SystemDirectories aSystemSystemDirectory,
+     }
+ 
+     case Win_Downloads: {
++#  if defined(GECKO_W10M)
++      // The phone's own Downloads -- the one Files and every other app show
++      // -- is the public one. The known folder resolves under the account
++      // the app runs as (C:\Data\Users\DefApps), where nothing else looks.
++      {
++        nsCOMPtr<nsIFile> publicDownloads;
++        bool exists = false;
++        if (NS_SUCCEEDED(NS_NewLocalFile(u"C:\\Data\\Users\\Public\\Downloads"_ns,
++                                         getter_AddRefs(publicDownloads))) &&
++            NS_SUCCEEDED(publicDownloads->Exists(&exists)) && exists) {
++          publicDownloads.forget(aFile);
++          return NS_OK;
++        }
++      }
++#  endif
+       return GetKnownFolder(FOLDERID_Downloads, aFile);
+     }
+ 
+diff --git a/xpcom/io/nsLocalFileWin.cpp b/xpcom/io/nsLocalFileWin.cpp
+index 3f2b46ead3..8b8f3eecd9 100644
+--- a/xpcom/io/nsLocalFileWin.cpp
++++ b/xpcom/io/nsLocalFileWin.cpp
+@@ -3353,10 +3353,32 @@ nsLocalFile::SetUseDOSDevicePathSyntax(bool aUseDOSDevicePathSyntax) {
+   return NS_OK;
+ }
+ 
++#if defined(GECKO_W10M)
++// Opening a downloaded file, and showing the folder it is in, goes to the
++// shell: ShellExecuteEx and SHOpenFolderAndSelectItems are refused in the app
++// container, so the downloads panel's Open did nothing. The shell hands the
++// path to Windows.System.Launcher (LaunchFileAsync / LaunchFolderAsync) on
++// its UI thread. aReveal: 0 open the file, 1 show the folder it is in.
++static void (*sGeckoW10mFileLauncher)(const wchar_t* aPath,
++                                      int32_t aReveal) = nullptr;
++
++extern "C" __declspec(dllexport) void gecko_w10m_set_file_launcher(
++    void (*aLauncher)(const wchar_t*, int32_t)) {
++  sGeckoW10mFileLauncher = aLauncher;
++}
++#endif
++
+ NS_IMETHODIMP
+ nsLocalFile::Reveal() {
+   // This API should be main thread only
+   MOZ_ASSERT(NS_IsMainThread());
++#if defined(GECKO_W10M)
++  if (sGeckoW10mFileLauncher) {
++    sGeckoW10mFileLauncher(static_cast<const wchar_t*>(mWorkingPath.get()),
++                           1);
++    return NS_OK;
++  }
++#endif
+ 
+   // make sure mResolvedPath is set
+   nsresult rv = Resolve();
+@@ -3414,6 +3436,13 @@ NS_IMETHODIMP
+ nsLocalFile::Launch() {
+   // This API should be main thread only
+   MOZ_ASSERT(NS_IsMainThread());
++#if defined(GECKO_W10M)
++  if (sGeckoW10mFileLauncher) {
++    sGeckoW10mFileLauncher(static_cast<const wchar_t*>(mWorkingPath.get()),
++                           0);
++    return NS_OK;
++  }
++#endif
+ 
+   // use the app registry name to launch a shell execute....
+   _bstr_t execPath(mWorkingPath.get());

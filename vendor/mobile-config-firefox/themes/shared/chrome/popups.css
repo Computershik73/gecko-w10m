@@ -63,7 +63,7 @@
     }
 }
 
-@media ((min-width: 701px) or (-moz-pref("mcf.toolbar.positionOnTop"))) {
+@media ((min-width: 1201px) or (-moz-pref("mcf.toolbar.positionOnTop"))) {
     panel, box.panel-viewcontainer > box.panel-viewstack {
         align-content: flex-start;
     }

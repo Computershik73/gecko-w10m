@@ -13,6 +13,7 @@
 #include <string>
 
 #include "client/DrmBridge.h"
+#include "client/FileBridge.h"
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
 #include "engine/OverlayProbe.h"
@@ -603,6 +604,10 @@ bool EngineView::Resolve() {
       set_fullscreen_(&FullscreenChanged);
       Log::Write(L"view: the engine can now ask for the whole screen");
     }
+  }
+  // File dialogs and opening downloaded files (client/FileBridge.cpp).
+  if (gUiDispatcher) {
+    InstallFileBridge(xul, gUiDispatcher);
   }
   if (!set_video_layer_ && video_panel_) {
     set_video_layer_ = reinterpret_cast<SetVideoLayerSinkFn>(

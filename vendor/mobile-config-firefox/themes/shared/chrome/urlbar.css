@@ -103,20 +103,25 @@
     #urlbar[breakout][breakout-extend] {
         left: 11vw !important; /* should be 10, but 10 looks off-center */
         width: 80vw !important;
-        bottom: 0 !important;
         z-index: 5 !important;
     }
 
     @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
         #urlbar[breakout][breakout-extend] {
             top: 0 !important;
+            bottom: 0 !important;
             align-content: flex-end !important;
         }
     }
 
+    /* Port: the bar at the top. This was top: calc(1.1 *
+     * --urlbar-container-height), which is not valid CSS (no var()) and was
+     * dropped, while bottom: 0 above applied either way -- the focused bar
+     * jumped to the bottom of the screen. */
     @media -moz-pref("mcf.toolbar.positionOnTop") {
         #urlbar[breakout][breakout-extend] {
-            top: calc(1.1 * --urlbar-container-height) !important;
+            top: 0 !important;
+            bottom: auto !important;
             align-content: flex-start !important;
         }
     }
@@ -175,7 +180,6 @@
 
     vbox.urlbarView {
         position: fixed !important;
-        bottom: 82px !important;
         box-shadow: rgba(0, 0, 0, 0.05) 0px -8px 8px 3px !important;
         left: 0 !important;
         right: 0 !important;
@@ -188,6 +192,27 @@
     vbox.urlbarView div#urlbar-results {
         display: flex !important;
         flex-direction: column-reverse;
+    }
+
+    /* Port: the suggestions open from the bar, wherever it is: upwards from
+     * the bottom, downwards from the top -- they always opened from the
+     * bottom, under a bar at the top. */
+    @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
+        vbox.urlbarView {
+            bottom: 82px !important;
+        }
+    }
+
+    @media -moz-pref("mcf.toolbar.positionOnTop") {
+        vbox.urlbarView {
+            top: 82px !important;
+            bottom: 0 !important;
+            box-shadow: rgba(0, 0, 0, 0.05) 0px 8px 8px 3px !important;
+        }
+
+        vbox.urlbarView div#urlbar-results {
+            flex-direction: column;
+        }
     }
 
     /* Ensure search results are always shown at the very top */

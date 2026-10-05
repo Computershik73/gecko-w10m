@@ -1,6 +1,15 @@
 /* Copyright 2022 plata
  * SPDX-License-Identifier: MPL-2.0 */
 
+/* Port: Firefox keeps its window at least 500 CSS pixels wide
+ * (--window-min-width), and a headless window takes that literally -- so the
+ * shell could never draw at more than 2.67 device pixels a CSS pixel on a
+ * 1440-pixel screen, and a denser, smaller phone (Lumia 950) got everything
+ * smaller. The phone layout here is made for 360. */
+:root {
+    --window-min-width: 360px !important;
+}
+
 @media (max-width: 1200px) {
     @media not (-moz-pref("mcf.toolbar.positionOnTop")) {
         /* Move navigation bar to bottom */
@@ -21,6 +30,29 @@
     /* Hide minimize/maximize/close buttons */
     .titlebar-buttonbox-container {
         display: none;
+    }
+
+    /* Port: the toolbar follows the theme picked in Settings. Light, Dark and
+     * System changed the pages and the menus but not the bar: with the title
+     * bar drawn by Firefox (browser.tabs.inTitlebar) its background comes from
+     * the window caption's system colours, which are fixed here, and from the
+     * inactive-window variant when the headless window counts as inactive.
+     * Pinned to the theme's own toolbar colours instead; extension themes
+     * ([lwtheme]) set their own and are left alone. */
+    :root:not([lwtheme]) {
+        --toolbox-background-color: var(--toolbar-background-color) !important;
+        --toolbox-background-color-inactive: var(--toolbar-background-color) !important;
+        --toolbox-text-color-inactive: var(--toolbox-text-color) !important;
+    }
+
+    :root:not([lwtheme]) :is(#navigator-toolbox, #nav-bar, #TabsToolbar) {
+        color-scheme: var(--toolbar-color-scheme);
+        background-color: var(--toolbar-background-color) !important;
+        color: var(--toolbar-text-color) !important;
+    }
+
+    :root:not([lwtheme]) body:-moz-window-inactive {
+        background-color: var(--toolbox-background-color) !important;
     }
 }
 

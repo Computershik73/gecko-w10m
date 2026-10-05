@@ -279,15 +279,39 @@ MainPage::MainPage() {
   // makes the shell measure the keyboard in the wrong unit: it reported 669
   // physical pixels covered where the keyboard really takes 878, and the
   // window moved up by too little.
-  constexpr double kNarrowestChromeCss = 540.0;
-  double cssScale = raw;
+  //
+  // That kept every phone 540 CSS pixels wide, whatever its size: on a
+  // Lumia 950 (5.2", 562 dpi) everything came out smaller than on the HP
+  // Elite X3 (5.96", 494 dpi) it was tuned on. The window's minimum is gone
+  // now (themes/shared/chrome/browser.css), so the scale follows the
+  // panel's own density instead: as many CSS pixels to the inch as the X3
+  // has at 540 across -- 494 dpi / 2.667 -- so the same things are the same
+  // size on every phone. Never narrower than 360 CSS pixels, which is what
+  // the phone layout is made for, and never larger than Windows' own scale.
+  constexpr double kCssPixelsPerInch = 494.0 / (1440.0 / 540.0);
+  constexpr double kNarrowestChromeCss = 360.0;
+  double dpi = 0;
+  try {
+    dpi = winrt::Windows::Graphics::Display::DisplayInformation::
+              GetForCurrentView()
+                  .RawDpiX();
+  } catch (...) {
+  }
+  double cssScale = dpi > 0 ? dpi / kCssPixelsPerInch : pixelWidth / 540.0;
+  if (cssScale > raw) {
+    cssScale = raw;
+  }
   if (pixelWidth > 0 && cssScale > pixelWidth / kNarrowestChromeCss) {
     cssScale = pixelWidth / kNarrowestChromeCss;
-    Log::Write(L"view: scale " + std::to_wstring(raw) + L" would leave " +
-               std::to_wstring(static_cast<int>(pixelWidth / raw)) +
-               L" CSS pixels, too narrow for the chrome; drawing at " +
-               std::to_wstring(cssScale));
   }
+  if (!(cssScale > 0)) {
+    cssScale = raw;
+  }
+  Log::Write(L"view: " + std::to_wstring(static_cast<int>(dpi + 0.5)) +
+             L" dpi, drawing at " + std::to_wstring(cssScale) +
+             L" device pixels a CSS pixel: " +
+             std::to_wstring(static_cast<int>(pixelWidth / cssScale + 0.5)) +
+             L" CSS pixels across");
   Log::WriteNum(L"cpu: cores visible to the process",
                 static_cast<int>(std::thread::hardware_concurrency()));
 
