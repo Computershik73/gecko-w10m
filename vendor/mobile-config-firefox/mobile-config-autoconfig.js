@@ -1156,6 +1156,34 @@ function gecko_desktop_sites() {
     };
     Services.obs.addObserver(observer, "content-document-global-created");
     Services.obs.addObserver(observer, "document-element-inserted");
+
+    // Every page load of these hosts, as the server answered it: whether the
+    // turn-away is the server's (a redirect on the request) or the page's
+    // own script (a second load after the first).
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const channel = subject.QueryInterface(Ci.nsIHttpChannel);
+                if (!matches(channel.URI.host.toLowerCase()) ||
+                    channel.loadInfo.externalContentPolicyType !==
+                        Ci.nsIContentPolicy.TYPE_DOCUMENT) {
+                    return;
+                }
+                let location = "";
+                try {
+                    location = channel.getResponseHeader("Location");
+                } catch (e) {}
+                let agent = "";
+                try {
+                    agent = channel.getRequestHeader("User-Agent");
+                } catch (e) {}
+                Services.console.logStringMessage(
+                    "gecko: desktop site load " + channel.URI.spec + " -> HTTP " +
+                    channel.responseStatus + (location ? " to " + location : "") +
+                    ", sent as " + agent);
+            } catch (e) {}
+        }
+    }, "http-on-examine-response");
 }
 
 // Firefox's own pages -- about:preferences, about:addons, about:support and
