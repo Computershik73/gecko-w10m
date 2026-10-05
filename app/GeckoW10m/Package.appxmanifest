@@ -35,7 +35,7 @@
   <Identity
       Name="Gecko"
       Publisher="CN=Computershik"
-      Version="155.0.1.147"
+      Version="155.0.1.148"
       ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity
@@ -136,6 +136,10 @@
     <Capability Name="privateNetworkClientServer" />
     <uap:Capability Name="removableStorage" />
     <uap:Capability Name="picturesLibrary" />
+    <!-- Media keeps playing minimised or with the screen locked: the app is
+         not suspended while it plays (the engine's audio is marked as media,
+         media/libcubeb/src/cubeb_wasapi.cpp). -->
+    <uap3:Capability Name="backgroundMediaPlayback" />
 
     <!-- JIT. The whole reason a real Gecko engine can run here. -->
     <rescap:Capability Name="codeGeneration" />

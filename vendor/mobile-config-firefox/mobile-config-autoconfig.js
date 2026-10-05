@@ -1207,6 +1207,50 @@ function gecko_desktop_sites() {
     }, "http-on-examine-response");
 }
 
+// Downloads, as they go: where they are saved, and why one failed -- the
+// downloads panel says only "Failed", and nothing else said anything.
+function gecko_note_downloads() {
+    gecko_after(5000, () => {
+        const note = m => Services.console.logStringMessage("gecko: download: " + m);
+        let Downloads;
+        try {
+            ({ Downloads } = ChromeUtils.importESModule(
+                "resource://gre/modules/Downloads.sys.mjs"));
+        } catch (e) {
+            note("no Downloads module: " + e);
+            return;
+        }
+        Downloads.getPreferredDownloadsDirectory().then(
+            dir => note("saved into " + dir),
+            e => note("no downloads directory: " + e));
+        const noted = new WeakSet();
+        Downloads.getList(Downloads.ALL).then(list => list.addView({
+            onDownloadAdded(d) {
+                note("started " + String(d.source.url).slice(0, 160) + " -> " +
+                     d.target.path);
+            },
+            onDownloadChanged(d) {
+                if (noted.has(d)) {
+                    return;
+                }
+                if (d.error) {
+                    noted.add(d);
+                    const error = d.error;
+                    note("FAILED " + d.target.path + ": " +
+                         (error.message || error) +
+                         (error.result ? " (0x" + (error.result >>> 0).toString(16) + ")" : "") +
+                         (error.becauseSourceFailed ? ", the source failed" : "") +
+                         (error.becauseTargetFailed ? ", the target failed" : "") +
+                         (error.becauseBlocked ? ", blocked" : ""));
+                } else if (d.succeeded) {
+                    noted.add(d);
+                    note("done " + d.target.path);
+                }
+            },
+        }), e => note("no downloads list: " + e));
+    });
+}
+
 // Firefox's own pages -- about:preferences, about:addons, about:support and
 // the rest -- carry no viewport meta tag: on the desktop they never needed
 // one. With mobile viewport handling on, a page without one is laid out 980
@@ -1371,6 +1415,7 @@ try {
     gecko_watch_fullscreen();
     gecko_h264ify();
     gecko_desktop_sites();
+    gecko_note_downloads();
     gecko_about_viewport();
     gecko_spotify();
     delete_old_mcf_files();

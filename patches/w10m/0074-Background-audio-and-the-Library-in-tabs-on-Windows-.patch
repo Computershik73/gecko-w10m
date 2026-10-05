@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Tue, 6 Oct 2026 03:15:36 +0400
+Subject: [PATCH] Background audio, and the Library in tabs, on Windows 10
+ Mobile
+
+- cubeb: render streams are marked AudioCategory_Media, so that an app with
+  the backgroundMediaPlayback capability is kept running while it plays,
+  minimised or with the screen locked.
+- The Library (downloads, history, bookmarks) opens in tabs when
+  gecko.places.inTab is set: a window of its own is never shown by the
+  Windows 10 Mobile shell and yet took every tap, and the browser seemed to
+  hang after "Show all downloads". Downloads go to about:downloads, history
+  to Firefox View, bookmarks to the Library's own page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser/base/content/browser-commands.js |  9 ++++++++-
+ browser/base/content/browser-places.js   | 14 ++++++++++++++
+ media/libcubeb/src/cubeb_wasapi.cpp      | 21 +++++++++++++++++++++
+ 3 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/browser/base/content/browser-commands.js b/browser/base/content/browser-commands.js
+index a56415fcca..1baa91c393 100644
+--- a/browser/base/content/browser-commands.js
++++ b/browser/base/content/browser-commands.js
+@@ -577,7 +577,14 @@ var BrowserCommands = {
+   },
+ 
+   downloadsUI() {
+-    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
++    // Windows 10 Mobile port: a window of its own is never shown there --
++    // the shell shows the browser window and nothing else -- yet it takes
++    // every tap, so the browser seemed to hang. The downloads list opens in
++    // a tab instead (gecko.places.inTab).
++    if (
++      PrivateBrowsingUtils.isWindowPrivate(window) ||
++      Services.prefs.getBoolPref("gecko.places.inTab", false)
++    ) {
+       openTrustedLinkIn("about:downloads", "tab");
+     } else {
+       PlacesCommandHook.showPlacesOrganizer("Downloads");
+diff --git a/browser/base/content/browser-places.js b/browser/base/content/browser-places.js
+index 8bcd572b58..8294721ba9 100644
+--- a/browser/base/content/browser-places.js
++++ b/browser/base/content/browser-places.js
+@@ -557,6 +557,20 @@ var PlacesCommandHook = {
+    *                      AllBookmarks, History, Downloads.
+    */
+   showPlacesOrganizer(item) {
++    // Windows 10 Mobile port: the Library is a window of its own, which is
++    // never shown there and yet takes every tap. Its parts open in tabs:
++    // downloads and history have pages of their own, bookmarks the Library's
++    // page itself (gecko.places.inTab).
++    if (Services.prefs.getBoolPref("gecko.places.inTab", false)) {
++      const page =
++        item == "Downloads"
++          ? "about:downloads"
++          : item == "History"
++            ? "about:firefoxview#history"
++            : "chrome://browser/content/places/places.xhtml";
++      openTrustedLinkIn(page, "tab");
++      return;
++    }
+     var organizer = Services.wm.getMostRecentWindow("Places:Organizer");
+     // Due to bug 528706, getMostRecentWindow can return closed windows.
+     if (!organizer || organizer.closed) {
+diff --git a/media/libcubeb/src/cubeb_wasapi.cpp b/media/libcubeb/src/cubeb_wasapi.cpp
+index f4c0f35edd..d5fe43d955 100644
+--- a/media/libcubeb/src/cubeb_wasapi.cpp
++++ b/media/libcubeb/src/cubeb_wasapi.cpp
+@@ -296,6 +296,13 @@ typedef enum {
+   CUBEB_AUDIO_CLIENT2_RAW,
+   /* Use CUBEB_STREAM_PREF_COMMUNICATIONS */
+   CUBEB_AUDIO_CLIENT2_VOICE
++#if defined(GECKO_W10M)
++  ,
++  /* AudioCategory_Media: a UWP app with the backgroundMediaPlayback
++   * capability keeps running while it plays media, minimised or with the
++   * screen locked, and a WASAPI stream counts as media by its category. */
++  CUBEB_AUDIO_CLIENT2_MEDIA
++#endif
+ } AudioClient2Option;
+ 
+ struct cubeb {
+@@ -2173,6 +2180,11 @@ initialize_iaudioclient2(com_ptr<IAudioClient> & audio_client,
+   } else if (option == CUBEB_AUDIO_CLIENT2_VOICE) {
+     properties.eCategory = AudioCategory_Communications;
+   }
++#  if defined(GECKO_W10M)
++  else if (option == CUBEB_AUDIO_CLIENT2_MEDIA) {
++    properties.eCategory = AudioCategory_Media;
++  }
++#  endif
+ #endif
+   HRESULT hr = audio_client2->SetClientProperties(&properties);
+   if (FAILED(hr)) {
+@@ -2510,6 +2522,15 @@ setup_wasapi_stream_one_side(cubeb_stream * stm,
+       return CUBEB_ERROR;
+     }
+   }
++#if defined(GECKO_W10M)
++  else if (direction == eRender) {
++    if (initialize_iaudioclient2(audio_client, CUBEB_AUDIO_CLIENT2_MEDIA) !=
++        CUBEB_OK) {
++      LOG("Can't mark the stream as media, error: %lx", GetLastError());
++      // Not fatal: it plays, only not in the background.
++    }
++  }
++#endif
+ 
+ #if 0 // See https://bugzilla.mozilla.org/show_bug.cgi?id=1590902
+   if (initialize_iaudioclient3(audio_client, stm, mix_format, flags, direction)) {

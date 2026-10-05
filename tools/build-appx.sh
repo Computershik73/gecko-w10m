@@ -336,6 +336,10 @@ pref("gfx.webrender.software.d3d11.gpu-shading", true);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
+// The Library (downloads, history, bookmarks) in tabs, not in a window of its
+// own: the shell shows only the browser window, and another window took every
+// tap while staying out of sight (browser-commands.js, browser-places.js).
+pref("gecko.places.inTab", true);
 // Every window a page opens is a tab, the sized ones included: sign-in windows
 // (Google, VK and the like) call window.open with a width and a height, and
 // Firefox makes those a window of their own -- which this port never shows, so
