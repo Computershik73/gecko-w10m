@@ -35,18 +35,19 @@ PORTAL_HTTPS = os.environ.get("GECKO_W10M_PORTAL_HTTPS", "https://127.0.0.1:1044
 
 
 def get(endpoint, **params):
+    import ssl
     global PORTAL
     query = endpoint + ("?" + urllib.parse.urlencode(params) if params else "")
+    unverified = ssl._create_unverified_context()
     try:
-        with urllib.request.urlopen(PORTAL + query, timeout=30) as r:
+        context = unverified if PORTAL.startswith("https:") else None
+        with urllib.request.urlopen(PORTAL + query, timeout=30, context=context) as r:
             return r.read()
     except urllib.error.URLError as e:
         if PORTAL == PORTAL_HTTPS or not isinstance(e.reason, ConnectionRefusedError):
             raise
-    import ssl
     PORTAL = PORTAL_HTTPS
-    with urllib.request.urlopen(PORTAL + query, timeout=30,
-                                context=ssl._create_unverified_context()) as r:
+    with urllib.request.urlopen(PORTAL + query, timeout=30, context=unverified) as r:
         return r.read()
 
 
