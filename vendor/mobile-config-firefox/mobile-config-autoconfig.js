@@ -1060,18 +1060,23 @@ function gecko_h264ify() {
     Services.obs.addObserver(observer, "document-element-inserted");
 }
 
-// Sites that turn a phone away, shown the browser as a computer's: no touch
-// screen, a fine pointer that hovers, a screen at least 1280x720. WhatsApp
-// Web sent this browser to its "use a computer" page (/mobile/) though the
-// user agent is the desktop one; what it saw was the touch screen and the
-// phone-sized screen. Taps still reach the page as clicks, so it is used as
-// usual. The hosts are gecko.desktop.hosts.
+// Sites that turn a phone away, shown the browser as a computer's: Firefox
+// for Windows in the User-Agent header and in navigator, no touch screen, a
+// fine pointer that hovers, a screen at least 1280x720. WhatsApp Web answered
+// the default user agent -- Firefox for Android, which UserAgentManager gives
+// every site so that they send their phone layouts -- with a redirect to its
+// "use a computer" page (/mobile/). Taps still reach the page as clicks, so
+// it is used as usual. The hosts are gecko.desktop.hosts.
 const DESKTOP_SOURCE = `
 (function () {
   "use strict";
   var define = function (proto, name, get) {
     try { Object.defineProperty(proto, name, { get: get, configurable: true }); } catch (e) {}
   };
+  define(Navigator.prototype, "userAgent", function () { return GECKO_DESKTOP_UA; });
+  define(Navigator.prototype, "appVersion", function () { return "5.0 (Windows)"; });
+  define(Navigator.prototype, "platform", function () { return "Win32"; });
+  define(Navigator.prototype, "oscpu", function () { return "Windows NT 10.0; Win64; x64"; });
   define(Navigator.prototype, "maxTouchPoints", function () { return 0; });
   ["ontouchstart", "ontouchmove", "ontouchend", "ontouchcancel"].forEach(function (name) {
     [Window.prototype, Document.prototype, HTMLElement.prototype, Element.prototype].forEach(function (proto) {
@@ -1120,6 +1125,21 @@ function gecko_desktop_sites() {
     }
     const matches = host =>
         hosts.some(h => host === h || host.endsWith("." + h));
+    const version = Services.appinfo.version.split(".")[0] + ".0";
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:" + version +
+               ") Gecko/20100101 Firefox/" + version;
+    const uaSource = "var GECKO_DESKTOP_UA = " + JSON.stringify(UA) + ";";
+    // The header, on every request to these hosts.
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const channel = subject.QueryInterface(Ci.nsIHttpChannel);
+                if (matches(channel.URI.host.toLowerCase())) {
+                    channel.setRequestHeader("User-Agent", UA, false);
+                }
+            } catch (e) {}
+        }
+    }, "http-on-modify-request");
     // Keyed by document, as in gecko_h264ify: a tab that navigates keeps its
     // window.
     const INJECTED = new WeakSet();
@@ -1145,6 +1165,7 @@ function gecko_desktop_sites() {
                     sandboxPrototype: win,
                     wantXrays: false,
                 });
+                Cu.evalInSandbox(uaSource, sandbox);
                 Cu.evalInSandbox(DESKTOP_SOURCE, sandbox);
                 Services.console.logStringMessage(
                     "gecko: " + host + " shown the browser as a computer's");
