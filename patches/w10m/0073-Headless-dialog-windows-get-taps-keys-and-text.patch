@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Tue, 6 Oct 2026 01:05:27 +0400
+Subject: [PATCH] Headless: dialog windows get taps, keys and text
+
+A dialog window (the "allow this site to open the ... link?" question, a
+slow-script warning, prompts) is drawn over the page like a popup, but only
+popups were given the taps over them: a tap on a dialog's button went
+through to the page under it, and the phone's back button's Escape went to
+the browser window, so a dialog could be neither answered nor closed.
+Dialogs now get the taps over them; a tap beside an open dialog reaches
+nobody, as with any modal window; and keys and text go to the top dialog.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/headless/HeadlessCompositorWidget.cpp |  7 +++-
+ widget/headless/HeadlessWidget.cpp           | 43 +++++++++++++++++---
+ widget/headless/HeadlessWidget.h             |  6 +++
+ 3 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 2cfaccc597..5779f1a31b 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -930,7 +930,8 @@ extern "C" __declspec(dllexport) void gecko_w10m_input_text(
+         // Typing has now failed twice for reasons that were in different
+         // halves of the path, so each step reports itself and the next log
+         // names the one that is silent.
+-        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        // An open dialog takes the text (a prompt's field, a sign-in box).
++        auto* widget = mozilla::widget::HeadlessWidget::KeyWidget();
+         if (!widget) {
+           GeckoW10mNote("text: arrived, but there is no shown widget");
+           return;
+@@ -959,7 +960,9 @@ extern "C" __declspec(dllexport) void gecko_w10m_input_text(
+ extern "C" __declspec(dllexport) void gecko_w10m_input_key(int32_t aKeyCode) {
+   GeckoW10mDispatchInput(
+       NS_NewRunnableFunction("gecko_w10m_input_key", [aKeyCode]() {
+-        auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
++        // An open dialog takes the keys: Escape from the phone's back button
++        // closes it, Enter answers it.
++        auto* widget = mozilla::widget::HeadlessWidget::KeyWidget();
+         if (!widget) {
+           return;
+         }
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index 288e0a82f7..f29f83d33e 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -112,10 +112,11 @@ namespace {
+ // Raw, and main thread only. A strong reference here would keep a window
+ // alive past its own teardown, which is worse than the discipline.
+ HeadlessWidget* sShownWidget = nullptr;
+-// Popups in creation order; the last visible one under a point is on top.
+-// The shell delivers every tap to the browser window, and an operating system
+-// would have delivered it to the popup window under the finger instead, so
+-// that is done here.
++// Popups and dialogs in creation order; the last visible one under a point
++// is on top. The shell delivers every tap to the browser window, and an
++// operating system would have delivered it to the window under the finger
++// instead, so that is done here. Dialogs were left out, and their buttons
++// never got a tap: it went through to the page under them.
+ std::vector<HeadlessWidget*> sGeckoW10mPopups;
+ }  // namespace
+ 
+@@ -124,6 +125,24 @@ HeadlessWidget* HeadlessWidget::ShownWidget() {
+   return sShownWidget;
+ }
+ 
++HeadlessWidget* HeadlessWidget::TopDialog() {
++  MOZ_ASSERT(NS_IsMainThread());
++  for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend();
++       ++it) {
++    HeadlessWidget* window = *it;
++    if (window->mWindowType == WindowType::Dialog && window->mVisible &&
++        !window->mDestroyed) {
++      return window;
++    }
++  }
++  return nullptr;
++}
++
++HeadlessWidget* HeadlessWidget::KeyWidget() {
++  HeadlessWidget* dialog = TopDialog();
++  return dialog ? dialog : ShownWidget();
++}
++
+ namespace {
+ // Written on the main thread when focus moves, read by the shell from its own.
+ // A bool either side of a torn read is still a bool.
+@@ -248,7 +267,7 @@ nsresult HeadlessWidget::Create(nsIWidget* aParent,
+   mRestoreBounds = aRect;
+   mAlwaysOnTop = aInitData.mAlwaysOnTop;
+ #if defined(GECKO_W10M)
+-  if (mWindowType == WindowType::Popup) {
++  if (mWindowType == WindowType::Popup || mWindowType == WindowType::Dialog) {
+     sGeckoW10mPopups.push_back(this);
+   }
+ #endif
+@@ -700,6 +719,12 @@ nsresult HeadlessWidget::SynthesizeNativeMouseEvent(
+                                                  aModifierFlags, nullptr);
+       }
+     }
++    // A dialog is modal: what is under it waits for its answer. A tap
++    // beside it reaching the page would act on a page that is not done
++    // asking.
++    if (TopDialog()) {
++      return NS_OK;
++    }
+   }
+ #endif
+   EventMessage msg;
+@@ -762,7 +787,8 @@ nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+     return NS_ERROR_UNEXPECTED;
+   }
+ #if defined(GECKO_W10M)
+-  // As with the mouse: a finger over a popup belongs to the popup window.
++  // As with the mouse: a finger over a popup or a dialog belongs to its
++  // window, and one beside an open dialog to nobody.
+   if (mWindowType == WindowType::TopLevel) {
+     for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend(); ++it) {
+       HeadlessWidget* popup = *it;
+@@ -773,6 +799,11 @@ nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+                                                  aPointerOrientation, nullptr);
+       }
+     }
++    // The whole touch, unless one the page already has under way is ending.
++    if (TopDialog() && (!mSynthesizedTouchInput ||
++                        mSynthesizedTouchInput->mTouches.IsEmpty())) {
++      return NS_OK;
++    }
+   }
+ #endif
+ 
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+index f7c25ea4be..90bf53baeb 100644
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -66,6 +66,12 @@ class HeadlessWidget final : public nsIWidget {
+   // it is destroyed, read by the input entry points in
+   // HeadlessCompositorWidget.cpp.
+   static HeadlessWidget* ShownWidget();
++  // The dialog window on top (a prompt, the "allow this site to open..."
++  // question, a slow-script warning), if one is showing: keys and text go to
++  // it rather than to the browser window under it.
++  static HeadlessWidget* TopDialog();
++  // Where keys and text go: the top dialog, else the shown window.
++  static HeadlessWidget* KeyWidget();
+   // True while focus is on something that takes text. It is the only
+   // signal a phone has that it should raise its keyboard.
+   static bool TextInputWanted();
