@@ -1060,6 +1060,104 @@ function gecko_h264ify() {
     Services.obs.addObserver(observer, "document-element-inserted");
 }
 
+// Sites that turn a phone away, shown the browser as a computer's: no touch
+// screen, a fine pointer that hovers, a screen at least 1280x720. WhatsApp
+// Web sent this browser to its "use a computer" page (/mobile/) though the
+// user agent is the desktop one; what it saw was the touch screen and the
+// phone-sized screen. Taps still reach the page as clicks, so it is used as
+// usual. The hosts are gecko.desktop.hosts.
+const DESKTOP_SOURCE = `
+(function () {
+  "use strict";
+  var define = function (proto, name, get) {
+    try { Object.defineProperty(proto, name, { get: get, configurable: true }); } catch (e) {}
+  };
+  define(Navigator.prototype, "maxTouchPoints", function () { return 0; });
+  ["ontouchstart", "ontouchmove", "ontouchend", "ontouchcancel"].forEach(function (name) {
+    [Window.prototype, Document.prototype, HTMLElement.prototype, Element.prototype].forEach(function (proto) {
+      try { delete proto[name]; } catch (e) {}
+    });
+    try { delete window[name]; } catch (e) {}
+  });
+  try { delete window.TouchEvent; } catch (e) {}
+  try { delete window.Touch; } catch (e) {}
+  try { delete window.TouchList; } catch (e) {}
+  var screenProto = Object.getPrototypeOf(window.screen);
+  ["width", "availWidth"].forEach(function (name) {
+    var real = Object.getOwnPropertyDescriptor(screenProto, name);
+    if (real && real.get) {
+      define(screenProto, name, function () { return Math.max(real.get.call(this), 1280); });
+    }
+  });
+  ["height", "availHeight"].forEach(function (name) {
+    var real = Object.getOwnPropertyDescriptor(screenProto, name);
+    if (real && real.get) {
+      define(screenProto, name, function () { return Math.max(real.get.call(this), 720); });
+    }
+  });
+  var realMatchMedia = window.matchMedia;
+  if (realMatchMedia) {
+    var never = "(max-width: 0px)", always = "(min-width: 0px)";
+    window.matchMedia = function (query) {
+      var q = String(query)
+        .replace(/\(\s*(any-)?pointer\s*:\s*coarse\s*\)/gi, never)
+        .replace(/\(\s*(any-)?pointer\s*:\s*fine\s*\)/gi, always)
+        .replace(/\(\s*(any-)?hover\s*:\s*none\s*\)/gi, never)
+        .replace(/\(\s*(any-)?hover\s*:\s*hover\s*\)/gi, always);
+      return realMatchMedia.call(window, q);
+    };
+  }
+})();
+`;
+
+function gecko_desktop_sites() {
+    const setting = Services.prefs.getStringPref("gecko.desktop.hosts",
+                                                 "web.whatsapp.com");
+    const hosts = setting.split(",").map(h => h.trim().toLowerCase())
+                         .filter(h => h.length);
+    if (!hosts.length) {
+        return;
+    }
+    const matches = host =>
+        hosts.some(h => host === h || host.endsWith("." + h));
+    // Keyed by document, as in gecko_h264ify: a tab that navigates keeps its
+    // window.
+    const INJECTED = new WeakSet();
+    const observer = {
+        observe(subject, topic) {
+            let win = topic === "document-element-inserted"
+                ? (subject && subject.defaultView) : subject;
+            if (!win || !win.document || INJECTED.has(win.document)) {
+                return;
+            }
+            let host;
+            try {
+                host = win.location.hostname.toLowerCase();
+            } catch (e) {
+                return;
+            }
+            if (!matches(host) || !win.document.documentElement) {
+                return;
+            }
+            INJECTED.add(win.document);
+            try {
+                const sandbox = Cu.Sandbox(win, {
+                    sandboxPrototype: win,
+                    wantXrays: false,
+                });
+                Cu.evalInSandbox(DESKTOP_SOURCE, sandbox);
+                Services.console.logStringMessage(
+                    "gecko: " + host + " shown the browser as a computer's");
+            } catch (e) {
+                Services.console.logStringMessage(
+                    "gecko: desktop mode failed on " + host + ": " + e);
+            }
+        }
+    };
+    Services.obs.addObserver(observer, "content-document-global-created");
+    Services.obs.addObserver(observer, "document-element-inserted");
+}
+
 // Firefox's own pages -- about:preferences, about:addons, about:support and
 // the rest -- carry no viewport meta tag: on the desktop they never needed
 // one. With mobile viewport handling on, a page without one is laid out 980
@@ -1223,6 +1321,7 @@ try {
     gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_h264ify();
+    gecko_desktop_sites();
     gecko_about_viewport();
     gecko_spotify();
     delete_old_mcf_files();
