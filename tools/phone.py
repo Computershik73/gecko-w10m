@@ -29,9 +29,24 @@ LOGS = [
 ]
 
 
+# Over USB the portal is sometimes only on its HTTPS port, with the phone's
+# own self-signed certificate.
+PORTAL_HTTPS = os.environ.get("GECKO_W10M_PORTAL_HTTPS", "https://127.0.0.1:10443")
+
+
 def get(endpoint, **params):
-    url = PORTAL + endpoint + ("?" + urllib.parse.urlencode(params) if params else "")
-    with urllib.request.urlopen(url, timeout=30) as r:
+    global PORTAL
+    query = endpoint + ("?" + urllib.parse.urlencode(params) if params else "")
+    try:
+        with urllib.request.urlopen(PORTAL + query, timeout=30) as r:
+            return r.read()
+    except urllib.error.URLError as e:
+        if PORTAL == PORTAL_HTTPS or not isinstance(e.reason, ConnectionRefusedError):
+            raise
+    import ssl
+    PORTAL = PORTAL_HTTPS
+    with urllib.request.urlopen(PORTAL + query, timeout=30,
+                                context=ssl._create_unverified_context()) as r:
         return r.read()
 
 
