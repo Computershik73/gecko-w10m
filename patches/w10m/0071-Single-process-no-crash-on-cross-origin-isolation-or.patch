@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Mon, 5 Oct 2026 15:54:53 +0400
+Subject: [PATCH] Single process: no crash on cross-origin isolation or a
+ dialog's light dismiss
+
+A page that asks to be cross-origin isolated (COOP same-origin with COEP
+require-corp; WhatsApp Web) is, in Firefox, loaded into a new process with a
+new browsing context: a context can never become isolated in place, CanSet
+refuses, and a refused transaction is a deliberate crash. In one process
+the load reuses the tab's context, so opening WhatsApp Web crashed the
+browser every time. The change is left out: the page loads, not isolated.
+
+Closing a <dialog> by tapping outside it (light dismiss) consumes the
+history activation, which tells the other processes through ContentChild;
+in one process there is none, and it crashed on null. Only the local
+processes' contexts are updated there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docshell/base/WindowContext.cpp |  9 +++++++++
+ dom/base/Document.cpp           | 27 +++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/docshell/base/WindowContext.cpp b/docshell/base/WindowContext.cpp
+index 77b3e1c21f..b531e06b0e 100644
+--- a/docshell/base/WindowContext.cpp
++++ b/docshell/base/WindowContext.cpp
+@@ -700,8 +700,17 @@ void WindowContext::ConsumeHistoryActivation() {
+   // including for example cross-origin iframes. As such we need to send an
+   // message over the IPC boundary to ensure out of processes contexts also
+   // consume their activations.
++#if defined(GECKO_W10M)
++  // In a single process there are no other processes to tell, and no
++  // ContentChild to tell them with: closing a <dialog> by tapping outside it
++  // (light dismiss) got here and crashed on a null ContentChild.
++  if (XRE_IsContentProcess()) {
++    ContentChild::GetSingleton()->SendConsumeHistoryActivation(top);
++  }
++#else
+   MOZ_ASSERT(XRE_IsContentProcess());
+   ContentChild::GetSingleton()->SendConsumeHistoryActivation(top);
++#endif
+ 
+   // Update the local process children immediately.
+   top->ConsumeHistoryActivation();
+diff --git a/dom/base/Document.cpp b/dom/base/Document.cpp
+index 9602541b0c..a7267b1d45 100644
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -3553,6 +3553,10 @@ bool Document::IsCallerChromeOrAddon(JSContext* aCx, JSObject* aObject) {
+                        principal->GetIsAddonOrExpandedAddonPrincipal());
+ }
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ static void CheckIsBadPolicy(nsILoadInfo::CrossOriginOpenerPolicy aPolicy,
+                              BrowsingContext* aContext, nsIChannel* aChannel) {
+ #if defined(NIGHTLY_BUILD)
+@@ -3716,6 +3720,29 @@ nsresult Document::StartDocumentLoad(const char* aCommand, nsIChannel* aChannel,
+       docShell->GetBrowsingContext()) {
+     CheckIsBadPolicy(policy, docShell->GetBrowsingContext(), aChannel);
+ 
++#if defined(GECKO_W10M)
++    // A page that asks to be cross-origin isolated (COOP same-origin with
++    // COEP require-corp: WhatsApp Web does) gets, in Firefox, a new process
++    // and with it a new browsing context, because a context can never
++    // become isolated, nor stop being, in place: CanSet refuses, and a
++    // refused transaction is a deliberate crash. This port runs in one
++    // process, so the load reuses the tab's context and WhatsApp Web
++    // crashed the browser every time it was opened. The change is left
++    // out instead: the page loads, just not isolated (no
++    // SharedArrayBuffer), as in a browser without the feature.
++    {
++      const auto requireCORP =
++          nsILoadInfo::OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP;
++      const auto current = docShell->GetBrowsingContext()->GetOpenerPolicy();
++      if (current != policy &&
++          (current == requireCORP || policy == requireCORP)) {
++        GeckoW10mNote(
++            "document: a page asked for cross-origin isolation; one process "
++            "cannot give it a new browsing context, so it loads without");
++        policy = current;
++      }
++    }
++#endif
+     // Setting the opener policy on a discarded context has no effect.
+     (void)docShell->GetBrowsingContext()->SetOpenerPolicy(policy);
+   }
