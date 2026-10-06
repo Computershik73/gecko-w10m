@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Tue, 6 Oct 2026 07:44:24 +0400
+Subject: [PATCH] Headless: a tap outside closes popups, and so does the back
+ button
+
+On the desktop the window manager tells Firefox when a click lands outside
+its open popups, and they roll up (nsWindow::DealWithPopups). Headless,
+nothing did: an extension's panel or the downloads panel stayed over the
+page for good. A finger or a click outside every open popup now rolls them
+up, and when Firefox says the event is to be consumed the whole touch stops
+there. The phone's back button, sent as Escape, rolls up the open popup
+directly when no dialog is open -- a panel whose page has the focus never
+saw an Escape sent to the browser window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/headless/HeadlessCompositorWidget.cpp | 13 ++++++
+ widget/headless/HeadlessWidget.cpp           | 43 ++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 5779f1a31b..9f16487891 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "HeadlessCompositorWidget.h"
++#include "nsIRollupListener.h"
+ #include "HeadlessScreenHelper.h"
+ #include "nsPrintfCString.h"
+ #if defined(GECKO_W10M)
+@@ -960,6 +961,18 @@ extern "C" __declspec(dllexport) void gecko_w10m_input_text(
+ extern "C" __declspec(dllexport) void gecko_w10m_input_key(int32_t aKeyCode) {
+   GeckoW10mDispatchInput(
+       NS_NewRunnableFunction("gecko_w10m_input_key", [aKeyCode]() {
++        // The phone's back button is Escape. With no dialog open it closes
++        // the open popup -- a panel whose page has the focus would never see
++        // an Escape sent to the browser window.
++        if (aKeyCode == 27 && !mozilla::widget::HeadlessWidget::TopDialog()) {
++          if (nsIRollupListener* rollup = nsIWidget::GetActiveRollupListener()) {
++            nsCOMPtr<nsIWidget> popup = rollup->GetRollupWidget();
++            if (popup) {
++              rollup->Rollup({});
++              return;
++            }
++          }
++        }
+         // An open dialog takes the keys: Escape from the phone's back button
+         // closes it, Enter answers it.
+         auto* widget = mozilla::widget::HeadlessWidget::KeyWidget();
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index f29f83d33e..5d7bbe0457 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -2,6 +2,9 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #include "HeadlessWidget.h"
++#if defined(GECKO_W10M)
++#  include "nsIRollupListener.h"
++#endif
+ 
+ #include <algorithm>
+ 
+@@ -118,6 +121,27 @@ HeadlessWidget* sShownWidget = nullptr;
+ // instead, so that is done here. Dialogs were left out, and their buttons
+ // never got a tap: it went through to the page under them.
+ std::vector<HeadlessWidget*> sGeckoW10mPopups;
++// A touch that closed a popup, kept from the page until the finger lifts.
++int64_t sGeckoW10mSwallowedPointer = -1;
++
++// A finger or a click outside every open popup closes them, as the operating
++// system's window manager tells Firefox to on the desktop (nsWindow's
++// DealWithPopups). Headless, nothing did, and a panel -- an extension's,
++// the downloads panel -- stayed over the page for good. True when the event
++// that closed them is to go no further.
++bool GeckoW10mRollupOutside(const mozilla::LayoutDeviceIntPoint& aPoint) {
++  nsIRollupListener* listener = nsIWidget::GetActiveRollupListener();
++  if (!listener) {
++    return false;
++  }
++  nsCOMPtr<nsIWidget> rollupWidget = listener->GetRollupWidget();
++  if (!rollupWidget) {
++    return false;
++  }
++  nsIRollupListener::RollupOptions options;
++  options.mPoint = &aPoint;
++  return listener->Rollup(options);
++}
+ }  // namespace
+ 
+ HeadlessWidget* HeadlessWidget::ShownWidget() {
+@@ -725,6 +749,10 @@ nsresult HeadlessWidget::SynthesizeNativeMouseEvent(
+     if (TopDialog()) {
+       return NS_OK;
+     }
++    if (aNativeMessage == NativeMouseMessage::ButtonDown &&
++        GeckoW10mRollupOutside(aPoint)) {
++      return NS_OK;
++    }
+   }
+ #endif
+   EventMessage msg;
+@@ -804,6 +832,21 @@ nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+                         mSynthesizedTouchInput->mTouches.IsEmpty())) {
+       return NS_OK;
+     }
++    // A touch outside the open popups closes them; if Firefox says so, the
++    // whole touch stops there.
++    if (sGeckoW10mSwallowedPointer == int64_t(aPointerId)) {
++      if (aPointerState & (TOUCH_REMOVE | TOUCH_CANCEL)) {
++        sGeckoW10mSwallowedPointer = -1;
++      }
++      return NS_OK;
++    }
++    if ((aPointerState & TOUCH_CONTACT) &&
++        (!mSynthesizedTouchInput ||
++         mSynthesizedTouchInput->mTouches.IsEmpty()) &&
++        GeckoW10mRollupOutside(aPoint)) {
++      sGeckoW10mSwallowedPointer = int64_t(aPointerId);
++      return NS_OK;
++    }
+   }
+ #endif
+ 
