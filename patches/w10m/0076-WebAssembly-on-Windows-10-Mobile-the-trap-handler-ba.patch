@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 10:17:26 +0400
+Subject: [PATCH] WebAssembly on Windows 10 Mobile: the trap handler back,
+ hardware divide
+
+The port compiled WasmTrapHandler out and returned early from
+EnsureEagerProcessSignalHandlers, believing UWP had no vectored exception
+handler. Without the handler wasm::HasSupport() is false and the global
+WebAssembly object is never defined, so no page could use wasm at all.
+xul.dll already imports AddVectoredExceptionHandler from kernel32 and loads
+on the phone, and the original code turns wasm off by itself if the call
+fails, so the upstream code is restored as it was.
+
+Windows has no auxv, so the ARM capabilities never included IDivA, and
+the wasm baseline compiler refuses to run without it: every module waited
+for Ion. IsProcessorFeaturePresent says whether the divide is there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ js/src/jit/arm/Architecture-arm.cpp | 10 ++++++++++
+ js/src/wasm/WasmSignalHandlers.cpp  | 12 +-----------
+ 2 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/js/src/jit/arm/Architecture-arm.cpp b/js/src/jit/arm/Architecture-arm.cpp
+index 44bc09786f..e40894bb9d 100644
+--- a/js/src/jit/arm/Architecture-arm.cpp
++++ b/js/src/jit/arm/Architecture-arm.cpp
+@@ -342,6 +342,16 @@ static auto ReadARMHwCapFlags() {
+   capabilities += ARMCapability::ARMv7;
+ #  endif
+ 
++#  if defined(XP_WIN) && defined(GECKO_W10M)
++  // Windows has no auxv to read. Hardware divide is the one capability that
++  // matters here: without it Ion divides through a call, and the wasm
++  // baseline compiler refuses to run at all (BaselinePlatformSupport), so
++  // every module waits for Ion. Every Windows 10 Mobile phone has it.
++  if (IsProcessorFeaturePresent(PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE)) {
++    capabilities += ARMCapability::IDivA;
++  }
++#  endif
++
+ #  if defined(__APPLE__)
+ #    if defined(__ARM_NEON__)
+   capabilities += ARMCapability::Neon;
+diff --git a/js/src/wasm/WasmSignalHandlers.cpp b/js/src/wasm/WasmSignalHandlers.cpp
+index b63af617eb..48bd59b364 100644
+--- a/js/src/wasm/WasmSignalHandlers.cpp
++++ b/js/src/wasm/WasmSignalHandlers.cpp
+@@ -591,11 +591,6 @@ struct AutoHandlingTrap {
+ // =============================================================================
+ 
+ #  if defined(XP_WIN)
+-// UWP has no vectored exception handler; the whole Windows async-trap handler
+-// is compiled out and wasm uses explicit bounds checks (see the early return in
+-// EnsureEagerProcessSignalHandlers). Keeping the XP_WIN arm avoids falling
+-// through to the POSIX signal path.
+-#    if !defined(GECKO_W10M)
+ // Obtained empirically from thread_local codegen on x86/x64/arm64.
+ // Compiled in all user binaries, so should be stable over time.
+ static const unsigned sThreadLocalArrayPointerIndex = 11;
+@@ -629,7 +624,6 @@ static LONG WINAPI WasmTrapHandler(LPEXCEPTION_POINTERS exception) {
+ 
+   return EXCEPTION_CONTINUE_EXECUTION;
+ }
+-#    endif  // !GECKO_W10M
+ 
+ #  elif defined(XP_DARWIN)
+ // On OSX we are forced to use the lower-level Mach exception mechanism instead
+@@ -892,11 +886,7 @@ void wasm::EnsureEagerProcessSignalHandlers() {
+   sAlreadyHandlingTrap.infallibleInit();
+ 
+   // Install whatever exception/signal handler is appropriate for the OS.
+-#  if defined(XP_WIN) && defined(GECKO_W10M)
+-  // UWP has no AddVectoredExceptionHandler; run wasm with explicit bounds
+-  // checks instead of the async trap handler.
+-  return;
+-#  elif defined(XP_WIN)
++#  if defined(XP_WIN)
+ 
+ #    if defined(MOZ_ASAN)
+   // Under ASan we need to let the ASan runtime's ShadowExceptionHandler stay

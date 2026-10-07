@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 10:17:27 +0400
+Subject: [PATCH] kvstore on Windows 10 Mobile: no canonicalize where the
+ container refuses it
+
+The extension scripting store, the extension menus and the remote
+settings history all failed with "I/O error: Os { code: 5, Access is
+denied }". kvstore canonicalizes the store path with std::fs::canonicalize,
+which ends in GetFinalPathNameByHandleW; turning the Data volume mounted at
+C:\Data back into a drive path is refused to the app container, though
+the directory itself can be read and written. On the UWP target the
+absolute form of the path is used when canonicalize fails.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ toolkit/components/kvstore/src/fs.rs | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/toolkit/components/kvstore/src/fs.rs b/toolkit/components/kvstore/src/fs.rs
+index 37ac203c85..8f51f86b39 100644
+--- a/toolkit/components/kvstore/src/fs.rs
++++ b/toolkit/components/kvstore/src/fs.rs
+@@ -41,7 +41,22 @@ impl WidePathBuf {
+         #[cfg(windows)]
+         {
+             use std::{ffi::OsString, os::windows::prelude::*};
+-            std::fs::canonicalize(OsString::from_wide(&*self.0))
++            let path = OsString::from_wide(&*self.0);
++            // Windows 10 Mobile: std::fs::canonicalize ends in
++            // GetFinalPathNameByHandleW, and turning the Data volume (mounted
++            // at C:\Data, where the profile lives) back into a drive path is
++            // a mount manager query the app container may not make -- "Access
++            // is denied" for a directory the app can read and write. Every
++            // caller passes an absolute profile path, the same way each time,
++            // so normalizing the string is as good a key and a directory.
++            #[cfg(target_vendor = "uwp")]
++            {
++                std::fs::canonicalize(&path).or_else(|_| std::path::absolute(&path))
++            }
++            #[cfg(not(target_vendor = "uwp"))]
++            {
++                std::fs::canonicalize(path)
++            }
+         }
+         #[cfg(unix)]
+         {

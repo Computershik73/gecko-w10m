@@ -234,6 +234,46 @@ void PrepareProfile(const std::wstring& profile, int width, int height,
       std::to_string(cssHeight) + " at " + scaleText + " device pixels per CSS pixel");
 }
 
+// Where downloads go. The phone's Downloads is C:\Data\Users\Public\Downloads,
+// and the browser's go in a Gecko folder there -- the same place the system
+// puts an app's files when it saves through DownloadsFolder. Whether the
+// engine may write there by path depends on the phone: with root access
+// (Interop Tools' full file system) it may; with interop unlock alone the
+// folder refuses the app container, and every download failed with
+// NS_ERROR_FILE_ACCESS_DENIED. There the engine downloads into
+// LocalState\Downloads, and the shell copies each finished file out through
+// the storage API (client/FileBridge.cpp) -- to Downloads\Gecko, or wherever
+// the user chose. The engine reads both variables: the first is its system
+// Downloads folder (xpcom/io/SpecialSystemDirectory.cpp), the second makes
+// every download land there whatever folder is chosen
+// (uriloader/exthandler/nsExternalHelperAppService.cpp,
+// toolkit/components/downloads/DownloadIntegration.sys.mjs).
+void PrepareDownloads(const std::wstring& localState) {
+  const std::wstring direct = L"C:\\Data\\Users\\Public\\Downloads\\Gecko";
+  ::CreateDirectoryW(direct.c_str(), nullptr);
+  const std::wstring probe = direct + L"\\.gecko-write-test";
+  CREATEFILE2_EXTENDED_PARAMETERS params = {};
+  params.dwSize = sizeof(params);
+  params.dwFileAttributes = FILE_ATTRIBUTE_TEMPORARY;
+  params.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE;
+  HANDLE h = ::CreateFile2(probe.c_str(), GENERIC_WRITE | DELETE, 0,
+                           CREATE_ALWAYS, &params);
+  if (h != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(h);
+    SetEngineEnvironment(L"GECKO_W10M_DOWNLOADS", direct.c_str());
+    Log("downloads: straight into " + Narrow(direct));
+    return;
+  }
+  const DWORD error = ::GetLastError();
+  const std::wstring staging = localState + L"\\Downloads";
+  ::CreateDirectoryW(staging.c_str(), nullptr);
+  SetEngineEnvironment(L"GECKO_W10M_DOWNLOADS", staging.c_str());
+  SetEngineEnvironment(L"GECKO_W10M_DOWNLOAD_STAGING", staging.c_str());
+  Log("downloads: the phone's Downloads refuses the app (error " +
+      std::to_string(error) + "), so into " + Narrow(staging) +
+      ", and the shell copies each one out");
+}
+
 using GetBootstrapFn = void(NS_FROZENCALL*)(mozilla::Bootstrap::UniquePtr&);
 
 }  // namespace
@@ -261,6 +301,13 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
                          std::to_wstring(height).c_str());
     Log("bootstrap: headless screen " + std::to_string(width) + "x" +
         std::to_string(height));
+  }
+
+  {
+    const size_t slash = profile.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+      PrepareDownloads(profile.substr(0, slash));
+    }
   }
 
   // Where libxul writes the delay-load substitutions it had to make. See the

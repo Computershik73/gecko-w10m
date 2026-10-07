@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 10:17:28 +0400
+Subject: [PATCH] WebRTC on Windows 10 Mobile: the phone's microphone consent,
+ no indicator window
+
+The microphone is behind the phone's own consent. Until the app has it
+the audio service refuses the capture endpoint, and nothing on the WASAPI
+path asks. The OS permission step Firefox runs after the user allows a
+site (WebRTCParent.checkOSPermission, used on macOS) now asks the shell:
+gecko_w10m_set_capture_consent_sink installs a state and a request
+function, gecko_w10m_capture_consent_result answers the promise.
+
+cubeb notes why a device would not open, and keeps the default input
+latency when the extra activation that measures it is refused, instead
+of giving up on the microphone. The microphone count goes to the notes.
+
+The global sharing indicator is an always-on-top dialog window; on the
+phone an open dialog takes every tap, so gecko.webrtc.globalIndicator.
+disabled keeps it from opening.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser/modules/webrtcUI.sys.mjs         |  7 ++
+ dom/media/webrtc/MediaEngineWebRTC.cpp   | 20 ++++++
+ dom/system/nsOSPermissionRequestBase.cpp | 82 ++++++++++++++++++++++++
+ media/libcubeb/src/cubeb_wasapi.cpp      | 28 ++++++++
+ 4 files changed, 137 insertions(+)
+
+diff --git a/browser/modules/webrtcUI.sys.mjs b/browser/modules/webrtcUI.sys.mjs
+index cc85adce90..7836f3ffc8 100644
+--- a/browser/modules/webrtcUI.sys.mjs
++++ b/browser/modules/webrtcUI.sys.mjs
+@@ -930,6 +930,13 @@ export var webrtcUI = {
+ };
+ 
+ function getGlobalIndicator() {
++  // Windows 10 Mobile: the indicator is a second, always-on-top dialog
++  // window. The phone shows one window, and an open dialog takes every tap
++  // (widget/headless), so for as long as the microphone was live the page
++  // under it -- the call's own controls included -- could not be touched.
++  if (Services.prefs.getBoolPref("gecko.webrtc.globalIndicator.disabled", false)) {
++    return null;
++  }
+   const INDICATOR_CHROME_URI = "chrome://browser/content/webrtcIndicator.xhtml";
+   let features = "chrome,titlebar=no,alwaysontop,minimizable,dialog";
+ 
+diff --git a/dom/media/webrtc/MediaEngineWebRTC.cpp b/dom/media/webrtc/MediaEngineWebRTC.cpp
+index d915abb45d..fd1f7715bf 100644
+--- a/dom/media/webrtc/MediaEngineWebRTC.cpp
++++ b/dom/media/webrtc/MediaEngineWebRTC.cpp
+@@ -24,6 +24,11 @@
+ #define FAKE_ONDEVICECHANGE_EVENT_PERIOD_IN_MS 500
+ 
+ static mozilla::LazyLogModule sGetUserMediaLog("GetUserMedia");
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char*);
++#endif
++
+ #define LOG(...) \
+   MOZ_LOG_FMT(sGetUserMediaLog, mozilla::LogLevel::Debug, __VA_ARGS__)
+ 
+@@ -203,6 +208,21 @@ void MediaEngineWebRTC::EnumerateMicrophoneDevices(
+       }
+     }
+   }
++#if defined(GECKO_W10M)
++  // A site asking for the microphone is told there is none (NotFoundError)
++  // when this comes back empty, before anyone is asked anything.
++  {
++    size_t enabled = 0;
++    for (const auto& deviceInfo : *devices) {
++      if (deviceInfo->State() == CUBEB_DEVICE_STATE_ENABLED) {
++        ++enabled;
++      }
++    }
++    nsPrintfCString note("capture: %zu microphone(s), %zu usable",
++                         size_t(devices->Length()), enabled);
++    GeckoW10mNote(note.get());
++  }
++#endif
+ }
+ 
+ void MediaEngineWebRTC::EnumerateSpeakerDevices(
+diff --git a/dom/system/nsOSPermissionRequestBase.cpp b/dom/system/nsOSPermissionRequestBase.cpp
+index 0b6c78c514..f0bf8054a3 100644
+--- a/dom/system/nsOSPermissionRequestBase.cpp
++++ b/dom/system/nsOSPermissionRequestBase.cpp
+@@ -10,6 +10,76 @@ using namespace mozilla;
+ 
+ using mozilla::dom::Promise;
+ 
++#if defined(GECKO_W10M)
++#  include <atomic>
++
++#  include "nsPrintfCString.h"
++#  include "nsTHashMap.h"
++#  include "nsThreadUtils.h"
++
++extern "C" void GeckoW10mNote(const char*);
++
++// Windows 10 Mobile: the microphone sits behind the phone's own consent
++// (Settings > Privacy > Microphone). Until the app has it the audio service
++// refuses the capture endpoint, and nothing on that path ever asks the user,
++// so a call in Discord or WhatsApp started without a microphone. The shell
++// knows the consent and can ask for it (MediaCapture, on its UI thread);
++// Firefox asks right after the user allowed the site, the same place macOS
++// asks (WebRTCParent.checkOSPermission).
++//   state(kind): a PERMISSION_STATE_* value, at once. kind 0 is the
++//                microphone, 1 the camera.
++//   request(id, kind): ask; answered later with
++//                gecko_w10m_capture_consent_result(id, granted).
++using GeckoW10mConsentState = int32_t (*)(int32_t aKind);
++using GeckoW10mConsentRequest = void (*)(uint32_t aId, int32_t aKind);
++static std::atomic<GeckoW10mConsentState> sGeckoW10mConsentState{nullptr};
++static std::atomic<GeckoW10mConsentRequest> sGeckoW10mConsentRequest{nullptr};
++
++// Main thread only.
++static nsTHashMap<uint32_t, RefPtr<Promise>>& GeckoW10mPendingConsents() {
++  static nsTHashMap<uint32_t, RefPtr<Promise>> sMap;
++  return sMap;
++}
++static uint32_t sGeckoW10mNextConsent = 1;
++
++extern "C" __declspec(dllexport) void gecko_w10m_set_capture_consent_sink(
++    GeckoW10mConsentState aState, GeckoW10mConsentRequest aRequest) {
++  sGeckoW10mConsentState.store(aState);
++  sGeckoW10mConsentRequest.store(aRequest);
++  GeckoW10mNote(aState ? "capture: the shell asks for microphone consent"
++                       : "capture: consent sink cleared");
++}
++
++// From the shell, on any thread.
++extern "C" __declspec(dllexport) void gecko_w10m_capture_consent_result(
++    uint32_t aId, int32_t aGranted) {
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "gecko_w10m_capture_consent_result", [aId, aGranted]() {
++        auto pending = GeckoW10mPendingConsents().Extract(aId);
++        if (!pending || !*pending) {
++          return;
++        }
++        RefPtr<Promise> promise = pending.extract();
++        nsPrintfCString note("capture: consent %u %s", aId,
++                             aGranted ? "given" : "refused");
++        GeckoW10mNote(note.get());
++        promise->MaybeResolve(aGranted != 0);
++      }));
++}
++
++// Hands the promise to the shell; false if there is no shell to ask.
++static bool GeckoW10mAskForConsent(int32_t aKind, Promise* aPromise) {
++  GeckoW10mConsentRequest request = sGeckoW10mConsentRequest.load();
++  if (!request) {
++    return false;
++  }
++  const uint32_t id = sGeckoW10mNextConsent++;
++  GeckoW10mPendingConsents().InsertOrUpdate(id, RefPtr<Promise>(aPromise));
++  request(id, aKind);
++  return true;
++}
++#endif
++
+ NS_IMPL_ISUPPORTS(nsOSPermissionRequestBase, nsIOSPermissionRequest,
+                   nsISupportsWeakReference)
+ 
+@@ -26,6 +96,12 @@ nsOSPermissionRequestBase::GetMediaCapturePermissionState(
+ NS_IMETHODIMP
+ nsOSPermissionRequestBase::GetAudioCapturePermissionState(uint16_t* aAudio) {
+   MOZ_ASSERT(aAudio);
++#if defined(GECKO_W10M)
++  if (GeckoW10mConsentState state = sGeckoW10mConsentState.load()) {
++    *aAudio = static_cast<uint16_t>(state(0));
++    return NS_OK;
++  }
++#endif
+   *aAudio = PERMISSION_STATE_AUTHORIZED;
+   return NS_OK;
+ }
+@@ -83,6 +159,12 @@ nsOSPermissionRequestBase::RequestAudioCapturePermission(
+     return rv;
+   }
+ 
++#if defined(GECKO_W10M)
++  if (GeckoW10mAskForConsent(0, promiseHandle)) {
++    promiseHandle.forget(aPromiseOut);
++    return NS_OK;
++  }
++#endif
+   promiseHandle->MaybeResolve(true /* access authorized */);
+   promiseHandle.forget(aPromiseOut);
+   return NS_OK;
+diff --git a/media/libcubeb/src/cubeb_wasapi.cpp b/media/libcubeb/src/cubeb_wasapi.cpp
+index d5fe43d955..f8f0c87949 100644
+--- a/media/libcubeb/src/cubeb_wasapi.cpp
++++ b/media/libcubeb/src/cubeb_wasapi.cpp
+@@ -305,6 +305,11 @@ typedef enum {
+ #endif
+ } AudioClient2Option;
+ 
++#if defined(GECKO_W10M)
++extern "C" void
++GeckoW10mNote(const char *);
++#endif
++
+ struct cubeb {
+   cubeb_ops const * ops = &wasapi_ops;
+   owned_critical_section lock;
+@@ -2381,6 +2386,18 @@ setup_wasapi_stream_one_side(cubeb_stream * stm,
+       LOG("Could not activate the device to get an audio"
+           " client for %s: error: %lx\n",
+           DIRECTION_NAME, hr);
++#if defined(GECKO_W10M)
++      {
++        // E_ACCESSDENIED for the input: the phone's microphone consent
++        // (Settings > Privacy > Microphone) is off or was never given.
++        char note[128];
++        snprintf(note, sizeof(note),
++                 "audio: the %s device would not open (0x%08lx)%s",
++                 DIRECTION_NAME, static_cast<unsigned long>(hr),
++                 hr == E_ACCESSDENIED ? ", no consent" : "");
++        GeckoW10mNote(note);
++      }
++#endif
+       // A particular device can't be activated because it has been
+       // unplugged, try fall back to the default audio device.
+       if (devid && hr == AUDCLNT_E_DEVICE_INVALIDATED && allow_fallback) {
+@@ -2475,7 +2492,15 @@ setup_wasapi_stream_one_side(cubeb_stream * stm,
+       if (device_info.latency_hi == 0) {
+         LOG("Input: could not query latency_hi to guess safe latency");
+         wasapi_destroy_device(&device_info);
++#if defined(GECKO_W10M)
++        // The latency comes from activating the device once more, which a
++        // phone may refuse where the real activation above went through.
++        // Keep the default latency rather than give up on the microphone.
++        GeckoW10mNote("audio: no input latency to go by, keeping the default");
++        goto input_settings_done;
++#else
+         return CUBEB_ERROR;
++#endif
+       }
+       // This multiplicator has been found empirically.
+       uint32_t latency_frames = device_info.latency_hi * 8;
+@@ -2496,6 +2521,9 @@ setup_wasapi_stream_one_side(cubeb_stream * stm,
+       LOG("Could not get cubeb_device_info. Skip customizing input settings");
+     }
+   }
++#if defined(GECKO_W10M)
++input_settings_done:
++#endif
+ 
+   if (stream_params->prefs & CUBEB_STREAM_PREF_RAW) {
+     if (initialize_iaudioclient2(audio_client, CUBEB_AUDIO_CLIENT2_RAW) !=

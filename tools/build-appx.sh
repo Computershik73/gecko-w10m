@@ -114,7 +114,7 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/DrmBridge.cpp client/EngineView.cpp client/FileBridge.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/OverlayProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/CaptureConsent.cpp client/DrmBridge.cpp client/EngineView.cpp client/FileBridge.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/OverlayProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
@@ -340,6 +340,18 @@ pref("browser.tabs.closeWindowWithLastTab", false);
 // own: the shell shows only the browser window, and another window took every
 // tap while staying out of sight (browser-commands.js, browser-places.js).
 pref("gecko.places.inTab", true);
+// Calls (Discord, WhatsApp Web). The sharing indicator is a second,
+// always-on-top dialog window; an open dialog takes every tap here, so while
+// the microphone was live nothing under it could be touched
+// (browser/modules/webrtcUI.sys.mjs).
+pref("gecko.webrtc.globalIndicator.disabled", true);
+// A call's sound as media, on the loudspeaker: voice routing opens it on the
+// communications endpoint, which a phone may send to the earpiece.
+pref("media.cubeb.output_voice_routing", false);
+pref("media.peerconnection.enabled", true);
+pref("media.navigator.enabled", true);
+// WebAssembly: on by default, said here so it stays so.
+pref("javascript.options.wasm", true);
 // Every window a page opens is a tab, the sized ones included: sign-in windows
 // (Google, VK and the like) call window.open with a width and a height, and
 // Firefox makes those a window of their own -- which this port never shows, so

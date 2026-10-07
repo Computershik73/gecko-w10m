@@ -643,6 +643,9 @@ function gecko_spotify() {
         observe(subject, topic, data) {
             let reply;
             try { reply = JSON.parse(data); } catch (e) { return; }
+            if (reply.op) {
+                return; // file.* -- gecko_note_downloads
+            }
             const entry = inflight.get(reply.id);
             if (!entry) {
                 if (reply.securityVersion !== undefined) {
@@ -1224,8 +1227,51 @@ function gecko_note_downloads() {
             dir => note("saved into " + dir),
             e => note("no downloads directory: " + e));
         const noted = new WeakSet();
+        // Interop unlock alone: the engine downloads into LocalState and the
+        // shell copies each finished file to where it belongs -- the folder
+        // chosen in the settings, the file chosen in a Save As, or the
+        // phone's Downloads\Gecko (client/FileBridge.cpp). Downloads already
+        // finished when the list is read were handed over in their session.
+        const staging = Services.env.get("GECKO_W10M_DOWNLOAD_STAGING");
+        const handedOver = new WeakSet();
+        let nextExport = 1000000;
+        if (staging) {
+            note("staged in " + staging + ", the shell copies each one out");
+            Services.obs.addObserver({
+                observe(subject, topic, data) {
+                    let reply;
+                    try { reply = JSON.parse(data); } catch (e) { return; }
+                    if (reply.op !== "file.export") {
+                        return;
+                    }
+                    note(reply.ok ? "copied " + reply.path + " -> " + reply.where
+                                  : "COULD NOT COPY " + reply.path + ": " + reply.error);
+                }
+            }, "gecko-w10m-bridge-reply");
+        }
+        const handOver = d => {
+            if (!staging || handedOver.has(d)) {
+                return;
+            }
+            handedOver.add(d);
+            const path = d.target.path;
+            if (!path || !path.toLowerCase().startsWith(staging.toLowerCase() + "\\")) {
+                return;
+            }
+            let dir = "";
+            try {
+                if (Services.prefs.getIntPref("browser.download.folderList", 1) == 2) {
+                    dir = Services.prefs.getComplexValue("browser.download.dir", Ci.nsIFile).path;
+                }
+            } catch (e) {}
+            Services.obs.notifyObservers(null, "gecko-w10m-bridge", JSON.stringify({
+                id: nextExport++, op: "file.export", path, dir }));
+        };
         Downloads.getList(Downloads.ALL).then(list => list.addView({
             onDownloadAdded(d) {
+                if (d.succeeded) {
+                    handedOver.add(d);
+                }
                 note("started " + String(d.source.url).slice(0, 160) + " -> " +
                      d.target.path);
             },
@@ -1245,6 +1291,7 @@ function gecko_note_downloads() {
                 } else if (d.succeeded) {
                     noted.add(d);
                     note("done " + d.target.path);
+                    handOver(d);
                 }
             },
         }), e => note("no downloads list: " + e));

@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 10:17:30 +0400
+Subject: [PATCH] Downloads on Windows 10 Mobile: the folder the shell chose,
+ staged when needed
+
+With interop unlock alone the phone's Downloads refuses the app
+container and every download failed with NS_ERROR_FILE_ACCESS_DENIED.
+The shell probes it at start: GECKO_W10M_DOWNLOADS is the system
+Downloads folder (Downloads\Gecko when writable), and with
+GECKO_W10M_DOWNLOAD_STAGING set every download lands in LocalState,
+whatever folder is chosen; the shell copies each finished file out
+through the storage API.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../downloads/DownloadIntegration.sys.mjs     |  9 ++++++++
+ .../exthandler/nsExternalHelperAppService.cpp | 21 +++++++++++++++++++
+ xpcom/io/SpecialSystemDirectory.cpp           | 16 ++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/toolkit/components/downloads/DownloadIntegration.sys.mjs b/toolkit/components/downloads/DownloadIntegration.sys.mjs
+index 4fc5e7a245..c249e8efc6 100644
+--- a/toolkit/components/downloads/DownloadIntegration.sys.mjs
++++ b/toolkit/components/downloads/DownloadIntegration.sys.mjs
+@@ -330,6 +330,15 @@ export var DownloadIntegration = {
+    *   Resolves to the downloads directory path.
+    */
+   async getPreferredDownloadsDirectory() {
++    // Windows 10 Mobile with interop unlock alone: see
++    // GetPreferredDownloadsDirectory in nsExternalHelperAppService.cpp.
++    let staging = Services.env.get("GECKO_W10M_DOWNLOAD_STAGING");
++    if (staging) {
++      await IOUtils.makeDirectory(staging, { createAncestors: false }).catch(
++        () => {}
++      );
++      return staging;
++    }
+     let directoryPath = null;
+     let prefValue = Services.prefs.getIntPref("browser.download.folderList", 1);
+ 
+diff --git a/uriloader/exthandler/nsExternalHelperAppService.cpp b/uriloader/exthandler/nsExternalHelperAppService.cpp
+index 566509f9ef..d0d6c8f8b5 100644
+--- a/uriloader/exthandler/nsExternalHelperAppService.cpp
++++ b/uriloader/exthandler/nsExternalHelperAppService.cpp
+@@ -37,6 +37,9 @@
+ #include "nsDependentSubstring.h"
+ #include "nsSandboxFlags.h"
+ #include "nsString.h"
++#if defined(GECKO_W10M)
++#  include "prenv.h"
++#endif
+ #include "nsUnicharUtils.h"
+ #include "nsIStringEnumerator.h"
+ #include "nsIStreamListener.h"
+@@ -292,6 +295,24 @@ static Result<nsCOMPtr<nsIFile>, nsresult> GetPreferredDownloadsDirectory(
+   return Err(NS_ERROR_FAILURE);
+ #else
+   nsresult rv;
++#  if defined(GECKO_W10M)
++  // Windows 10 Mobile with interop unlock alone: no folder outside the app's
++  // own may be written by path, the one the user chose included. Everything
++  // is downloaded into LocalState\Downloads and the shell copies it to the
++  // chosen folder -- or the phone's Downloads\Gecko -- once it is complete.
++  // Keep in step with DownloadIntegration.getPreferredDownloadsDirectory.
++  if (const char* staging = PR_GetEnv("GECKO_W10M_DOWNLOAD_STAGING");
++      staging && *staging) {
++    nsCOMPtr<nsIFile> dir;
++    if (NS_SUCCEEDED(NS_NewLocalFile(NS_ConvertUTF8toUTF16(staging),
++                                     getter_AddRefs(dir)))) {
++      if (!aSkipChecks) {
++        (void)EnsureDirectoryExists(dir);
++      }
++      return dir;
++    }
++  }
++#  endif
+   // Try to get the users download location, if it's set.
+   switch (Preferences::GetInt(NS_PREF_DOWNLOAD_FOLDERLIST, -1)) {
+     case NS_FOLDER_VALUE_DESKTOP: {
+diff --git a/xpcom/io/SpecialSystemDirectory.cpp b/xpcom/io/SpecialSystemDirectory.cpp
+index 94bd117311..2e5e1d235e 100644
+--- a/xpcom/io/SpecialSystemDirectory.cpp
++++ b/xpcom/io/SpecialSystemDirectory.cpp
+@@ -23,6 +23,9 @@
+ 
+ #  include "mozilla/WinHeaderOnlyUtils.h"
+ #  include "nsIWindowsRegKey.h"
++#  if defined(GECKO_W10M)
++#    include "prenv.h"
++#  endif
+ 
+ #elif defined(XP_UNIX)
+ 
+@@ -567,6 +570,19 @@ nsresult GetSpecialSystemDirectory(SystemDirectories aSystemSystemDirectory,
+ 
+     case Win_Downloads: {
+ #  if defined(GECKO_W10M)
++      // The shell decides (app/GeckoW10m/engine/gecko_bootstrap.cpp): the
++      // phone's Downloads\Gecko when the app may write there, otherwise
++      // LocalState\Downloads, from where the shell copies each finished file
++      // out through the storage API.
++      if (const char* chosen = PR_GetEnv("GECKO_W10M_DOWNLOADS");
++          chosen && *chosen) {
++        nsCOMPtr<nsIFile> dir;
++        if (NS_SUCCEEDED(NS_NewLocalFile(NS_ConvertUTF8toUTF16(chosen),
++                                         getter_AddRefs(dir)))) {
++          dir.forget(aFile);
++          return NS_OK;
++        }
++      }
+       // The phone's own Downloads -- the one Files and every other app show
+       // -- is the public one. The known folder resolves under the account
+       // the app runs as (C:\Data\Users\DefApps), where nothing else looks.

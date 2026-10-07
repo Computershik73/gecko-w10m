@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/FileBridge.h"
 #include "client/Log.h"
 
 namespace gecko_w10m::client {
@@ -255,6 +256,9 @@ void Handle(std::string json) {
       HandleChallenge(id, msg);
     } else if (op == L"drm.response") {
       HandleResponse(id, msg);
+    } else if (op.rfind(L"file.", 0) == 0) {
+      // Not DRM, but the same channel: client/FileBridge.cpp.
+      OnFileMessage(id, op, msg, &Send);
     } else {
       Send(Failure(id, L"unknown op " + op));
     }
