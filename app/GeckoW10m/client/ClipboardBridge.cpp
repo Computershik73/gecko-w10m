@@ -200,7 +200,20 @@ class StaThread {
       if (!mStarted) {
         mStarted = true;
         mWake = ::CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-        std::thread([this]() { Run(); }).detach();
+        // CreateThread, not std::thread: the app's C runtime starts each of
+        // its own threads in the multithreaded apartment, and an apartment
+        // cannot be changed once set ("Cannot change thread mode after it
+        // is set", build 158 on the phone).
+        HANDLE thread = ::CreateThread(
+            nullptr, 0,
+            [](void* self) -> DWORD {
+              static_cast<StaThread*>(self)->Run();
+              return 0;
+            },
+            this, 0, nullptr);
+        if (thread) {
+          ::CloseHandle(thread);
+        }
       }
     }
     if (mWake) {
