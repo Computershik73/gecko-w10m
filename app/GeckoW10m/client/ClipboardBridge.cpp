@@ -4,7 +4,12 @@
 #include "client/ClipboardBridge.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
 
@@ -13,7 +18,6 @@
 using namespace winrt::Windows::ApplicationModel::DataTransfer;
 using winrt::Windows::Foundation::AsyncStatus;
 using winrt::Windows::Foundation::IAsyncOperation;
-using winrt::Windows::UI::Core::CoreDispatcherPriority;
 
 namespace gecko_w10m::client {
 
@@ -28,48 +32,128 @@ using CopySink = void (*)(uint32_t copy, const wchar_t* text,
 using SetCopySinkFn = void (*)(CopySink);
 using PhoneTextFn = void (*)(uint32_t afterCopy, const wchar_t* text);
 
-winrt::Windows::UI::Core::CoreDispatcher gUi{nullptr};
 PhoneTextFn gPhoneText = nullptr;
 bool gInstalled = false;
 
+// Everything that touches the phone's clipboard runs on this one thread,
+// never on the UI thread. On the phone the first call into the clipboard --
+// wiring ContentChanged, or reading it -- did not come back, and on the UI
+// thread that was the whole app: no splash going down, and ANGLE waiting on
+// that thread for the panel's swap chain, so builds 153 and 155 never
+// started (gecko (31).log, gecko (32).log). Here a call that hangs holds
+// only this thread; the browser keeps its own clipboard and goes on.
+class Worker {
+ public:
+  void Post(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(mLock);
+      mTasks.push_back(std::move(task));
+      if (!mStarted) {
+        mStarted = true;
+        std::thread([this]() { Run(); }).detach();
+      }
+    }
+    mWake.notify_one();
+  }
+
+ private:
+  void Run() {
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mLock);
+        mWake.wait(lock, [this]() { return !mTasks.empty(); });
+        task = std::move(mTasks.front());
+        mTasks.pop_front();
+      }
+      try {
+        task();
+      } catch (winrt::hresult_error const& error) {
+        Log::Write(L"clipboard: a call failed", std::wstring(error.message()));
+      } catch (...) {
+        Log::Write(L"clipboard: a call failed");
+      }
+    }
+  }
+
+  std::mutex mLock;
+  std::condition_variable mWake;
+  std::deque<std::function<void()>> mTasks;
+  bool mStarted = false;
+};
+Worker& TheWorker() {
+  static Worker* worker = new Worker();  // never destroyed: its thread lives on
+  return *worker;
+}
+
 // The newest copy the engine handed over; written on the engine's thread.
 std::atomic<uint32_t> gLatest{0};
-// UI thread only from here on. The newest copy actually on the phone.
+// The worker's own from here on. The newest copy actually on the phone.
 uint32_t gApplied = 0;
 // A copy the phone refused, tried again before the next read -- unless the
 // phone's clipboard may have been given something newer since.
 DataPackage gRefused{nullptr};
 uint32_t gRefusedCopy = 0;
-// Whether the window is out of sight, when another app may copy.
+// Whether the window is out of sight, when another app may copy, and
+// whether it has been activated at all: only the app in front may read.
 bool gHidden = false;
-// Whether the window has been activated yet. The phone's clipboard is not
-// touched before: asked for on a window not yet activated, the clipboard
-// held the UI thread for good on the phone -- no "window: visible", no
-// splash going down, and ANGLE waiting on that thread for its swap chain:
-// build 153 never started (gecko (31).log).
 bool gActivated = false;
-// Whether the phone's clipboard has been asked anything yet; the first
-// question is logged before and after, in case it is the one that hangs.
-bool gAsked = false;
-// A file in LocalState that is there only while that first question is
-// unanswered. Found at the next start, it means the question never came
-// back -- the app had to be closed -- and the phone's clipboard is left
-// alone for that launch, so a hang there cannot keep the browser from
-// starting twice.
-bool gSkipReads = false;
+bool gWired = false;
 
-std::wstring AskingMarker() {
+// A file in LocalState that stands while the first call into the phone's
+// clipboard has not come back. Found at the next start, it means that call
+// never did -- the app had to be closed -- and the phone's clipboard is left
+// alone for that launch.
+std::wstring Marker() {
   try {
-    return std::wstring(winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()) +
+    return std::wstring(winrt::Windows::Storage::ApplicationData::Current()
+                            .LocalFolder()
+                            .Path()) +
            L"\\clipboard-asking.txt";
   } catch (...) {
     return L"";
   }
 }
+bool gContacted = false;
+
+// Runs the first call into the phone's clipboard with the marker standing,
+// and says in the log that it went in and that it came back.
+template <typename F>
+void Contact(const wchar_t* what, F&& call) {
+  if (gContacted) {
+    call();
+    return;
+  }
+  gContacted = true;
+  const std::wstring marker = Marker();
+  if (!marker.empty()) {
+    HANDLE h = ::CreateFile2(marker.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS,
+                             nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(h);
+    }
+  }
+  Log::Write(std::wstring(L"clipboard: first call into the phone's clipboard: ") +
+             what);
+  struct Clear {
+    std::wstring path;
+    ~Clear() {
+      if (!path.empty()) {
+        ::DeleteFileW(path.c_str());
+      }
+    }
+  } clear{marker};
+  call();
+  Log::Write(L"clipboard: the phone's clipboard answered");
+}
 
 // The refused copy is not put back: what is on the phone now may be newer,
 // and wins. Reads go ahead again, numbered as after that copy, so the engine
-// takes what the phone has. UI thread.
+// takes what the phone has.
 void Supersede(const wchar_t* why) {
   if (!gRefused) {
     return;
@@ -82,10 +166,10 @@ void Supersede(const wchar_t* why) {
              L")");
 }
 
-// Puts a package on the phone's clipboard. UI thread.
+// Puts a package on the phone's clipboard.
 bool Put(DataPackage const& package, uint32_t copy) {
   try {
-    Clipboard::SetContent(package);
+    Contact(L"putting a copy on it", [&]() { Clipboard::SetContent(package); });
   } catch (winrt::hresult_error const& error) {
     gRefused = package;
     gRefusedCopy = copy;
@@ -110,15 +194,10 @@ bool Put(DataPackage const& package, uint32_t copy) {
   return true;
 }
 
-// Reads the phone's clipboard and leaves the text with the engine. UI thread:
-// the phone lets an app read its clipboard only there, and only while it is
-// in front, so this runs again whenever the app comes back.
+// Reads the phone's clipboard and leaves the text with the engine.
 void Read(const wchar_t* why) {
-  if (!gPhoneText) {
-    return;
-  }
-  if (!gActivated || gHidden) {
-    return;  // only the app in front may use it, and only once activated
+  if (!gPhoneText || !gActivated || gHidden) {
+    return;  // only the app in front may read it
   }
   if (gRefused && !Put(gRefused, gRefusedCopy)) {
     return;  // the phone holds something older than the browser's copy
@@ -127,32 +206,9 @@ void Read(const wchar_t* why) {
   if (copy != gLatest.load()) {
     return;  // a copy from the browser is still on its way; it comes first
   }
-  if (gSkipReads) {
-    return;
-  }
-  const bool first = !gAsked;
-  std::wstring marker;
-  if (first) {
-    gAsked = true;
-    Log::Write(std::wstring(L"clipboard: asking the phone's clipboard (") +
-               why + L")");
-    marker = AskingMarker();
-    if (!marker.empty()) {
-      HANDLE h = ::CreateFile2(marker.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS,
-                               nullptr);
-      if (h != INVALID_HANDLE_VALUE) {
-        ::CloseHandle(h);
-      }
-    }
-  }
   try {
-    auto view = Clipboard::GetContent();
-    if (first) {
-      if (!marker.empty()) {
-        ::DeleteFileW(marker.c_str());
-      }
-      Log::Write(L"clipboard: the phone's clipboard answered");
-    }
+    DataPackageView view{nullptr};
+    Contact(L"reading it", [&]() { view = Clipboard::GetContent(); });
     if (!view.Contains(StandardDataFormats::Text())) {
       gPhoneText(copy, nullptr);
       return;
@@ -172,9 +228,6 @@ void Read(const wchar_t* why) {
           }
         });
   } catch (winrt::hresult_error const& error) {
-    if (first && !marker.empty()) {
-      ::DeleteFileW(marker.c_str());  // it answered, with a refusal
-    }
     Log::Write(std::wstring(L"clipboard: the phone's could not be read (") +
                    why + L")",
                std::wstring(error.message()));
@@ -185,16 +238,13 @@ void Read(const wchar_t* why) {
 // Nothing may be thrown from here -- the caller is engine code built
 // without exceptions -- so anything that does is caught and logged.
 void OnCopy(uint32_t copy, const wchar_t* text, const wchar_t* html) {
-  if (!gUi) {
-    return;
-  }
   gLatest.store(copy);
   const bool hasText = text != nullptr;
   const bool hasHtml = html != nullptr;
   try {
     std::wstring plain = hasText ? text : L"";
     std::wstring markup = hasHtml ? html : L"";
-    gUi.RunAsync(CoreDispatcherPriority::Normal, [=]() {
+    TheWorker().Post([=]() {
       if (copy != gLatest.load()) {
         return;  // a newer copy follows
       }
@@ -224,14 +274,14 @@ void OnCopy(uint32_t copy, const wchar_t* text, const wchar_t* html) {
       }
     });
   } catch (...) {
-    Log::Write(L"clipboard: the copy could not be handed to the UI thread");
+    Log::Write(L"clipboard: the copy could not be handed over");
   }
 }
 
 }  // namespace
 
 void InstallClipboardBridge(HMODULE xul,
-                            winrt::Windows::UI::Core::CoreDispatcher const& ui) {
+                            winrt::Windows::UI::Core::CoreDispatcher const&) {
   if (gInstalled || !xul) {
     return;
   }
@@ -242,41 +292,41 @@ void InstallClipboardBridge(HMODULE xul,
   if (!setSink || !gPhoneText) {
     return;
   }
-  gUi = ui;
-  setSink(&OnCopy);
   gInstalled = true;
-  const std::wstring marker = AskingMarker();
+  const std::wstring marker = Marker();
   if (!marker.empty() &&
       ::GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    // The engine keeps its own clipboard, as before the bridge.
     ::DeleteFileW(marker.c_str());
-    gSkipReads = true;
+    gPhoneText = nullptr;
     Log::Write(L"clipboard: the last launch never heard back from the "
-               L"phone's clipboard -- not reading it this time; copying "
-               L"still goes to it");
+               L"phone's clipboard -- copy and paste stay inside the "
+               L"browser this time");
+    return;
   }
-  // Nothing is asked of the phone's clipboard here: the window is not
-  // activated yet (see gActivated). The first activation does it.
+  setSink(&OnCopy);
+  // Nothing is asked of the phone's clipboard here; the first activation of
+  // the window does it, on the worker.
   Log::Write(L"view: copy and paste go through the phone's clipboard");
 }
 
 void ClipboardWindowActivated() {
-  if (!gInstalled || !gUi) {
+  if (!gInstalled || !gPhoneText) {
     return;
   }
-  // Not from inside the activation itself: posted, and behind everything
-  // else the UI thread has to do.
-  gUi.RunAsync(CoreDispatcherPriority::Low, []() {
+  TheWorker().Post([]() {
     gActivated = true;
-    static bool wired = false;
-    if (!wired) {
-      wired = true;
+    if (!gWired) {
+      gWired = true;
       try {
         // A refused copy never raises this, so a change seen while one is
         // held came from another app, and is newer.
-        Clipboard::ContentChanged([](auto&&, auto&&) {
-          gUi.RunAsync(CoreDispatcherPriority::Low, []() {
-            Supersede(L"the phone's changed");
-            Read(L"it changed");
+        Contact(L"asking to hear of changes", []() {
+          Clipboard::ContentChanged([](auto&&, auto&&) {
+            TheWorker().Post([]() {
+              Supersede(L"the phone's changed");
+              Read(L"it changed");
+            });
           });
         });
       } catch (winrt::hresult_error const& error) {
@@ -289,10 +339,15 @@ void ClipboardWindowActivated() {
 }
 
 void ClipboardWindowVisible(bool visible) {
-  gHidden = !visible;
-  if (!visible) {
-    Supersede(L"the window went out of sight");
+  if (!gInstalled || !gPhoneText) {
+    return;
   }
+  TheWorker().Post([visible]() {
+    gHidden = !visible;
+    if (!visible) {
+      Supersede(L"the window went out of sight");
+    }
+  });
 }
 
 }  // namespace gecko_w10m::client
