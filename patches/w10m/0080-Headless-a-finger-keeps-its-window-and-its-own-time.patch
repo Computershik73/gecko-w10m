@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 14:12:43 +0400
+Subject: [PATCH] Headless: a finger keeps its window and its own time
+
+A touch from the shell was stamped when the Gecko main thread got to
+it. Here input runs at Normal priority behind whatever the page queued
+(the input task manager is only turned on in a content process), so
+the moves of a swipe made while a feed loaded reached APZ in a burst
+and were measured as a flick to the end of the page, or as no speed at
+all. gecko_w10m_input_touch now takes the time on the shell's thread
+and GeckoW10mSynthesizeTouch hands it to UpdateSynthesizedTouchState;
+one note per swipe says how late its moves arrived.
+
+Each event of a touch was routed by where that event landed, so a
+finger that slid onto a popup, or under which one opened or closed,
+went down in one window and up in another, and the first kept it for
+good. A finger now belongs to the window it went down in until it
+lifts. A press for an id some window still holds cancels it there
+first (GeckoW10mPress). Popups keep the input region Firefox gives
+them: a see-through one (every tooltip) and a panel's margin no longer
+take taps meant for what is under them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/headless/HeadlessCompositorWidget.cpp |  55 ++++++-
+ widget/headless/HeadlessWidget.cpp           | 154 +++++++++++++++++--
+ widget/headless/HeadlessWidget.h             |  33 ++++
+ 3 files changed, 222 insertions(+), 20 deletions(-)
+
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 9f16487891..1859c15c5d 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -480,6 +480,13 @@ extern "C" __declspec(dllexport) uint64_t gecko_w10m_frame_serial() {
+ // were going through NS_DispatchToMainThread, which puts them behind all of
+ // it -- which is how taps came to be swallowed while a video was playing, and
+ // why a burst of them used to arrive at once when a page finished loading.
++//
++// Only in a content process, though: the input task manager that gives
++// InputHigh its meaning is turned on by ContentChild alone, and in this
++// single-process port InputHigh runs as Normal -- first in, first out, behind
++// whatever the page queued before it. So a finger's moves still wait during
++// a load, and arrive together; touches carry the time the shell saw them
++// for that reason (gecko_w10m_input_touch).
+ static void GeckoW10mDispatchInput(already_AddRefed<nsIRunnable> aRunnable) {
+   NS_DispatchToMainThreadQueue(std::move(aRunnable),
+                                mozilla::EventQueuePriority::InputHigh);
+@@ -749,8 +756,16 @@ extern "C" __declspec(dllexport) void gecko_w10m_input_touch(int32_t aPointerId,
+                                                           int32_t aState,
+                                                           int32_t aX,
+                                                           int32_t aY) {
++  // When the finger was there: taken here, on the shell's UI thread, as XAML
++  // reports it. The runnable below runs only when the main thread reaches it,
++  // behind whatever the page queued, and while a feed loads that can be
++  // hundreds of milliseconds; every move queued meanwhile then ran within a
++  // millisecond or two. Stamped as they ran, APZ divided a whole swipe by
++  // those few milliseconds and flung the page to its end -- or, when a long
++  // task fell between the last moves, measured no speed at all.
++  const mozilla::TimeStamp when = mozilla::TimeStamp::Now();
+   GeckoW10mDispatchInput(NS_NewRunnableFunction(
+-      "gecko_w10m_input_touch", [aPointerId, aState, aX, aY]() {
++      "gecko_w10m_input_touch", [aPointerId, aState, aX, aY, when]() {
+ 
+         auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
+         if (!widget) {
+@@ -762,9 +777,43 @@ extern "C" __declspec(dllexport) void gecko_w10m_input_touch(int32_t aPointerId,
+         } else if (aState == 3) {
+           state = TOUCH_CANCEL;
+         }
+-        widget->SynthesizeNativeTouchPoint(
++        if (aState == 0) {
++          mozilla::widget::HeadlessWidget::GeckoW10mPress(
++              static_cast<uint32_t>(aPointerId));
++        }
++
++        // How late the moves of one swipe reached APZ, once per swipe: the
++        // number a fling that goes too far, or not at all, comes down to.
++        static uint32_t sMoves = 0;
++        static double sLongestWaitMs = 0;
++        static mozilla::TimeStamp sDownMade;
++        static mozilla::TimeStamp sDownRan;
++        const mozilla::TimeStamp ran = mozilla::TimeStamp::Now();
++        const double waitMs = (ran - when).ToMilliseconds();
++        if (aState == 0) {
++          sMoves = 0;
++          sLongestWaitMs = waitMs;
++          sDownMade = when;
++          sDownRan = ran;
++        } else if (aState == 1) {
++          ++sMoves;
++          sLongestWaitMs = std::max(sLongestWaitMs, waitMs);
++        } else if (sMoves >= 2 && !sDownMade.IsNull()) {
++          char note[192];
++          SprintfLiteral(note,
++                         "touch: a swipe of %u moves, made over %.0f ms, reached "
++                         "APZ over %.0f ms; the longest wait for the main thread "
++                         "was %.0f ms",
++                         sMoves, (when - sDownMade).ToMilliseconds(),
++                         (ran - sDownRan).ToMilliseconds(),
++                         std::max(sLongestWaitMs, waitMs));
++          GeckoW10mNote(note);
++          sMoves = 0;
++        }
++
++        widget->GeckoW10mSynthesizeTouch(
+             static_cast<uint32_t>(aPointerId), state,
+-            mozilla::LayoutDeviceIntPoint(aX, aY), 1.0, 90, nullptr);
++            mozilla::LayoutDeviceIntPoint(aX, aY), 1.0, 90, when);
+       }));
+ }
+ 
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index 5d7bbe0457..22c7e7522b 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -124,6 +124,19 @@ std::vector<HeadlessWidget*> sGeckoW10mPopups;
+ // A touch that closed a popup, kept from the page until the finger lifts.
+ int64_t sGeckoW10mSwallowedPointer = -1;
+ 
++// The window each finger went down in, which keeps the finger until it
++// lifts -- what an operating system does for a window under a finger.
++// Routing every event of a touch by where that one event landed split a
++// touch whose finger slid onto a popup, or under which a popup opened or
++// closed: the down went to one window and the up to another, and the window
++// that never heard the up held that finger for good. Null once the window
++// is gone: the rest of that finger goes nowhere.
++struct GeckoW10mFinger {
++  uint32_t mId;
++  HeadlessWidget* mWindow;
++};
++std::vector<GeckoW10mFinger> sGeckoW10mFingers;
++
+ // A finger or a click outside every open popup closes them, as the operating
+ // system's window manager tells Firefox to on the desktop (nsWindow's
+ // DealWithPopups). Headless, nothing did, and a panel -- an extension's,
+@@ -149,6 +162,71 @@ HeadlessWidget* HeadlessWidget::ShownWidget() {
+   return sShownWidget;
+ }
+ 
++/* static */
++HeadlessWidget* HeadlessWidget::GeckoW10mPopupUnder(
++    const LayoutDeviceIntPoint& aPoint) {
++  for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend(); ++it) {
++    HeadlessWidget* popup = *it;
++    if (!popup->mVisible || popup->mDestroyed ||
++        popup->mGeckoW10mInputRegion.mFullyTransparent) {
++      continue;
++    }
++    // The margin is outside the popup for input, as on the desktop
++    // (nsWindow's WM_NCHITTEST): a tap in a panel's shadow closes it.
++    LayoutDeviceIntRect area = popup->mBounds;
++    area.Deflate(popup->mGeckoW10mInputRegion.mMargin);
++    if (area.Contains(aPoint.x, aPoint.y)) {
++      return popup;
++    }
++  }
++  return nullptr;
++}
++
++/* static */
++void HeadlessWidget::GeckoW10mPress(uint32_t aPointerId) {
++  MOZ_ASSERT(NS_IsMainThread());
++  std::erase_if(sGeckoW10mFingers, [aPointerId](const GeckoW10mFinger& aFinger) {
++    return aFinger.mId == aPointerId;
++  });
++  // A finger a rollup swallowed whose release was lost: the new one with its
++  // id is a new touch, not the rest of that one.
++  if (sGeckoW10mSwallowedPointer == int64_t(aPointerId)) {
++    sGeckoW10mSwallowedPointer = -1;
++  }
++  // Strong references: the cancel runs page script and APZ, which may hide
++  // or destroy a popup, and Destroy takes it out of sGeckoW10mPopups.
++  AutoTArray<RefPtr<HeadlessWidget>, 8> windows;
++  if (sShownWidget) {
++    windows.AppendElement(sShownWidget);
++  }
++  for (HeadlessWidget* popup : sGeckoW10mPopups) {
++    windows.AppendElement(popup);
++  }
++  for (const RefPtr<HeadlessWidget>& window : windows) {
++    if (window->mDestroyed || !window->mSynthesizedTouchInput) {
++      continue;
++    }
++    const int32_t index =
++        window->mSynthesizedTouchInput->IndexOfTouch(int32_t(aPointerId));
++    if (index < 0) {
++      continue;
++    }
++    const LayoutDeviceIntPoint at = ViewAs<LayoutDevicePixel>(
++        window->mSynthesizedTouchInput->mTouches[index].mScreenPoint,
++        PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
++    char note[160];
++    SprintfLiteral(note,
++                   "touch: finger %u went down again in a window (type %d) "
++                   "still holding it -- its release was lost; cancelled",
++                   aPointerId, int(window->mWindowType));
++    GeckoW10mNote(note);
++    MultiTouchInput cancel = UpdateSynthesizedTouchState(
++        window->mSynthesizedTouchInput.get(), TimeStamp::Now(), aPointerId,
++        TOUCH_CANCEL, at, 1.0, 90);
++    window->DispatchTouchInput(cancel);
++  }
++}
++
+ HeadlessWidget* HeadlessWidget::TopDialog() {
+   MOZ_ASSERT(NS_IsMainThread());
+   for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend();
+@@ -250,6 +328,11 @@ void HeadlessWidget::Destroy() {
+   if (sShownWidget == this) {
+     sShownWidget = nullptr;
+   }
++  for (GeckoW10mFinger& finger : sGeckoW10mFingers) {
++    if (finger.mWindow == this) {
++      finger.mWindow = nullptr;
++    }
++  }
+   for (auto it = sGeckoW10mPopups.begin(); it != sGeckoW10mPopups.end(); ++it) {
+     if (*it == this) {
+       sGeckoW10mPopups.erase(it);
+@@ -735,13 +818,9 @@ nsresult HeadlessWidget::SynthesizeNativeMouseEvent(
+   AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+ #if defined(GECKO_W10M)
+   if (mWindowType == WindowType::TopLevel) {
+-    for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend(); ++it) {
+-      HeadlessWidget* popup = *it;
+-      if (popup->mVisible && !popup->mDestroyed &&
+-          popup->mBounds.Contains(aPoint.x, aPoint.y)) {
+-        return popup->SynthesizeNativeMouseEvent(aPoint, aNativeMessage, aButton,
+-                                                 aModifierFlags, nullptr);
+-      }
++    if (HeadlessWidget* popup = GeckoW10mPopupUnder(aPoint)) {
++      return popup->SynthesizeNativeMouseEvent(aPoint, aNativeMessage, aButton,
++                                               aModifierFlags, nullptr);
+     }
+     // A dialog is modal: what is under it waits for its answer. A tap
+     // beside it reaching the page would act on a page that is not done
+@@ -809,27 +888,62 @@ nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+     LayoutDeviceIntPoint aPoint, double aPointerPressure,
+     uint32_t aPointerOrientation, nsISynthesizedEventCallback* aCallback) {
+   AutoSynthesizedEventCallbackNotifier notifier(aCallback);
++#if defined(GECKO_W10M)
++  return GeckoW10mSynthesizeTouch(aPointerId, aPointerState, aPoint,
++                                  aPointerPressure, aPointerOrientation,
++                                  TimeStamp::Now());
++}
++
++nsresult HeadlessWidget::GeckoW10mSynthesizeTouch(
++    uint32_t aPointerId, TouchPointerState aPointerState,
++    LayoutDeviceIntPoint aPoint, double aPointerPressure,
++    uint32_t aPointerOrientation, const TimeStamp& aTime) {
++#endif
+ 
+   MOZ_ASSERT(NS_IsMainThread());
+   if (aPointerState == TOUCH_HOVER) {
+     return NS_ERROR_UNEXPECTED;
+   }
+ #if defined(GECKO_W10M)
+-  // As with the mouse: a finger over a popup or a dialog belongs to its
+-  // window, and one beside an open dialog to nobody.
++  // As with the mouse: a finger that goes down over a popup or a dialog
++  // belongs to its window until it lifts, and one beside an open dialog to
++  // nobody.
+   if (mWindowType == WindowType::TopLevel) {
+-    for (auto it = sGeckoW10mPopups.rbegin(); it != sGeckoW10mPopups.rend(); ++it) {
+-      HeadlessWidget* popup = *it;
+-      if (popup->mVisible && !popup->mDestroyed &&
+-          popup->mBounds.Contains(aPoint.x, aPoint.y)) {
+-        return popup->SynthesizeNativeTouchPoint(aPointerId, aPointerState,
+-                                                 aPoint, aPointerPressure,
+-                                                 aPointerOrientation, nullptr);
++    HeadlessWidget* owner = this;
++    bool fresh = false;
++    auto finger = std::find_if(
++        sGeckoW10mFingers.begin(), sGeckoW10mFingers.end(),
++        [aPointerId](const GeckoW10mFinger& aFinger) {
++          return aFinger.mId == aPointerId;
++        });
++    if (finger != sGeckoW10mFingers.end()) {
++      owner = finger->mWindow;
++      if (aPointerState & (TOUCH_REMOVE | TOUCH_CANCEL)) {
++        sGeckoW10mFingers.erase(finger);
++      }
++      if (!owner) {
++        return NS_OK;  // its window is gone
+       }
++    } else if (aPointerState & TOUCH_CONTACT) {
++      if (HeadlessWidget* popup = GeckoW10mPopupUnder(aPoint)) {
++        owner = popup;
++      }
++      sGeckoW10mFingers.push_back({aPointerId, owner});
++      fresh = true;
++    }
++    if (owner != this) {
++      return owner->GeckoW10mSynthesizeTouch(aPointerId, aPointerState, aPoint,
++                                             aPointerPressure,
++                                             aPointerOrientation, aTime);
+     }
+     // The whole touch, unless one the page already has under way is ending.
+     if (TopDialog() && (!mSynthesizedTouchInput ||
+                         mSynthesizedTouchInput->mTouches.IsEmpty())) {
++      // A finger that went down beside the dialog stays nobody's until it
++      // lifts, even if the dialog closes under it meanwhile.
++      if (fresh) {
++        sGeckoW10mFingers.back().mWindow = nullptr;
++      }
+       return NS_OK;
+     }
+     // A touch outside the open popups closes them; if Firefox says so, the
+@@ -855,8 +969,14 @@ nsresult HeadlessWidget::SynthesizeNativeTouchPoint(
+   }
+ 
+   LayoutDeviceIntPoint pointInWindow = aPoint - WidgetToScreenOffset();
++#if defined(GECKO_W10M)
++  // The finger's time, not the main thread's (GeckoW10mSynthesizeTouch).
++  const TimeStamp when = aTime;
++#else
++  const TimeStamp when = TimeStamp::Now();
++#endif
+   MultiTouchInput inputToDispatch = UpdateSynthesizedTouchState(
+-      mSynthesizedTouchInput.get(), TimeStamp::Now(), aPointerId, aPointerState,
++      mSynthesizedTouchInput.get(), when, aPointerId, aPointerState,
+       pointInWindow, aPointerPressure, aPointerOrientation);
+   DispatchTouchInput(inputToDispatch);
+   return NS_OK;
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+index 90bf53baeb..242c5f7e6e 100644
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -81,6 +81,33 @@ class HeadlessWidget final : public nsIWidget {
+   // Goes up each time an editable field takes the focus, so the shell can
+   // tell a new field -- or the same one tapped again -- from no change.
+   static uint32_t TextInputSerial();
++
++  // A finger from the shell, stamped with the time the shell saw it rather
++  // than the time the main thread got round to it. Every input runnable
++  // waits behind whatever the page queued before it, and APZ takes a
++  // fling's speed from the gaps between these times: stamped late, a swipe
++  // made while a feed was loading arrived as a burst and flung the page to
++  // its end. SynthesizeNativeTouchPoint gives "now", as before.
++  nsresult GeckoW10mSynthesizeTouch(uint32_t aPointerId,
++                                    TouchPointerState aPointerState,
++                                    LayoutDeviceIntPoint aPoint,
++                                    double aPointerPressure,
++                                    uint32_t aPointerOrientation,
++                                    const mozilla::TimeStamp& aTime);
++  // The shell says a finger has just gone down. A window still holding a
++  // finger with that id lost its release somewhere; it is cancelled there
++  // first, or every later touch in that window would have two fingers --
++  // a pinch to APZ, never a tap.
++  static void GeckoW10mPress(uint32_t aPointerId);
++
++  // Firefox marks a popup it means to be see-through to the pointer --
++  // every tooltip is pointer-events: none -- and gives others a margin that
++  // is not theirs (the shadow round a panel). A real window lets input
++  // there fall through; headless kept neither, so a tooltip a long press
++  // left behind took every tap aimed at what was under it.
++  void SetInputRegion(const InputRegion& aRegion) override {
++    mGeckoW10mInputRegion = aRegion;
++  }
+ #endif
+ 
+   nsresult Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
+@@ -192,6 +219,12 @@ class HeadlessWidget final : public nsIWidget {
+   static StaticAutoPtr<nsTArray<HeadlessWidget*>> sActiveWindows;
+   // Get the most recently activated widget or null if there are none.
+   static already_AddRefed<HeadlessWidget> GetActiveWindow();
++#if defined(GECKO_W10M)
++  InputRegion mGeckoW10mInputRegion;
++  // The topmost visible popup or dialog under a point that takes input
++  // there, or null.
++  static HeadlessWidget* GeckoW10mPopupUnder(const LayoutDeviceIntPoint& aPoint);
++#endif
+ };
+ 
+ }  // namespace widget

@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 14:12:49 +0400
+Subject: [PATCH] Startup on Windows 10 Mobile: the crash count in the notes,
+ no restart
+
+Firefox's startup-crash count and its Safe Mode decision, and whether
+the last launch counted as a success, go to the notes. A restart is
+only an exit on the phone, which cannot start a second copy of the
+app, so none is launched and the note says so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ toolkit/xre/nsAppRunner.cpp      |  6 ++++++
+ toolkit/xre/nsXREDirProvider.cpp | 22 ++++++++++++++++++++++
+ xpcom/base/AppShutdown.cpp       | 13 +++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index 04f81c8be8..e02bebfa6a 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -5822,6 +5822,12 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
+ #endif
+ 
+   bool lastStartupWasCrash = CheckLastStartupWasCrash();
++#if defined(GECKO_W10M)
++  GeckoW10mStartupMark(lastStartupWasCrash
++                           ? "startup: the last launch ended before it was "
++                             "called a success -- caches purged"
++                           : "startup: the last launch was a success");
++#endif
+ 
+   CrashReporter::RecordAnnotationBool(
+       CrashReporter::Annotation::LastStartupWasCrash, lastStartupWasCrash);
+diff --git a/toolkit/xre/nsXREDirProvider.cpp b/toolkit/xre/nsXREDirProvider.cpp
+index dcce3335e1..5ccf9f7d9b 100644
+--- a/toolkit/xre/nsXREDirProvider.cpp
++++ b/toolkit/xre/nsXREDirProvider.cpp
+@@ -93,6 +93,10 @@
+ #  define APP_REGISTRY_NAME "appreg"
+ #endif
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ #define PREF_OVERRIDE_DIRNAME "preferences"
+ 
+ nsXREDirProvider* gDirServiceProvider = nullptr;
+@@ -634,6 +638,24 @@ nsXREDirProvider::DoStartup() {
+       rv = appStartup->TrackStartupCrashBegin(&safeModeNecessary);
+       if (NS_FAILED(rv) && rv != NS_ERROR_NOT_AVAILABLE)
+         NS_WARNING("Error while beginning startup crash tracking");
++#if defined(GECKO_W10M)
++      {
++        // Firefox's own count of launches that ended before it called the
++        // start a success, and whether it is about to quit for Safe Mode --
++        // which an app on the phone cannot restart into, so the quit is all
++        // that would happen (toolkit.startup.max_resumed_crashes is -1 for
++        // that reason, tools/build-appx.sh).
++        nsPrintfCString note(
++            "startup crashes: %d recent, max %d, last success %d -> safe mode "
++            "%s",
++            mozilla::Preferences::GetInt("toolkit.startup.recent_crashes", 0),
++            mozilla::Preferences::GetInt(
++                "toolkit.startup.max_resumed_crashes", -1),
++            mozilla::Preferences::GetInt("toolkit.startup.last_success", 0),
++            safeModeNecessary ? "NEEDED" : "no");
++        GeckoW10mNote(note.get());
++      }
++#endif
+ 
+       if (!gSafeMode && safeModeNecessary) {
+         appStartup->RestartInSafeMode(nsIAppStartup::eForceQuit);
+diff --git a/xpcom/base/AppShutdown.cpp b/xpcom/base/AppShutdown.cpp
+index 4b6e4e80aa..fe8d9df752 100644
+--- a/xpcom/base/AppShutdown.cpp
++++ b/xpcom/base/AppShutdown.cpp
+@@ -146,8 +146,21 @@ const char* AppShutdown::GetShutdownPhaseName(ShutdownPhase aPhase) {
+       aPhase)];
+ }
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ void AppShutdown::MaybeDoRestart() {
+   if (sShutdownMode == AppShutdownMode::Restart) {
++#if defined(GECKO_W10M)
++    // An app on the phone cannot start a second copy of itself; a restart
++    // here is only an exit. Said in the log, and no child is launched.
++    GeckoW10mNote("restart: asked for, but this port cannot restart itself; "
++                  "exiting -- open the browser again");
++    StopLateWriteChecks();
++    UnlockProfile();
++    return;
++#endif
+     StopLateWriteChecks();
+ 
+     // Since we'll be launching our child while we're still alive, make sure

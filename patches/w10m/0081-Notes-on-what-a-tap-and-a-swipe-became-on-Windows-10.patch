@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 14:12:44 +0400
+Subject: [PATCH] Notes on what a tap and a swipe became on Windows 10 Mobile
+
+One line each for a fling's measured speed, a double tap that clicks
+nothing, a second tap that drops an unconfirmed first, a press held
+into a long press, a touchend the page cancelled, and a touchstart the
+touch radius sent somewhere other than under the finger. The tap note
+reuses the hit the targeting already made instead of a second one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/layers/apz/src/AsyncPanZoomController.cpp | 14 +++++++++++
+ gfx/layers/apz/src/GestureEventListener.cpp   | 17 +++++++++++++
+ gfx/layers/apz/util/APZEventState.cpp         |  3 +++
+ layout/base/PositionedEventTargeting.cpp      | 25 +++++++++++++++++--
+ 4 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/gfx/layers/apz/src/AsyncPanZoomController.cpp b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+index 5644081c2b..1d48c0c35c 100644
+--- a/gfx/layers/apz/src/AsyncPanZoomController.cpp
++++ b/gfx/layers/apz/src/AsyncPanZoomController.cpp
+@@ -2004,6 +2004,20 @@ nsEventStatus AsyncPanZoomController::HandleEndOfPan() {
+   MOZ_ASSERT(GetCurrentTouchBlock() || GetCurrentPanGestureBlock());
+   GetCurrentInputBlock()->GetOverscrollHandoffChain()->FlushRepaints();
+   ParentLayerPoint flingVelocity = GetVelocityVector();
++#if defined(GECKO_W10M)
++  {
++    // One line per swipe that pans: how fast the finger was measured to go.
++    // A fling to the end of a page shows here as a speed no finger makes;
++    // none at all as 0.
++    nsPrintfCString note(
++        "fling: %.1f,%.1f px/ms from the finger (a fling above %.1f); "
++        "rested %.0f ms before panning",
++        flingVelocity.x.value, flingVelocity.y.value,
++        StaticPrefs::apz_fling_min_velocity_threshold(),
++        mTouchStartRestingTimeBeforePan.ToMilliseconds());
++    GeckoW10mNote(note.get());
++  }
++#endif
+ 
+   // Clear our velocities; if DispatchFling() gives the fling to us,
+   // the fling velocity gets *added* to our existing velocity in
+diff --git a/gfx/layers/apz/src/GestureEventListener.cpp b/gfx/layers/apz/src/GestureEventListener.cpp
+index f6526bb826..b50737a41c 100644
+--- a/gfx/layers/apz/src/GestureEventListener.cpp
++++ b/gfx/layers/apz/src/GestureEventListener.cpp
+@@ -202,6 +202,12 @@ nsEventStatus GestureEventListener::HandleInputTouchSingleStart() {
+         // allow the second tap to participate in a gesture
+         // (e.g. lead to a single tap, or a double tap if an additional
+         // tap occurs near the same location).
++#if defined(GECKO_W10M)
++        if (mSingleTapSent.isSome() && !mSingleTapSent.value()) {
++          GeckoW10mNote("tap: a second tap far from the first came before the "
++                        "first was confirmed -- the first gives no click");
++        }
++#endif
+         mSingleTapSent = Nothing();
+         EnterFirstSingleTouchDown();
+       } else {
+@@ -485,6 +491,13 @@ nsEventStatus GestureEventListener::HandleInputTouchEnd() {
+ 
+     case GESTURE_SECOND_SINGLE_TOUCH_DOWN: {
+       MOZ_ASSERT(mSingleTapSent.isSome());
++#if defined(GECKO_W10M)
++      // Two taps close in time and place: on a page that may zoom that is a
++      // double tap, and neither one clicks.
++      GeckoW10mNote(mSingleTapSent.value()
++                        ? "tap: a second tap close to the first -- it clicks"
++                        : "tap: a double tap -- a zoom, neither tap clicks");
++#endif
+       mAsyncPanZoomController->HandleGestureEvent(CreateTapEvent(
+           mLastTouchInput, mSingleTapSent.value()
+                                ? TapGestureInput::TAPGESTURE_SECOND
+@@ -580,6 +593,10 @@ void GestureEventListener::HandleInputTimeoutLongTap() {
+       CancelMaxTapTimeoutTask();
+       [[fallthrough]];
+     case GESTURE_FIRST_SINGLE_TOUCH_MAX_TAP_DOWN: {
++#if defined(GECKO_W10M)
++      GeckoW10mNote("tap: held past the long-press delay -- a context menu "
++                    "when it lifts, no click");
++#endif
+       SetState(GESTURE_LONG_TOUCH_DOWN);
+       mAsyncPanZoomController->HandleGestureEvent(
+           CreateTapEvent(mLastTouchInput, TapGestureInput::TAPGESTURE_LONG));
+diff --git a/gfx/layers/apz/util/APZEventState.cpp b/gfx/layers/apz/util/APZEventState.cpp
+index 13bf763037..5f2f9f9fe1 100644
+--- a/gfx/layers/apz/util/APZEventState.cpp
++++ b/gfx/layers/apz/util/APZEventState.cpp
+@@ -86,6 +86,9 @@ void APZEventState::ProcessSingleTap(const CSSPoint& aPoint,
+ 
+ 
+   if (mTouchEndCancelled) {
++#if defined(GECKO_W10M)
++    GeckoW10mNote("tap: the page cancelled touchend -- no click");
++#endif
+     return;
+   }
+ 
+diff --git a/layout/base/PositionedEventTargeting.cpp b/layout/base/PositionedEventTargeting.cpp
+index fe54924134..43ebce3375 100644
+--- a/layout/base/PositionedEventTargeting.cpp
++++ b/layout/base/PositionedEventTargeting.cpp
+@@ -750,6 +750,10 @@ static const nsIFrame* FindZIndexAncestor(const nsIFrame* aTarget,
+ static nsIFrame* FindFrameTargetedByInputEventUnnoted(
+     WidgetGUIEvent* aEvent, RelativeTo aRootFrame,
+     const nsPoint& aPointRelativeToRootFrame, uint32_t aFlags);
++// What was exactly under the point in the last call, before the radius had
++// its say: kept by that call, so the note needs no second hit test of its
++// own on every touch. Main thread; read at once, before anything can go.
++static nsIFrame* sGeckoW10mExactTarget = nullptr;
+ 
+ static nsCString GeckoW10mDescribe(nsIFrame* aFrame) {
+   if (!aFrame) {
+@@ -793,8 +797,7 @@ nsIFrame* FindFrameTargetedByInputEvent(
+   if (aEvent->mMessage == eMouseDown && aEvent->mClass == eMouseEventClass &&
+       aEvent->AsMouseEvent()->mInputSource ==
+           dom::MouseEvent_Binding::MOZ_SOURCE_TOUCH) {
+-    nsIFrame* exact =
+-        nsLayoutUtils::GetFrameForPoint(aRootFrame, aPointRelativeToRootFrame);
++    nsIFrame* exact = sGeckoW10mExactTarget;
+     const CSSPoint css = CSSPoint::FromAppUnits(aPointRelativeToRootFrame);
+     nsPresContext* pc = aRootFrame.mFrame->PresContext();
+     PresShell* shell = pc->PresShell();
+@@ -820,6 +823,21 @@ nsIFrame* FindFrameTargetedByInputEvent(
+         GeckoW10mDescribe(exact).get(),
+         result == exact ? "the same" : GeckoW10mDescribe(result).get());
+     GeckoW10mNote(note.get());
++  } else if (aEvent->mMessage == eTouchStart) {
++    // A touch's events -- touchstart, pointerdown, and through implicit
++    // capture everything after them -- go where the touch radius sends the
++    // touchstart, which is not where the click goes. Noted only when it
++    // moved the target, which on a page that listens for touches is the
++    // case worth seeing.
++    nsIFrame* exact = sGeckoW10mExactTarget;
++    if (result != exact) {
++      const CSSPoint css = CSSPoint::FromAppUnits(aPointRelativeToRootFrame);
++      nsPrintfCString note(
++          "touch: at %.0f,%.0f CSS px under the finger %s, touchstart sent to %s",
++          double(css.x.value), double(css.y.value),
++          GeckoW10mDescribe(exact).get(), GeckoW10mDescribe(result).get());
++      GeckoW10mNote(note.get());
++    }
+   }
+   return result;
+ }
+@@ -840,6 +858,9 @@ nsIFrame* FindFrameTargetedByInputEvent(
+   nsIFrame* target = nsLayoutUtils::GetFrameForPoint(
+       aRootFrame, aPointRelativeToRootFrame, options);
+   nsIFrame* initialTarget = target;
++#if defined(GECKO_W10M)
++  sGeckoW10mExactTarget = target;
++#endif
+   PET_LOG(
+       "Found initial target %s for event class %s message %s point %s "
+       "relative to root frame %s\n",

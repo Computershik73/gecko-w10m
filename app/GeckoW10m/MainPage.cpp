@@ -10,6 +10,7 @@
 #include <atomic>
 #include <thread>
 
+#include "client/ClipboardBridge.h"
 #include "client/Log.h"
 #include "engine/CrashProbe.h"
 #include "engine/GeckoRuntimeHost.h"
@@ -350,8 +351,23 @@ MainPage::MainPage() {
 
   // Last, so the window is up and the log is readable before Gecko gets its
   // chance to take the process down with it.
-  engine::StartGeckoRuntime(std::wstring(localState), pixelWidth, pixelHeight,
-                            cssScale);
+  if (engine::StartGeckoRuntime(std::wstring(localState), pixelWidth,
+                                pixelHeight, cssScale) ==
+          engine::StartResult::SkippedAfterFailures &&
+      splash_) {
+    // Without a word the logo is all there is, and it never goes away.
+    TextBlock note;
+    note.Text(L"The browser did not start the last few times, so it was left "
+              L"alone this once. To try again, close it in the task list "
+              L"(hold Back) and open it again.");
+    note.Foreground(Brush(ContentFg()));
+    note.TextWrapping(TextWrapping::Wrap);
+    note.TextAlignment(TextAlignment::Center);
+    note.Margin(Thickness{24, 0, 24, 48});
+    note.HorizontalAlignment(HorizontalAlignment::Center);
+    note.VerticalAlignment(VerticalAlignment::Bottom);
+    splash_.Children().Append(note);
+  }
 }
 
 void MainPage::PushDpi() {
@@ -394,8 +410,11 @@ void MainPage::ApplyVisibleBounds() {
     handlersInstalled = true;
   Window::Current().VisibilityChanged(
       [this](auto&&, auto const& e) {
+        client::ClipboardWindowVisible(e.Visible());
         if (e.Visible()) {
           client::Log::Write(L"window: visible");
+          // Another app may have copied something while we were away.
+          client::RefreshClipboard(L"visible again");
           // Back from the background: the keyboard that was up when the app
           // left is gone, and nobody said so.
           if (engineView_) {
@@ -436,6 +455,11 @@ void MainPage::ApplyVisibleBounds() {
                 : (which == CoreWindowActivationState::PointerActivated
                        ? L"window: activated by a pointer"
                        : L"window: activated"));
+        // The phone lets the app in front read its clipboard; this is when it
+        // is in front again.
+        if (which != CoreWindowActivationState::Deactivated) {
+          client::RefreshClipboard(L"activated");
+        }
       });
 
   }
@@ -509,7 +533,12 @@ void MainPage::BuildUi() {
 
   // --- Content host (engine SwapChainPanel would attach here) ---
   contentHost_ = Border();
-  contentHost_.Background(Brush(ContentBg()));
+  // With verbose logs on, what lies under the browser's panel is magenta: a
+  // pixel the browser leaves see-through shows it, so specks over a page
+  // that are magenta are transparent pixels, and white ones are drawn.
+  contentHost_.Background(Brush(client::Log::Verbose()
+                                    ? ColorHelper::FromArgb(255, 255, 0, 255)
+                                    : ContentBg()));
   statusText_ = TextBlock();
   statusText_.Text(L"Gecko");
   statusText_.HorizontalAlignment(HorizontalAlignment::Center);
@@ -712,25 +741,11 @@ void MainPage::BuildUi() {
   }
   PushDpi();
 
-  // On a phone an unhandled Back is a navigation away from the app: the shell
-  // hides the view and suspends it a few seconds later -- which is, step for
-  // step, what has been observed. Nobody presses anything, but the strings in
-  // the navigation client name Windows.Phone.UI.Input.HardwareButtons and
-  // BackPressedEventArgs, and a Back that arrives from nowhere would look
-  // exactly like this. So it is logged, and handled, and if the hide stops
-  // that is the answer.
-  {
-    using winrt::Windows::UI::Core::SystemNavigationManager;
-    auto navigation = SystemNavigationManager::GetForCurrentView();
-    navigation.BackRequested([](auto const&, auto const& e) {
-      client::Log::Write(L"back: BackRequested arrived -- handling it so the "
-                         L"shell does not navigate away");
-      client::Log::FlushFromFault();
-      e.Handled(true);
-    });
-    // HardwareButtons.BackPressed lives in a phone extension SDK this build
-    // does not have; BackRequested is the same button by the newer road.
-  }
+  // The phone's back button belongs to EngineView (WireKeyboard): the
+  // browser's while it has something to undo, the phone's -- which puts the
+  // app in the background -- once it has not. Every press used to be handled
+  // here and nothing done with it, a leftover of a theory about the window
+  // hiding itself that turned out to be ANGLE.
 
   auto view = ApplicationView::GetForCurrentView();
   // Consolidated is the view being removed from the switcher -- the shell's

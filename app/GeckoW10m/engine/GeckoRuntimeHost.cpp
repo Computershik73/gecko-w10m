@@ -61,6 +61,8 @@ std::wstring AttemptsPath(const std::wstring& localState) {
 // cleared when the engine has drawn something, which is the only definition of
 // a successful start that is worth anything.
 std::wstring gInstallDir;
+// Where the count is kept, for NoteAppSuspended.
+std::wstring gLocalState;
 
 int ReadAttempts(const std::wstring& localState, const std::wstring& installDir) {
   CREATEFILE2_EXTENDED_PARAMETERS params{};
@@ -148,21 +150,38 @@ void MarkGeckoHealthy(const std::wstring& localStatePath) {
   gInstallDir.clear();
 }
 
-bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
-                       int height, double scale) {
+void NoteAppSuspended() {
+  if (gInstallDir.empty() || gLocalState.empty()) {
+    return;  // the first frame came, or the engine was never started
+  }
+  WriteAttempts(gLocalState, gInstallDir, 0);
+  Log::Write(L"gecko: suspended before the first frame -- not a failed start");
+  gInstallDir.clear();
+}
+
+StartResult StartGeckoRuntime(const std::wstring& localStatePath, int width,
+                              int height, double scale) {
   const std::wstring installDir = InstallDirectory();
   if (installDir.empty()) {
     Log::Write(L"gecko: could not determine the install directory");
-    return false;
+    return StartResult::Failed;
   }
 
   gInstallDir = installDir;
+  gLocalState = localStatePath;
 
   int attempts = ReadAttempts(localStatePath, installDir);
   if (attempts >= kMaxAttempts) {
-    Log::WriteNum(L"gecko: not starting, failed attempts", attempts);
-    Log::Write(L"gecko: delete gecko-attempts.txt in LocalState to try again");
-    return false;
+    // One launch without the engine, so a build that dies on every start
+    // leaves a readable log -- and only one. Stopping for good left the logo
+    // up at every launch until a new build was installed: three launches
+    // closed or suspended before their first frame were enough, with no
+    // crash at all. The count starts over and the next launch tries again.
+    Log::WriteNum(L"gecko: skipping the engine this once, failed attempts",
+                  attempts);
+    WriteAttempts(localStatePath, installDir, 0);
+    gInstallDir.clear();
+    return StartResult::SkippedAfterFailures;
   }
   WriteAttempts(localStatePath, installDir, attempts + 1);
   Log::WriteNum(L"gecko: starting runtime, attempt", attempts + 1);
@@ -185,7 +204,7 @@ bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
   if (!thread) {
     Log::WriteNum(L"gecko: CreateThread failed, err", ::GetLastError());
     delete args;
-    return false;
+    return StartResult::Failed;
   }
   // The sampler takes the handle: it is the only thing that will know where
   // the thread was if the process goes without a word. It suspends the UI
@@ -195,7 +214,7 @@ bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
   } else {
     ::CloseHandle(thread);
   }
-  return true;
+  return StartResult::Started;
 }
 
 }  // namespace gecko_w10m::engine

@@ -17,7 +17,20 @@ namespace gecko_w10m::engine {
 // failed-attempt count. Nothing else is evidence that a start succeeded.
 void MarkGeckoHealthy(const std::wstring& localStatePath);
 
-bool StartGeckoRuntime(const std::wstring& localStatePath, int width,
-                       int height, double scale);
+// The app is being suspended. One suspended before its first frame -- and
+// then ended by the system, as a phone does -- did not fail to start, and is
+// not counted as if it had. UI thread.
+void NoteAppSuspended();
+
+enum class StartResult {
+  Started,
+  // This launch leaves the engine alone after failed starts; the next one
+  // tries again.
+  SkippedAfterFailures,
+  Failed,
+};
+
+StartResult StartGeckoRuntime(const std::wstring& localStatePath, int width,
+                              int height, double scale);
 
 }  // namespace gecko_w10m::engine

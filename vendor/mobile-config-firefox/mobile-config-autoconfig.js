@@ -155,6 +155,17 @@ function gecko_watch_app_state() {
             const t0 = Date.now();
             const done = [];
             try {
+                // A start that got as far as the background succeeded. On the
+                // phone it is the system, not a crash, that ends a suspended
+                // app, and Firefox would count that as a failed start: the
+                // next launch would throw its startup cache away, and enough
+                // of them would have it quit for Safe Mode.
+                Services.startup.trackStartupCrashEnd();
+                done.push("start marked good");
+            } catch (e) {
+                done.push("start not marked: " + e);
+            }
+            try {
                 Services.prefs.savePrefFile(null);
                 done.push("prefs");
             } catch (e) {
@@ -1451,6 +1462,206 @@ function gecko_watch_fullscreen() {
     }, "domwindowopened");
 }
 
+// The phone's back button. The shell has to answer a press at once --
+// handled, or left to the phone, which puts the app in the background -- so
+// it cannot ask. Chrome tells it instead, whenever the answer changes,
+// whether Back has anything to do here: a prompt over the page, fullscreen,
+// the address bar being edited, history in the selected tab, or a tab a page
+// opened that can go back to the tab that opened it (as Firefox for Android
+// does). A press the shell takes comes back as {op:"nav.back"} and is done
+// here, in that order. See EngineView::WireKeyboard and DrmBridge.
+function gecko_back_button() {
+    const note = m => Services.console.logStringMessage("gecko: back: " + m);
+    const browserWindow = () => {
+        const win = Services.wm.getMostRecentWindow("navigator:browser");
+        return win && !win.closed ? win : null;
+    };
+    // Prompts drawn inside the browser's document: alert, confirm, "leave
+    // this page?", and window-modal ones in the same style. They have no
+    // window of their own, so the engine's check for an open dialog never
+    // sees them. Tab prompts sit over the page's; both queue, and the one
+    // showing is the first not closing.
+    const topPrompt = win => {
+        try {
+            if (win.gDialogBox && win.gDialogBox.isOpen) {
+                return win.gDialogBox.dialog;
+            }
+            const box = win.gBrowser.selectedBrowser.tabDialogBox;
+            if (!box) {
+                return null;
+            }
+            for (const manager of [box.getTabDialogManager(), box._contentDialogManager]) {
+                if (manager && manager.hasDialogs) {
+                    return manager.dialogs.find(d => !d._isClosing) || null;
+                }
+            }
+        } catch (e) {}
+        return null;
+    };
+    // Firefox's own test (browser.js): on a blank page -- where it puts the
+    // focus in the address bar by itself, with no valid page to show --
+    // edited means typed into; elsewhere, not showing the page's address.
+    const editingAddress = win => {
+        try {
+            const bar = win.gURLBar;
+            if (!bar) {
+                return false;
+            }
+            const edited = win.isBlankPageURL(win.gBrowser.currentURI.spec)
+                ? bar.hasAttribute("usertyping")
+                : bar.getAttribute("pageproxystate") != "valid";
+            return bar.view.isOpen || (bar.focused && edited);
+        } catch (e) {
+            return false;
+        }
+    };
+    const openerOf = win => {
+        if (!Services.prefs.getBoolPref("gecko.back.closes_opened_tab", true)) {
+            return null;
+        }
+        const tab = win.gBrowser.selectedTab;
+        const opener = tab.openerTab;
+        // openerTab is not cleared when the opener closes.
+        return opener && opener !== tab && opener.isConnected && !opener.closing
+            ? opener : null;
+    };
+    const state = win => {
+        const s = {
+            prompt: !!topPrompt(win),
+            fullscreen: !!win.document.fullscreenElement || !!win.fullScreen,
+            address: editingAddress(win),
+            history: !!win.gBrowser.canGoBack,
+        };
+        s.opener = !s.history && !!openerOf(win);
+        s.take = s.prompt || s.fullscreen || s.address || s.history || s.opener;
+        return s;
+    };
+    let last = "";
+    const push = () => {
+        const win = browserWindow();
+        if (!win || !win.gBrowser) {
+            return;
+        }
+        let msg;
+        try {
+            msg = JSON.stringify(Object.assign({ op: "nav.state" }, state(win)));
+        } catch (e) {
+            note("state failed: " + e);
+            return;
+        }
+        if (msg === last) {
+            return;
+        }
+        last = msg;
+        Services.obs.notifyObservers(null, "gecko-w10m-bridge", msg);
+    };
+    // Once whatever changed has settled: Firefox updates its own back
+    // button in the same call that tells us.
+    let queued = false;
+    const later = () => {
+        if (queued) {
+            return;
+        }
+        queued = true;
+        Services.tm.dispatchToMainThread(() => { queued = false; push(); });
+    };
+
+    const watch = win => {
+        if (win.document.location.href !== "chrome://browser/content/browser.xhtml") {
+            return;
+        }
+        // Firefox's own back command, disabled exactly when the selected tab
+        // has nothing to go back to (UpdateBackForwardCommands).
+        const back = win.document.getElementById("Browser:Back");
+        if (back) {
+            new win.MutationObserver(later).observe(back,
+                { attributes: true, attributeFilter: ["disabled"] });
+        }
+        if (win.gURLBar) {
+            new win.MutationObserver(later).observe(win.gURLBar,
+                { attributes: true,
+                  attributeFilter: ["open", "focused", "pageproxystate", "usertyping"] });
+        }
+        for (const name of ["TabSelect", "TabOpen", "TabClose"]) {
+            win.gBrowser.tabContainer.addEventListener(name, later);
+        }
+        for (const name of ["dialogopen", "dialogclose", "MozDOMFullscreen:Entered",
+                            "MozDOMFullscreen:Exited", "fullscreen", "sizemodechange"]) {
+            win.addEventListener(name, later, true);
+        }
+        // A prompt is let go of a moment after it says it closed.
+        win.addEventListener("dialogclose", () => win.setTimeout(later, 500), true);
+        later();
+    };
+    Services.obs.addObserver({
+        observe(subject, topic) {
+            if (topic !== "domwindowopened") {
+                return;
+            }
+            subject.addEventListener("load", () => {
+                try {
+                    watch(subject);
+                } catch (e) {
+                    note("watch failed: " + e);
+                }
+            }, { once: true });
+        }
+    }, "domwindowopened");
+
+    Services.obs.addObserver({
+        observe(subject, topic, data) {
+            let msg;
+            try { msg = JSON.parse(data); } catch (e) { return; }
+            if (msg.op === "nav.ask") {
+                last = "";
+                later();
+                return;
+            }
+            if (msg.op !== "nav.back") {
+                return;
+            }
+            const win = browserWindow();
+            if (!win || !win.gBrowser) {
+                note("pressed, but there is no browser window");
+                return;
+            }
+            try {
+                const prompt = topPrompt(win);
+                const opener = openerOf(win);
+                if (prompt) {
+                    note("cancelling the prompt over the page");
+                    prompt.abort();
+                } else if (win.document.fullscreenElement) {
+                    note("leaving the page's fullscreen");
+                    win.FullScreen.exitDomFullScreen();
+                } else if (win.fullScreen) {
+                    note("leaving the browser's fullscreen");
+                    win.fullScreen = false;
+                } else if (editingAddress(win)) {
+                    note("closing the address bar");
+                    win.gURLBar.view.close();
+                    win.gURLBar.handleRevert();
+                    win.gBrowser.selectedBrowser.focus();
+                } else if (win.gBrowser.canGoBack) {
+                    note("back in the tab's history");
+                    win.BrowserCommands.back();
+                } else if (opener) {
+                    const tab = win.gBrowser.selectedTab;
+                    note("closing a tab a page opened, back to the tab that opened it");
+                    win.gBrowser.selectedTab = opener;
+                    win.gBrowser.removeTab(tab, { animate: false });
+                } else {
+                    note("nothing to go back to -- the shell's state was stale");
+                }
+            } catch (e) {
+                note("failed: " + e);
+            }
+            last = "";
+            later();
+        }
+    }, "gecko-w10m-bridge-reply");
+}
+
 try {
     gecko_note_phases();
     gecko_fix_homepage();
@@ -1460,6 +1671,7 @@ try {
     gecko_watch_memory();
     gecko_watch_app_state();
     gecko_watch_fullscreen();
+    gecko_back_button();
     gecko_h264ify();
     gecko_desktop_sites();
     gecko_note_downloads();

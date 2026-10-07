@@ -13,6 +13,7 @@
 #include <string>
 
 #include "client/CaptureConsent.h"
+#include "client/ClipboardBridge.h"
 #include "client/DrmBridge.h"
 #include "client/FileBridge.h"
 #include "client/Log.h"
@@ -41,6 +42,13 @@ namespace {
 // The UI thread's dispatcher, kept for the launcher callback, which is called
 // from Gecko's threads and has no way to ask for one.
 winrt::Windows::UI::Core::CoreDispatcher gUiDispatcher{nullptr};
+// Whether the engine has a window fullscreen, as it last told the shell
+// (FullscreenChanged); the back button must answer at once and reads it.
+std::atomic<bool> gFullscreen{false};
+// When the on-screen keyboard last went away. A Back that closes the keyboard
+// seems to reach the app as well, in the same moment, and that press was the
+// keyboard's, not the page's.
+std::atomic<unsigned long long> gKeyboardHiddenAt{0};
 }  // namespace
 
 namespace {
@@ -246,6 +254,23 @@ void StackVideoPanel(bool above) {
     }
   }
 }
+
+// Where a finger is, in the coordinates ToFrame reads: the panel's while the
+// GPU presents through it, whichever element the finger landed on. The image
+// above the panel holds the layer of menus and dialogs, and it was taking the
+// fingers over its rectangle once a menu had painted -- transparent or not --
+// sized to the window as it was then and shown centred in the room. After the
+// phone turned it was a band down the middle of the screen, and a point
+// measured from its corner reached the page about 190 view pixels to the left
+// of the finger: landscape taps landed on the wrong thing.
+winrt::Windows::Foundation::Point FingerPoint(
+    Input::PointerRoutedEventArgs const& args, SwapChainPanel const& panel,
+    Image const& image) {
+  if (g_panelPresenting.load() && panel) {
+    return args.GetCurrentPoint(panel).Position();
+  }
+  return args.GetCurrentPoint(image).Position();
+}
 }  // namespace
 
 
@@ -308,16 +333,16 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
   image_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                Input::PointerRoutedEventArgs const& args) {
     touched_ = true;
-    OnPressed(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
+    OnPressed(args.Pointer().PointerId(), FingerPoint(args, panel_, image_));
     image_.CapturePointer(args.Pointer());
   });
   image_.PointerMoved([this](winrt::Windows::Foundation::IInspectable const&,
                              Input::PointerRoutedEventArgs const& args) {
-    OnMoved(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
+    OnMoved(args.Pointer().PointerId(), FingerPoint(args, panel_, image_));
   });
   image_.PointerReleased([this](winrt::Windows::Foundation::IInspectable const&,
                                 Input::PointerRoutedEventArgs const& args) {
-    OnReleased(args.Pointer().PointerId(), args.GetCurrentPoint(image_).Position());
+    OnReleased(args.Pointer().PointerId(), FingerPoint(args, panel_, image_));
     image_.ReleasePointerCapture(args.Pointer());
   });
   image_.PointerCaptureLost(
@@ -326,9 +351,10 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
         OnCaptureLost(args.Pointer().PointerId());
       });
 
-  // On the hardware path the picture is the panel, not the image -- the image
-  // never gets a source, so it has no size and no taps land on it. The panel
-  // takes the same gestures; ToFrame knows which one is showing.
+  // On the hardware path the picture is the panel; the image above it shows
+  // only the layer of menus and dialogs, and once the panel presents it takes
+  // no fingers at all (PlaceLayer). The panel takes the same gestures; ToFrame
+  // knows which one is showing.
   if (panel_) {
     panel_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                  Input::PointerRoutedEventArgs const& args) {
@@ -457,18 +483,78 @@ void EngineView::WireKeyboard() {
   // phone's back button does it instead, as Escape, which is what closes a
   // dialog or a menu in Firefox.
   //
-  // Only while something is actually open. Swallowing back the rest of the
-  // time would take away the way out of the app.
+  // The rest of the time Back is the browser's while it has something to undo
+  // -- a prompt over the page, fullscreen, the address bar being edited,
+  // history in the tab, a tab a page opened -- and the phone's once it has
+  // not: an unhandled Back puts the app in the background, which is what it
+  // should do then. Handled must be decided before this returns, so nothing
+  // here waits for the engine: the overlay the engine says itself, fullscreen
+  // it has already told us, and the rest chrome sends whenever it changes
+  // ("nav.state", client/DrmBridge.cpp). The press goes to chrome as
+  // {"op":"nav.back"} (gecko_back_button in mobile-config-autoconfig.js).
   auto navigation =
       winrt::Windows::UI::Core::SystemNavigationManager::GetForCurrentView();
   navigation.BackRequested(
       [this](winrt::Windows::Foundation::IInspectable const&,
              winrt::Windows::UI::Core::BackRequestedEventArgs const& args) {
-        if (!key_ || !overlay_ || overlay_() != 1) {
+        const bool overlay = key_ && overlay_ && overlay_() == 1;
+        const bool fullscreen = gFullscreen.load();
+        const bool armed = bridgeArmed_ && bridge_reply_ != nullptr;
+        const bool chrome = armed && DrmBridge::ChromeTakesBack();
+        bool keyboard = false;
+        try {
+          keyboard = InputPane::GetForCurrentView().Visible();
+        } catch (winrt::hresult_error const&) {
+        }
+        const unsigned long long sinceKeyboard =
+            ::GetTickCount64() - gKeyboardHiddenAt.load();
+        const bool forKeyboard = keyboard || sinceKeyboard < 300;
+        const wchar_t* branch =
+            forKeyboard                ? L"the keyboard's"
+            : overlay                  ? L"Escape to the menu or dialog"
+            : chrome                   ? L"to chrome"
+            : (fullscreen && key_)     ? L"Escape out of fullscreen"
+                                       : L"the phone's";
+        Log::Write(std::wstring(L"back: ") + branch + L" -- overlay " +
+                   (overlay ? L"open" : L"none") + L", fullscreen " +
+                   (fullscreen ? L"yes" : L"no") + L", chrome " +
+                   (armed ? (chrome ? L"takes it" : L"has nothing")
+                          : L"not listening") +
+                   L", keyboard " +
+                   (keyboard ? std::wstring(L"up")
+                             : L"gone " + std::to_wstring(sinceKeyboard) +
+                                   L" ms"));
+        if (forKeyboard) {
+          // Closing the keyboard is all this press was for. Not from inside
+          // this system handler (see the Showing handler above).
+          if (keyboard) {
+            PostToUi([]() {
+              try {
+                InputPane::GetForCurrentView().TryHide();
+              } catch (winrt::hresult_error const&) {
+              }
+            });
+          }
+          args.Handled(true);
           return;
         }
-        key_(27);  // Escape
-        args.Handled(true);
+        if (overlay) {
+          key_(27);  // Escape: the engine's rollup or the dialog's cancel
+          args.Handled(true);
+          return;
+        }
+        if (chrome) {
+          bridge_reply_("{\"op\":\"nav.back\"}");
+          args.Handled(true);
+          return;
+        }
+        if (fullscreen && key_) {
+          // Chrome not listening yet: Escape still leaves a page's
+          // fullscreen.
+          key_(27);
+          args.Handled(true);
+          return;
+        }
       });
 
   // The keyboard takes the bottom of the screen away. Telling the engine makes
@@ -509,6 +595,7 @@ void EngineView::WireKeyboard() {
   pane.Hiding([this](InputPane const&,
                      winrt::Windows::UI::ViewManagement::
                          InputPaneVisibilityEventArgs const& args) {
+    gKeyboardHiddenAt.store(::GetTickCount64());
     args.EnsuredFocusedElementInView(true);
     if (!host_) {
       return;
@@ -544,6 +631,9 @@ void EngineView::ArmBridge() {
   if (set_bridge_(&DrmBridge::OnMessage) == 1) {
     bridgeArmed_ = true;
     Log::Write(L"bridge: the shell is listening for chrome");
+    // Chrome may have said what the back button would do before anyone was
+    // listening; it is asked to say it again.
+    bridge_reply_("{\"op\":\"nav.ask\"}");
   }
 }
 
@@ -611,6 +701,8 @@ bool EngineView::Resolve() {
     InstallFileBridge(xul, gUiDispatcher);
     // The phone's microphone consent (client/CaptureConsent.cpp).
     InstallCaptureConsent(xul, gUiDispatcher);
+    // The phone's clipboard (client/ClipboardBridge.cpp).
+    InstallClipboardBridge(xul, gUiDispatcher);
   }
   if (!set_video_layer_ && video_panel_) {
     set_video_layer_ = reinterpret_cast<SetVideoLayerSinkFn>(
@@ -732,6 +824,32 @@ void EngineView::EnsureBitmap(int32_t width, int32_t height) {
   image_.Source(bitmap_);
   Log::Write(L"view: frame size " + std::to_wstring(width) + L"x" +
              std::to_wstring(height));
+  PlaceLayer();
+}
+
+void EngineView::PlaceLayer() {
+  if (!g_panelPresenting.load() || !panel_) {
+    return;  // the software path: the image is the whole picture
+  }
+  if (!layerPlaced_) {
+    layerPlaced_ = true;
+    // Shown the way the panel shows the GPU's frame -- from its corner, one
+    // device pixel a pixel -- not fitted into the room: the layer keeps the
+    // size the window had when a menu last painted, and fitted it was
+    // squeezed into the middle of the screen after the phone turned or the
+    // keyboard came and went, with the menus drawn somewhere else than the
+    // engine had them.
+    image_.IsHitTestVisible(false);
+    image_.Stretch(Stretch::Fill);
+    image_.HorizontalAlignment(HorizontalAlignment::Left);
+    image_.VerticalAlignment(VerticalAlignment::Top);
+    Log::Write(L"view: the panel takes the fingers; the menu layer only "
+               L"shows, from the panel's corner");
+  }
+  if (width_ > 0 && height_ > 0) {
+    image_.Width(width_ / rawPerView_);
+    image_.Height(height_ / rawPerView_);
+  }
 }
 
 void EngineView::WatchRoom(
@@ -1055,6 +1173,7 @@ void EngineView::VideoLayerShow(int32_t visible) {
 }
 
 void EngineView::FullscreenChanged(int32_t on) {
+  gFullscreen.store(on != 0);
   if (!gUiDispatcher) {
     return;
   }
@@ -1170,6 +1289,9 @@ void EngineView::Tick() {
     firstFrame_ = nullptr;
     Log::Write(L"view: the GPU is presenting through the panel, splash down");
     handler();
+  }
+  if (g_panelPresenting.load() && !layerPlaced_) {
+    PlaceLayer();
   }
 
   if (!Resolve()) {
@@ -1340,7 +1462,15 @@ void EngineView::OnPressed(uint32_t id,
       f->x = x;
       f->y = y;
     } else {
-      fingers_.push_back({id, x, y, x, y});
+      if (!fingers_.empty()) {
+        std::wstring held;
+        for (const Finger& other : fingers_) {
+          held += L" " + std::to_wstring(other.id);
+        }
+        Log::Write(L"touch: finger " + std::to_wstring(id) +
+                   L" down while the shell holds" + held);
+      }
+      fingers_.push_back({id, x, y, x, y, ::GetTickCount64()});
     }
     touch_(static_cast<int32_t>(id), 0, x, y);
     return;
@@ -1422,7 +1552,11 @@ void EngineView::OnReleased(uint32_t id,
       Log::Write(L"touch: tap at " + std::to_wstring(x) + L"," +
                  std::to_wstring(y) + L" frame px (" +
                  std::to_wstring(static_cast<int>(point.X)) + L"," +
-                 std::to_wstring(static_cast<int>(point.Y)) + L" view px)");
+                 std::to_wstring(static_cast<int>(point.Y)) + L" view px), id " +
+                 std::to_wstring(id) + L", " +
+                 std::to_wstring(::GetTickCount64() - last.downAt) +
+                 L" ms on the glass, " + std::to_wstring(fingers_.size()) +
+                 L" other finger(s) held");
       tapKeyboardCheckAt_ = ::GetTickCount64() + 300;
     }
     return;

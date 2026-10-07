@@ -8,6 +8,8 @@
 #include <winrt/Windows.Security.Cryptography.h>
 #include <winrt/Windows.Storage.Streams.h>
 
+#include <atomic>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -27,6 +29,8 @@ using winrt::Windows::Security::Cryptography::CryptographicBuffer;
 using winrt::Windows::Storage::Streams::IBuffer;
 
 void (*gReply)(const char*) = nullptr;
+// Chrome's last word on the back button (DrmBridge::ChromeTakesBack).
+std::atomic<bool> gChromeTakesBack{false};
 std::mutex gLock;
 // One license-acquisition request per session, kept until the response.
 std::map<std::wstring, PlayReadyLicenseAcquisitionServiceRequest> gRequests;
@@ -273,8 +277,21 @@ void Handle(std::string json) {
 
 void DrmBridge::SetReply(void (*reply)(const char*)) { gReply = reply; }
 
+bool DrmBridge::ChromeTakesBack() { return gChromeTakesBack.load(); }
+
 void DrmBridge::OnMessage(const char* json) {
   if (!json) return;
+  // Chrome's word on the back button, kept here on the engine's thread
+  // rather than handed to a worker: it is read the moment Back is pressed,
+  // two workers could store two of them out of order, and it is a notice
+  // that Handle would answer with "unknown op".
+  if (std::strstr(json, "\"op\":\"nav.state\"")) {
+    const bool take = std::strstr(json, "\"take\":true") != nullptr;
+    if (gChromeTakesBack.exchange(take) != take) {
+      Log::Write(L"back: chrome says " + Widen(json));
+    }
+    return;
+  }
   std::thread(Handle, std::string(json)).detach();
 }
 

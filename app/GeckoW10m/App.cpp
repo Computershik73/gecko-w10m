@@ -10,6 +10,7 @@
 #include <vector>
 #include "MainPage.h"
 #include "client/Log.h"
+#include "engine/GeckoRuntimeHost.h"
 
 using namespace winrt;
 using namespace winrt::Windows::ApplicationModel;
@@ -124,6 +125,9 @@ struct App : ApplicationT<App, winrt::Windows::UI::Xaml::Markup::IXamlMetadataPr
     Suspending([](auto const&, SuspendingEventArgs const& args) {
       client::Log::Write(L"app: suspending -- telling the engine, holding "
                          L"the deferral");
+      // Being suspended is the system's doing, not a failed start, though the
+      // system may well end the app from here.
+      engine::NoteAppSuspended();
       client::Log::FlushFromFault();
       auto deferral = args.SuspendingOperation().GetDeferral();
       std::thread([deferral] {

@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 14:12:47 +0400
+Subject: [PATCH] WebRender on Windows 10 Mobile: switches to look for specks,
+ partial present kept
+
+gfx.webrender.max-partial-present-rects was never read on the EGL
+path. Partial present stays the default (1); 0 now gives whole frames,
+a frame that changed nothing still skipped, for a comparison on the
+phone. gfx.webrender.gecko-w10m.tile-partial-update=false redraws a
+changed picture tile whole, the workaround upstream uses for other
+mobile GPUs. The note says which mode runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../RenderCompositorEGL.cpp                   | 43 +++++++++++++++----
+ gfx/webrender_bindings/RenderCompositorEGL.h  |  7 +++
+ gfx/wr/webrender/src/device/gl.rs             |  7 ++-
+ gfx/wr/webrender/src/renderer/composite.rs    |  9 +++-
+ modules/libpref/init/StaticPrefList.yaml      | 10 +++++
+ 5 files changed, 65 insertions(+), 11 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index 9535700695..9d6075afc4 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -163,11 +163,33 @@ RenderCompositorEGL::RenderCompositorEGL(
+       mPostSubBuffer = reinterpret_cast<PostSubBufferFn>(
+           egl->mLib->fGetProcAddress("eglPostSubBufferNV"));
+     }
+-    GeckoW10mNote(mPostSubBuffer
+-                      ? "gfx: partial present -- only what changed is drawn "
+-                        "and presented"
+-                      : "gfx: no EGL_NV_post_sub_buffer -- every frame is "
+-                        "drawn whole");
++    // The preference was set to 0 once and then never read on this path, so
++    // partial present ran regardless of it. Now 0 means whole frames, for a
++    // comparison on the phone, and the build ships with partial present on.
++    mWholeFrames =
++        mPostSubBuffer &&
++        StaticPrefs::gfx_webrender_max_partial_present_rects_AtStartup() == 0;
++    {
++      char note[256];
++      SprintfLiteral(
++          note, "gfx: %s (max-partial-present-rects: pref %u, in use %d)",
++          !mPostSubBuffer ? "no EGL_NV_post_sub_buffer -- every frame is "
++                            "drawn whole"
++          : mWholeFrames  ? "whole frames -- a frame that changed anything is "
++                            "drawn and presented whole, one that changed "
++                            "nothing is skipped"
++                          : "partial present -- only what changed is drawn "
++                            "and presented",
++          StaticPrefs::gfx_webrender_max_partial_present_rects_AtStartup(),
++          int(gfx::gfxVars::WebRenderMaxPartialPresentRects()));
++      GeckoW10mNote(note);
++    }
++    // WebRender reads this when it sets its device up, which is after the
++    // compositor is made (WebRenderAPI.cpp, NewRenderer).
++    if (!StaticPrefs::gfx_webrender_gecko_w10m_tile_partial_update_AtStartup()) {
++      ::SetEnvironmentVariableW(L"GECKO_W10M_NO_TILE_PARTIAL_UPDATE", L"1");
++      GeckoW10mNote("gfx: a changed picture tile is redrawn whole");
++    }
+   }
+ #endif
+ #ifdef MOZ_WAYLAND
+@@ -254,9 +276,10 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+ #if defined(GECKO_W10M)
+   if (mPostSubBuffer && mEGLSurface != EGL_NO_SURFACE) {
+     const auto bufferSize = GetBufferSize();
+-    // WebRender drew this frame whole (RequestFullRender decided it), so
+-    // the whole of it goes out.
+-    const bool whole = mWholeFrame;
++    // WebRender drew this frame whole (RequestFullRender decided it, or
++    // whole frames are asked for and it changed something), so the whole of
++    // it goes out.
++    const bool whole = mWholeFrame || (mWholeFrames && !aDirtyRects.IsEmpty());
+     gfx::IntRect bounds;
+     for (const DeviceIntRect& rect : aDirtyRects) {
+       const auto left = std::clamp(rect.min.x, 0, bufferSize.width);
+@@ -539,7 +562,9 @@ bool RenderCompositorEGL::ShouldDrawPreviousPartialPresentRegions() {
+   // DXGI carry the rest of the previous frame into the next back buffer,
+   // which is what Firefox's own ANGLE compositor relies on too.
+   if (mPostSubBuffer) {
+-    return false;
++    // Whole frames: nothing of it is trusted, and with a buffer age of 0
++    // WebRender redraws all of any frame that changed something.
++    return mWholeFrames;
+   }
+ #endif
+   return true;
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 602f77c24b..7b8be38bd6 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -86,6 +86,13 @@ class RenderCompositorEGL : public RenderCompositor {
+                                                   EGLint, EGLint, EGLint,
+                                                   EGLint);
+   PostSubBufferFn mPostSubBuffer = nullptr;
++  // gfx.webrender.max-partial-present-rects == 0: nothing outside
++  // WebRender's dirty rectangle is trusted to be on the screen; a frame that
++  // changes anything is drawn and presented whole, one that changes nothing
++  // is neither. Off by default -- partial present is what keeps scrolling
++  // and video cheap -- and there to tell a fault of partial present from
++  // anything else on the phone.
++  bool mWholeFrames = false;
+   // A new size, or a present that failed, means the next frame is drawn
+   // and presented whole.
+   LayoutDeviceIntSize mPresentedSize;
+diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
+index cdadce86ae..ed0746f329 100644
+--- a/gfx/wr/webrender/src/device/gl.rs
++++ b/gfx/wr/webrender/src/device/gl.rs
+@@ -1915,7 +1915,12 @@ impl Device {
+         // We have Additionally encountered issues on PowerVR D-Series. See bug 2005312.
+         let supports_render_target_partial_update = !is_mali_midgard(&renderer_name)
+             && !is_mali_bifrost(&renderer_name)
+-            && !renderer_name.starts_with("PowerVR D-Series");
++            && !renderer_name.starts_with("PowerVR D-Series")
++            // GeckoW10m: gfx.webrender.gecko-w10m.tile-partial-update = false
++            // (RenderCompositorEGL.cpp) -- a test for specks on Qualcomm's
++            // Direct3D driver under ANGLE.
++            && !(is_windows_angle
++                && std::env::var_os("GECKO_W10M_NO_TILE_PARTIAL_UPDATE").is_some());
+ 
+         let supports_shader_storage_object = match gl.get_type() {
+             // see https://www.g-truc.net/post-0734.html
+diff --git a/gfx/wr/webrender/src/renderer/composite.rs b/gfx/wr/webrender/src/renderer/composite.rs
+index 4fc1b00049..1c2148b96b 100644
+--- a/gfx/wr/webrender/src/renderer/composite.rs
++++ b/gfx/wr/webrender/src/renderer/composite.rs
+@@ -1507,7 +1507,14 @@ impl Renderer {
+                 // to determine the total_dirty_rect. The is used to determine what region we
+                 // render to, and is what we send to the compositor as the buffer damage region
+                 // (eg for KHR_partial_update).
+-                let total_dirty_rect = if draw_previous_partial_present_regions {
++                let total_dirty_rect = if draw_previous_partial_present_regions
++                    // GeckoW10m: RenderCompositorEGL's whole frames present
++                    // nothing for a frame that changed nothing, so nothing of
++                    // the earlier frames has to be drawn again into it.
++                    // Without this a video on its own layer would have the
++                    // whole screen composed, for nothing, on every frame.
++                    && !(cfg!(windows) && combined_dirty_rect.is_empty())
++                {
+                     combined_dirty_rect.union(&prev_frames_damage_rect.unwrap())
+                 } else {
+                     combined_dirty_rect
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index 38eaf139aa..592b84bc09 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -8740,6 +8740,16 @@
+   type: bool
+   value: true
+   mirror: once
++
++# Picture-cache tiles are redrawn only in the part that changed. False redraws
++# a changed tile whole -- a test for specks on Qualcomm's Direct3D driver,
++# which upstream saw from partial updates of render targets on other mobile
++# GPUs (Mali, PowerVR). Partial present, which is the screen and not the
++# tiles, is gfx.webrender.max-partial-present-rects.
++- name: gfx.webrender.gecko-w10m.tile-partial-update
++  type: bool
++  value: true
++  mirror: once
+ #endif
+ 
+ #if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)

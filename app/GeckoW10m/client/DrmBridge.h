@@ -24,6 +24,14 @@ class DrmBridge {
   // to a worker thread; replies come back through the reply function.
   static void OnMessage(const char* json);
   static void SetReply(void (*reply)(const char*));
+
+  // Whether the phone's back button has something to do in the browser: a
+  // prompt over the page, fullscreen, the address bar being edited, history
+  // in the selected tab, or a tab to close back to the tab that opened it.
+  // Chrome sends {"op":"nav.state",...,"take":true|false} whenever that
+  // changes (gecko_back_button in mobile-config-autoconfig.js); it is never
+  // answered. Read on the UI thread the moment Back is pressed.
+  static bool ChromeTakesBack();
 };
 
 }  // namespace gecko_w10m::client

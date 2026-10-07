@@ -85,6 +85,7 @@
     <ClCompile Include="MainPage.cpp" />
     <ClCompile Include="client\BrowserPreferences.cpp" />
     <ClCompile Include="client\CaptureConsent.cpp" />
+    <ClCompile Include="client\ClipboardBridge.cpp" />
     <ClCompile Include="client\FileBridge.cpp" />
     <ClCompile Include="client\SearchEngines.cpp" />
     <ClCompile Include="client\TabManager.cpp" />

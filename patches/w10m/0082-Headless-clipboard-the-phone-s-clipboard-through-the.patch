@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Wed, 7 Oct 2026 14:12:46 +0400
+Subject: [PATCH] Headless clipboard: the phone's clipboard through the shell
+
+The headless clipboard kept what was copied in memory only, so
+nothing copied in the browser reached another app and nothing copied
+there could be pasted here. A copy is now handed to the shell
+(gecko_w10m_set_clipboard_sink), which puts it on the phone's
+clipboard on its UI thread; the shell leaves the phone's text here
+when it changes (gecko_w10m_clipboard_phone_text), and the clipboard's
+next question takes it. Copies are numbered, so a reading begun before
+the browser's latest copy reached the phone cannot put older text back
+over it. Global clipboard only; text, with HTML going out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/headless/HeadlessClipboard.cpp | 153 ++++++++++++++++++++++++++
+ widget/headless/HeadlessClipboard.h   |   8 ++
+ 2 files changed, 161 insertions(+)
+
+diff --git a/widget/headless/HeadlessClipboard.cpp b/widget/headless/HeadlessClipboard.cpp
+index 02c6cdf851..100ccf3fd2 100644
+--- a/widget/headless/HeadlessClipboard.cpp
++++ b/widget/headless/HeadlessClipboard.cpp
+@@ -8,6 +8,74 @@
+ #include "nsComponentManagerUtils.h"
+ #include "nsISupportsPrimitives.h"
+ 
++#if defined(GECKO_W10M)
++#  include <atomic>
++
++#  include "mozilla/StaticMutex.h"
++#  include "mozilla/StaticPtr.h"
++#  include "nsLinebreakConverter.h"
++#  include "nsPrintfCString.h"
++
++extern "C" void GeckoW10mNote(const char* aText);
++
++// Windows 10 Mobile: the engine runs headless, so nsWidgetFactory.cpp hands
++// out this clipboard, and it kept what was copied in memory and nowhere else.
++// Copy and paste worked inside the browser, but nothing copied here reached
++// another app, and nothing copied there could be pasted here. The phone's
++// clipboard may only be used on the shell's UI thread, while a paste asks
++// synchronously on the engine's main thread, so neither side waits:
++//  - a copy here is handed to the shell (the sink), which puts it on the
++//    phone's clipboard on its UI thread a moment later;
++//  - the shell reads the phone's clipboard when it changes and whenever the
++//    app comes to the front, and leaves the text here
++//    (gecko_w10m_clipboard_phone_text); the clipboard's next question picks
++//    it up.
++// Each copy handed over is numbered. A reading carries the number of the last
++// copy the shell had put on the phone when it began, and one begun before the
++// browser's latest copy got there is dropped -- it would otherwise put the
++// older text back over that copy. UTF-16 both ways; HTML goes out with text.
++using GeckoW10mClipboardSink = void (*)(uint32_t aCopy, const wchar_t* aText,
++                                        const wchar_t* aHTML);
++static std::atomic<GeckoW10mClipboardSink> sGeckoW10mClipboardSink{nullptr};
++
++static mozilla::StaticMutex sGeckoW10mClipboardLock MOZ_UNANNOTATED;
++// The shell's last reading taken: the phone's text, or null for none.
++static mozilla::StaticAutoPtr<nsString> sGeckoW10mPhoneText;
++// One more for every reading taken.
++static uint32_t sGeckoW10mPhoneSerial = 0;
++// One more for every copy handed to the shell.
++static uint32_t sGeckoW10mCopy = 0;
++
++extern "C" __declspec(dllexport) void gecko_w10m_set_clipboard_sink(
++    GeckoW10mClipboardSink aSink) {
++  sGeckoW10mClipboardSink.store(aSink);
++  GeckoW10mNote(aSink ? "clipboard: the phone's, through the shell"
++                      : "clipboard: in memory only");
++}
++
++// From the shell, any thread. aAfterCopy: the copy the shell had last put on
++// the phone when it began this read. aText null: no text there.
++extern "C" __declspec(dllexport) void gecko_w10m_clipboard_phone_text(
++    uint32_t aAfterCopy, const wchar_t* aText) {
++  nsString* text = nullptr;
++  if (aText) {
++    text = new nsString(reinterpret_cast<const char16_t*>(aText));
++    // Windows ends lines in CR LF (and XAML's text boxes in a lone CR), the
++    // DOM in LF; nsClipboard.cpp converts the same way on the desktop.
++    nsLinebreakConverter::ConvertStringLineBreaks(
++        *text, nsLinebreakConverter::eLinebreakAny,
++        nsLinebreakConverter::eLinebreakContent);
++  }
++  mozilla::StaticMutexAutoLock lock(sGeckoW10mClipboardLock);
++  if (aAfterCopy != sGeckoW10mCopy) {
++    delete text;  // read before the browser's latest copy reached the phone
++    return;
++  }
++  sGeckoW10mPhoneText = text;
++  ++sGeckoW10mPhoneSerial;
++}
++#endif
++
+ namespace mozilla::widget {
+ 
+ NS_IMPL_ISUPPORTS_INHERITED0(HeadlessClipboard, nsBaseClipboard)
+@@ -63,15 +131,94 @@ HeadlessClipboard::SetNativeClipboardData(nsITransferable* aTransferable,
+                                     : clipboard->SetHTML(utf16string);
+   }
+ 
++#if defined(GECKO_W10M)
++  if (aWhichClipboard == nsIClipboard::kGlobalClipboard) {
++    GeckoW10mClipboardSink sink = sGeckoW10mClipboardSink.load();
++    const bool any = clipboard->HasText() || clipboard->HasHTML();
++    uint32_t copy = 0;
++    {
++      mozilla::StaticMutexAutoLock lock(sGeckoW10mClipboardLock);
++      // Whatever the shell read before this copy is older than it.
++      mGeckoW10mSeenSerial = sGeckoW10mPhoneSerial;
++      if (sink && any) {
++        copy = ++sGeckoW10mCopy;
++      }
++    }
++    if (copy) {
++      // nsStrings, so NUL-ended; the shell copies them before returning.
++      nsString text(clipboard->GetText()), html(clipboard->GetHTML());
++      sink(copy,
++           clipboard->HasText() ? static_cast<const wchar_t*>(text.get())
++                                : nullptr,
++           clipboard->HasHTML() ? static_cast<const wchar_t*>(html.get())
++                                : nullptr);
++      nsPrintfCString note("clipboard: copy %u, %u characters%s, to the phone's",
++                           copy, clipboard->HasText() ? text.Length() : 0u,
++                           clipboard->HasHTML() ? " with HTML" : "");
++      GeckoW10mNote(note.get());
++    }
++  }
++#endif
++
+   return NS_OK;
+ }
+ 
++#if defined(GECKO_W10M)
++void HeadlessClipboard::GeckoW10mTakePhoneText(ClipboardType aWhichClipboard) {
++  if (aWhichClipboard != nsIClipboard::kGlobalClipboard ||
++      !sGeckoW10mClipboardSink.load()) {
++    return;
++  }
++  bool hasText = false;
++  nsString text;
++  {
++    mozilla::StaticMutexAutoLock lock(sGeckoW10mClipboardLock);
++    if (sGeckoW10mPhoneSerial == mGeckoW10mSeenSerial) {
++      return;
++    }
++    mGeckoW10mSeenSerial = sGeckoW10mPhoneSerial;
++    if (sGeckoW10mPhoneText) {
++      hasText = true;
++      text = *sGeckoW10mPhoneText;
++    }
++  }
++  auto& clipboard = mClipboards[aWhichClipboard];
++  if (!hasText && !clipboard->HasText()) {
++    // Nothing on the phone and nothing here; or a copy of only HTML made
++    // here, which the phone shows as no text -- ours, so it stays.
++    return;
++  }
++  if (hasText && clipboard->HasText()) {
++    // What was copied here, back from the phone: keep it, and the HTML
++    // that went with it. Line ends aside.
++    nsAutoString ours(clipboard->GetText()), theirs(text);
++    ours.StripChar(u'\r');
++    theirs.StripChar(u'\r');
++    if (ours == theirs) {
++      return;
++    }
++  }
++  // Another app copied something since: that is what Paste gives now. The
++  // change count moves, so nsBaseClipboard drops what it knew of our copy.
++  clipboard->Clear();
++  if (hasText) {
++    clipboard->SetText(text);
++  }
++  nsPrintfCString note("clipboard: the phone's changed, %u characters taken",
++                       hasText ? text.Length() : 0u);
++  GeckoW10mNote(note.get());
++}
++#endif
++
+ mozilla::Result<nsCOMPtr<nsISupports>, nsresult>
+ HeadlessClipboard::GetNativeClipboardData(const nsACString& aFlavor,
+                                           ClipboardType aWhichClipboard,
+                                           uint64_t aThreshold) {
+   MOZ_DIAGNOSTIC_ASSERT(
+       nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
++#if defined(GECKO_W10M)
++  GeckoW10mTakePhoneText(aWhichClipboard);
++#endif
+ 
+   auto& clipboard = mClipboards[aWhichClipboard];
+   MOZ_ASSERT(clipboard);
+@@ -116,6 +263,9 @@ HeadlessClipboard::GetNativeClipboardSequenceNumber(
+     ClipboardType aWhichClipboard) {
+   MOZ_DIAGNOSTIC_ASSERT(
+       nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
++#if defined(GECKO_W10M)
++  GeckoW10mTakePhoneText(aWhichClipboard);
++#endif
+   auto& clipboard = mClipboards[aWhichClipboard];
+   MOZ_ASSERT(clipboard);
+   return clipboard->GetChangeCount();
+@@ -127,6 +277,9 @@ HeadlessClipboard::HasNativeClipboardDataMatchingFlavors(
+     const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard) {
+   MOZ_DIAGNOSTIC_ASSERT(
+       nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
++#if defined(GECKO_W10M)
++  GeckoW10mTakePhoneText(aWhichClipboard);
++#endif
+ 
+   auto& clipboard = mClipboards[aWhichClipboard];
+   MOZ_ASSERT(clipboard);
+diff --git a/widget/headless/HeadlessClipboard.h b/widget/headless/HeadlessClipboard.h
+index d6a717b42c..e175c8b97b 100644
+--- a/widget/headless/HeadlessClipboard.h
++++ b/widget/headless/HeadlessClipboard.h
+@@ -36,6 +36,14 @@ class HeadlessClipboard final : public nsBaseClipboard {
+       ClipboardType aWhichClipboard) override;
+ 
+  private:
++#if defined(GECKO_W10M)
++  // Takes what the shell last read from the phone's clipboard, if that
++  // changed since the last look. Main thread; the global clipboard only.
++  void GeckoW10mTakePhoneText(ClipboardType aWhichClipboard);
++  // The shell's reading this clipboard last took (or set aside as older
++  // than a copy made here).
++  uint32_t mGeckoW10mSeenSerial = 0;
++#endif
+   UniquePtr<HeadlessClipboardData>
+       mClipboards[nsIClipboard::kClipboardTypeCount];
+ };

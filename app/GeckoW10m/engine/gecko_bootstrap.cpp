@@ -443,10 +443,19 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // gives up on a slow start and kills the app -- which one device log shows
   // happening twice, followed by "hardware compositing is off -- Crashed
   // during startup in a previous session" on every launch after. There is no
-  // crash reporter here to tell a kill from a crash, so the guard is off. The
-  // variable is read through the CRT, which the shell and xul share.
-  ::_putenv_s("MOZ_DISABLE_CRASH_GUARD", "1");
-  Log("bootstrap: graphics crash guards are off");
+  // crash reporter here to tell a kill from a crash, so the guard is off.
+  // Through SetEngineEnvironment: ::_putenv_s set it in the shell's own
+  // runtime, which xul.dll never reads, and the engine's log went on showing
+  // the variable empty.
+  SetEngineEnvironment(L"MOZ_DISABLE_CRASH_GUARD", L"1");
+  // Firefox's automatic Safe Mode, for the same reason and more: it counts a
+  // launch ended in its first minute as a startup crash -- a kill, or the
+  // phone ending a suspended app, counts -- and after three it quits so as to
+  // restart in Safe Mode, which an app on the phone cannot do. The quit was
+  // all that happened, at every launch, until six hours passed without one.
+  // toolkit.startup.max_resumed_crashes is -1 as well (tools/build-appx.sh).
+  SetEngineEnvironment(L"MOZ_DISABLE_AUTO_SAFE_MODE", L"1");
+  Log("bootstrap: graphics crash guards and automatic Safe Mode are off");
 
   Log("bootstrap: XRE_main with " + appIni);
   int rc = bootstrap->XRE_main(static_cast<int>(argv.size()) - 1, argv.data(),

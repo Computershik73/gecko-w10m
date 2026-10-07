@@ -114,7 +114,7 @@ STAGE_W="$(cygpath -w "$STAGE")"
 OBJDIR_W="$(cygpath -w "$OUT/obj")"
 
 echo "=== compile the shell (cl.exe, ARM, C++/WinRT) ==="
-SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/CaptureConsent.cpp client/DrmBridge.cpp client/EngineView.cpp client/FileBridge.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/OverlayProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
+SRCS="pch.cpp App.cpp MainPage.cpp client/BrowserPreferences.cpp client/CaptureConsent.cpp client/ClipboardBridge.cpp client/DrmBridge.cpp client/EngineView.cpp client/FileBridge.cpp client/Log.cpp client/SearchEngines.cpp client/TabManager.cpp engine/CrashProbe.cpp engine/OverlayProbe.cpp engine/GeckoEngine.cpp engine/GeckoRuntimeHost.cpp engine/gecko_capi_stub.cpp"
 OBJS=""
 for s in $SRCS; do
   name="$(echo "$s" | tr '/' '_' | sed 's/\.cpp$/.obj/')"
@@ -378,6 +378,13 @@ pref("gecko.debug.verbose_logs", false);
 // button still goes to the home page above; startup just does not wait for
 // the network. (1 to start on the home page again.)
 pref("browser.startup.page", 0);
+// Firefox's automatic Safe Mode is off. It counts a launch that ends in its
+// first minute as a startup crash -- here a kill during a slow start, or the
+// phone ending a suspended app, counts -- and after three it quits so as to
+// restart in Safe Mode. An app on the phone cannot start itself again, so the
+// quit was all that happened, at every launch, until six hours passed without
+// one: the browser seemed to hang on start as if its profile were broken.
+pref("toolkit.startup.max_resumed_crashes", -1);
 // On a brand new profile Firefox skips the home page on purpose, because it
 // normally shows its onboarding tour instead -- and that is off here, so the
 // first launch after installing landed on about:blank. Do not skip it.
@@ -488,6 +495,30 @@ pref("dom.meta-viewport.enabled", true);
 pref("apz.allow_zooming", true);
 pref("apz.allow_double_tap_zooming", true);
 pref("ui.touch.radius.enabled", true);
+// The touch radius had kept the desktop defaults -- 12 mm above the finger, 8
+// to either side -- and it decides where touchstart, pointerdown and (through
+// implicit capture) every later touch and pointer event of that finger go. A
+// page that draws clickable marks where you tap, a captcha asking for figures
+// in order, got its later taps pulled onto the marks already there. Firefox
+// for Android's values, as for the mouse below.
+pref("ui.touch.radius.topmm", 2);
+pref("ui.touch.radius.rightmm", 3);
+pref("ui.touch.radius.bottommm", 2);
+pref("ui.touch.radius.leftmm", 3);
+// A fling no faster than a finger goes: Firefox for Android's ceiling, about
+// 35 device pixels a millisecond here. Moves that waited behind a loading
+// page used to reach APZ in a burst and read as a flick fast enough to reach
+// the bottom of a feed; they now carry the time they were made
+// (gecko_w10m_input_touch), and this bounds whatever error is left.
+pref("apz.max_velocity_inches_per_ms", "0.07");
+// No Escape key to hold on a phone, as on Firefox for Android: a page that
+// locks the keyboard in fullscreen would otherwise keep the back button from
+// taking it out.
+pref("dom.fullscreen.keyboard_lock.enabled", false);
+// The back button closes a tab a page opened and goes back to the tab that
+// opened it, once the opened tab has no history of its own (gecko_back_button
+// in mobile-config-autoconfig.js).
+pref("gecko.back.closes_opened_tab", true);
 // The same for the click a tap becomes: without it a tap must land inside the
 // element, and desktop-sized controls -- a menu item, the buttons of a dialog
 // in the settings -- are a few millimetres tall at this density. These are
@@ -606,13 +637,16 @@ pref("toolkit.telemetry.archive.enabled", false);
 // feature reported "Disabled by GPU Process disabled". allow-in-parent is the
 // switch upstream added for exactly this case; force-enabled is again for the
 // blocklist, which does not know this GPU.
-// Partial present: WebRender redraws only what changed and trusts the swap
-// chain to have kept the rest. On this ANGLE-on-D3D11 chain what comes back is
-// not always what was left there -- the log shows frames rendered with one
-// dirty rect, and the leftovers show up as specks of an older frame, white
-// dots scattered over a dark photograph. Redrawing the whole frame costs fill
-// rate this GPU can spare more easily than it can spare being wrong.
-pref("gfx.webrender.max-partial-present-rects", 0);
+// Partial present: WebRender redraws and presents only what changed, which is
+// what keeps scrolling and video cheap here, and it stays on. 0 is whole
+// frames (RenderCompositorEGL.cpp), a comparison to make in about:config --
+// restart after changing it -- when looking for specks on a page. The white
+// specks once blamed on partial present were seen while every frame was drawn
+// and presented whole (ANGLE has no buffer age), so it is not the cause it was
+// taken for; with verbose logs on the background under the page is magenta,
+// which tells see-through pixels from drawn ones, and
+// gfx.webrender.gecko-w10m.tile-partial-update is the other comparison.
+pref("gfx.webrender.max-partial-present-rects", 1);
 pref("gfx.webrender.allow-partial-present-buffer-age", false);
 
 // The sidebar's launcher strip is off. It is the vertical bar down the left

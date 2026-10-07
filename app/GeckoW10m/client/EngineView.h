@@ -139,6 +139,11 @@ class EngineView {
   void FollowTextInput();
   // Tells the engine how much room the picture has, whenever that changes.
   void PushSize();
+  // On the hardware path the image above the panel shows only the layer of
+  // menus and dialogs: it is made to show it where the engine has it, one
+  // device pixel a pixel from the panel's corner, and to take no fingers.
+  void PlaceLayer();
+  bool layerPlaced_ = false;
   // Runs work on a later turn of the UI loop, never inside the handler that
   // asked for it.
   static void PostToUi(std::function<void()> work);
@@ -220,6 +225,9 @@ class EngineView {
     int32_t y;
     int32_t startX;
     int32_t startY;
+    // When it went down: a press of half a second or more is a long press to
+    // the engine (a context menu, no click), and the tap line says so.
+    unsigned long long downAt;
   };
   std::vector<Finger> fingers_;
   Finger* FindFinger(uint32_t id);

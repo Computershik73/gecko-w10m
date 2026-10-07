@@ -588,6 +588,37 @@ void DumpObject(const wchar_t* tag, uintptr_t at, size_t bytes) {
   Log::FlushFromFault();
 }
 
+// A deliberate crash -- MOZ_CRASH, MOZ_RELEASE_ASSERT -- leaves its reason in
+// mozglue's exported gMozCrashReason before it stops the process: the one
+// line that names such a crash without symbols. Nothing when it is unset.
+void LogCrashReason(const wchar_t* tag) {
+  HMODULE glue = ::GetModuleHandleW(L"mozglue.dll");
+  const auto* slot =
+      glue ? reinterpret_cast<const char* const*>(
+                 ::GetProcAddress(glue, "gMozCrashReason"))
+           : nullptr;
+  const char* reason = slot ? *slot : nullptr;
+  if (!reason) {
+    return;
+  }
+  // No IsBadStringPtr in an app container; the page is checked instead, and
+  // the string read no further than the end of it.
+  MEMORY_BASIC_INFORMATION page = {};
+  if (!::VirtualQuery(reason, &page, sizeof(page)) ||
+      page.State != MEM_COMMIT ||
+      (page.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+    return;
+  }
+  const char* end =
+      static_cast<const char*>(page.BaseAddress) + page.RegionSize;
+  size_t length = 0;
+  while (reason + length < end && length < 400 && reason[length]) {
+    ++length;
+  }
+  Log::WriteFromFault(std::wstring(tag) + L" reason: " +
+                      Widen(std::string(reason, length).c_str()));
+}
+
 LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
   if (!IsFatal(code)) return EXCEPTION_CONTINUE_SEARCH;
@@ -617,6 +648,7 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
                                                          : L""));
   LogMemory(L"first-chance:");
   LogAddressSpace(L"first-chance:");
+  LogCrashReason(L"first-chance:");
   if (gProbeDevice) {
     Log::WriteFromFault(L"first-chance: gpu device removed reason " +
                         Hex(static_cast<uintptr_t>(gProbeDevice->GetDeviceRemovedReason())));
@@ -1614,6 +1646,7 @@ LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS info) {
              L" at " + DescribeAddress(info->ExceptionRecord->ExceptionAddress) +
              FaultDetail(*info->ExceptionRecord));
   LogMemory(L"FATAL:");
+  LogCrashReason(L"FATAL:");
   Log::WriteFromFault(L"FATAL: code" + Registers(*info->ContextRecord));
   Log::WriteFromFault(L"FATAL: at pc " +
              CodeAt(info->ExceptionRecord->ExceptionAddress));

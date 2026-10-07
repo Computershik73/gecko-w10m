@@ -84,51 +84,56 @@ void OnRequest(uint32_t id, int32_t kind) {
     Answer(id, kind, true, L"no UI thread to ask on, left to the device");
     return;
   }
-  gUi.RunAsync(
-      winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [id, kind]() {
-        try {
-          const auto status =
-              DeviceAccessInformation::CreateFromDeviceClass(ClassFor(kind))
-                  .CurrentStatus();
-          if (status == DeviceAccessStatus::DeniedByUser) {
-            // Turned off for this app in Settings: the only place it can be
-            // turned back on, so that is where the user is taken.
-            winrt::Windows::System::Launcher::LaunchUriAsync(
-                winrt::Windows::Foundation::Uri(
-                    kind == kCamera ? L"ms-settings:privacy-webcam"
-                                    : L"ms-settings:privacy-microphone"));
-            Answer(id, kind, false, L"off in Settings, opened them");
-            return;
+  // From engine code built without exceptions: nothing may be thrown back.
+  try {
+    gUi.RunAsync(
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [id, kind]() {
+          try {
+            const auto status =
+                DeviceAccessInformation::CreateFromDeviceClass(ClassFor(kind))
+                    .CurrentStatus();
+            if (status == DeviceAccessStatus::DeniedByUser) {
+              // Turned off for this app in Settings: the only place it can be
+              // turned back on, so that is where the user is taken.
+              winrt::Windows::System::Launcher::LaunchUriAsync(
+                  winrt::Windows::Foundation::Uri(
+                      kind == kCamera ? L"ms-settings:privacy-webcam"
+                                      : L"ms-settings:privacy-microphone"));
+              Answer(id, kind, false, L"off in Settings, opened them");
+              return;
+            }
+            MediaCaptureInitializationSettings settings;
+            settings.StreamingCaptureMode(kind == kCamera
+                                              ? StreamingCaptureMode::Video
+                                              : StreamingCaptureMode::Audio);
+            MediaCapture capture;
+            capture.InitializeAsync(settings).Completed(
+                [id, kind, capture](IAsyncAction const& op, AsyncStatus done) {
+                  try {
+                    capture.Close();
+                  } catch (...) {
+                  }
+                  if (done == AsyncStatus::Completed) {
+                    Answer(id, kind, true, L"");
+                    return;
+                  }
+                  const HRESULT code = op.ErrorCode();
+                  wchar_t text[64];
+                  swprintf_s(text, L"MediaCapture said 0x%08x",
+                             static_cast<unsigned>(code));
+                  // Only a refusal is final. Anything else -- the capture
+                  // pipeline itself unhappy -- is left to the engine's own
+                  // WASAPI capture to try.
+                  Answer(id, kind, code != E_ACCESSDENIED, text);
+                });
+          } catch (winrt::hresult_error const& error) {
+            Answer(id, kind, error.code() != E_ACCESSDENIED,
+                   std::wstring(error.message()));
           }
-          MediaCaptureInitializationSettings settings;
-          settings.StreamingCaptureMode(kind == kCamera
-                                            ? StreamingCaptureMode::Video
-                                            : StreamingCaptureMode::Audio);
-          MediaCapture capture;
-          capture.InitializeAsync(settings).Completed(
-              [id, kind, capture](IAsyncAction const& op, AsyncStatus done) {
-                try {
-                  capture.Close();
-                } catch (...) {
-                }
-                if (done == AsyncStatus::Completed) {
-                  Answer(id, kind, true, L"");
-                  return;
-                }
-                const HRESULT code = op.ErrorCode();
-                wchar_t text[64];
-                swprintf_s(text, L"MediaCapture said 0x%08x",
-                           static_cast<unsigned>(code));
-                // Only a refusal is final. Anything else -- the capture
-                // pipeline itself unhappy -- is left to the engine's own
-                // WASAPI capture to try.
-                Answer(id, kind, code != E_ACCESSDENIED, text);
-              });
-        } catch (winrt::hresult_error const& error) {
-          Answer(id, kind, error.code() != E_ACCESSDENIED,
-                 std::wstring(error.message()));
-        }
-      });
+        });
+  } catch (...) {
+    Answer(id, kind, true, L"could not reach the UI thread, left to the device");
+  }
 }
 
 }  // namespace
