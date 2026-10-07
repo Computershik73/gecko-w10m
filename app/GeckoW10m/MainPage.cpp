@@ -413,8 +413,6 @@ void MainPage::ApplyVisibleBounds() {
         client::ClipboardWindowVisible(e.Visible());
         if (e.Visible()) {
           client::Log::Write(L"window: visible");
-          // Another app may have copied something while we were away.
-          client::RefreshClipboard(L"visible again");
           // Back from the background: the keyboard that was up when the app
           // left is gone, and nobody said so.
           if (engineView_) {
@@ -458,7 +456,7 @@ void MainPage::ApplyVisibleBounds() {
         // The phone lets the app in front read its clipboard; this is when it
         // is in front again.
         if (which != CoreWindowActivationState::Deactivated) {
-          client::RefreshClipboard(L"activated");
+          client::ClipboardWindowActivated();
         }
       });
 

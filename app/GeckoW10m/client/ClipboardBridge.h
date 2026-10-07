@@ -26,10 +26,11 @@ namespace gecko_w10m::client {
 void InstallClipboardBridge(HMODULE xul,
                             winrt::Windows::UI::Core::CoreDispatcher const& ui);
 
-// Reads the phone's clipboard again, on the UI thread; why goes in the log.
-// For the app coming back to the front, where another app may have copied
-// something meanwhile. Does nothing before the bridge is installed.
-void RefreshClipboard(const wchar_t* why);
+// The app's window was activated: the phone's clipboard is read then, and
+// never before the first activation -- asked for earlier, it held the UI
+// thread for good. Another app may have copied something meanwhile. Does
+// nothing before the bridge is installed. UI thread.
+void ClipboardWindowActivated();
 
 // The app's window went out of sight or came back. Only while it is out of
 // sight can another app copy anything, so a browser copy the phone refused
