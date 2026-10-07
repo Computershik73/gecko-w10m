@@ -6,13 +6,15 @@
 // engine's paste asks synchronously on its own main thread, so neither side
 // waits for the other (widget/headless/HeadlessClipboard.cpp):
 //  - a copy in the browser comes here and is put on the phone's clipboard;
-//  - the phone's clipboard is read when it changes and whenever the app is
-//    activated, and the text left with the engine for its next paste.
-// Every call into the phone's clipboard runs on a thread of its own, never
-// on the UI thread: on the phone the first such call did not come back, and
-// on the UI thread that kept the browser from starting at all. Text, and HTML
-// with it when the browser copied some; the logs give sizes only, never what
-// was copied.
+//  - the phone's clipboard is read when the app is activated, when a field
+//    is about to be typed into, and once the engine has drawn, and the text
+//    is left with the engine for its next paste.
+// ContentChanged is never used: on the phone it waited on Gecko's thread for
+// good, and on the UI thread that kept the browser from starting. Reads and
+// writes run on a single-threaded apartment of our own, or on the UI thread
+// if the phone refuses them there; a way that ever hangs is not used again in
+// that build. Text, and HTML with it when the browser copied some; the logs
+// give sizes only, never what was copied.
 #pragma once
 
 #include <windows.h>
@@ -22,20 +24,24 @@
 namespace gecko_w10m::client {
 
 // Resolves the engine's entry points in xul and installs the shell's side.
-// Safe to call more than once; does nothing after the first success. If the
-// last launch never heard back from the phone's clipboard, the engine keeps
-// its own clipboard for this one.
+// Safe to call more than once; does nothing after the first success.
 void InstallClipboardBridge(HMODULE xul,
                             winrt::Windows::UI::Core::CoreDispatcher const& ui);
 
-// The app's window was activated: the phone's clipboard is read then (on
-// the clipboard's own thread), and never before the first activation.
-// Another app may have copied something meanwhile.
-void ClipboardWindowActivated();
+// The engine drew its first frame: nothing touches the phone's clipboard
+// before, so it can never keep the browser from starting.
+void ClipboardEngineDrawing();
 
-// The app's window went out of sight or came back. Only while it is out of
-// sight can another app copy anything, so a browser copy the phone refused
-// before that is not put back over what may be there now.
+// The app's window was activated (true) or deactivated (false). The phone's
+// clipboard is read on activation -- another app may have copied something
+// meanwhile -- and a copy it refused while we were not in front is put on it.
+void ClipboardWindowActivated(bool active);
+
+// The app's window went out of sight or came back. Out of sight another app
+// may copy, so a browser copy not yet on the phone is let go.
 void ClipboardWindowVisible(bool visible);
+
+// Reads the phone's clipboard again, for a field about to be typed into.
+void ClipboardRefresh(const wchar_t* why);
 
 }  // namespace gecko_w10m::client

@@ -346,6 +346,9 @@ MainPage::MainPage() {
     // Drawing is the only proof the engine started; anything short of it could
     // be a launch that is about to die.
     engine::MarkGeckoHealthy(state);
+    // Not a moment before: nothing about the clipboard may stand between the
+    // launch and the first frame.
+    client::ClipboardEngineDrawing();
   });
   engineView_->Start();
 
@@ -453,11 +456,10 @@ void MainPage::ApplyVisibleBounds() {
                 : (which == CoreWindowActivationState::PointerActivated
                        ? L"window: activated by a pointer"
                        : L"window: activated"));
-        // The phone lets the app in front read its clipboard; this is when it
-        // is in front again.
-        if (which != CoreWindowActivationState::Deactivated) {
-          client::ClipboardWindowActivated();
-        }
+        // The phone lets the app in front use its clipboard; this is when it
+        // is in front again, or no longer.
+        client::ClipboardWindowActivated(
+            which != CoreWindowActivationState::Deactivated);
       });
 
   }

@@ -988,6 +988,10 @@ void EngineView::FollowTextInput() {
   }
   lastTextSerial_ = serial;
   typing_ = wants;
+  if (wants) {
+    // Someone may be about to paste: what the phone's clipboard holds now.
+    ClipboardRefresh(L"a field took the focus");
+  }
 
   auto pane = InputPane::GetForCurrentView();
   if (wants) {
