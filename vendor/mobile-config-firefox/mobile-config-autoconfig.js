@@ -308,7 +308,13 @@ function gecko_note_memory(when) {
         };
         Services.console.logStringMessage(
             "gecko: memory (" + when + "): resident " + read("resident") +
-            ", virtual " + read("vsize") + ", heap " + read("heapAllocated") +
+            ", virtual " + read("vsize") +
+            // The 32-bit address space runs out in pieces long before it
+            // runs out in total; this is the biggest one left. A walk of the
+            // whole address space, so not for every pressure notice.
+            (when === "under pressure" ? "" :
+                ", largest free piece " + read("vsizeMaxContiguous")) +
+            ", heap " + read("heapAllocated") +
             ", js gc heap " + read("JSMainRuntimeGCHeap") +
             ", images " + read("imagesContentUsedUncompressed") +
             ", ghost windows " + (mgr.ghostWindows ?? "?"));
@@ -1462,6 +1468,144 @@ function gecko_watch_fullscreen() {
     }, "domwindowopened");
 }
 
+// What the network did for the pages, in a few lines a page, so a log says
+// whether a page that never came was the network's doing or the browser's
+// -- with no verbose logging, which writes thousands of lines and slows the
+// phone. Written: every top-level document; every request that failed (not
+// the ones cancelled or redirected), answered 400 or worse, or took over ten
+// seconds, with where its time went; and every fifteen seconds, requests
+// still waiting after fifteen, grouped by host. At most 25 lines a page.
+// Hosts and paths only: no query strings, headers or bodies.
+// gecko.log.network = false turns it off.
+function gecko_note_network() {
+    if (!Services.prefs.getBoolPref("gecko.log.network", true)) {
+        return;
+    }
+    const note = m => Services.console.logStringMessage("gecko: net: " + m);
+    const get = (f, d) => { try { return f(); } catch (e) { return d; } };
+    const SKIP = new Set([Cr.NS_BINDING_REDIRECTED, Cr.NS_BINDING_RETARGETED,
+                          Cr.NS_BINDING_ABORTED]);
+    // Pages' own requests only: the browser's are made by the system
+    // principal; a top-level document has no loading principal at all.
+    const web = ch => {
+        const p = get(() => ch.loadInfo.loadingPrincipal, null);
+        return !p || !p.isSystemPrincipal;
+    };
+    const isDoc = ch => get(() => ch.loadInfo.externalContentPolicyType ===
+                                  Ci.nsIContentPolicy.TYPE_DOCUMENT, false);
+    // A page is named by its host alone -- the log is a file people send, and
+    // a path can carry a token or say what was read. A resource keeps its
+    // path, without the query: that is what tells /api/.../login from a font.
+    const where = (ch, doc) => get(() => doc ? ch.URI.host
+                                             : ch.URI.host + ch.URI.filePath.slice(0, 60), "?");
+    // Lines per tab, by its top-level browsing context: requests from an
+    // iframe count against the page around it.
+    const top = ch => get(() => ch.loadInfo.browsingContext.top.id, 0);
+    const budget = new Map();
+    const spend = ch => {
+        const id = top(ch);
+        const used = budget.get(id) || 0;
+        if (used >= 25) {
+            return false;
+        }
+        budget.set(id, used + 1);
+        return true;
+    };
+    const pending = new Map();  // channel -> [opened ms, host/path, reported]
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const ch = subject.QueryInterface(Ci.nsIHttpChannel);
+                if (isDoc(ch)) {
+                    budget.set(top(ch), 0);  // a new page in this tab
+                    if (budget.size > 64) {
+                        budget.clear();
+                    }
+                }
+            } catch (e) {}
+        }
+    }, "http-on-modify-request");
+    // Timed from just before it connects: a channel handed over before that
+    // -- an upgrade to https, an add-on's redirect -- never stops, and timed
+    // from the earlier notification it stayed "waiting" for good.
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const ch = subject.QueryInterface(Ci.nsIHttpChannel);
+                if (!web(ch) || pending.size >= 2000) {
+                    return;
+                }
+                pending.set(ch, [Date.now(), where(ch, isDoc(ch)), false]);
+            } catch (e) {}
+        }
+    }, "http-on-before-connect");
+    Services.obs.addObserver({
+        observe(subject) {
+            try {
+                const ch = subject.QueryInterface(Ci.nsIHttpChannel);
+                const started = pending.get(ch);
+                pending.delete(ch);
+                if (!web(ch)) {
+                    return;
+                }
+                const doc = isDoc(ch);
+                const st = ch.status;
+                const failed = !Components.isSuccessCode(st) && (doc || !SKIP.has(st));
+                const http = get(() => ch.responseStatus, 0);
+                const ms = started ? Date.now() - started[0] : -1;
+                if (!(doc || failed || http >= 400 || ms > 10000) || !spend(ch)) {
+                    return;
+                }
+                const t = ch.QueryInterface(Ci.nsITimedChannel);
+                const span = (a, b) => a && b && b >= a ? Math.round((b - a) / 1000) + " ms" : "-";
+                note((doc ? "page " : "") + ch.requestMethod + " " + where(ch, doc) + " -> " +
+                     (failed ? ChromeUtils.getXPCOMErrorName(st) : "HTTP " + http) +
+                     " in " + ms + " ms, " + get(() => ch.protocolVersion, "?") + ", " +
+                     Math.round(get(() => ch.transferSize, 0) / 1024) + " KB; dns " +
+                     span(t.domainLookupStartTime, t.domainLookupEndTime) + ", connect " +
+                     span(t.connectStartTime, t.connectEndTime) + ", first byte " +
+                     span(t.requestStartTime, t.responseStartTime) + ", body " +
+                     span(t.responseStartTime, t.responseEndTime));
+            } catch (e) {}
+        }
+    }, "http-on-stop-request");
+    // Waiting requests, every fifteen seconds while there are any.
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback({
+        notify() {
+            try {
+                const now = Date.now();
+                const byHost = new Map();
+                for (const [ch, entry] of pending) {
+                    // Handed over or cancelled without a stop: not waiting.
+                    if (!Components.isSuccessCode(get(() => ch.status, 0))) {
+                        pending.delete(ch);
+                        continue;
+                    }
+                    if (now - entry[0] < 15000 || entry[2]) {
+                        continue;
+                    }
+                    entry[2] = true;  // reported once
+                    const host = entry[1].split("/")[0];
+                    const h = byHost.get(host) || { count: 0, oldest: 0, path: "" };
+                    h.count++;
+                    if (now - entry[0] > h.oldest) {
+                        h.oldest = now - entry[0];
+                        h.path = entry[1];
+                    }
+                    byHost.set(host, h);
+                }
+                for (const [host, h] of byHost) {
+                    note("waiting: " + h.count + " request(s) to " + host +
+                         " over 15 s, the oldest " + Math.round(h.oldest / 1000) +
+                         " s (" + h.path + ")");
+                }
+            } catch (e) {}
+        }
+    }, 15000, Ci.nsITimer.TYPE_REPEATING_SLACK);
+    gecko_note_network.timer = timer;  // kept alive
+}
+
 // The phone's back button. The shell has to answer a press at once --
 // handled, or left to the phone, which puts the app in the background -- so
 // it cannot ask. Chrome tells it instead, whenever the answer changes,
@@ -1672,6 +1816,7 @@ try {
     gecko_watch_app_state();
     gecko_watch_fullscreen();
     gecko_back_button();
+    gecko_note_network();
     gecko_h264ify();
     gecko_desktop_sites();
     gecko_note_downloads();

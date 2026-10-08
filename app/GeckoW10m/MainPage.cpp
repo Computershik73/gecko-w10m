@@ -5,6 +5,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Display.h>
+#include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.System.Diagnostics.h>
 
 #include <atomic>
@@ -100,6 +101,63 @@ MainPage::MainPage() {
                  : L"logs: quiet (Settings > About > Verbose logs for debugging "
                    L"turns the diagnostics on at the next launch)");
   std::thread([] { Log::Mirror(); }).detach();
+
+  // Which connections the phone has and which one carries the internet, at
+  // start and whenever that changes: whether a page that never came was the
+  // network's fault -- a VPN down, or not covering the app -- or the
+  // browser's needs this, and nothing else in the log says it. A VPN shows
+  // as a connection with internet access over a tunnel or PPP adapter (IANA
+  // types 131 and 23). Off the UI thread; nothing here may hold it.
+  std::thread([] {
+    using namespace winrt::Windows::Networking::Connectivity;
+    auto describe = [](const wchar_t* when) {
+      try {
+        // Kinds only, never names: a Wi-Fi name says where the phone is,
+        // and this log is a file people send.
+        std::wstring line = std::wstring(L"net: ") + when + L" --";
+        auto internet = NetworkInformation::GetInternetConnectionProfile();
+        auto internetAdapter = internet ? internet.NetworkAdapter() : nullptr;
+        const winrt::guid internetId =
+            internetAdapter ? internetAdapter.NetworkAdapterId() : winrt::guid{};
+        bool any = false;
+        for (auto const& profile : NetworkInformation::GetConnectionProfiles()) {
+          const auto level = profile.GetNetworkConnectivityLevel();
+          if (level == NetworkConnectivityLevel::None) {
+            continue;
+          }
+          any = true;
+          auto adapter = profile.NetworkAdapter();
+          const uint32_t iana = adapter ? adapter.IanaInterfaceType() : 0;
+          const bool carries = internetAdapter && adapter &&
+                               adapter.NetworkAdapterId() == internetId;
+          line += std::wstring(L" ") +
+                  (profile.IsWlanConnectionProfile()   ? L"Wi-Fi"
+                   : profile.IsWwanConnectionProfile() ? L"cellular"
+                   : iana == 131 || iana == 23         ? L"VPN"
+                                                       : L"type " + std::to_wstring(iana)) +
+                  (level == NetworkConnectivityLevel::InternetAccess
+                       ? L" (internet"
+                       : L" (local only") +
+                  (carries ? L", carries the internet)" : L")");
+        }
+        if (!any) {
+          line += L" no connection";
+        }
+        Log::Write(line);
+      } catch (winrt::hresult_error const& error) {
+        Log::Write(L"net: the connections could not be read",
+                   std::wstring(error.message()));
+      }
+    };
+    describe(L"at start");
+    try {
+      NetworkInformation::NetworkStatusChanged(
+          [describe](auto&&) { describe(L"changed"); });
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"net: the phone will not say when connections change",
+                 std::wstring(error.message()));
+    }
+  }).detach();
 
   // The number every memory question on this platform comes down to. A phone
   // does not give an app its RAM, it gives it a ceiling set by the device's

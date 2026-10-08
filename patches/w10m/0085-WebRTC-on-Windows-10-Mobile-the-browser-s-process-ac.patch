@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 04:26:43 +0400
+Subject: [PATCH] WebRTC on Windows 10 Mobile: the browser's process actor is
+ in the parent
+
+Without content processes every web page lives in the parent process, and
+the BrowserProcess actor -- the one that turns getUserMedia:request,
+PeerConnection:request and the rest into a permission panel -- was
+registered for content processes only. JSProcessActorProtocol::Matches
+refused it in the parent, the notifications went nowhere, and a site that
+asked for the microphone got neither a prompt nor an answer: its promise
+never settled, and a call never got as far as an offer.
+
+includeParent follows browserTabsRemoteAutostart, so desktop Firefox with
+content processes is unchanged. The actor creates nothing on its own and
+has no parent half; with no content process the messages it sends go to the
+same window's parent actors.
+
+Notes for the log: what getUserMedia did with a request (allowed without
+asking, queued, asked, and the answer), and once per actor and topic, a
+process actor's notification dropped because the actor is not in the parent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../components/DesktopActorRegistry.sys.mjs   |  6 +++
+ dom/ipc/jsactor/JSProcessActorProtocol.cpp    | 22 +++++++++++
+ dom/media/MediaManager.cpp                    | 39 +++++++++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/browser/components/DesktopActorRegistry.sys.mjs b/browser/components/DesktopActorRegistry.sys.mjs
+index a452690518..428b230424 100644
+--- a/browser/components/DesktopActorRegistry.sys.mjs
++++ b/browser/components/DesktopActorRegistry.sys.mjs
+@@ -31,6 +31,12 @@ let JSPROCESSACTORS = {
+         "recording-window-ended",
+       ],
+     },
++    // Without content processes (Windows 10 Mobile runs single-process) web
++    // pages live in the parent process, and a process actor that is not
++    // included there never sees these notifications: getUserMedia never
++    // asked anyone and never settled, and RTCPeerConnection's offer and
++    // answer waited for good -- no microphone and no calls at all.
++    includeParent: !Services.appinfo.browserTabsRemoteAutostart,
+     safeForUntrustedWebProcess: true,
+   },
+ 
+diff --git a/dom/ipc/jsactor/JSProcessActorProtocol.cpp b/dom/ipc/jsactor/JSProcessActorProtocol.cpp
+index 08679cf708..d3b53bd2de 100644
+--- a/dom/ipc/jsactor/JSProcessActorProtocol.cpp
++++ b/dom/ipc/jsactor/JSProcessActorProtocol.cpp
+@@ -12,6 +12,10 @@
+ #include "mozilla/dom/JSProcessActorBinding.h"
+ #include "mozilla/dom/PContent.h"
+ #include "nsContentUtils.h"
++#if defined(GECKO_W10M)
++#  include "nsTHashSet.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
+ 
+ namespace mozilla::dom {
+ 
+@@ -69,6 +73,24 @@ JSProcessActorProtocol::FromWebIDLOptions(const nsACString& aName,
+ NS_IMETHODIMP JSProcessActorProtocol::Observe(nsISupports* aSubject,
+                                               const char* aTopic,
+                                               const char16_t* aData) {
++#if defined(GECKO_W10M)
++  // Without content processes a process actor that is not included in the
++  // parent never receives what it observes, and nothing says so: this is how
++  // getUserMedia went unanswered on Windows 10 Mobile. Said once per actor
++  // and topic.
++  if (XRE_IsParentProcess() && !mIncludeParent) {
++    static nsTHashSet<nsCString> sNoted;  // main thread only
++    nsAutoCString key(mName);
++    key.Append(' ');
++    key.Append(aTopic);
++    if (sNoted.EnsureInserted(key)) {
++      nsAutoCString note("jsactor: ");
++      note.Append(key);
++      note.AppendLiteral(" dropped -- the actor is not in the parent process");
++      GeckoW10mNote(note.get());
++    }
++  }
++#endif
+   MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+ 
+   RefPtr<JSActorManager> manager;
+diff --git a/dom/media/MediaManager.cpp b/dom/media/MediaManager.cpp
+index 07725888a4..a41bc8dcc4 100644
+--- a/dom/media/MediaManager.cpp
++++ b/dom/media/MediaManager.cpp
+@@ -144,6 +144,11 @@ class nsMainThreadPtrHolder<
+ #endif
+ };
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ 
+ LazyLogModule gMediaManagerLog("MediaManager");
+@@ -3362,18 +3367,41 @@ RefPtr<MediaManager::StreamPromise> MediaManager::GetUserMedia(
+                 self->AddTaskAndGetCount(windowID, callID, std::move(task));
+ 
+             if (!askPermission) {
++#if defined(GECKO_W10M)
++              GeckoW10mNote("gum: allowed without asking");
++#endif
+               self->NotifyAllowed(callID, *aDevices);
+             } else {
++#if defined(GECKO_W10M)
++              // Before the move below.
++              const size_t deviceCount = aDevices->Length();
++#endif
+               auto req = MakeRefPtr<GetUserMediaRequest>(
+                   window, callID, std::move(aDevices), c, isSecure,
+                   isHandlingUserInput);
+               if (!Preferences::GetBool("media.navigator.permission.force") &&
+                   taskCount > 1) {
++#if defined(GECKO_W10M)
++                GeckoW10mNote(nsPrintfCString("gum: queued behind %zu pending",
++                                              taskCount - 1)
++                                  .get());
++#endif
+                 // there is at least 1 pending gUM request
+                 // For the scarySources test case, always send the
+                 // request
+                 self->mPendingGUMRequest.AppendElement(req.forget());
+               } else {
++#if defined(GECKO_W10M)
++                // A request that is asked and never answered shows up as an
++                // "asking" line with no "answered" after it.
++                GeckoW10mNote(
++                    nsPrintfCString("gum: asking -- %s%s, %zu device(s), "
++                                    "user input %s",
++                                    hasAudio ? "audio" : "",
++                                    hasVideo ? " video" : "", deviceCount,
++                                    isHandlingUserInput ? "yes" : "no")
++                        .get());
++#endif
+                 nsCOMPtr<nsIObserverService> obs =
+                     services::GetObserverService();
+                 obs->NotifyObservers(req, "getUserMedia:request", nullptr);
+@@ -3601,6 +3629,9 @@ RefPtr<LocalDevicePromise> MediaManager::SelectAudioOutput(
+                 // there is at least 1 pending gUM request
+                 self->mPendingGUMRequest.AppendElement(req.forget());
+               } else {
++#if defined(GECKO_W10M)
++                GeckoW10mNote("gum: asking -- where to play sound");
++#endif
+                 nsCOMPtr<nsIObserverService> obs =
+                     services::GetObserverService();
+                 obs->NotifyObservers(req, "getUserMedia:request", nullptr);
+@@ -3976,6 +4007,9 @@ void MediaManager::Shutdown() {
+ void MediaManager::SendPendingGUMRequest() {
+   if (mPendingGUMRequest.Length() > 0) {
+     nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
++#if defined(GECKO_W10M)
++    GeckoW10mNote("gum: asking -- a request that was queued");
++#endif
+     obs->NotifyObservers(mPendingGUMRequest[0], "getUserMedia:request",
+                          nullptr);
+     mPendingGUMRequest.RemoveElementAt(0);
+@@ -4019,6 +4053,11 @@ nsresult MediaManager::Observe(nsISupports* aSubject, const char* aTopic,
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   MediaMgrError::Name gumNoAccessError = MediaMgrError::Name::NotAllowedError;
++#if defined(GECKO_W10M)
++  if (!strncmp(aTopic, "getUserMedia:response:", 22)) {
++    GeckoW10mNote(nsPrintfCString("gum: answered %s", aTopic + 22).get());
++  }
++#endif
+ 
+   if (!strcmp(aTopic, NS_PREFBRANCH_PREFCHANGE_TOPIC_ID)) {
+     nsCOMPtr<nsIPrefBranch> branch(do_QueryInterface(aSubject));
