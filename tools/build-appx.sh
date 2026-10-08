@@ -494,6 +494,12 @@ pref("dom.w3c_touch_events.enabled", 1);
 pref("dom.meta-viewport.enabled", true);
 pref("apz.allow_zooming", true);
 pref("apz.allow_double_tap_zooming", true);
+// Text on pages laid out for a desktop -- no meta viewport, 980 CSS px zoomed
+// out to the phone's width -- came out tiny. Font inflation, as Firefox for
+// Android does it: 120 twips (a twelfth of an inch on the glass) is the value
+// GeckoView sets when inflation is on. Pages made for phones (a viewport of
+// width=device-width) are left as they are, and so is text-size-adjust: none.
+pref("font.size.inflation.minTwips", 120);
 pref("ui.touch.radius.enabled", true);
 // The touch radius had kept the desktop defaults -- 12 mm above the finger, 8
 // to either side -- and it decides where touchstart, pointerdown and (through
