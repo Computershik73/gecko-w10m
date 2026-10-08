@@ -6,9 +6,15 @@ Usage:
     python tools/phone.py logs [--dir DIR]       # gecko.log, gecko-notes.log (readable while running)
     python tools/phone.py mem [--watch SEC] [--top N]
                                                  # memory of the browser, the phone and the GPU
+
+Over Wi-Fi, name the phone's portal (Settings > Update & security > For
+developers > Device Portal shows it), before the command:
+    python tools/phone.py --portal http://192.168.31.226 install
+or set GECKO_W10M_PORTAL. With two phones on USB only one gets the USB port.
 """
 import argparse
 import glob
+import http.cookiejar
 import json
 import os
 import subprocess
@@ -16,6 +22,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 PORTAL = os.environ.get("GECKO_W10M_PORTAL", "http://127.0.0.1:10080")
 PACKAGE_PREFIX = "Gecko_"
@@ -34,20 +41,48 @@ LOGS = [
 PORTAL_HTTPS = os.environ.get("GECKO_W10M_PORTAL_HTTPS", "https://127.0.0.1:10443")
 
 
-def get(endpoint, **params):
+# Never through a proxy: the phone is on this desk or this network, and a
+# proxy set for the PC (a VPN client's, say) cannot reach it. The cookies are
+# for the portal's CSRF token, which it wants back on every POST.
+def _opener():
     import ssl
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+        urllib.request.HTTPCookieProcessor(_COOKIES))
+
+
+_COOKIES = http.cookiejar.CookieJar()
+
+
+def _usb():
+    return urllib.parse.urlsplit(PORTAL).hostname in ("127.0.0.1", "localhost")
+
+
+def request(endpoint, data=None, method=None, headers=None, timeout=30, **params):
     global PORTAL
     query = endpoint + ("?" + urllib.parse.urlencode(params) if params else "")
-    unverified = ssl._create_unverified_context()
+
+    def send():
+        req = urllib.request.Request(PORTAL + query, data=data, method=method,
+                                     headers=dict(headers or {}))
+        for c in _COOKIES:
+            if c.name == "CSRF-Token":
+                req.add_header("X-CSRF-Token", c.value)
+        return _opener().open(req, timeout=timeout)
+
     try:
-        context = unverified if PORTAL.startswith("https:") else None
-        with urllib.request.urlopen(PORTAL + query, timeout=30, context=context) as r:
-            return r.read()
+        return send()
     except urllib.error.URLError as e:
-        if PORTAL == PORTAL_HTTPS or not isinstance(e.reason, ConnectionRefusedError):
+        if (not _usb() or PORTAL == PORTAL_HTTPS or
+                not isinstance(getattr(e, "reason", None), ConnectionRefusedError)):
             raise
     PORTAL = PORTAL_HTTPS
-    with urllib.request.urlopen(PORTAL + query, timeout=30, context=unverified) as r:
+    return send()
+
+
+def get(endpoint, **params):
+    with request(endpoint, **params) as r:
         return r.read()
 
 
@@ -74,6 +109,41 @@ def winappdeploycmd():
     return found[-1]
 
 
+def install_through_portal(appx):
+    """The portal's own install: an update when the package is newer, so the
+    app's data stays. Used over Wi-Fi, where WinAppDeployCmd wants pairing."""
+    name = os.path.basename(appx)
+    get("/api/os/machinename")  # for the CSRF cookie
+    boundary = uuid.uuid4().hex
+    with open(appx, "rb") as f:
+        payload = f.read()
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+            f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+    started = time.time()
+    request("/api/app/packagemanager/package", data=body, method="POST", timeout=1800,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            package=name).close()
+    print(f"uploaded {len(payload) / 2**20:.0f} MB in {time.time() - started:.0f} s")
+    # The install goes on after the upload; the state call says 204 meanwhile.
+    while True:
+        time.sleep(3)
+        try:
+            with request("/api/app/packagemanager/state") as r:
+                if r.status == 204:
+                    continue
+                text = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            print("install failed:", e.code, e.read().decode("utf-8", "replace").strip())
+            return 1
+        try:
+            state = json.loads(text)
+        except ValueError:
+            state = {}
+        print("install:", state.get("Reason") or text.strip())
+        return 0 if state.get("Success", True) else 1
+
+
 def cmd_install(a):
     appx = a.appx
     if not appx:
@@ -81,13 +151,17 @@ def cmd_install(a):
         if not candidates:
             sys.exit(f"no Gecko_*_ARM.appx in {APPX_DIR}")
         appx = max(candidates, key=os.path.getmtime)
-    print(f"installing {os.path.basename(appx)} (app data kept)")
-    # update keeps the app's data; the phone already trusts the certificate.
-    r = subprocess.run([winappdeploycmd(), "update", "-file", appx, "-ip", "127.0.0.1"],
-                       capture_output=True, text=True)
-    print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "")
+    print(f"installing {os.path.basename(appx)} on {PORTAL} (app data kept)")
+    if _usb():
+        # update keeps the app's data; the phone already trusts the certificate.
+        r = subprocess.run([winappdeploycmd(), "update", "-file", appx, "-ip", "127.0.0.1"],
+                           capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "")
+        code = r.returncode
+    else:
+        code = install_through_portal(appx)
     print("now on the phone:", package()["PackageFullName"])
-    return r.returncode
+    return code
 
 
 def cmd_logs(a):
@@ -147,7 +221,9 @@ def cmd_mem(a):
 
 
 def main():
+    global PORTAL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--portal", help="the phone's Device Portal, e.g. http://192.168.31.226")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("version")
     ip = sub.add_parser("install")
@@ -158,6 +234,8 @@ def main():
     mp.add_argument("--watch", type=float, default=0)
     mp.add_argument("--top", type=int, default=10)
     a = ap.parse_args()
+    if a.portal:
+        PORTAL = a.portal.rstrip("/")
     sys.exit({"version": cmd_version, "install": cmd_install, "logs": cmd_logs,
               "mem": cmd_mem}[a.cmd](a))
 
