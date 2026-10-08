@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 01:14:34 +0400
+Subject: [PATCH] cubeb on Windows 10 Mobile: a WASAPI call that fails
+ mid-stream is an error
+
+A failed call in the render loop -- reading a microphone packet
+(GetNextPacketSize, GetBuffer, ReleaseBuffer) or handing over output
+(GetCurrentPadding, GetBuffer, ReleaseBuffer) -- ended the loop with hr still
+S_OK, so no CUBEB_STATE_ERROR was sent. The graph above had let its
+fallback clock go at the first callback and waited for callbacks that never
+came: its time stood still. On the HP Elite x3 a microphone page then saw
+its <audio> element stuck at 0 s and said "audio track paused".
+
+Under GECKO_W10M the failing call and its HRESULT are kept on the stream
+and noted, and the loop's end reports them as an error unless one was
+already reported for this run (wasapi_state_callback marks it); each run of
+the loop starts clean. A failed GetNextPacketSize is now looked at before
+its packet size: one that left the size at 0 used to read as "nothing to
+read".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ media/libcubeb/src/cubeb_wasapi.cpp | 97 +++++++++++++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+
+diff --git a/media/libcubeb/src/cubeb_wasapi.cpp b/media/libcubeb/src/cubeb_wasapi.cpp
+index f8f0c87949..e0a1c60e22 100644
+--- a/media/libcubeb/src/cubeb_wasapi.cpp
++++ b/media/libcubeb/src/cubeb_wasapi.cpp
+@@ -493,6 +493,13 @@ struct cubeb_stream {
+   the OS, to be able to detect drifts. This is only used for logging for now. */
+   size_t total_input_frames = 0;
+   size_t total_output_frames = 0;
++#if defined(GECKO_W10M)
++  /* The call that failed and ended the render loop, if one did, and whether
++   * an error has already been reported for this run of the loop. */
++  HRESULT w10m_failed_hr = S_OK;
++  const char * w10m_failed_at = nullptr;
++  bool w10m_error_sent = false;
++#endif
+   /* This is set by the render loop thread once it has obtained a reference to
+    * COM and this stream object. */
+   HANDLE thread_ready_event = 0;
+@@ -953,6 +960,11 @@ wasapi_data_callback(cubeb_stream * stm, void * user_ptr,
+ void
+ wasapi_state_callback(cubeb_stream * stm, void * user_ptr, cubeb_state state)
+ {
++#if defined(GECKO_W10M)
++  if (state == CUBEB_STATE_ERROR) {
++    stm->w10m_error_sent = true;
++  }
++#endif
+   return stm->state_callback(stm, user_ptr, state);
+ }
+ 
+@@ -1163,6 +1175,30 @@ trigger_async_reconfigure(cubeb_stream * stm)
+ /* This helper grabs all the frames available from a capture client, put them in
+  * the linear_input_buffer.  This helper does not work with exclusive mode
+  * streams. */
++#if defined(GECKO_W10M)
++/* A failed call in the render loop used to end the loop without a word: the
++ * stream reported no error, the graph above it had already let its fallback
++ * clock go at the first callback, and it waited for callbacks that never came
++ * again. Its time stood still -- a microphone page saw its <audio> element
++ * stuck at 0 s, "audio track paused". The failure is noted and kept, and the
++ * loop's end reports it as an error, so the graph goes back to its clock and
++ * opens the stream again. */
++static std::atomic<int> w10m_stream_notes{0};
++
++static void
++w10m_stream_failed(cubeb_stream * stm, const char * where, HRESULT hr)
++{
++  stm->w10m_failed_hr = hr;
++  stm->w10m_failed_at = where;
++  if (w10m_stream_notes++ < 30) {
++    char note[160];
++    snprintf(note, sizeof(note), "audio: %s failed (0x%08lx), the stream stops",
++             where, static_cast<unsigned long>(hr));
++    GeckoW10mNote(note);
++  }
++}
++#endif
++
+ bool
+ get_input_buffer(cubeb_stream * stm)
+ {
+@@ -1173,7 +1209,11 @@ get_input_buffer(cubeb_stream * stm)
+   DWORD flags;
+   UINT64 dev_pos;
+   UINT64 pc_position;
++#if defined(GECKO_W10M)
++  UINT32 next = 0;
++#else
+   UINT32 next;
++#endif
+   /* Get input packets until we have captured enough frames, and put them in a
+    * contiguous buffer. */
+   uint32_t offset = 0;
+@@ -1181,8 +1221,18 @@ get_input_buffer(cubeb_stream * stm)
+   // single packet each time. However, if we're pulling from the stream we may
+   // need to grab multiple packets worth of frames that have accumulated (so
+   // need a loop).
++#if defined(GECKO_W10M)
++  // The size is looked at only after the call has said it worked: a failed
++  // call that leaves it at 0 used to end the loop as "nothing to read".
++  for (;;) {
++    hr = stm->capture_client->GetNextPacketSize(&next);
++    if (SUCCEEDED(hr) && next == 0) {
++      break;
++    }
++#else
+   for (hr = stm->capture_client->GetNextPacketSize(&next); next > 0;
+        hr = stm->capture_client->GetNextPacketSize(&next)) {
++#endif
+     if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+       // Application can recover from this error. More info
+       // https://msdn.microsoft.com/en-us/library/windows/desktop/dd316605(v=vs.85).aspx
+@@ -1201,6 +1251,9 @@ get_input_buffer(cubeb_stream * stm)
+ 
+     if (FAILED(hr)) {
+       LOG("cannot get next packet size: %lx", hr);
++#if defined(GECKO_W10M)
++      w10m_stream_failed(stm, "microphone GetNextPacketSize", hr);
++#endif
+       return false;
+     }
+ 
+@@ -1210,6 +1263,9 @@ get_input_buffer(cubeb_stream * stm)
+ 
+     if (FAILED(hr)) {
+       LOG("GetBuffer failed for capture: %lx", hr);
++#if defined(GECKO_W10M)
++      w10m_stream_failed(stm, "microphone GetBuffer", hr);
++#endif
+       return false;
+     }
+     XASSERT(frames == next);
+@@ -1273,6 +1329,9 @@ get_input_buffer(cubeb_stream * stm)
+     hr = stm->capture_client->ReleaseBuffer(frames);
+     if (FAILED(hr)) {
+       LOG("FAILED to release intput buffer");
++#if defined(GECKO_W10M)
++      w10m_stream_failed(stm, "microphone ReleaseBuffer", hr);
++#endif
+       return false;
+     }
+     offset += input_stream_samples;
+@@ -1314,6 +1373,9 @@ get_output_buffer(cubeb_stream * stm, void *& buffer, size_t & frame_count)
+ 
+   if (FAILED(hr)) {
+     LOG("Failed to get padding: %lx", hr);
++#if defined(GECKO_W10M)
++    w10m_stream_failed(stm, "output GetCurrentPadding", hr);
++#endif
+     return false;
+   }
+ 
+@@ -1335,6 +1397,9 @@ get_output_buffer(cubeb_stream * stm, void *& buffer, size_t & frame_count)
+   hr = stm->render_client->GetBuffer(frame_count, &output_buffer);
+   if (FAILED(hr)) {
+     LOG("cannot get render buffer");
++#if defined(GECKO_W10M)
++    w10m_stream_failed(stm, "output GetBuffer", hr);
++#endif
+     return false;
+   }
+ 
+@@ -1422,6 +1487,9 @@ refill_callback_duplex(cubeb_stream * stm)
+   }
+   if (FAILED(hr)) {
+     LOG("failed to release buffer: %lx", hr);
++#if defined(GECKO_W10M)
++    w10m_stream_failed(stm, "duplex output ReleaseBuffer", hr);
++#endif
+     return false;
+   }
+   if (got < 0) {
+@@ -1493,6 +1561,9 @@ refill_callback_output(cubeb_stream * stm)
+   hr = stm->render_client->ReleaseBuffer(got, 0);
+   if (FAILED(hr)) {
+     LOG("failed to release buffer: %lx", hr);
++#if defined(GECKO_W10M)
++    w10m_stream_failed(stm, "output ReleaseBuffer", hr);
++#endif
+     return false;
+   }
+ 
+@@ -1525,6 +1596,13 @@ static unsigned int __stdcall wasapi_stream_render_loop(LPVOID stream)
+   HRESULT hr = 0;
+   DWORD mmcss_task_index = 0;
+ 
++#if defined(GECKO_W10M)
++  // A new run of the loop (the stream object outlives a stop and a start).
++  stm->w10m_failed_hr = S_OK;
++  stm->w10m_failed_at = nullptr;
++  stm->w10m_error_sent = false;
++#endif
++
+   // Signal wasapi_stream_start that we've initialized COM and incremented
+   // the stream's ref_count.
+   BOOL ok = SetEvent(stm->thread_ready_event);
+@@ -1662,6 +1740,25 @@ static unsigned int __stdcall wasapi_stream_render_loop(LPVOID stream)
+     AvRevertMmThreadCharacteristics(mmcss_handle);
+   }
+ 
++#if defined(GECKO_W10M)
++  // Ended by a failed call that said nothing: an error after all (see
++  // w10m_stream_failed). A loop ended by shutdown or a finished drain
++  // recorded no failure and stays a quiet end.
++  if (SUCCEEDED(hr) && FAILED(stm->w10m_failed_hr) && !stm->w10m_error_sent) {
++    hr = stm->w10m_failed_hr;
++    if (w10m_stream_notes++ < 30) {
++      char note[200];
++      snprintf(note, sizeof(note),
++               "audio: stream thread left after %s, reported as an error -- "
++               "%llu frames in, %llu out",
++               stm->w10m_failed_at ? stm->w10m_failed_at : "a failed call",
++               static_cast<unsigned long long>(stm->total_input_frames),
++               static_cast<unsigned long long>(stm->total_output_frames));
++      GeckoW10mNote(note);
++    }
++  }
++#endif
++
+   if (FAILED(hr)) {
+     wasapi_state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
+   }

@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 01:14:35 +0400
+Subject: [PATCH] Audio graph on Windows 10 Mobile: notes on its stream, and no
+ reopen storm
+
+Notes for the graph's own cubeb stream: opened (input, channels, rates,
+latency) or refused, would not start, first called back, reported an
+error. Sixty a run.
+
+A stream that dies after taking over the graph is reopened by the fallback
+driver, whose backoff starts again at 10 ms every time; one that keeps
+dying soon after it opens would be reopened about ten times a second. Under
+GECKO_W10M a second such failure within five seconds of the last starts the
+retries at media.audio.device.retry.ms instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/GraphDriver.cpp | 80 +++++++++++++++++++++++++++++++++++++++
+ dom/media/GraphDriver.h   |  6 +++
+ 2 files changed, 86 insertions(+)
+
+diff --git a/dom/media/GraphDriver.cpp b/dom/media/GraphDriver.cpp
+index c482001bcf..c18d7c2c1c 100644
+--- a/dom/media/GraphDriver.cpp
++++ b/dom/media/GraphDriver.cpp
+@@ -36,6 +36,20 @@ extern mozilla::LazyLogModule gMediaTrackGraphLog;
+ #define LOG(type, ...) \
+   MOZ_LOG_FMT(gMediaTrackGraphLog, type, MOZ_LOG_EXPAND_ARGS __VA_ARGS__)
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Atomics.h"
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* aText);
++// What the audio graph's own stream did -- opened or refused, started, first
++// called back. A microphone page that never advanced (currentTime stuck at
++// 0, "audio track paused") left nothing in the log to say which. Sixty a
++// run: every page with sound opens one.
++static bool GeckoW10mAudioNoteAllowed() {
++  static mozilla::Atomic<uint32_t> sNotes{0};
++  return sNotes++ < 60;
++}
++#endif
++
+ namespace mozilla {
+ 
+ GraphDriver::GraphDriver(GraphInterface* aGraphInterface,
+@@ -617,7 +631,30 @@ void AudioCallbackDriver::Init(const nsCString& aStreamName) {
+         rv == CUBEB_OK,
+         "Could not set the audio stream volume in GraphDriver.cpp");
+     CubebUtils::ReportCubebBackendUsed();
++#if defined(GECKO_W10M)
++    if (GeckoW10mAudioNoteAllowed()) {
++      char note[200];
++      SprintfLiteral(note,
++                     "audio: graph stream opened -- input %s (%u ch at %u Hz), "
++                     "output %u ch at %u Hz, latency %u frames",
++                     inputWanted ? (inputId ? "a chosen device" : "the default")
++                                 : "none",
++                     inputWanted ? input.channels : 0,
++                     inputWanted ? input.rate : 0, output.channels,
++                     output.rate, latencyFrames);
++      GeckoW10mNote(note);
++    }
++#endif
+   } else {
++#if defined(GECKO_W10M)
++    if (GeckoW10mAudioNoteAllowed()) {
++      GeckoW10mNote(inputWanted
++                        ? "audio: graph stream with the microphone refused, "
++                          "the system clock drives the graph"
++                        : "audio: graph stream refused, the system clock "
++                          "drives the graph");
++    }
++#endif
+     NS_WARNING(
+         "Could not create a cubeb stream for MediaTrackGraph, falling "
+         "back to a SystemClockDriver");
+@@ -729,6 +766,11 @@ bool AudioCallbackDriver::StartStream() {
+   auto streamLocked = mAudioStream.Lock();
+   if (cubeb_stream_start(streamLocked.ref()) != CUBEB_OK) {
+     NS_WARNING("Could not start cubeb stream for MTG.");
++#if defined(GECKO_W10M)
++    if (GeckoW10mAudioNoteAllowed()) {
++      GeckoW10mNote("audio: graph stream would not start");
++    }
++#endif
+     return false;
+   }
+ 
+@@ -862,6 +904,18 @@ long AudioCallbackDriver::DataCallback(const AudioDataValue* aInputBuffer,
+     LOG(LogLevel::Verbose, ("{}: AudioCallbackDriver {} First audio callback "
+                             "close the Fallback driver",
+                             fmt::ptr(Graph()), fmt::ptr(this)));
++#if defined(GECKO_W10M)
++    if (GeckoW10mAudioNoteAllowed()) {
++      char note[160];
++      SprintfLiteral(note,
++                     "audio: graph stream called back -- %ld frames, %s",
++                     aFrames,
++                     mInputChannelCount == 0 ? "no input"
++                     : aInputBuffer         ? "with microphone data"
++                                            : "no microphone data");
++      GeckoW10mNote(note);
++    }
++#endif
+   }
+ 
+   FallbackDriverState fallbackState = mFallbackDriverState;
+@@ -1084,12 +1138,30 @@ void AudioCallbackDriver::StateCallback(cubeb_state aState) {
+   streamState = mAudioStreamState.exchange(AudioStreamState::None);
+ 
+   if (aState == CUBEB_STATE_ERROR) {
++#if defined(GECKO_W10M)
++    if (GeckoW10mAudioNoteAllowed()) {
++      GeckoW10mNote("audio: graph stream reported an error, the system clock "
++                    "drives the graph until it is opened again");
++    }
++#endif
+     // About to hand over control of the graph.  Do not start a new driver if
+     // StateCallback() receives an error for this stream while the main thread
+     // or another driver has control of the graph.
+     if (streamState == AudioStreamState::Starting ||
+         streamState == AudioStreamState::ChangingDevice ||
+         streamState == AudioStreamState::Running) {
++#if defined(GECKO_W10M)
++      if (streamState == AudioStreamState::Running) {
++        // Failed after taking over the graph. Again within seconds of the
++        // last time, it is a stream that keeps dying soon after it opens;
++        // the fallback below would retry it from 10 ms each time.
++        const TimeStamp now = TimeStamp::Now();
++        const bool soon = !mGeckoW10mLastRunningFailure.IsNull() &&
++                          (now - mGeckoW10mLastRunningFailure).ToSeconds() < 5.0;
++        mGeckoW10mQuickFailures = soon ? mGeckoW10mQuickFailures + 1 : 0;
++        mGeckoW10mLastRunningFailure = now;
++      }
++#endif
+       if (mFallbackDriverState.compareExchange(FallbackDriverState::None,
+                                                FallbackDriverState::Running)) {
+         // Only switch to fallback if it's not already running. It could be
+@@ -1322,6 +1394,14 @@ AudioCallbackDriver::CreateFallbackSystemClockDriver() {
+ 
+   mNextReInitBackoffStep =
+       TimeDuration::FromMilliseconds(AUDIO_INITIAL_FALLBACK_BACKOFF_STEP_MS);
++#if defined(GECKO_W10M)
++  // A stream that keeps dying soon after it opens is retried at the longest
++  // interval, not from 10 ms again (see StateCallback).
++  if (mGeckoW10mQuickFailures > 0) {
++    mNextReInitBackoffStep = TimeDuration::FromMilliseconds(
++        StaticPrefs::media_audio_device_retry_ms());
++  }
++#endif
+   mNextReInitAttempt = TimeStamp::Now() + mNextReInitBackoffStep;
+   auto fallback = MakeRefPtr<FallbackWrapper>(Graph(), this, mSampleRate,
+                                               mStreamName, mStateComputedTime,
+diff --git a/dom/media/GraphDriver.h b/dom/media/GraphDriver.h
+index d4f06b9f86..68ff9df724 100644
+--- a/dom/media/GraphDriver.h
++++ b/dom/media/GraphDriver.h
+@@ -834,6 +834,12 @@ class AudioCallbackDriver final : public GraphDriver,
+   /* If using a fallback driver, this is the duration to wait after failing to
+    * start it before attempting to start it again. */
+   TimeDuration mNextReInitBackoffStep;
++#if defined(GECKO_W10M)
++  // When the stream last failed after it had taken over the graph, and how
++  // many times in a row that came within seconds of the one before.
++  TimeStamp mGeckoW10mLastRunningFailure;
++  Atomic<uint32_t> mGeckoW10mQuickFailures{0};
++#endif
+   /* If using a fallback driver, this is the next time we'll try to start the
+    * audio stream. */
+   TimeStamp mNextReInitAttempt;

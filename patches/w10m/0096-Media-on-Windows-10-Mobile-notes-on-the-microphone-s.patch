@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 01:14:36 +0400
+Subject: [PATCH] Media on Windows 10 Mobile: notes on the microphone starting
+ and play() refused
+
+"capture: the microphone starts" with the processing it gets (echo
+cancellation, gain control, noise suppression, channels), and "media:
+play() not allowed to start (autoplay)" with whether the element was muted
+and played a stream: the two other ways a microphone page can sit still.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/mediaelement/HTMLMediaElement.cpp | 17 ++++++++++++++++
+ dom/media/webrtc/MediaEngineWebRTCAudio.cpp | 22 +++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/dom/media/mediaelement/HTMLMediaElement.cpp b/dom/media/mediaelement/HTMLMediaElement.cpp
+index 99393980f5..81c26b7fb3 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.cpp
++++ b/dom/media/mediaelement/HTMLMediaElement.cpp
+@@ -165,6 +165,11 @@ extern mozilla::LazyLogModule gAutoplayPermissionLog;
+ using namespace mozilla::layers;
+ using namespace mozilla::dom::HTMLMediaElement_Binding;
+ 
++#if defined(GECKO_W10M)
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla::dom {
+ 
+ using AudibleState = AudioChannelService::AudibleState;
+@@ -5185,6 +5190,18 @@ already_AddRefed<Promise> HTMLMediaElement::Play(ErrorResult& aRv) {
+     }
+ #endif
+     AUTOPLAY_LOG("reject MediaElement {} to play", fmt::ptr(this));
++#if defined(GECKO_W10M)
++    {
++      static uint32_t sRefusedNotes = 0;  // main thread only
++      if (sRefusedNotes++ < 20) {
++        GeckoW10mNote(nsPrintfCString(
++                          "media: play() not allowed to start (autoplay), "
++                          "muted %s, a stream %s",
++                          Muted() ? "yes" : "no", mSrcStream ? "yes" : "no")
++                          .get());
++      }
++    }
++#endif
+     AsyncRejectPendingPlayPromises(NS_ERROR_DOM_MEDIA_NOT_ALLOWED_ERR);
+   }
+   return promise.forget();
+diff --git a/dom/media/webrtc/MediaEngineWebRTCAudio.cpp b/dom/media/webrtc/MediaEngineWebRTCAudio.cpp
+index 7c6ce1a3dd..1f7702c10e 100644
+--- a/dom/media/webrtc/MediaEngineWebRTCAudio.cpp
++++ b/dom/media/webrtc/MediaEngineWebRTCAudio.cpp
+@@ -32,6 +32,12 @@ using namespace webrtc;
+ #define MONO 1
+ #define MAX_SAMPLING_FREQ 48000  // Hz - multiple of 100
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Atomics.h"
++#  include "nsPrintfCString.h"
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla {
+ 
+ using dom::MediaSourceEnum;
+@@ -405,6 +411,22 @@ nsresult MediaEngineWebRTCMicrophoneSource::Start() {
+ 
+   ApplySettings(mCurrentPrefs);
+ 
++#if defined(GECKO_W10M)
++  {
++    static Atomic<uint32_t> sStartNotes{0};
++    if (sStartNotes++ < 40) {
++      GeckoW10mNote(
++          nsPrintfCString(
++              "capture: the microphone starts -- echo cancellation %s, gain "
++              "control %s, noise suppression %s, %d channel(s)",
++              mCurrentPrefs.mAecOn ? "on" : "off",
++              mCurrentPrefs.mAgcOn ? "on" : "off",
++              mCurrentPrefs.mNoiseOn ? "on" : "off", mCurrentPrefs.mChannels)
++              .get());
++    }
++  }
++#endif
++
+   CubebUtils::AudioDeviceID deviceID = mDeviceInfo->DeviceID();
+   NS_DispatchToMainThread(NS_NewRunnableFunction(
+       __func__, [inputProcessing = mInputProcessing, deviceID, track = mTrack,
