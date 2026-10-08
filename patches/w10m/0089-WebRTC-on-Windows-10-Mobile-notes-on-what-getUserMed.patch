@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 20:09:25 +0400
+Subject: [PATCH] WebRTC on Windows 10 Mobile: notes on what getUserMedia was
+ asked and why it refused
+
+"gum: called" when a page asks, "gum: refused -- <name> (<constraint>)" when
+the page is told no, and "capture: N camera source(s)" after each camera
+count -- the step the hang above stopped at. Forty of each a run, like the
+microphone count, which gets the same cap: a page can call in a loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/MediaDevices.cpp             | 19 +++++++++++++++++++
+ dom/media/MediaManager.cpp             | 10 ++++++++++
+ dom/media/webrtc/MediaEngineWebRTC.cpp | 23 ++++++++++++++++++++---
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/dom/media/MediaDevices.cpp b/dom/media/MediaDevices.cpp
+index 5c4939eca5..d03a442162 100644
+--- a/dom/media/MediaDevices.cpp
++++ b/dom/media/MediaDevices.cpp
+@@ -29,6 +29,10 @@
+ #include "nsPIDOMWindowInlines.h"
+ #include "nsQueryObject.h"
+ 
++#if defined(GECKO_W10M)
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
++
+ namespace mozilla::dom {
+ 
+ using ConstDeviceSetPromise = MediaManager::ConstDeviceSetPromise;
+@@ -121,6 +125,21 @@ already_AddRefed<Promise> MediaDevices::GetUserMedia(
+             p->MaybeResolve(std::move(aStream));
+           },
+           [this, self, p](const RefPtr<MediaMgrError>& error) {
++#if defined(GECKO_W10M)
++            // The page is told only the name; this says it in the log,
++            // forty times a run (a page may retry in a loop).
++            static uint32_t sRefusedNotes = 0;  // main thread only
++            if (sRefusedNotes++ < 40) {
++              nsAutoCString note("gum: refused -- ");
++              AppendUTF16toUTF8(error->mNameString, note);
++              if (!error->mConstraint.IsEmpty()) {
++                note.AppendLiteral(" (");
++                AppendUTF16toUTF8(error->mConstraint, note);
++                note.AppendLiteral(")");
++              }
++              GeckoW10mNote(note.get());
++            }
++#endif
+             nsPIDOMWindowInner* window = GetWindowIfCurrent();
+             if (!window) {
+               return;  // Leave Promise pending after navigation by design.
+diff --git a/dom/media/MediaManager.cpp b/dom/media/MediaManager.cpp
+index a41bc8dcc4..5d900c3fea 100644
+--- a/dom/media/MediaManager.cpp
++++ b/dom/media/MediaManager.cpp
+@@ -3232,6 +3232,16 @@ RefPtr<MediaManager::StreamPromise> MediaManager::GetUserMedia(
+         })));
+   }
+   RefPtr<MediaManager> self = this;
++#if defined(GECKO_W10M)
++  // Forty a run: a page may call in a loop.
++  static uint32_t sCalledNotes = 0;  // main thread only
++  if (sCalledNotes++ < 40) {
++    GeckoW10mNote(nsPrintfCString("gum: called -- %s%s",
++                                  hasAudio ? "audio" : "",
++                                  hasVideo ? " video" : "")
++                      .get());
++  }
++#endif
+   return EnumerateDevicesImpl(
+              aWindow, CreateEnumerationParams(videoType, audioType, flags))
+       ->Then(
+diff --git a/dom/media/webrtc/MediaEngineWebRTC.cpp b/dom/media/webrtc/MediaEngineWebRTC.cpp
+index fd1f7715bf..255d88b0f5 100644
+--- a/dom/media/webrtc/MediaEngineWebRTC.cpp
++++ b/dom/media/webrtc/MediaEngineWebRTC.cpp
+@@ -26,6 +26,7 @@
+ static mozilla::LazyLogModule sGetUserMediaLog("GetUserMedia");
+ #if defined(GECKO_W10M)
+ #  include "nsPrintfCString.h"
++#  include "mozilla/Atomics.h"
+ extern "C" void GeckoW10mNote(const char*);
+ #endif
+ 
+@@ -115,6 +116,19 @@ void MediaEngineWebRTC::EnumerateVideoDevices(
+   camera::CaptureEngine capEngine =
+       MediaEngineRemoteVideoSource::CaptureEngine(aMediaSource);
+   num = GetChildAndCall(&CamerasChild::NumberOfCaptureDevices, capEngine);
++#if defined(GECKO_W10M)
++  // Every full device list asks for cameras; this asking never came back
++  // while the camera thread could not be woken, and nothing after it ran.
++  // Forty a run: a page may enumerate in a loop.
++  static Atomic<uint32_t> sCameraNotes{0};
++  if (sCameraNotes++ < 40) {
++    GeckoW10mNote(nsPrintfCString("capture: %d %s source(s)", num,
++                                  aMediaSource == MediaSourceEnum::Camera
++                                      ? "camera"
++                                      : "screen capture")
++                      .get());
++  }
++#endif
+ 
+   for (int i = 0; i < num; i++) {
+     char deviceName[MediaEngineSource::kMaxDeviceNameLength];
+@@ -218,9 +232,12 @@ void MediaEngineWebRTC::EnumerateMicrophoneDevices(
+         ++enabled;
+       }
+     }
+-    nsPrintfCString note("capture: %zu microphone(s), %zu usable",
+-                         size_t(devices->Length()), enabled);
+-    GeckoW10mNote(note.get());
++    static Atomic<uint32_t> sMicrophoneNotes{0};
++    if (sMicrophoneNotes++ < 40) {
++      nsPrintfCString note("capture: %zu microphone(s), %zu usable",
++                           size_t(devices->Length()), enabled);
++      GeckoW10mNote(note.get());
++    }
+   }
+ #endif
+ }

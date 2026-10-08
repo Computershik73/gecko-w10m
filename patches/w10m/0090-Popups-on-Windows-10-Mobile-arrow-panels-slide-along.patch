@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 20:09:26 +0400
+Subject: [PATCH] Popups on Windows 10 Mobile: arrow panels slide along the
+ screen
+
+The phone's theme (mobile-config-firefox) makes every panel as wide as the
+screen. With panel.js's default flip="both", a panel opened from an icon in
+the middle of the address bar was cut down to the room right of the icon and
+ran a few pixels past the screen's edge: the microphone prompt lost its
+bottom-right corner, where Allow is. On Wayland, which the theme is made for,
+the compositor moves such a popup back on screen. Under GECKO_W10M an arrow
+panel flipped "both" slides instead; vertical flipping is unchanged.
+
+Done here rather than by setting the attribute from the autoconfig script:
+some panels (form validation, date and colour pickers) are put in and opened
+in one go, before a script could change them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ layout/xul/nsMenuPopupFrame.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/layout/xul/nsMenuPopupFrame.cpp b/layout/xul/nsMenuPopupFrame.cpp
+index bb9a0a491b..575c2ba35f 100644
+--- a/layout/xul/nsMenuPopupFrame.cpp
++++ b/layout/xul/nsMenuPopupFrame.cpp
+@@ -799,6 +799,19 @@ static FlipType FlipFromAttribute(nsMenuPopupFrame* aFrame) {
+     return FlipType::None;
+   }
+   if (flip.EqualsLiteral("both")) {
++#if defined(GECKO_W10M)
++    // The phone's theme (mobile-config-firefox) makes every panel as wide as
++    // the screen. Flipped "both", which panel.js gives every arrow panel, one
++    // opened from an icon mid-way along the address bar was cut down to the
++    // room right of the icon and ran past the screen's edge: the microphone
++    // prompt lost its bottom-right corner, where Allow is. On Wayland, which
++    // the theme is made for, the compositor moves such a popup back on
++    // screen; here an arrow panel slides along the screen instead.
++    if (aFrame->PopupElement().AttrValueIs(kNameSpaceID_None, nsGkAtoms::type,
++                                           nsGkAtoms::arrow, eCaseMatters)) {
++      return FlipType::Slide;
++    }
++#endif
+     return FlipType::Both;
+   }
+   if (flip.EqualsLiteral("slide")) {

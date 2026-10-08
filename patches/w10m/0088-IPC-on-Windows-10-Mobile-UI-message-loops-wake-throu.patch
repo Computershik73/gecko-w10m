@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 20:09:24 +0400
+Subject: [PATCH] IPC on Windows 10 Mobile: UI message loops wake through an
+ event
+
+MessagePumpForUI is woken by a message posted to a hidden window. The phone
+has neither: CreateWindow and PostMessage are stubs, and the substitute for
+MsgWaitForMultipleObjectsEx with no handles sleeps for the whole timeout. A
+thread on this pump ran what was queued before its first wait and then slept
+for good; nothing posted to it afterwards ever ran.
+
+The VideoCapture thread is one (CamerasParent makes it a UI thread on
+Windows). The first full device list -- a page's enumerateDevices(), a
+devicechange listener -- asked it for cameras and waited for the answer
+forever, holding the serial MediaManager task queue, so every getUserMedia
+after that hung before the permission prompt: the microphone worked once
+per run and then sat on "connecting". WinCompositorWindowThread's shutdown
+task was lost the same way and cost a two-second wait at every exit.
+
+Under GECKO_W10M the pump keeps an auto-reset event: ScheduleWork sets it
+instead of posting, WaitForWork waits on it (with the delayed-work timeout)
+and clears have_work_ as HandleWorkMessage would. Desktop is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ipc/chromium/src/base/message_pump_win.cc | 25 ++++++++++++++++++++++-
+ ipc/chromium/src/base/message_pump_win.h  | 10 +++++++++
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/ipc/chromium/src/base/message_pump_win.cc b/ipc/chromium/src/base/message_pump_win.cc
+index 71670b50e2..2b4af1f504 100644
+--- a/ipc/chromium/src/base/message_pump_win.cc
++++ b/ipc/chromium/src/base/message_pump_win.cc
+@@ -86,23 +86,38 @@ int MessagePumpWin::GetCurrentDelay() const {
+ //-----------------------------------------------------------------------------
+ // MessagePumpForUI public:
+ 
+-MessagePumpForUI::MessagePumpForUI() { InitMessageWnd(); }
++MessagePumpForUI::MessagePumpForUI() {
++  InitMessageWnd();
++#if defined(GECKO_W10M)
++  wake_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
++#endif
++}
+ 
+ MessagePumpForUI::~MessagePumpForUI() {
+   DestroyWindow(message_hwnd_);
+   UnregisterClass(kWndClass, GetModuleHandle(NULL));
++#if defined(GECKO_W10M)
++  if (wake_event_) {
++    ::CloseHandle(wake_event_);
++  }
++#endif
+ }
+ 
+ void MessagePumpForUI::ScheduleWork() {
+   if (InterlockedExchange(&have_work_, 1))
+     return;  // Someone else continued the pumping.
+ 
++#if defined(GECKO_W10M)
++  // No message would arrive (see wake_event_); WaitForWork wakes on this.
++  ::SetEvent(wake_event_);
++#else
+   // Make sure the MessagePump does some work for us.
+   PostMessage(message_hwnd_, kMsgHaveWork, reinterpret_cast<WPARAM>(this), 0);
+ 
+   // In order to wake up any cross-process COM calls which may currently be
+   // pending on the main thread, we also have to post a UI message.
+   PostMessage(message_hwnd_, WM_NULL, 0, 0);
++#endif
+ }
+ 
+ void MessagePumpForUI::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
+@@ -247,7 +262,15 @@ void MessagePumpForUI::WaitForWork() {
+   if (delay < 0)  // Negative value means no timers waiting.
+     delay = INFINITE;
+ 
++#if defined(GECKO_W10M)
++  ::WaitForSingleObject(wake_event_, static_cast<DWORD>(delay));
++  // What HandleWorkMessage does when the posted message arrives: the next
++  // ScheduleWork has to signal again. Cleared before the loop looks for
++  // work, so work posted from here on is either found by it or signals anew.
++  InterlockedExchange(&have_work_, 0);
++#else
+   mozilla::widget::WinUtils::WaitForMessage(delay);
++#endif
+ }
+ 
+ void MessagePumpForUI::HandleWorkMessage() {
+diff --git a/ipc/chromium/src/base/message_pump_win.h b/ipc/chromium/src/base/message_pump_win.h
+index c2c617feb9..0d1299c773 100644
+--- a/ipc/chromium/src/base/message_pump_win.h
++++ b/ipc/chromium/src/base/message_pump_win.h
+@@ -182,6 +182,16 @@ class MessagePumpForUI : public MessagePumpWin {
+   // A hidden message-only window.
+   HWND message_hwnd_;
+ 
++#if defined(GECKO_W10M)
++  // Windows 10 Mobile has no window messages: CreateWindow and PostMessage
++  // are stubs there, so the window above is never made and a posted message
++  // never arrives. A thread waiting in WaitForWork slept for good, and work
++  // posted to it later was never run -- the VideoCapture thread, and with
++  // it every getUserMedia after the first device list. Work is announced
++  // through this event instead.
++  HANDLE wake_event_ = nullptr;
++#endif
++
+  private:
+   static LRESULT CALLBACK WndProcThunk(HWND hwnd, UINT message, WPARAM wparam,
+                                        LPARAM lparam);

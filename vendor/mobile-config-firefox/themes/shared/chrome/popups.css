@@ -61,6 +61,24 @@
         visibility: hidden !important;
         pointer-events: none !important;
     }
+
+    /* gecko-w10m: doorhangers (permission prompts, add-on installs and the
+     * "added" note after them, an extension's changes) are as tall as what
+     * they say, right above the bar they are anchored in. Gecko
+     * places popups itself here -- there is no Wayland compositor to move
+     * them -- and flips this one above its anchor on its own. The -100vh
+     * offset above pinned it to the top of the screen instead, and the
+     * full-height panel left a see-through area over the page that took
+     * every tap. Size containment would collapse a panel with no fixed
+     * height to nothing, so it keeps paint containment only. No input
+     * margin either: the panel lines up with the screen's edges, not 4px
+     * past them. See README-PORT.md. */
+    panel.popup-notification-panel {
+        margin-top: 0 !important;
+        min-height: 0 !important;
+        contain: paint !important;
+        -moz-window-input-region-margin: 0 !important;
+    }
 }
 
 @media ((min-width: 1201px) or (-moz-pref("mcf.toolbar.positionOnTop"))) {
