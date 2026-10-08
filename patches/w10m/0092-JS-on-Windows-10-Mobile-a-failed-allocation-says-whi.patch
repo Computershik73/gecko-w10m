@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 23:22:50 +0400
+Subject: [PATCH] JS on Windows 10 Mobile: a failed allocation says which
+ script was running
+
+The failure note named only its direct caller, which is always a vector's
+allocation policy. On the HP Elite x3 a 256 MB realloc failed every few
+seconds on microphone test pages, and the page then showed an error; nothing
+said whose. The note now adds the script running at the time (file without
+query, line and column, through JS::DescribeScriptedCaller) and up to ten
+native callers inside xul.dll for tools/symbolize.py. RtlCaptureStackBackTrace
+is looked up rather than imported, so a phone without it still loads xul.dll.
+An allocation made in the atoms zone has no realm and no caller to name; the
+note says so instead of claiming no script was running.
+
+The microphone note gives the longest device name as well: a name that is
+not one would be a reason for pages and the prompt to run out of memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/webrtc/MediaEngineWebRTC.cpp | 12 +++++-
+ js/src/vm/Runtime.cpp                  | 59 +++++++++++++++++++++++++-
+ 2 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/dom/media/webrtc/MediaEngineWebRTC.cpp b/dom/media/webrtc/MediaEngineWebRTC.cpp
+index 255d88b0f5..dd5c038faa 100644
+--- a/dom/media/webrtc/MediaEngineWebRTC.cpp
++++ b/dom/media/webrtc/MediaEngineWebRTC.cpp
+@@ -26,6 +26,7 @@
+ static mozilla::LazyLogModule sGetUserMediaLog("GetUserMedia");
+ #if defined(GECKO_W10M)
+ #  include "nsPrintfCString.h"
++#  include <algorithm>
+ #  include "mozilla/Atomics.h"
+ extern "C" void GeckoW10mNote(const char*);
+ #endif
+@@ -227,15 +228,22 @@ void MediaEngineWebRTC::EnumerateMicrophoneDevices(
+   // when this comes back empty, before anyone is asked anything.
+   {
+     size_t enabled = 0;
++    size_t longest = 0;
+     for (const auto& deviceInfo : *devices) {
+       if (deviceInfo->State() == CUBEB_DEVICE_STATE_ENABLED) {
+         ++enabled;
+       }
++      longest = std::max(longest, size_t(deviceInfo->Name().Length()));
+     }
++    // The longest name too: pages and the permission prompt build lists
++    // from these names, and one that is not a name -- garbage thousands of
++    // characters long -- would be a reason for them to run out of memory.
+     static Atomic<uint32_t> sMicrophoneNotes{0};
+     if (sMicrophoneNotes++ < 40) {
+-      nsPrintfCString note("capture: %zu microphone(s), %zu usable",
+-                           size_t(devices->Length()), enabled);
++      nsPrintfCString note(
++          "capture: %zu microphone(s), %zu usable, the longest name %zu "
++          "characters",
++          size_t(devices->Length()), enabled, longest);
+       GeckoW10mNote(note.get());
+     }
+   }
+diff --git a/js/src/vm/Runtime.cpp b/js/src/vm/Runtime.cpp
+index 52d75628d0..a1f6de0ab6 100644
+--- a/js/src/vm/Runtime.cpp
++++ b/js/src/vm/Runtime.cpp
+@@ -680,6 +680,7 @@ js::HashNumber JSRuntime::randomHashCode() {
+ #if defined(GECKO_W10M)
+ #  include <algorithm>
+ 
++#  include "jsapi.h"
+ #  include "mozilla/Sprintf.h"
+ #  include "util/WindowsWrapper.h"
+ extern "C" void GeckoW10mNote(const char* text);
+@@ -693,7 +694,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
+ // says who asked.
+ static void GeckoW10mNoteMallocFailure(JSRuntime* aRuntime,
+                                        AllocFunction aFunc, size_t aBytes,
+-                                       void* aCaller) {
++                                       void* aCaller, JSContext* aCx) {
+   static mozilla::Atomic<uint32_t> sNotes{0};
+   if (sNotes++ >= 8) {
+     return;
+@@ -727,6 +728,60 @@ static void GeckoW10mNoteMallocFailure(JSRuntime* aRuntime,
+                  unsigned((uintptr_t(aCaller) & ~uintptr_t(1)) -
+                           uintptr_t(&__ImageBase)));
+   GeckoW10mNote(note);
++
++  // The direct caller is a vector's allocation policy, which says nothing.
++  // The script running at the time does -- a page's own, or the browser's --
++  // and so do the native callers further up, for tools/symbolize.py. The
++  // stack walker is looked up, not imported: an import the phone lacks
++  // would stop xul.dll from loading at all.
++  if (aCx && js::CurrentThreadCanAccessRuntime(aRuntime) && !aCx->realm()) {
++    // Atoms are made outside any realm, and then no caller can be named.
++    GeckoW10mNote("js: it was in the atoms zone, no script can be named");
++  } else if (aCx && js::CurrentThreadCanAccessRuntime(aRuntime)) {
++    JS::AutoFilename file;
++    uint32_t line = 0;
++    JS::ColumnNumberOneOrigin column;
++    if (JS::DescribeScriptedCaller(&file, aCx, &line, &column) && file.get()) {
++      char where[200];
++      SprintfLiteral(where, "%s", file.get());
++      // No query or fragment: the log is a file people send.
++      for (char* c = where; *c; ++c) {
++        if (*c == '?' || *c == '#') {
++          *c = 0;
++          break;
++        }
++      }
++      SprintfLiteral(note, "js: the script running then: %s:%u:%u", where,
++                     line, column.oneOriginValue());
++      GeckoW10mNote(note);
++    } else {
++      GeckoW10mNote("js: no script was running then");
++    }
++  }
++  using CaptureFn = USHORT(WINAPI*)(ULONG, ULONG, PVOID*, PULONG);
++  static const auto capture = reinterpret_cast<CaptureFn>(::GetProcAddress(
++      ::GetModuleHandleW(L"ntdll.dll"), "RtlCaptureStackBackTrace"));
++  if (capture) {
++    void* frames[24];
++    const USHORT count = capture(1, 24, frames, nullptr);
++    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(
++        reinterpret_cast<const char*>(&__ImageBase) + __ImageBase.e_lfanew);
++    const uintptr_t begin = uintptr_t(&__ImageBase);
++    const uintptr_t end = begin + headers->OptionalHeader.SizeOfImage;
++    int length = SprintfLiteral(note, "js: native callers (%u frames):", count);
++    int listed = 0;
++    for (USHORT i = 0; i < count && listed < 10 && length > 0 &&
++                       length < int(sizeof(note)) - 16;
++         ++i) {
++      const uintptr_t pc = uintptr_t(frames[i]) & ~uintptr_t(1);
++      if (pc >= begin && pc < end) {
++        length += snprintf(note + length, sizeof(note) - length, " +0x%x",
++                           unsigned(pc - begin));
++        ++listed;
++      }
++    }
++    GeckoW10mNote(note);
++  }
+ }
+ #endif
+ 
+@@ -765,7 +820,7 @@ JS_PUBLIC_API void* JSRuntime::onOutOfMemory(AllocFunction allocFunc,
+     }
+ #if defined(GECKO_W10M)
+     GeckoW10mNoteMallocFailure(this, allocFunc, nbytes,
+-                               __builtin_return_address(0));
++                               __builtin_return_address(0), maybecx);
+ #endif
+   }
+ 

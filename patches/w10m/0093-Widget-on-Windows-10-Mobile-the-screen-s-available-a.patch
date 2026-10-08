@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Thu, 8 Oct 2026 23:22:52 +0400
+Subject: [PATCH] Widget on Windows 10 Mobile: the screen's available area is
+ the window's
+
+The headless screen was the whole display, available area included. Menus
+and panels are kept inside the available area, so a list opened near the
+bottom -- the microphone choice in the permission prompt, which now sits
+above the bottom bar -- "fitted" below its field into the part of the
+display under the navigation bar: it neither opened upwards nor shrank and
+scrolled, and its last items could not be reached.
+
+The shell already tells the engine the window's size whenever it changes
+(status bar, navigation bar, keyboard, turning the phone). That size now
+becomes the screen's available area, from the origin where the window sits,
+before the window is resized to it; a new display size keeps it. The
+screen itself stays the display.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widget/headless/HeadlessCompositorWidget.cpp |  3 ++
+ widget/headless/HeadlessScreenHelper.cpp     | 47 ++++++++++++++++----
+ widget/headless/HeadlessScreenHelper.h       |  4 ++
+ 3 files changed, 46 insertions(+), 8 deletions(-)
+
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 1859c15c5d..0b4a8f61e5 100644
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -1119,6 +1119,9 @@ extern "C" __declspec(dllexport) void gecko_w10m_resize(int32_t aWidth,
+   mozilla::widget::gGeckoW10mPendingHeight = aHeight;
+   NS_DispatchToMainThread(
+       NS_NewRunnableFunction("gecko_w10m_resize", [aWidth, aHeight]() {
++        // The screen's available area first: the window is kept inside it.
++        mozilla::widget::HeadlessScreenHelper::GeckoW10mSetRoom(aWidth,
++                                                                aHeight);
+         auto* widget = mozilla::widget::HeadlessWidget::ShownWidget();
+         if (!widget) {
+           return;
+diff --git a/widget/headless/HeadlessScreenHelper.cpp b/widget/headless/HeadlessScreenHelper.cpp
+index 32cab7e436..0739ee2445 100644
+--- a/widget/headless/HeadlessScreenHelper.cpp
++++ b/widget/headless/HeadlessScreenHelper.cpp
+@@ -21,6 +21,33 @@ namespace widget {
+ // The shell says what the display is right now; a phone turns over.
+ static int32_t sGeckoW10mScreenWidth = 0;
+ static int32_t sGeckoW10mScreenHeight = 0;
++// And how much of it the window has. That is the screen's available area:
++// menus and panels are kept inside it. Left as the whole display, a list
++// opened near the bottom -- the microphone choice in the permission prompt
++// -- "fitted" below its field, into the part under the navigation bar, so it
++// neither opened upwards nor got a scroll bar, and its end could not be
++// reached.
++static int32_t sGeckoW10mRoomWidth = 0;
++static int32_t sGeckoW10mRoomHeight = 0;
++
++static void GeckoW10mRefreshScreen(const LayoutDeviceIntRect& aRect) {
++  LayoutDeviceIntRect avail = aRect;
++  if (sGeckoW10mRoomWidth > 0 && sGeckoW10mRoomHeight > 0) {
++    // The window sits at the screen's origin in the engine's coordinates.
++    avail = aRect.Intersect(LayoutDeviceIntRect(0, 0, sGeckoW10mRoomWidth,
++                                                sGeckoW10mRoomHeight));
++    if (avail.IsEmpty()) {
++      avail = aRect;
++    }
++  }
++  AutoTArray<RefPtr<Screen>, 1> screenList;
++  auto screen = MakeRefPtr<Screen>(
++      aRect, avail, 24, 24, 0, DesktopToLayoutDeviceScale(),
++      CSSToLayoutDeviceScale(), 96.0f, Screen::IsPseudoDisplay::No,
++      Screen::IsHDR::No, 80.0f, 1000.0f);
++  screenList.AppendElement(screen.forget());
++  ScreenManager::Refresh(std::move(screenList));
++}
+ #endif
+ 
+ /* static */
+@@ -52,18 +79,22 @@ void HeadlessScreenHelper::GeckoW10mSetScreen(int32_t aWidth, int32_t aHeight) {
+   }
+   sGeckoW10mScreenWidth = aWidth;
+   sGeckoW10mScreenHeight = aHeight;
+-  LayoutDeviceIntRect rect(0, 0, aWidth, aHeight);
+-  AutoTArray<RefPtr<Screen>, 1> screenList;
+-  auto screen = MakeRefPtr<Screen>(
+-      rect, rect, 24, 24, 0, DesktopToLayoutDeviceScale(),
+-      CSSToLayoutDeviceScale(), 96.0f, Screen::IsPseudoDisplay::No,
+-      Screen::IsHDR::No, 80.0f, 1000.0f);
+-  screenList.AppendElement(screen.forget());
+-  ScreenManager::Refresh(std::move(screenList));
++  GeckoW10mRefreshScreen(LayoutDeviceIntRect(0, 0, aWidth, aHeight));
+   char note[96];
+   SprintfLiteral(note, "screen: now %dx%d", aWidth, aHeight);
+   GeckoW10mNote(note);
+ }
++
++/* static */
++void HeadlessScreenHelper::GeckoW10mSetRoom(int32_t aWidth, int32_t aHeight) {
++  if (aWidth <= 0 || aHeight <= 0 ||
++      (aWidth == sGeckoW10mRoomWidth && aHeight == sGeckoW10mRoomHeight)) {
++    return;
++  }
++  sGeckoW10mRoomWidth = aWidth;
++  sGeckoW10mRoomHeight = aHeight;
++  GeckoW10mRefreshScreen(GetScreenRect());
++}
+ #endif
+ 
+ HeadlessScreenHelper::HeadlessScreenHelper() {
+diff --git a/widget/headless/HeadlessScreenHelper.h b/widget/headless/HeadlessScreenHelper.h
+index e8a9003fcb..c473a57703 100644
+--- a/widget/headless/HeadlessScreenHelper.h
++++ b/widget/headless/HeadlessScreenHelper.h
+@@ -21,6 +21,10 @@ class HeadlessScreenHelper final : public ScreenManager::Helper {
+  public:
+   // Main thread only. Replaces the one screen with one of this size.
+   static void GeckoW10mSetScreen(int32_t aWidth, int32_t aHeight);
++  // Main thread only. The part of the screen the browser's window has --
++  // less the status bar, the navigation bar and the keyboard -- which is
++  // where popups have to stay.
++  static void GeckoW10mSetRoom(int32_t aWidth, int32_t aHeight);
+ #endif
+ };
+ 

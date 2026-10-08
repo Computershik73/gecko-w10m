@@ -3,7 +3,11 @@
 
 #include "client/CaptureConsent.h"
 
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Media.Capture.h>
@@ -40,6 +44,23 @@ winrt::Windows::UI::Core::CoreDispatcher gUi{nullptr};
 ConsentResultFn gResult = nullptr;
 bool gInstalled = false;
 
+// One consent request: the MediaCapture whose start shows the system's
+// prompt, and that start -- and through it, its completion handler. Left to
+// Windows.Media they were let go while its prompt was up on the HP Elite x3,
+// and the freed handler was called all the same: the browser fell over the
+// moment the user answered. So they are kept here for as long as the browser
+// runs: there is no telling when Windows.Media is done with them, and there
+// is one of these per system prompt, which stops coming once it is answered.
+struct Ask {
+  uint32_t id = 0;
+  int32_t kind = 0;
+  MediaCapture capture{nullptr};
+  IAsyncAction start{nullptr};
+  std::atomic<bool> answered{false};
+};
+std::mutex gAsksLock;
+std::vector<std::shared_ptr<Ask>> gAsks;
+
 DeviceClass ClassFor(int32_t kind) {
   return kind == kCamera ? DeviceClass::VideoCapture : DeviceClass::AudioCapture;
 }
@@ -48,13 +69,31 @@ const wchar_t* NameFor(int32_t kind) {
   return kind == kCamera ? L"camera" : L"microphone";
 }
 
-void Answer(uint32_t id, int32_t kind, bool granted, std::wstring const& why) {
-  Log::Write(std::wstring(L"capture: ") + NameFor(kind) +
-             (granted ? L" allowed" : L" refused") +
-             (why.empty() ? L"" : L", " + why));
+// Never throws, and tells the engine before anything else: the log line
+// goes through the UI dispatcher, which is the very thing that may have
+// refused work when this is the fallback.
+void Answer(uint32_t id, int32_t kind, bool granted,
+            std::wstring const& why) noexcept {
   if (gResult) {
     gResult(id, granted ? 1 : 0);
   }
+  try {
+    Log::Write(std::wstring(L"capture: ") + NameFor(kind) +
+               (granted ? L" allowed" : L" refused") +
+               (why.empty() ? L"" : L", " + why));
+  } catch (...) {
+  }
+}
+
+// On the UI thread, where the capture was made: closed first, so the engine
+// asks for the device only once it is free again, then the answer.
+void Finish(std::shared_ptr<Ask> const& ask, bool granted,
+            std::wstring const& why) noexcept {
+  try {
+    ask->capture.Close();
+  } catch (...) {
+  }
+  Answer(ask->id, ask->kind, granted, why);
 }
 
 // From the engine's main thread; must answer at once and never ask.
@@ -106,26 +145,58 @@ void OnRequest(uint32_t id, int32_t kind) {
             settings.StreamingCaptureMode(kind == kCamera
                                               ? StreamingCaptureMode::Video
                                               : StreamingCaptureMode::Audio);
-            MediaCapture capture;
-            capture.InitializeAsync(settings).Completed(
-                [id, kind, capture](IAsyncAction const& op, AsyncStatus done) {
-                  try {
-                    capture.Close();
-                  } catch (...) {
-                  }
-                  if (done == AsyncStatus::Completed) {
-                    Answer(id, kind, true, L"");
-                    return;
-                  }
-                  const HRESULT code = op.ErrorCode();
-                  wchar_t text[64];
-                  swprintf_s(text, L"MediaCapture said 0x%08x",
-                             static_cast<unsigned>(code));
-                  // Only a refusal is final. Anything else -- the capture
-                  // pipeline itself unhappy -- is left to the engine's own
-                  // WASAPI capture to try.
-                  Answer(id, kind, code != E_ACCESSDENIED, text);
-                });
+            auto ask = std::make_shared<Ask>();
+            ask->id = id;
+            ask->kind = kind;
+            ask->capture = MediaCapture();
+            {
+              std::lock_guard<std::mutex> lock(gAsksLock);
+              gAsks.push_back(ask);
+            }
+            Log::Write(std::wstring(L"capture: asking the phone for the ") +
+                       NameFor(kind));
+            ask->start = ask->capture.InitializeAsync(settings);
+            ask->start.Completed([ask](IAsyncAction const& op,
+                                       AsyncStatus done) {
+              // A copy of our own: nothing of the handler's is touched after
+              // the work is handed over below.
+              const std::shared_ptr<Ask> mine = ask;
+              // Once: whatever comes after the first answer is not one.
+              if (mine->answered.exchange(true)) {
+                return;
+              }
+              HRESULT code = S_OK;
+              if (done != AsyncStatus::Completed) {
+                try {
+                  code = op.ErrorCode();
+                } catch (...) {
+                  code = E_FAIL;
+                }
+              }
+              // Only a refusal is final. Anything else -- the capture
+              // pipeline itself unhappy -- is left to the engine's own
+              // WASAPI capture to try.
+              const bool granted =
+                  done == AsyncStatus::Completed || code != E_ACCESSDENIED;
+              std::wstring why;
+              if (done != AsyncStatus::Completed) {
+                wchar_t text[64];
+                swprintf_s(text, L"MediaCapture said 0x%08x",
+                           static_cast<unsigned>(code));
+                why = text;
+              }
+              // Not from inside its own completion, on a media work-queue
+              // thread: closed and answered on the UI thread.
+              try {
+                gUi.RunAsync(
+                    winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                    [mine, granted, why]() { Finish(mine, granted, why); });
+              } catch (...) {
+                // The answer at least; the capture stays open, once.
+                Answer(mine->id, mine->kind, granted,
+                       why.empty() ? std::wstring(L"not closed") : why);
+              }
+            });
           } catch (winrt::hresult_error const& error) {
             Answer(id, kind, error.code() != E_ACCESSDENIED,
                    std::wstring(error.message()));

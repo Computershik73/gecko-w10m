@@ -46,3 +46,11 @@ Two port changes undo that:
   It is done there rather than by setting `flip="slide"` from the autoconfig
   script because some panels (form validation, date and colour pickers) are
   put in and opened in one go, before any script could change them.
+
+Menus need nothing here: the theme's `max-content` block sizes behave as
+`auto` in Gecko, so a list with no room for all its items is already shrunk
+and scrolls. What it needs is the right room. The engine is told the area
+the status bar, navigation bar and keyboard leave free as the screen's
+available area (HeadlessScreenHelper, under GECKO_W10M); with the whole
+display there, a list near the bottom "fitted" into the part under the
+navigation bar and was cut off.
