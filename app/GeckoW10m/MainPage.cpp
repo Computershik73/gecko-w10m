@@ -208,6 +208,27 @@ MainPage::MainPage() {
           }
         }
       }
+      // Then what the address space is made of -- after the engine has been
+      // told, which at OverLimit cannot wait -- each time the level climbs
+      // past the highest one mapped so far. The system repeats a level
+      // several times a second; a repeat is not a rise.
+      static std::atomic<int> highestMapped{0};
+      int mappedLevel = highestMapped.load();
+      while (static_cast<int>(level) > mappedLevel &&
+             !highestMapped.compare_exchange_weak(mappedLevel,
+                                                  static_cast<int>(level))) {
+      }
+      if (static_cast<int>(level) > mappedLevel) {
+        if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+          using MapFn = void(__cdecl*)(const char*);
+          if (auto map = reinterpret_cast<MapFn>(
+                  ::GetProcAddress(xul, "gecko_w10m_note_address_space"))) {
+            map(static_cast<int>(level) >= 3   ? "memory use over the limit"
+                : static_cast<int>(level) >= 2 ? "memory use high"
+                                               : "memory use medium");
+          }
+        }
+      }
     });
     MemoryManager::AppMemoryUsageDecreased([mb](auto&&, auto&&) {
       Log::Write(L"mem: usage went down a level -- now " +
@@ -254,6 +275,19 @@ MainPage::MainPage() {
             line += L"; phone stats unavailable";
           }
           Log::Write(line);
+          // A minute in, what the address space is made of: the browser
+          // settled, before the pages that run out of it.
+          static bool mapped = false;
+          if (!mapped && ::GetTickCount64() - started >= 60000) {
+            mapped = true;
+            if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+              using MapFn = void(__cdecl*)(const char*);
+              if (auto map = reinterpret_cast<MapFn>(
+                      ::GetProcAddress(xul, "gecko_w10m_note_address_space"))) {
+                map("a minute after start");
+              }
+            }
+          }
           // Every other sample -- every minute once past the first two --
           // what that memory is made of.
           if (++samples % 2 == 0 && Log::Verbose()) {

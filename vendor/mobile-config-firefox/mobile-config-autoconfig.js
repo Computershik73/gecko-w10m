@@ -1085,8 +1085,9 @@ function gecko_h264ify() {
 // fine pointer that hovers, a screen at least 1280x720. WhatsApp Web answered
 // the default user agent -- Firefox for Android, which UserAgentManager gives
 // every site so that they send their phone layouts -- with a redirect to its
-// "use a computer" page (/mobile/). Taps still reach the page as clicks, so
-// it is used as usual. The hosts are gecko.desktop.hosts.
+// "use a computer" page (/mobile/). Discord, after login, put up "this
+// browser is not supported" and pointed at its app. Taps still reach the
+// page as clicks, so it is used as usual. The hosts are gecko.desktop.hosts.
 const DESKTOP_SOURCE = `
 (function () {
   "use strict";
@@ -1137,7 +1138,7 @@ const DESKTOP_SOURCE = `
 
 function gecko_desktop_sites() {
     const setting = Services.prefs.getStringPref("gecko.desktop.hosts",
-                                                 "web.whatsapp.com");
+                                                 "web.whatsapp.com,discord.com");
     const hosts = setting.split(",").map(h => h.trim().toLowerCase())
                          .filter(h => h.length);
     if (!hosts.length) {
