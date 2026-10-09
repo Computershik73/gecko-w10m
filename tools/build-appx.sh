@@ -452,6 +452,16 @@ pref("media.memory_caches_combined_limit_kb", 24576);
 // Tabs in the background are unloaded when memory is tight, and the phone
 // says when that is (gecko_w10m_memory_pressure).
 pref("browser.tabs.unloadOnLowMemory", true);
+// While memory stays critical (the phone at High or over its limit) the
+// engine is told afresh every thirty seconds -- memory-pressure-stop, then a
+// new low-memory and another shrinking GC -- instead of low-memory-ongoing,
+// which the JS engine ignores. And the address
+// space is watched: when its largest free piece falls under 96 MB the engine
+// is put under pressure as well, until the piece is back above 144 MB
+// (widget/headless/GeckoW10mMemoryPressure.cpp). These are the defaults;
+// 0 turns either off.
+// pref("memory.gecko-w10m.pressure-rearm-ms", 30000);
+// pref("memory.gecko-w10m.address-space.low-mb", 96);
 // Connection pool sized as on Android.
 pref("network.http.max-connections", 128);
 // Twenty seconds before a script is called slow, as on Android: the CPU is a

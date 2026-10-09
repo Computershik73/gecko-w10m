@@ -177,6 +177,9 @@ MainPage::MainPage() {
       Log::Write(L"mem: the limit is changing from " + mb(args.OldLimit()) +
                  L" to " + mb(args.NewLimit()));
     });
+    // When the engine was last told the phone's level went up. Shared with
+    // the fall to Low below, which starts a new spell of pressure.
+    static std::atomic<unsigned long long> lastSent{0};
     MemoryManager::AppMemoryUsageIncreased([mb](auto&&, auto&&) {
       const auto level = MemoryManager::AppMemoryUsageLevel();
       Log::Write(L"mem: the system says usage went UP a level -- now " +
@@ -190,7 +193,6 @@ MainPage::MainPage() {
       // purge on a CPU that is already 90% busy: the cure was the illness.
       // Medium goes through once in thirty seconds, High and over once in
       // five.
-      static std::atomic<unsigned long long> lastSent{0};
       const unsigned long long now = ::GetTickCount64();
       // Past the limit (OverLimit, 3) the app is about to be ended, so that
       // one always goes through.
@@ -231,9 +233,26 @@ MainPage::MainPage() {
       }
     });
     MemoryManager::AppMemoryUsageDecreased([mb](auto&&, auto&&) {
+      const auto level = MemoryManager::AppMemoryUsageLevel();
       Log::Write(L"mem: usage went down a level -- now " +
-                 std::to_wstring(static_cast<int>(MemoryManager::AppMemoryUsageLevel())) +
+                 std::to_wstring(static_cast<int>(level)) +
                  L" at " + mb(MemoryManager::AppMemoryUsage()));
+      // Back to Low: the engine is told, so that its memory pressure ends --
+      // it holds it from the first Medium on, and from High up collects
+      // afresh every half minute. Not rate-limited: a fall to Low is rare,
+      // and the engine does nothing for a Low it already had. The next rise
+      // is a new spell and goes through at once, not after the gap the last
+      // Medium left: the engine spaces its collections itself now.
+      if (static_cast<int>(level) == 0) {
+        lastSent.store(0);
+        if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+          using PressureFn = void(__cdecl*)(int32_t);
+          if (auto fn = reinterpret_cast<PressureFn>(
+                  ::GetProcAddress(xul, "gecko_w10m_memory_pressure"))) {
+            fn(0);
+          }
+        }
+      }
     });
     // Every ten seconds for the first two minutes, then every thirty: the
     // app's own usage, and beside it what the whole phone is doing -- CPU
