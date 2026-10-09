@@ -1,0 +1,1495 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 16:52:43 +0400
+Subject: [PATCH] WebGL on Windows 10 Mobile at feature level 9_3, behind a
+ pref
+
+ANGLE's D3D11 renderer asked for feature level 10_0 and up only, so at 9_3
+(Lumia 550, 650, 950) WebGL fell to WARP, a CPU rasteriser on four Cortex-A7
+cores. ANGLE now also accepts 9_3 (last in the list, so higher levels are
+unchanged), and its clear shaders get level_9_3 forms again
+(Clear11_FL9.hlsl, compiled with fxc vs/ps_4_0_level_9_3): upstream had
+dropped them, and every masked or scissored clear failed. WebGL 2 is never
+offered at 9_3. webgl.gecko-w10m.feature-level-9, off by default until the
+cost of pages probing WebGL is measured on a Lumia, decides whether WebGL 1
+runs there; off, getContext fails at once and nothing is loaded. WARP is no
+longer taken silently (webgl.forbid-software), and failIfMajorPerformanceCaveat
+is honoured. Accelerated canvas 2D is turned off at 9_3: it draws through
+WebGL 2. gfxPlatform also says whether the shader cache is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/canvas/WebGLContext.cpp                   |  70 ++++++++
+ dom/canvas/WebGLProgram.cpp                   |  32 +++-
+ gfx/gl/GLLibraryEGL.cpp                       | 161 ++++++++++++++++++
+ gfx/thebes/gfxPlatform.cpp                    |  77 ++++++++-
+ .../renderer/d3d/ProgramExecutableD3D.cpp     |  10 ++
+ .../libANGLE/renderer/d3d/d3d11/Clear11.cpp   |  70 ++++++++
+ .../src/libANGLE/renderer/d3d/d3d11/Clear11.h |  12 ++
+ .../renderer/d3d/d3d11/Renderer11.cpp         |  14 ++
+ .../renderer/d3d/d3d11/renderer11_utils.cpp   |   8 +
+ .../d3d/d3d11/shaders/Clear11_FL9.hlsl        | 105 ++++++++++++
+ .../d3d11/shaders/compiled/clear11_fl9vs.h    | 120 +++++++++++++
+ .../shaders/compiled/cleardepth11_fl9ps.h     |  62 +++++++
+ .../shaders/compiled/clearfloat11_fl9ps1.h    |  96 +++++++++++
+ .../shaders/compiled/clearfloat11_fl9ps2.h    | 104 +++++++++++
+ .../shaders/compiled/clearfloat11_fl9ps3.h    | 112 ++++++++++++
+ .../shaders/compiled/clearfloat11_fl9ps4.h    | 120 +++++++++++++
+ 16 files changed, 1170 insertions(+), 3 deletions(-)
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/Clear11_FL9.hlsl
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clear11_fl9vs.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/cleardepth11_fl9ps.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps1.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps2.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps3.h
+ create mode 100644 third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps4.h
+
+diff --git a/dom/canvas/WebGLContext.cpp b/dom/canvas/WebGLContext.cpp
+index d72c6ac8b7..cc76fece3e 100644
+--- a/dom/canvas/WebGLContext.cpp
++++ b/dom/canvas/WebGLContext.cpp
+@@ -88,6 +88,12 @@
+ #  include "WGLLibrary.h"
+ #endif
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++#  include "mozilla/TimeStamp.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ // Generated
+ #include "mozilla/dom/WebGLRenderingContextBinding.h"
+ 
+@@ -439,6 +445,32 @@ bool WebGLContext::CreateAndInitGL(
+     return false;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    // What a page actually got. At feature level 9_3 the renderer string
++    // reads "... vs_4_0_level_9_3 ...", with 7 varyings and no vertex
++    // textures -- the limits most "my WebGL page is broken" reports there
++    // come down to. alpha:false matters because Gecko then masks alpha on
++    // every clear, which at 9_3 goes through ANGLE's level 9 clear shaders.
++    static uint32_t sNotes = 0;  // CanvasRenderer thread only
++    if (sNotes < 3) {
++      ++sNotes;
++      const auto* const renderer =
++          reinterpret_cast<const char*>(gl->fGetString(LOCAL_GL_RENDERER));
++      char note[256];
++      SprintfLiteral(note,
++                     "webgl: context %ux%u alpha %d, ES %u.%u, varyings %u, "
++                     "vertex textures %u, max texture %u, %.60s",
++                     mRequestedSize.x, mRequestedSize.y, mOptions.alpha ? 1 : 0,
++                     gl->Version() / 100, (gl->Version() % 100) / 10,
++                     mGLMaxFragmentInputVectors, mGLMaxVertexTextureImageUnits,
++                     mLimits ? mLimits->maxTex2dSize : 0u,
++                     renderer ? renderer : "?");
++      GeckoW10mNote(note);
++    }
++  }
++#endif
++
+   const auto val = StaticPrefs::webgl_debug_incomplete_tex_color();
+   if (val) {
+     mIncompleteTexOverride.reset(new gl::Texture(*gl));
+@@ -1424,6 +1456,17 @@ bool WebGLContext::PushRemoteTexture(
+     Range<uint8_t> range = {mappedData.data,
+                             data->AsBufferTextureData()->GetBufferSize()};
+ 
++#if defined(GECKO_W10M)
++    // A feature level 9_3 device shares no textures, so every frame a WebGL
++    // page presents there is read back here: a pipeline drain, a staging
++    // copy and a swizzle, on the CanvasRenderer thread. The X3 shares
++    // textures and does not come here for a normal page. Timed only while
++    // there are notes left to write.
++    static uint32_t sReadbackNotes = 0;  // CanvasRenderer thread only
++    const TimeStamp readbackStart =
++        sReadbackNotes < 5 ? TimeStamp::Now() : TimeStamp();
++#endif
++
+     // If we have a surface representing the front buffer, then try to snapshot
+     // that. Otherwise, when there is no surface, we read back directly from the
+     // WebGL framebuffer.
+@@ -1445,6 +1488,33 @@ bool WebGLContext::PushRemoteTexture(
+       MOZ_RELEASE_ASSERT(rv, "SwizzleData failed!");
+     }
+ 
++#if defined(GECKO_W10M)
++    if (!readbackStart.IsNull()) {
++      // Summed up 600 frames at a time, five lines a run at most.
++      static uint32_t sFrames = 0;
++      static double sSumMs = 0.0;
++      static double sWorstMs = 0.0;
++      const double ms = (TimeStamp::Now() - readbackStart).ToMilliseconds();
++      ++sFrames;
++      sSumMs += ms;
++      if (ms > sWorstMs) {
++        sWorstMs = ms;
++      }
++      if (sFrames >= 600) {
++        ++sReadbackNotes;
++        char note[160];
++        SprintfLiteral(note,
++                       "webgl: last 600 frames read back, %dx%d, %.1f ms "
++                       "average, %.1f ms worst",
++                       size.width, size.height, sSumMs / sFrames, sWorstMs);
++        GeckoW10mNote(note);
++        sFrames = 0;
++        sSumMs = 0.0;
++        sWorstMs = 0.0;
++      }
++    }
++#endif
++
+     ownerClient->PushTexture(textureId, ownerId, std::move(data));
+     return true;
+   }
+diff --git a/dom/canvas/WebGLProgram.cpp b/dom/canvas/WebGLProgram.cpp
+index 05f549dc7d..8eca5870da 100644
+--- a/dom/canvas/WebGLProgram.cpp
++++ b/dom/canvas/WebGLProgram.cpp
+@@ -20,6 +20,13 @@
+ #include "mozilla/gfx/Logging.h"
+ #include "nsPrintfCString.h"
+ 
++#if defined(GECKO_W10M)
++#  include <algorithm>
++
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ namespace mozilla {
+ 
+ static bool IsShadowSampler(const GLenum elemType) {
+@@ -1191,7 +1198,30 @@ void WebGLProgram::LinkAndUpdate() {
+ 
+   GLint ok = 0;
+   gl->fGetProgramiv(mGLName, LOCAL_GL_LINK_STATUS, &ok);
+-  if (!ok) return;
++  if (!ok) {
++#if defined(GECKO_W10M)
++    // ANGLE's Direct3D backend compiles HLSL at link time, so this is where
++    // fxc refuses a shader at feature level 9_3 (shader model 2 limits: about
++    // 512 instructions, 32 temporaries, loops indexed by constants only).
++    // Gecko's own validation passed by now; the log is the driver's. Variants
++    // compiled later at draw time fail as GL errors and are not seen here.
++    static uint32_t sNotes = 0;  // CanvasRenderer thread only
++    if (sNotes < 5) {
++      ++sNotes;
++      char log[101] = {};
++      const size_t len = std::min(mLinkLog.size(), sizeof(log) - 1);
++      for (size_t i = 0; i < len; ++i) {
++        const char c = mLinkLog[i];
++        log[i] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
++      }
++      char note[160];
++      SprintfLiteral(note, "webgl: the driver refused a program: %s",
++                     len ? log : "(no log)");
++      GeckoW10mNote(note);
++    }
++#endif
++    return;
++  }
+ 
+   mMostRecentLinkInfo =
+       QueryProgramInfo(this, gl);  // Fallible after context loss.
+diff --git a/gfx/gl/GLLibraryEGL.cpp b/gfx/gl/GLLibraryEGL.cpp
+index 0b7c03ed7d..ff04399b65 100644
+--- a/gfx/gl/GLLibraryEGL.cpp
++++ b/gfx/gl/GLLibraryEGL.cpp
+@@ -46,12 +46,26 @@
+ 
+ #include <mutex>  // for call_once
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++#  include "mozilla/TimeStamp.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ namespace mozilla {
+ namespace gl {
+ 
+ StaticMutex GLLibraryEGL::sMutex;
+ StaticRefPtr<GLLibraryEGL> GLLibraryEGL::sInstance;
+ 
++#if defined(GECKO_W10M)
++// What the last display creation did about WARP, for the note DefaultDisplay
++// writes when it gets no display. Both run with sMutex held, so a plain
++// static is enough.
++enum class GeckoW10mWarp { NotTried, Failed, Forbidden };
++static GeckoW10mWarp sGeckoW10mWarp = GeckoW10mWarp::NotTried;
++#endif
++
+ // should match the order of EGLExtensions, and be null-terminated.
+ static const char* sEGLLibraryExtensionNames[] = {
+     "EGL_ANDROID_get_native_client_buffer",
+@@ -305,6 +319,32 @@ static std::shared_ptr<EglDisplay> GetAndInitWARPDisplay(
+   return EglDisplay::Create(egl, display, true, aProofOfLock);
+ }
+ 
++#if defined(GECKO_W10M)
++// A test hook, off unless webgl.gecko-w10m.angle-fl93-test is set: ANGLE's
++// own D3D11 device capped at feature level 9_3, the level the Lumia 550, 650
++// and 950 run at. ANGLE's internal shaders fail at 9_3 the same way on any
++// GPU, so the level 9 path can be tried on the X3 first. WebRender is not
++// touched by it -- it builds its display from Gecko's own device
++// (RenderThread, CreateDisplay below).
++static std::shared_ptr<EglDisplay> GetAndInitFL93TestDisplay(
++    GLLibraryEGL& egl, const StaticMutexAutoLock& aProofOfLock) {
++  const EGLAttrib attrib_list[] = {
++      LOCAL_EGL_PLATFORM_ANGLE_TYPE_ANGLE,
++      LOCAL_EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
++      LOCAL_EGL_PLATFORM_ANGLE_MAX_VERSION_MAJOR_ANGLE,
++      9,
++      LOCAL_EGL_PLATFORM_ANGLE_MAX_VERSION_MINOR_ANGLE,
++      3,
++      LOCAL_EGL_NONE};
++  const EGLDisplay display = egl.fGetPlatformDisplay(
++      LOCAL_EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY, attrib_list);
++  if (display == EGL_NO_DISPLAY) {
++    return nullptr;
++  }
++  return EglDisplay::Create(egl, display, false, aProofOfLock);
++}
++#endif
++
+ std::shared_ptr<EglDisplay> GLLibraryEGL::CreateDisplay(
+     ID3D11Device* const d3d11Device) {
+   StaticMutexAutoLock lock(sMutex);
+@@ -451,7 +491,16 @@ static std::shared_ptr<EglDisplay> GetAndInitDisplayForAccelANGLE(
+   }
+ 
+   std::shared_ptr<EglDisplay> ret;
++#if defined(GECKO_W10M)
++  // Ahead of the D3D11 display, which would otherwise give the X3 its own
++  // feature level and never reach the 9_3 path this hook is for.
++  if (StaticPrefs::webgl_gecko_w10m_angle_fl93_test()) {
++    ret = GetAndInitFL93TestDisplay(egl, aProofOfLock);
++  }
++  if (!ret && d3d11ANGLE.IsEnabled()) {
++#else
+   if (d3d11ANGLE.IsEnabled()) {
++#endif
+     ret = GetAndInitDisplay(egl, LOCAL_EGL_D3D11_ELSE_D3D9_DISPLAY_ANGLE,
+                             aProofOfLock);
+   }
+@@ -944,13 +993,94 @@ EglDisplay::~EglDisplay() {
+ 
+ // -
+ 
++#if defined(GECKO_W10M)
++// WebGL's display. It lives only as long as some context holds it, so on a
++// phone where nothing else keeps it alive every page that probes for WebGL
++// makes a new one: a D3D11 device, ANGLE's start-up and its caps. How often
++// that happens and what it costs is the measure for leaving WebGL on at
++// feature level 9_3, so the first three creations are written down, then
++// every tenth, eight lines a run at most. Called with sMutex held.
++static void GeckoW10mNoteDefaultDisplay(
++    GLLibraryEGL& aLib, const std::shared_ptr<EglDisplay>& aDisplay,
++    const nsACString& aFailureId, const TimeStamp& aStart) {
++  static uint32_t sCreations = 0;
++  static uint32_t sTotalMs = 0;
++  static uint32_t sNotes = 0;
++  const auto ms =
++      static_cast<uint32_t>((TimeStamp::Now() - aStart).ToMilliseconds());
++  ++sCreations;
++  sTotalMs += ms;
++  if ((sCreations > 3 && sCreations % 10 != 0) || sNotes >= 8) {
++    return;
++  }
++  ++sNotes;
++
++  char note[256];
++  if (aDisplay) {
++    unsigned level = 0;
++    const char* clearView = "unknown";
++#  ifdef XP_WIN
++    // The same query SharedSurfaceANGLE makes for the device behind the
++    // display. ClearView is what ANGLE's scissored clears need to avoid its
++    // shader path.
++    if (aLib.IsExtensionSupported(EGLLibExtension::EXT_device_query)) {
++      EGLDeviceEXT eglDevice = nullptr;
++      ID3D11Device* device = nullptr;
++      if (aDisplay->fQueryDisplayAttribEXT(LOCAL_EGL_DEVICE_EXT,
++                                           (EGLAttrib*)&eglDevice) &&
++          eglDevice &&
++          aLib.fQueryDeviceAttribEXT(eglDevice, LOCAL_EGL_D3D11_DEVICE_ANGLE,
++                                     (EGLAttrib*)&device) &&
++          device) {
++        level = static_cast<unsigned>(device->GetFeatureLevel());
++        D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
++        if (SUCCEEDED(device->CheckFeatureSupport(
++                D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)))) {
++          clearView = options.ClearView ? "yes" : "no";
++        }
++      }
++    }
++#  endif
++    SprintfLiteral(note,
++                   "webgl: EGL display #%u up in %u ms (total %u ms), device "
++                   "feature level 0x%04x, ClearView %s%s",
++                   sCreations, ms, sTotalMs, level, clearView,
++                   aDisplay->mIsWARP ? ", on WARP" : "");
++  } else {
++    const char* warp = "not tried";
++    switch (sGeckoW10mWarp) {
++      case GeckoW10mWarp::NotTried:
++        break;
++      case GeckoW10mWarp::Failed:
++        warp = "failed";
++        break;
++      case GeckoW10mWarp::Forbidden:
++        warp = "skipped by webgl.forbid-software";
++        break;
++    }
++    const nsCString failureId(aFailureId);
++    SprintfLiteral(note, "webgl: EGL display #%u failed in %u ms (%s), WARP %s",
++                   sCreations, ms,
++                   failureId.IsEmpty() ? "no failure id" : failureId.get(),
++                   warp);
++  }
++  GeckoW10mNote(note);
++}
++#endif
++
+ std::shared_ptr<EglDisplay> GLLibraryEGL::DefaultDisplay(
+     nsACString* const out_failureId) {
+   StaticMutexAutoLock lock(sMutex);
+   auto ret = mDefaultDisplay.lock();
+   if (ret) return ret;
+ 
++#if defined(GECKO_W10M)
++  const auto start = TimeStamp::Now();
++#endif
+   ret = CreateDisplayLocked({}, out_failureId, lock);
++#if defined(GECKO_W10M)
++  GeckoW10mNoteDefaultDisplay(*this, ret, *out_failureId, start);
++#endif
+   mDefaultDisplay = ret;
+   return ret;
+ }
+@@ -986,6 +1116,22 @@ std::shared_ptr<EglDisplay> GLLibraryEGL::CreateDisplayLocked(
+       }
+     }
+ 
++#if defined(GECKO_W10M)
++    // webgl.forbid-software (true by default) means "fall back to canvas 2d
++    // rather than to software GL", but only CGL and EAGL ever read it; here
++    // a page whose hardware display failed went straight on to WARP, Direct3D
++    // on the CPU. On four Cortex-A7 cores that holds the whole browser while
++    // the page animates. A display asked for as software, and
++    // webgl.angle.force-warp, still get WARP.
++    sGeckoW10mWarp = GeckoW10mWarp::NotTried;
++    bool warpForbidden = false;
++    if (!aFlags.mForceSoftware && !StaticPrefs::webgl_angle_force_warp() &&
++        StaticPrefs::webgl_forbid_software()) {
++      warpForbidden = shouldTryWARP;
++      shouldTryWARP = false;
++    }
++#endif
++
+     // Hardware accelerated ANGLE path (supported or force accel)
+     if (shouldTryAccel) {
+       ret = GetAndInitDisplayForAccelANGLE(*this, out_failureId, aProofOfLock);
+@@ -1008,6 +1154,9 @@ std::shared_ptr<EglDisplay> GLLibraryEGL::CreateDisplayLocked(
+     if (!ret && shouldTryWARP) {
+       ret = GetAndInitWARPDisplay(*this, EGL_DEFAULT_DISPLAY, aProofOfLock);
+       if (!ret) {
++#if defined(GECKO_W10M)
++        sGeckoW10mWarp = GeckoW10mWarp::Failed;
++#endif
+         if (out_failureId->IsEmpty()) {
+           *out_failureId = "FEATURE_FAILURE_WARP_FALLBACK"_ns;
+         }
+@@ -1015,6 +1164,18 @@ std::shared_ptr<EglDisplay> GLLibraryEGL::CreateDisplayLocked(
+         return nullptr;
+       }
+     }
++#if defined(GECKO_W10M)
++    if (!ret && warpForbidden) {
++      sGeckoW10mWarp = GeckoW10mWarp::Forbidden;
++      // When the hardware display was never tried (gfxVars refused ANGLE),
++      // its reason sits only in accelAngleFailureId. WARP used to hide that
++      // by succeeding or by setting its own id; with WARP skipped the caller
++      // and DefaultDisplay's note would otherwise get no reason at all.
++      if (out_failureId->IsEmpty()) {
++        *out_failureId = accelAngleFailureId;
++      }
++    }
++#endif
+   } else {
+     void* nativeDisplay = EGL_DEFAULT_DISPLAY;
+ #ifdef MOZ_WIDGET_GTK
+diff --git a/gfx/thebes/gfxPlatform.cpp b/gfx/thebes/gfxPlatform.cpp
+index 6b9e70ed31..c735614122 100644
+--- a/gfx/thebes/gfxPlatform.cpp
++++ b/gfx/thebes/gfxPlatform.cpp
+@@ -2704,6 +2704,10 @@ void gfxPlatform::InitWebRenderConfig() {
+     say("webrender", Feature::WEBRENDER);
+     say("d3d11 hardware angle", Feature::D3D11_HW_ANGLE);
+     say("webrender angle", Feature::WEBRENDER_ANGLE);
++    // Whether compiled shader programs are kept in the profile's
++    // shader-cache: with it, a relaunch links them from binaries instead of
++    // compiling them again, which is about a second of the second frame.
++    say("webrender shader cache", Feature::WEBRENDER_SHADER_CACHE);
+     say("d3d11 compositing", Feature::D3D11_COMPOSITING);
+     say("hardware video decoding", Feature::HARDWARE_VIDEO_DECODING);
+     // Not canvas 2d: it is configured a few lines later than this runs, and
+@@ -3332,6 +3336,52 @@ void gfxPlatform::InitWebGLConfig() {
+       StaticPrefs::webgl_out_of_process_enable_ahardwarebuffer_AtStartup());
+ #endif
+ 
++#if defined(GECKO_W10M) && defined(XP_WIN)
++  {
++    // The Lumia 550, 650 and 950 (Adreno 3xx) stop at Direct3D feature level
++    // 9_3. ANGLE can make a device there for WebGL 1 only -- ES 2, so never
++    // WebGL 2 -- and a 9_3 device shares no textures, so its frames are read
++    // back to the compositor. Every page whose scripts merely probe for WebGL
++    // would also pay for a device and a shader compile on a Cortex-A7. So at
++    // 9_3 WebGL 2 is refused (WebGLContext::CreateAndInitGL checks this before
++    // anything is loaded), and WebGL 1 is offered only when
++    // webgl.gecko-w10m.feature-level-9 says so: without it AllowWebGL is
++    // false and getContext fails in ClientWebGLContext with no IPC and no
++    // ANGLE. The X3 and anything else at 10_0 or above is left alone.
++    static unsigned sNotes = 0;
++    auto* const dm = gfx::DeviceManagerDx::Get();
++    const unsigned level = dm ? dm->GetCompositorFeatureLevel() : 0;
++    const char* note = nullptr;
++    if (!level) {
++      // The device is made before this runs (InitAcceleration). If it is not
++      // there, this gate cannot do anything, and the log has to say so.
++      note =
++          "webgl: compositor feature level not known when WebGL was "
++          "configured";
++    } else if (level < static_cast<unsigned>(D3D_FEATURE_LEVEL_10_0)) {
++      gfxVars::SetAllowWebgl2(false);
++      if (!StaticPrefs::webgl_gecko_w10m_feature_level_9_AtStartup()) {
++        // FeatureState keeps 63 characters of a reason.
++        featureWebGL.Disable(
++            FeatureStatus::Blocked,
++            "Feature level 9_3: off by webgl.gecko-w10m.feature-level-9",
++            "FEATURE_FAILURE_GECKO_W10M_FL9"_ns);
++        note =
++            "webgl: feature level 9_3 -- WebGL off by "
++            "webgl.gecko-w10m.feature-level-9";
++      } else {
++        note =
++            "webgl: feature level 9_3 -- WebGL 1 on ANGLE's own 9_3 device, "
++            "frames read back to the compositor; WebGL 2 not offered";
++      }
++    }
++    if (note && sNotes < 1) {
++      ++sNotes;
++      GeckoW10mNote(note);
++    }
++  }
++#endif
++
+   // Until bug 1999136 lands and the GPU process works with headless, we should
+   // allow WebGL in the parent process when headless.
+   if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS) && !IsHeadless() &&
+@@ -3620,17 +3670,40 @@ static void AcceleratedCanvas2DPrefChangeCallback(const char*, void*) {
+     feature.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+   }
+ 
++#if defined(GECKO_W10M) && defined(XP_WIN)
++  {
++    // Accelerated canvas draws through DrawTargetWebgl, which needs WebGL 2
++    // (ES 3), and ANGLE offers only ES 2 at feature level 9_3. Nothing would
++    // use the feature here anyway -- every consumer is remote or content
++    // only -- but about:support and the note below should give the real
++    // reason rather than an "ON" or a WebRender one.
++    auto* const dm = gfx::DeviceManagerDx::Get();
++    const unsigned level = dm ? dm->GetCompositorFeatureLevel() : 0;
++    if (level && level < static_cast<unsigned>(D3D_FEATURE_LEVEL_10_0)) {
++      // FeatureState keeps 63 characters of a reason.
++      feature.ForceDisable(
++          FeatureStatus::Unavailable,
++          "Feature level 9_3: needs WebGL 2 (ES 3), ANGLE has ES 2",
++          "FEATURE_FAILURE_GECKO_W10M_FL9"_ns);
++    }
++  }
++#endif
++
+   gfxVars::SetUseAcceleratedCanvas2D(feature.IsEnabled());
+ 
+ #if defined(GECKO_W10M)
+   {
+     // The feature note near the WebRender ones is printed by
+     // InitWebRenderConfig, which runs before this -- so it always said "off",
+-    // whatever this then decided. Here is the decision itself.
++    // whatever this then decided. Here is the decision itself. "ON" changes
++    // nothing in a single-process build: CanvasRenderingContext2D only
++    // accelerates in a content process, and there is none.
+     const char* why = feature.GetFailureMessage();
++    const bool inert = feature.IsEnabled() && !BrowserTabsRemoteAutostart();
+     char note[256];
+-    SprintfLiteral(note, "gfx: accelerated canvas 2d is %s%s%s",
++    SprintfLiteral(note, "gfx: accelerated canvas 2d is %s%s%s%s",
+                    feature.IsEnabled() ? "ON" : "off",
++                   inert ? " (inert: single process)" : "",
+                    (why && *why) ? " -- " : "", (why && *why) ? why : "");
+     GeckoW10mNote(note);
+   }
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+index 66d550e395..77cf1a58e0 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+@@ -1185,6 +1185,16 @@ gl::RangeUI ProgramExecutableD3D::getUsedImageRange(gl::ShaderType type, bool re
+ 
+ bool ProgramExecutableD3D::usesPointSpriteEmulation(RendererD3D *renderer) const
+ {
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // GeckoW10m: the emulation is a geometry shader, and feature level 9_3 (the only level
++    // with a shader model suffix) has none, so every point draw failed there. Without it a
++    // point is drawn one pixel wide, which is what ALIASED_POINT_SIZE_RANGE then says
++    // (GenerateCaps in renderer11_utils.cpp).
++    if (mUsesPointSize && !renderer->getShaderModelSuffix().empty())
++    {
++        return false;
++    }
++#endif
+     return mUsesPointSize && renderer->getMajorShaderModel() >= 4;
+ }
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
+index ccedcf99d3..59d5ed5b7d 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
+@@ -55,6 +55,16 @@
+ #include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearuint11ps7.h"
+ #include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearuint11ps8.h"
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++// GeckoW10m: the feature level 9_3 variants, see shaders/Clear11_FL9.hlsl.
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clear11_fl9vs.h"
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/cleardepth11_fl9ps.h"
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps1.h"
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps2.h"
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps3.h"
++#    include "libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps4.h"
++#endif
++
+ namespace rx
+ {
+ 
+@@ -63,6 +73,13 @@ namespace
+ constexpr uint32_t g_ConstantBufferSize = sizeof(RtvDsvClearInfo<float>);
+ constexpr uint32_t g_VertexSize         = sizeof(d3d11::PositionVertex);
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++// GeckoW10m: one d3d11::PositionVertex per corner, as ensureVertexBufferCreated writes them.
++const D3D11_INPUT_ELEMENT_DESC g_ClearFL9InputLayout[] = {
++    {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
++};
++#endif
++
+ // Updates color, depth and alpha components of cached CB if necessary.
+ // Returns true if any constants are updated, false otherwise.
+ template <typename T>
+@@ -124,6 +141,18 @@ Clear11::ShaderManager::ShaderManager()
+                CLEARPS(Uint6), CLEARPS(Uint7), CLEARPS(Uint8)}},
+       mPsSInt{{CLEARPS(Sint1), CLEARPS(Sint2), CLEARPS(Sint3), CLEARPS(Sint4), CLEARPS(Sint5),
+                CLEARPS(Sint6), CLEARPS(Sint7), CLEARPS(Sint8)}}
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++      ,
++      mIl9(g_ClearFL9InputLayout,
++           ArraySize(g_ClearFL9InputLayout),
++           g_VS_Clear_FL9,
++           ArraySize(g_VS_Clear_FL9),
++           "Clear11 IL FL9"),
++      mVs9(g_VS_Clear_FL9, ArraySize(g_VS_Clear_FL9), "Clear11 VS FL9"),
++      mPs9Depth(g_PS_ClearDepth_FL9, ArraySize(g_PS_ClearDepth_FL9), "Clear11 PS Depth FL9"),
++      mPs9Float{{CLEARPS(Float1_FL9), CLEARPS(Float2_FL9), CLEARPS(Float3_FL9),
++                 CLEARPS(Float4_FL9)}}
++#endif
+ {}
+ 
+ #undef CLEARPS
+@@ -142,6 +171,39 @@ angle::Result Clear11::ShaderManager::getShadersAndLayout(const gl::Context *con
+ {
+     Context11 *context11 = GetImplAs<Context11>(context);
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // GeckoW10m: at feature level 9_3 only the level 9 shaders can be created. ES 2 clears only
++    // to floats and has no multiview, so the float variants and the plain quad are all it needs.
++    if (renderer->getRenderer11DeviceCaps().featureLevel <= D3D_FEATURE_LEVEL_9_3)
++    {
++        ASSERT(clearType == GL_FLOAT);
++        ASSERT(!hasLayeredLayout);
++        if (numRTs > kNumShadersFL9)
++        {
++            // maxDrawBuffers is 4 at this level, so this cannot be reached.
++            ANGLE_HR_UNREACHABLE(context11);
++        }
++
++        ANGLE_TRY(mIl9.resolve(context11, renderer));
++        ANGLE_TRY(mVs9.resolve(context11, renderer));
++        *il = &mIl9.getObj();
++        *vs = &mVs9.getObj();
++        *gs = nullptr;
++
++        if (numRTs == 0)
++        {
++            ANGLE_TRY(mPs9Depth.resolve(context11, renderer));
++            *ps = &mPs9Depth.getObj();
++        }
++        else
++        {
++            ANGLE_TRY(mPs9Float[numRTs - 1].resolve(context11, renderer));
++            *ps = &mPs9Float[numRTs - 1].getObj();
++        }
++        return angle::Result::Continue;
++    }
++#endif
++
+     if (!hasLayeredLayout)
+     {
+         ANGLE_TRY(mVs.resolve(context11, renderer));
+@@ -743,6 +805,14 @@ angle::Result Clear11::clearFramebuffer(const gl::Context *context,
+     // Apply Shaders
+     stateManager->setDrawShaders(vs, gs, ps);
+     stateManager->setPixelConstantBuffer(0, &mConstantBuffer);
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // GeckoW10m: the level 9 vertex shader puts the depth to clear to into the quad's z, so it
++    // reads the same constants as the pixel shader.
++    if (useVertexBuffer())
++    {
++        stateManager->setVertexConstantBuffer(0, &mConstantBuffer);
++    }
++#endif
+ 
+     // Bind IL & VB if needed
+     stateManager->setIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.h
+index 10a860a6aa..ffe01ccc56 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.h
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.h
+@@ -69,6 +69,18 @@ class Clear11 : angle::NonCopyable
+         std::array<d3d11::LazyShader<ID3D11PixelShader>, kNumShaders> mPsFloat;
+         std::array<d3d11::LazyShader<ID3D11PixelShader>, kNumShaders> mPsUInt;
+         std::array<d3d11::LazyShader<ID3D11PixelShader>, kNumShaders> mPsSInt;
++
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        // GeckoW10m: a feature level 9_3 device refuses the shaders above, which are
++        // vs_4_0/ps_4_0 only. These are built for level 9 (shaders/Clear11_FL9.hlsl) and take
++        // the quad from the vertex buffer Clear11 keeps for that level, through mIl9.
++        constexpr static size_t kNumShadersFL9 = D3D_FL9_3_SIMULTANEOUS_RENDER_TARGET_COUNT;
++
++        d3d11::LazyInputLayout mIl9;
++        d3d11::LazyShader<ID3D11VertexShader> mVs9;
++        d3d11::LazyShader<ID3D11PixelShader> mPs9Depth;
++        std::array<d3d11::LazyShader<ID3D11PixelShader>, kNumShadersFL9> mPs9Float;
++#endif
+     };
+ 
+     bool useVertexBuffer() const;
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+index f021160da3..cbc7f6165f 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+@@ -497,6 +497,20 @@ Renderer11::Renderer11(egl::Display *display)
+             }
+         }
+ 
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        // GeckoW10m: the Adreno 3xx of the Lumia 550, 650 and 950 stops at feature level 9_3,
++        // and without it here WebGL there has no device at all. Asked last, so a GPU with a
++        // higher level still gets its highest; the list has to stay in descending order for
++        // the E_INVALIDARG retry below. 9_3 means ES 2 only, and Clear11 needs its level 9
++        // shaders for it (shaders/Clear11_FL9.hlsl).
++        if (requestedMajorVersion == EGL_DONT_CARE || requestedMajorVersion > 9 ||
++            (requestedMajorVersion == 9 &&
++             (requestedMinorVersion == EGL_DONT_CARE || requestedMinorVersion >= 3)))
++        {
++            mAvailableFeatureLevels.push_back(D3D_FEATURE_LEVEL_9_3);
++        }
++#endif
++
+         EGLint requestedDeviceType = static_cast<EGLint>(attributes.get(
+             EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE));
+         switch (requestedDeviceType)
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+index f410161ff6..ca30508738 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+@@ -1410,6 +1410,14 @@ void GenerateCaps(ID3D11Device *device,
+     // Choose a reasonable maximum, enforced in the shader.
+     caps->minAliasedPointSize = 1.0f;
+     caps->maxAliasedPointSize = 1024.0f;
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // GeckoW10m: wide points are a geometry shader, which feature level 9_3 does not have
++    // (ProgramExecutableD3D::usesPointSpriteEmulation), so points there are one pixel.
++    if (featureLevel <= D3D_FEATURE_LEVEL_9_3)
++    {
++        caps->maxAliasedPointSize = 1.0f;
++    }
++#endif
+ 
+     // Wide lines not supported
+     caps->minAliasedLineWidth = 1.0f;
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/Clear11_FL9.hlsl b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/Clear11_FL9.hlsl
+new file mode 100644
+index 0000000000..de743f8b23
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/Clear11_FL9.hlsl
+@@ -0,0 +1,105 @@
++// GeckoW10m: Clear11's shaders for Direct3D feature level 9_3, the level of
++// the Adreno 3xx in the Lumia 550, 650 and 950.
++//
++// Clear11 draws a quad whenever ClearRenderTargetView cannot do the clear: a
++// colour mask (every gl.clear on an alpha:false WebGL context, because Gecko
++// masks alpha there), a scissor without ClearView, part of the stencil. Its
++// other shaders are vs_4_0/ps_4_0, which a 9_3 device refuses to create, so
++// at that level every such clear failed. These are built for the level 9
++// profiles instead.
++//
++// A level 9 vertex shader has no SV_VertexID, so the quad's corners come from
++// the vertex buffer Clear11 already keeps for this level (POSITION, four
++// floats), and the depth to clear to comes from the vertex shader as the
++// quad's z rather than from the pixel shader. ES 2 clears only to floats, so
++// there are no integer variants; 9_3 has four render targets, so four colour
++// variants.
++//
++// Compiled once, offline, into shaders/compiled/ (the build does not run
++// fxc); see the command lines at the end.
++
++cbuffer ColorAndDepthDataFloat : register(b0)
++{
++    float4 color_Float   : packoffset(c0);
++    float  zValueF_Float : packoffset(c1);
++}
++
++void VS_Clear_FL9(in float4 inPosition : POSITION, out float4 outPosition : SV_POSITION)
++{
++    outPosition = float4(inPosition.xy, zValueF_Float, 1.0f);
++}
++
++struct PS_OutputFloat1_FL9
++{
++    float4 color0 : SV_TARGET0;
++};
++
++struct PS_OutputFloat2_FL9
++{
++    float4 color0 : SV_TARGET0;
++    float4 color1 : SV_TARGET1;
++};
++
++struct PS_OutputFloat3_FL9
++{
++    float4 color0 : SV_TARGET0;
++    float4 color1 : SV_TARGET1;
++    float4 color2 : SV_TARGET2;
++};
++
++struct PS_OutputFloat4_FL9
++{
++    float4 color0 : SV_TARGET0;
++    float4 color1 : SV_TARGET1;
++    float4 color2 : SV_TARGET2;
++    float4 color3 : SV_TARGET3;
++};
++
++PS_OutputFloat1_FL9 PS_ClearFloat1_FL9()
++{
++    PS_OutputFloat1_FL9 outColor;
++    outColor.color0 = color_Float;
++    return outColor;
++}
++
++PS_OutputFloat2_FL9 PS_ClearFloat2_FL9()
++{
++    PS_OutputFloat2_FL9 outColor;
++    outColor.color0 = color_Float;
++    outColor.color1 = color_Float;
++    return outColor;
++}
++
++PS_OutputFloat3_FL9 PS_ClearFloat3_FL9()
++{
++    PS_OutputFloat3_FL9 outColor;
++    outColor.color0 = color_Float;
++    outColor.color1 = color_Float;
++    outColor.color2 = color_Float;
++    return outColor;
++}
++
++PS_OutputFloat4_FL9 PS_ClearFloat4_FL9()
++{
++    PS_OutputFloat4_FL9 outColor;
++    outColor.color0 = color_Float;
++    outColor.color1 = color_Float;
++    outColor.color2 = color_Float;
++    outColor.color3 = color_Float;
++    return outColor;
++}
++
++// Depth or stencil only. Level 9 will not draw without a colour output (the
++// translator adds a dummy one for the same reason), and with no render target
++// bound this one goes nowhere.
++float4 PS_ClearDepth_FL9() : SV_TARGET0
++{
++    return float4(0.0f, 0.0f, 0.0f, 1.0f);
++}
++
++// fxc /nologo /E VS_Clear_FL9 /T vs_4_0_level_9_3 /Vn g_VS_Clear_FL9 /Fh compiled/clear11_fl9vs.h Clear11_FL9.hlsl
++// fxc /nologo /E PS_ClearFloat1_FL9 /T ps_4_0_level_9_3 /Vn g_PS_ClearFloat1_FL9 /Fh compiled/clearfloat11_fl9ps1.h Clear11_FL9.hlsl
++// fxc /nologo /E PS_ClearFloat2_FL9 /T ps_4_0_level_9_3 /Vn g_PS_ClearFloat2_FL9 /Fh compiled/clearfloat11_fl9ps2.h Clear11_FL9.hlsl
++// fxc /nologo /E PS_ClearFloat3_FL9 /T ps_4_0_level_9_3 /Vn g_PS_ClearFloat3_FL9 /Fh compiled/clearfloat11_fl9ps3.h Clear11_FL9.hlsl
++// fxc /nologo /E PS_ClearFloat4_FL9 /T ps_4_0_level_9_3 /Vn g_PS_ClearFloat4_FL9 /Fh compiled/clearfloat11_fl9ps4.h Clear11_FL9.hlsl
++// fxc /nologo /E PS_ClearDepth_FL9 /T ps_4_0_level_9_3 /Vn g_PS_ClearDepth_FL9 /Fh compiled/cleardepth11_fl9ps.h Clear11_FL9.hlsl
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clear11_fl9vs.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clear11_fl9vs.h
+new file mode 100644
+index 0000000000..d066c6042f
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clear11_fl9vs.h
+@@ -0,0 +1,120 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer ColorAndDepthDataFloat
++// {
++//
++//   float4 color_Float;                // Offset:    0 Size:    16 [unused]
++//   float zValueF_Float;               // Offset:   16 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- -------------- ------
++// ColorAndDepthDataFloat            cbuffer      NA          NA            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// POSITION                 0   xyzw        0     NONE   float   xy
++//
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_POSITION              0   xyzw        0      POS   float   xyzw
++//
++//
++// Constant buffer to DX9 shader constant mappings:
++//
++// Target Reg Buffer  Start Reg # of Regs        Data Conversion
++// ---------- ------- --------- --------- ----------------------
++// c1         cb0             1         1  ( FLT, FLT, FLT, FLT)
++//
++//
++// Runtime generated constant mappings:
++//
++// Target Reg                               Constant Description
++// ---------- --------------------------------------------------
++// c0                              Vertex Shader position offset
++//
++//
++// Level9 shader bytecode:
++//
++    vs_2_x
++    def c2, 1, 0, 0, 0
++    dcl_texcoord v0
++    add oPos.xy, v0, c0
++    mov r0.xy, c2
++    mad oPos.zw, c1.x, r0.xyxy, r0.xyyx
++
++// approximately 3 instruction slots used
++vs_4_0
++dcl_constantbuffer CB0[2], immediateIndexed
++dcl_input v0.xy
++dcl_output_siv o0.xyzw, position
++mov o0.xy, v0.xyxx
++mov o0.z, cb0[1].x
++mov o0.w, l(1.000000)
++ret
++// Approximately 4 instruction slots used
++#endif
++
++const BYTE g_VS_Clear_FL9[] = {
++    68,  88,  66,  67,  76,  124, 229, 199, 73,  128, 214, 213, 60,  139, 109, 121, 240, 154, 182,
++    176, 1,   0,   0,   0,   60,  3,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   208, 0,
++    0,   0,   80,  1,   0,   0,   204, 1,   0,   0,   212, 2,   0,   0,   8,   3,   0,   0,   65,
++    111, 110, 57,  144, 0,   0,   0,   144, 0,   0,   0,   0,   2,   254, 255, 92,  0,   0,   0,
++    52,  0,   0,   0,   1,   0,   36,  0,   0,   0,   48,  0,   0,   0,   48,  0,   0,   0,   36,
++    0,   1,   0,   48,  0,   0,   0,   1,   0,   1,   0,   1,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   1,   2,   254, 255, 81,  0,   0,   5,   2,   0,   15,  160, 0,   0,   128, 63,  0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   31,  0,   0,   2,   5,   0,   0,   128,
++    0,   0,   15,  144, 2,   0,   0,   3,   0,   0,   3,   192, 0,   0,   228, 144, 0,   0,   228,
++    160, 1,   0,   0,   2,   0,   0,   3,   128, 2,   0,   228, 160, 4,   0,   0,   4,   0,   0,
++    12,  192, 1,   0,   0,   160, 0,   0,   68,  128, 0,   0,   20,  128, 255, 255, 0,   0,   83,
++    72,  68,  82,  120, 0,   0,   0,   64,  0,   1,   0,   30,  0,   0,   0,   89,  0,   0,   4,
++    70,  142, 32,  0,   0,   0,   0,   0,   2,   0,   0,   0,   95,  0,   0,   3,   50,  16,  16,
++    0,   0,   0,   0,   0,   103, 0,   0,   4,   242, 32,  16,  0,   0,   0,   0,   0,   1,   0,
++    0,   0,   54,  0,   0,   5,   50,  32,  16,  0,   0,   0,   0,   0,   70,  16,  16,  0,   0,
++    0,   0,   0,   54,  0,   0,   6,   66,  32,  16,  0,   0,   0,   0,   0,   10,  128, 32,  0,
++    0,   0,   0,   0,   1,   0,   0,   0,   54,  0,   0,   5,   130, 32,  16,  0,   0,   0,   0,
++    0,   1,   64,  0,   0,   0,   0,   128, 63,  62,  0,   0,   1,   83,  84,  65,  84,  116, 0,
++    0,   0,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   2,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   82,  68,  69,  70,  0,   1,   0,   0,   1,   0,   0,   0,   84,  0,   0,
++    0,   1,   0,   0,   0,   28,  0,   0,   0,   0,   4,   254, 255, 0,   1,   0,   0,   216, 0,
++    0,   0,   60,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   1,   0,   0,   0,   67,  111, 108, 111,
++    114, 65,  110, 100, 68,  101, 112, 116, 104, 68,  97,  116, 97,  70,  108, 111, 97,  116, 0,
++    171, 60,  0,   0,   0,   2,   0,   0,   0,   108, 0,   0,   0,   32,  0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   156, 0,   0,   0,   0,   0,   0,   0,   16,  0,   0,   0,   0,
++    0,   0,   0,   168, 0,   0,   0,   0,   0,   0,   0,   184, 0,   0,   0,   16,  0,   0,   0,
++    4,   0,   0,   0,   2,   0,   0,   0,   200, 0,   0,   0,   0,   0,   0,   0,   99,  111, 108,
++    111, 114, 95,  70,  108, 111, 97,  116, 0,   1,   0,   3,   0,   1,   0,   4,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   122, 86,  97,  108, 117, 101, 70,  95,  70,  108, 111, 97,  116,
++    0,   171, 171, 0,   0,   3,   0,   1,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    77,  105, 99,  114, 111, 115, 111, 102, 116, 32,  40,  82,  41,  32,  72,  76,  83,  76,  32,
++    83,  104, 97,  100, 101, 114, 32,  67,  111, 109, 112, 105, 108, 101, 114, 32,  49,  48,  46,
++    49,  0,   73,  83,  71,  78,  44,  0,   0,   0,   1,   0,   0,   0,   8,   0,   0,   0,   32,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,
++    15,  3,   0,   0,   80,  79,  83,  73,  84,  73,  79,  78,  0,   171, 171, 171, 79,  83,  71,
++    78,  44,  0,   0,   0,   1,   0,   0,   0,   8,   0,   0,   0,   32,  0,   0,   0,   0,   0,
++    0,   0,   1,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   15,  0,   0,   0,   83,
++    86,  95,  80,  79,  83,  73,  84,  73,  79,  78,  0};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/cleardepth11_fl9ps.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/cleardepth11_fl9ps.h
+new file mode 100644
+index 0000000000..9810f4e65c
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/cleardepth11_fl9ps.h
+@@ -0,0 +1,62 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_TARGET                0   xyzw        0   TARGET   float   xyzw
++//
++//
++// Level9 shader bytecode:
++//
++    ps_2_x
++    def c0, 0, 0, 0, 1
++    mov oC0, c0
++
++// approximately 1 instruction slot used
++ps_4_0
++dcl_output o0.xyzw
++mov o0.xyzw, l(0,0,0,1.000000)
++ret
++// Approximately 2 instruction slots used
++#endif
++
++const BYTE g_PS_ClearDepth_FL9[] = {
++    68,  88,  66,  67,  50,  99,  45,  97,  112, 23,  189, 166, 160, 85,  254, 84,  246, 43,  129,
++    165, 1,   0,   0,   0,   220, 1,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   144, 0,
++    0,   0,   208, 0,   0,   0,   76,  1,   0,   0,   152, 1,   0,   0,   168, 1,   0,   0,   65,
++    111, 110, 57,  80,  0,   0,   0,   80,  0,   0,   0,   0,   2,   255, 255, 44,  0,   0,   0,
++    36,  0,   0,   0,   0,   0,   36,  0,   0,   0,   36,  0,   0,   0,   36,  0,   0,   0,   36,
++    0,   0,   0,   36,  0,   1,   2,   255, 255, 81,  0,   0,   5,   0,   0,   15,  160, 0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   128, 63,  1,   0,   0,   2,   0,
++    8,   15,  128, 0,   0,   228, 160, 255, 255, 0,   0,   83,  72,  68,  82,  56,  0,   0,   0,
++    64,  0,   0,   0,   14,  0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   0,   0,   0,
++    0,   54,  0,   0,   8,   242, 32,  16,  0,   0,   0,   0,   0,   2,   64,  0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   128, 63,  62,  0,   0,   1,   83,
++    84,  65,  84,  116, 0,   0,   0,   2,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   82,  68,  69,  70,  68,  0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   28,  0,   0,   0,   0,   4,   255, 255, 0,
++    1,   0,   0,   28,  0,   0,   0,   77,  105, 99,  114, 111, 115, 111, 102, 116, 32,  40,  82,
++    41,  32,  72,  76,  83,  76,  32,  83,  104, 97,  100, 101, 114, 32,  67,  111, 109, 112, 105,
++    108, 101, 114, 32,  49,  48,  46,  49,  0,   73,  83,  71,  78,  8,   0,   0,   0,   0,   0,
++    0,   0,   8,   0,   0,   0,   79,  83,  71,  78,  44,  0,   0,   0,   1,   0,   0,   0,   8,
++    0,   0,   0,   32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,
++    0,   0,   0,   0,   15,  0,   0,   0,   83,  86,  95,  84,  65,  82,  71,  69,  84,  0,   171,
++    171};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps1.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps1.h
+new file mode 100644
+index 0000000000..540cd85d62
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps1.h
+@@ -0,0 +1,96 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer ColorAndDepthDataFloat
++// {
++//
++//   float4 color_Float;                // Offset:    0 Size:    16
++//   float zValueF_Float;               // Offset:   16 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- -------------- ------
++// ColorAndDepthDataFloat            cbuffer      NA          NA            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_TARGET                0   xyzw        0   TARGET   float   xyzw
++//
++//
++// Constant buffer to DX9 shader constant mappings:
++//
++// Target Reg Buffer  Start Reg # of Regs        Data Conversion
++// ---------- ------- --------- --------- ----------------------
++// c0         cb0             0         1  ( FLT, FLT, FLT, FLT)
++//
++//
++// Level9 shader bytecode:
++//
++    ps_2_x
++    mov oC0, c0
++
++// approximately 1 instruction slot used
++ps_4_0
++dcl_constantbuffer CB0[1], immediateIndexed
++dcl_output o0.xyzw
++mov o0.xyzw, cb0[0].xyzw
++ret
++// Approximately 2 instruction slots used
++#endif
++
++const BYTE g_PS_ClearFloat1_FL9[] = {
++    68,  88,  66,  67,  192, 76,  204, 210, 78,  241, 195, 93,  54,  76,  99,  27,  231, 14,  246,
++    47,  1,   0,   0,   0,   148, 2,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   132, 0,
++    0,   0,   204, 0,   0,   0,   72,  1,   0,   0,   80,  2,   0,   0,   96,  2,   0,   0,   65,
++    111, 110, 57,  68,  0,   0,   0,   68,  0,   0,   0,   0,   2,   255, 255, 20,  0,   0,   0,
++    48,  0,   0,   0,   1,   0,   36,  0,   0,   0,   48,  0,   0,   0,   48,  0,   0,   0,   36,
++    0,   0,   0,   48,  0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   1,   2,
++    255, 255, 1,   0,   0,   2,   0,   8,   15,  128, 0,   0,   228, 160, 255, 255, 0,   0,   83,
++    72,  68,  82,  64,  0,   0,   0,   64,  0,   0,   0,   16,  0,   0,   0,   89,  0,   0,   4,
++    70,  142, 32,  0,   0,   0,   0,   0,   1,   0,   0,   0,   101, 0,   0,   3,   242, 32,  16,
++    0,   0,   0,   0,   0,   54,  0,   0,   6,   242, 32,  16,  0,   0,   0,   0,   0,   70,  142,
++    32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   62,  0,   0,   1,   83,  84,  65,  84,  116,
++    0,   0,   0,   2,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   82,  68,  69,  70,  0,   1,   0,   0,   1,   0,   0,   0,   84,  0,
++    0,   0,   1,   0,   0,   0,   28,  0,   0,   0,   0,   4,   255, 255, 0,   1,   0,   0,   216,
++    0,   0,   0,   60,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   1,   0,   0,   0,   67,  111, 108,
++    111, 114, 65,  110, 100, 68,  101, 112, 116, 104, 68,  97,  116, 97,  70,  108, 111, 97,  116,
++    0,   171, 60,  0,   0,   0,   2,   0,   0,   0,   108, 0,   0,   0,   32,  0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   156, 0,   0,   0,   0,   0,   0,   0,   16,  0,   0,   0,
++    2,   0,   0,   0,   168, 0,   0,   0,   0,   0,   0,   0,   184, 0,   0,   0,   16,  0,   0,
++    0,   4,   0,   0,   0,   0,   0,   0,   0,   200, 0,   0,   0,   0,   0,   0,   0,   99,  111,
++    108, 111, 114, 95,  70,  108, 111, 97,  116, 0,   1,   0,   3,   0,   1,   0,   4,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   122, 86,  97,  108, 117, 101, 70,  95,  70,  108, 111, 97,
++    116, 0,   171, 171, 0,   0,   3,   0,   1,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   77,  105, 99,  114, 111, 115, 111, 102, 116, 32,  40,  82,  41,  32,  72,  76,  83,  76,
++    32,  83,  104, 97,  100, 101, 114, 32,  67,  111, 109, 112, 105, 108, 101, 114, 32,  49,  48,
++    46,  49,  0,   73,  83,  71,  78,  8,   0,   0,   0,   0,   0,   0,   0,   8,   0,   0,   0,
++    79,  83,  71,  78,  44,  0,   0,   0,   1,   0,   0,   0,   8,   0,   0,   0,   32,  0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   15,  0,
++    0,   0,   83,  86,  95,  84,  65,  82,  71,  69,  84,  0,   171, 171};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps2.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps2.h
+new file mode 100644
+index 0000000000..c29bf54744
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps2.h
+@@ -0,0 +1,104 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer ColorAndDepthDataFloat
++// {
++//
++//   float4 color_Float;                // Offset:    0 Size:    16
++//   float zValueF_Float;               // Offset:   16 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- -------------- ------
++// ColorAndDepthDataFloat            cbuffer      NA          NA            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_TARGET                0   xyzw        0   TARGET   float   xyzw
++// SV_TARGET                1   xyzw        1   TARGET   float   xyzw
++//
++//
++// Constant buffer to DX9 shader constant mappings:
++//
++// Target Reg Buffer  Start Reg # of Regs        Data Conversion
++// ---------- ------- --------- --------- ----------------------
++// c0         cb0             0         1  ( FLT, FLT, FLT, FLT)
++//
++//
++// Level9 shader bytecode:
++//
++    ps_2_x
++    mov oC0, c0
++    mov oC1, c0
++
++// approximately 2 instruction slots used
++ps_4_0
++dcl_constantbuffer CB0[1], immediateIndexed
++dcl_output o0.xyzw
++dcl_output o1.xyzw
++mov o0.xyzw, cb0[0].xyzw
++mov o1.xyzw, cb0[0].xyzw
++ret
++// Approximately 3 instruction slots used
++#endif
++
++const BYTE g_PS_ClearFloat2_FL9[] = {
++    68,  88,  66,  67,  31,  136, 73,  102, 229, 124, 31,  230, 35,  158, 128, 156, 176, 226, 238,
++    158, 1,   0,   0,   0,   220, 2,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   144, 0,
++    0,   0,   252, 0,   0,   0,   120, 1,   0,   0,   128, 2,   0,   0,   144, 2,   0,   0,   65,
++    111, 110, 57,  80,  0,   0,   0,   80,  0,   0,   0,   0,   2,   255, 255, 32,  0,   0,   0,
++    48,  0,   0,   0,   1,   0,   36,  0,   0,   0,   48,  0,   0,   0,   48,  0,   0,   0,   36,
++    0,   0,   0,   48,  0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   1,   2,
++    255, 255, 1,   0,   0,   2,   0,   8,   15,  128, 0,   0,   228, 160, 1,   0,   0,   2,   1,
++    8,   15,  128, 0,   0,   228, 160, 255, 255, 0,   0,   83,  72,  68,  82,  100, 0,   0,   0,
++    64,  0,   0,   0,   25,  0,   0,   0,   89,  0,   0,   4,   70,  142, 32,  0,   0,   0,   0,
++    0,   1,   0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   0,   0,   0,   0,   101, 0,
++    0,   3,   242, 32,  16,  0,   1,   0,   0,   0,   54,  0,   0,   6,   242, 32,  16,  0,   0,
++    0,   0,   0,   70,  142, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   54,  0,   0,   6,
++    242, 32,  16,  0,   1,   0,   0,   0,   70,  142, 32,  0,   0,   0,   0,   0,   0,   0,   0,
++    0,   62,  0,   0,   1,   83,  84,  65,  84,  116, 0,   0,   0,   3,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   2,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   2,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   82,  68,  69,  70,
++    0,   1,   0,   0,   1,   0,   0,   0,   84,  0,   0,   0,   1,   0,   0,   0,   28,  0,   0,
++    0,   0,   4,   255, 255, 0,   1,   0,   0,   216, 0,   0,   0,   60,  0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,
++    0,   0,   0,   1,   0,   0,   0,   67,  111, 108, 111, 114, 65,  110, 100, 68,  101, 112, 116,
++    104, 68,  97,  116, 97,  70,  108, 111, 97,  116, 0,   171, 60,  0,   0,   0,   2,   0,   0,
++    0,   108, 0,   0,   0,   32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   156, 0,
++    0,   0,   0,   0,   0,   0,   16,  0,   0,   0,   2,   0,   0,   0,   168, 0,   0,   0,   0,
++    0,   0,   0,   184, 0,   0,   0,   16,  0,   0,   0,   4,   0,   0,   0,   0,   0,   0,   0,
++    200, 0,   0,   0,   0,   0,   0,   0,   99,  111, 108, 111, 114, 95,  70,  108, 111, 97,  116,
++    0,   1,   0,   3,   0,   1,   0,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   122, 86,
++    97,  108, 117, 101, 70,  95,  70,  108, 111, 97,  116, 0,   171, 171, 0,   0,   3,   0,   1,
++    0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   77,  105, 99,  114, 111, 115, 111, 102,
++    116, 32,  40,  82,  41,  32,  72,  76,  83,  76,  32,  83,  104, 97,  100, 101, 114, 32,  67,
++    111, 109, 112, 105, 108, 101, 114, 32,  49,  48,  46,  49,  0,   73,  83,  71,  78,  8,   0,
++    0,   0,   0,   0,   0,   0,   8,   0,   0,   0,   79,  83,  71,  78,  68,  0,   0,   0,   2,
++    0,   0,   0,   8,   0,   0,   0,   56,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    3,   0,   0,   0,   0,   0,   0,   0,   15,  0,   0,   0,   56,  0,   0,   0,   1,   0,   0,
++    0,   0,   0,   0,   0,   3,   0,   0,   0,   1,   0,   0,   0,   15,  0,   0,   0,   83,  86,
++    95,  84,  65,  82,  71,  69,  84,  0,   171, 171};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps3.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps3.h
+new file mode 100644
+index 0000000000..f176a2ad53
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps3.h
+@@ -0,0 +1,112 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer ColorAndDepthDataFloat
++// {
++//
++//   float4 color_Float;                // Offset:    0 Size:    16
++//   float zValueF_Float;               // Offset:   16 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- -------------- ------
++// ColorAndDepthDataFloat            cbuffer      NA          NA            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_TARGET                0   xyzw        0   TARGET   float   xyzw
++// SV_TARGET                1   xyzw        1   TARGET   float   xyzw
++// SV_TARGET                2   xyzw        2   TARGET   float   xyzw
++//
++//
++// Constant buffer to DX9 shader constant mappings:
++//
++// Target Reg Buffer  Start Reg # of Regs        Data Conversion
++// ---------- ------- --------- --------- ----------------------
++// c0         cb0             0         1  ( FLT, FLT, FLT, FLT)
++//
++//
++// Level9 shader bytecode:
++//
++    ps_2_x
++    mov oC0, c0
++    mov oC1, c0
++    mov oC2, c0
++
++// approximately 3 instruction slots used
++ps_4_0
++dcl_constantbuffer CB0[1], immediateIndexed
++dcl_output o0.xyzw
++dcl_output o1.xyzw
++dcl_output o2.xyzw
++mov o0.xyzw, cb0[0].xyzw
++mov o1.xyzw, cb0[0].xyzw
++mov o2.xyzw, cb0[0].xyzw
++ret
++// Approximately 4 instruction slots used
++#endif
++
++const BYTE g_PS_ClearFloat3_FL9[] = {
++    68,  88,  66,  67,  116, 230, 26,  236, 230, 2,   0,   20,  78,  182, 96,  112, 197, 46,  109,
++    86,  1,   0,   0,   0,   36,  3,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   156, 0,
++    0,   0,   44,  1,   0,   0,   168, 1,   0,   0,   176, 2,   0,   0,   192, 2,   0,   0,   65,
++    111, 110, 57,  92,  0,   0,   0,   92,  0,   0,   0,   0,   2,   255, 255, 44,  0,   0,   0,
++    48,  0,   0,   0,   1,   0,   36,  0,   0,   0,   48,  0,   0,   0,   48,  0,   0,   0,   36,
++    0,   0,   0,   48,  0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   1,   2,
++    255, 255, 1,   0,   0,   2,   0,   8,   15,  128, 0,   0,   228, 160, 1,   0,   0,   2,   1,
++    8,   15,  128, 0,   0,   228, 160, 1,   0,   0,   2,   2,   8,   15,  128, 0,   0,   228, 160,
++    255, 255, 0,   0,   83,  72,  68,  82,  136, 0,   0,   0,   64,  0,   0,   0,   34,  0,   0,
++    0,   89,  0,   0,   4,   70,  142, 32,  0,   0,   0,   0,   0,   1,   0,   0,   0,   101, 0,
++    0,   3,   242, 32,  16,  0,   0,   0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   1,
++    0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   2,   0,   0,   0,   54,  0,   0,   6,
++    242, 32,  16,  0,   0,   0,   0,   0,   70,  142, 32,  0,   0,   0,   0,   0,   0,   0,   0,
++    0,   54,  0,   0,   6,   242, 32,  16,  0,   1,   0,   0,   0,   70,  142, 32,  0,   0,   0,
++    0,   0,   0,   0,   0,   0,   54,  0,   0,   6,   242, 32,  16,  0,   2,   0,   0,   0,   70,
++    142, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   62,  0,   0,   1,   83,  84,  65,  84,
++    116, 0,   0,   0,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   82,  68,  69,  70,  0,   1,   0,   0,   1,   0,   0,   0,   84,
++    0,   0,   0,   1,   0,   0,   0,   28,  0,   0,   0,   0,   4,   255, 255, 0,   1,   0,   0,
++    216, 0,   0,   0,   60,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   1,   0,   0,   0,   67,  111,
++    108, 111, 114, 65,  110, 100, 68,  101, 112, 116, 104, 68,  97,  116, 97,  70,  108, 111, 97,
++    116, 0,   171, 60,  0,   0,   0,   2,   0,   0,   0,   108, 0,   0,   0,   32,  0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   156, 0,   0,   0,   0,   0,   0,   0,   16,  0,   0,
++    0,   2,   0,   0,   0,   168, 0,   0,   0,   0,   0,   0,   0,   184, 0,   0,   0,   16,  0,
++    0,   0,   4,   0,   0,   0,   0,   0,   0,   0,   200, 0,   0,   0,   0,   0,   0,   0,   99,
++    111, 108, 111, 114, 95,  70,  108, 111, 97,  116, 0,   1,   0,   3,   0,   1,   0,   4,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   122, 86,  97,  108, 117, 101, 70,  95,  70,  108, 111,
++    97,  116, 0,   171, 171, 0,   0,   3,   0,   1,   0,   1,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   77,  105, 99,  114, 111, 115, 111, 102, 116, 32,  40,  82,  41,  32,  72,  76,  83,
++    76,  32,  83,  104, 97,  100, 101, 114, 32,  67,  111, 109, 112, 105, 108, 101, 114, 32,  49,
++    48,  46,  49,  0,   73,  83,  71,  78,  8,   0,   0,   0,   0,   0,   0,   0,   8,   0,   0,
++    0,   79,  83,  71,  78,  92,  0,   0,   0,   3,   0,   0,   0,   8,   0,   0,   0,   80,  0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   15,
++    0,   0,   0,   80,  0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,
++    1,   0,   0,   0,   15,  0,   0,   0,   80,  0,   0,   0,   2,   0,   0,   0,   0,   0,   0,
++    0,   3,   0,   0,   0,   2,   0,   0,   0,   15,  0,   0,   0,   83,  86,  95,  84,  65,  82,
++    71,  69,  84,  0,   171, 171};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps4.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps4.h
+new file mode 100644
+index 0000000000..2719906e2c
+--- /dev/null
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/shaders/compiled/clearfloat11_fl9ps4.h
+@@ -0,0 +1,120 @@
++// GeckoW10m: compiled from ../Clear11_FL9.hlsl; the fxc command lines are at
++// the end of that file.
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer ColorAndDepthDataFloat
++// {
++//
++//   float4 color_Float;                // Offset:    0 Size:    16
++//   float zValueF_Float;               // Offset:   16 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- -------------- ------
++// ColorAndDepthDataFloat            cbuffer      NA          NA            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_TARGET                0   xyzw        0   TARGET   float   xyzw
++// SV_TARGET                1   xyzw        1   TARGET   float   xyzw
++// SV_TARGET                2   xyzw        2   TARGET   float   xyzw
++// SV_TARGET                3   xyzw        3   TARGET   float   xyzw
++//
++//
++// Constant buffer to DX9 shader constant mappings:
++//
++// Target Reg Buffer  Start Reg # of Regs        Data Conversion
++// ---------- ------- --------- --------- ----------------------
++// c0         cb0             0         1  ( FLT, FLT, FLT, FLT)
++//
++//
++// Level9 shader bytecode:
++//
++    ps_2_x
++    mov oC0, c0
++    mov oC1, c0
++    mov oC2, c0
++    mov oC3, c0
++
++// approximately 4 instruction slots used
++ps_4_0
++dcl_constantbuffer CB0[1], immediateIndexed
++dcl_output o0.xyzw
++dcl_output o1.xyzw
++dcl_output o2.xyzw
++dcl_output o3.xyzw
++mov o0.xyzw, cb0[0].xyzw
++mov o1.xyzw, cb0[0].xyzw
++mov o2.xyzw, cb0[0].xyzw
++mov o3.xyzw, cb0[0].xyzw
++ret
++// Approximately 5 instruction slots used
++#endif
++
++const BYTE g_PS_ClearFloat4_FL9[] = {
++    68,  88,  66,  67,  248, 188, 69,  151, 49,  209, 227, 146, 41,  203, 25,  37,  28,  47,  211,
++    96,  1,   0,   0,   0,   108, 3,   0,   0,   6,   0,   0,   0,   56,  0,   0,   0,   168, 0,
++    0,   0,   92,  1,   0,   0,   216, 1,   0,   0,   224, 2,   0,   0,   240, 2,   0,   0,   65,
++    111, 110, 57,  104, 0,   0,   0,   104, 0,   0,   0,   0,   2,   255, 255, 56,  0,   0,   0,
++    48,  0,   0,   0,   1,   0,   36,  0,   0,   0,   48,  0,   0,   0,   48,  0,   0,   0,   36,
++    0,   0,   0,   48,  0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   1,   2,
++    255, 255, 1,   0,   0,   2,   0,   8,   15,  128, 0,   0,   228, 160, 1,   0,   0,   2,   1,
++    8,   15,  128, 0,   0,   228, 160, 1,   0,   0,   2,   2,   8,   15,  128, 0,   0,   228, 160,
++    1,   0,   0,   2,   3,   8,   15,  128, 0,   0,   228, 160, 255, 255, 0,   0,   83,  72,  68,
++    82,  172, 0,   0,   0,   64,  0,   0,   0,   43,  0,   0,   0,   89,  0,   0,   4,   70,  142,
++    32,  0,   0,   0,   0,   0,   1,   0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   0,
++    0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   1,   0,   0,   0,   101, 0,   0,   3,
++    242, 32,  16,  0,   2,   0,   0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   3,   0,   0,
++    0,   54,  0,   0,   6,   242, 32,  16,  0,   0,   0,   0,   0,   70,  142, 32,  0,   0,   0,
++    0,   0,   0,   0,   0,   0,   54,  0,   0,   6,   242, 32,  16,  0,   1,   0,   0,   0,   70,
++    142, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   54,  0,   0,   6,   242, 32,  16,  0,
++    2,   0,   0,   0,   70,  142, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   54,  0,   0,
++    6,   242, 32,  16,  0,   3,   0,   0,   0,   70,  142, 32,  0,   0,   0,   0,   0,   0,   0,
++    0,   0,   62,  0,   0,   1,   83,  84,  65,  84,  116, 0,   0,   0,   5,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   4,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   82,  68,  69,
++    70,  0,   1,   0,   0,   1,   0,   0,   0,   84,  0,   0,   0,   1,   0,   0,   0,   28,  0,
++    0,   0,   0,   4,   255, 255, 0,   1,   0,   0,   216, 0,   0,   0,   60,  0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    1,   0,   0,   0,   1,   0,   0,   0,   67,  111, 108, 111, 114, 65,  110, 100, 68,  101, 112,
++    116, 104, 68,  97,  116, 97,  70,  108, 111, 97,  116, 0,   171, 60,  0,   0,   0,   2,   0,
++    0,   0,   108, 0,   0,   0,   32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   156,
++    0,   0,   0,   0,   0,   0,   0,   16,  0,   0,   0,   2,   0,   0,   0,   168, 0,   0,   0,
++    0,   0,   0,   0,   184, 0,   0,   0,   16,  0,   0,   0,   4,   0,   0,   0,   0,   0,   0,
++    0,   200, 0,   0,   0,   0,   0,   0,   0,   99,  111, 108, 111, 114, 95,  70,  108, 111, 97,
++    116, 0,   1,   0,   3,   0,   1,   0,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   122,
++    86,  97,  108, 117, 101, 70,  95,  70,  108, 111, 97,  116, 0,   171, 171, 0,   0,   3,   0,
++    1,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   77,  105, 99,  114, 111, 115, 111,
++    102, 116, 32,  40,  82,  41,  32,  72,  76,  83,  76,  32,  83,  104, 97,  100, 101, 114, 32,
++    67,  111, 109, 112, 105, 108, 101, 114, 32,  49,  48,  46,  49,  0,   73,  83,  71,  78,  8,
++    0,   0,   0,   0,   0,   0,   0,   8,   0,   0,   0,   79,  83,  71,  78,  116, 0,   0,   0,
++    4,   0,   0,   0,   8,   0,   0,   0,   104, 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   3,   0,   0,   0,   0,   0,   0,   0,   15,  0,   0,   0,   104, 0,   0,   0,   1,   0,
++    0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   1,   0,   0,   0,   15,  0,   0,   0,   104,
++    0,   0,   0,   2,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   2,   0,   0,   0,
++    15,  0,   0,   0,   104, 0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,
++    0,   3,   0,   0,   0,   15,  0,   0,   0,   83,  86,  95,  84,  65,  82,  71,  69,  84,  0,
++    171, 171};

@@ -333,6 +333,14 @@ pref("gfx.webrender.software.d3d11", true);
 // that do not fit stay on the CPU; text is greyscale-antialiased, since
 // subpixel text needs dual-source blending.
 pref("gfx.webrender.software.d3d11.gpu-shading", true);
+// The pixel shader probe for GPU shading: some seconds after the first
+// GPU-shaded frame, at idle, the 9_3 pixel shaders no draw has needed yet are
+// created between frames, so a program's first draw no longer creates its
+// shader inside a frame (gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp).
+// These are the defaults. warmup 0 turns the probe off for an A/B run; 1 only
+// tests the shaders and releases what the device accepts.
+// pref("gfx.webrender.software.d3d11.gpu-shading.warmup", 2);
+// pref("gfx.webrender.software.d3d11.gpu-shading.warmup-delay-ms", 4000);
 // Closing the last tab opens a fresh one instead of quitting the browser: on a
 // phone a quit is a black screen and a relaunch, not something anyone asked for.
 pref("browser.tabs.closeWindowWithLastTab", false);
@@ -549,8 +557,10 @@ pref("ui.mouse.radius.reposition", true);
 // Hardware video decoding. Without it every frame above 360p is decoded by
 // four phone cores and then converted from YV12 to RGB by the same cores,
 // which is why 720p stuttered: the log said "wmf H264 codec software video
-// decoder - no DXVA, yv12". With DXVA the Adreno decodes H.264, VP9 and AV1
-// itself and hands the compositor an NV12 texture it can sample directly.
+// decoder - no DXVA, yv12". With DXVA the Adreno decodes H.264 -- the one
+// codec it has a decoder for here -- into an NV12 texture. At feature level
+// 10 and above the compositor samples that texture directly; at 9_3 the
+// video processor first converts it to BGRA on the GPU.
 // force-enabled skips the blocklist, which has nothing to say about a phone
 // GPU it has never heard of.
 pref("media.hardware-video-decoding.enabled", true);
@@ -564,14 +574,27 @@ pref("media.sanity-test.disabled", true);
 // ARM32 cores manage about 360p. Sites that offer a choice -- YouTube offers
 // VP9 first -- have to be told we cannot take it.
 //
-// Not with these prefs, though. Switching the codecs off browser-wide takes
-// them from every site, including ones with nothing else to fall back to, and
-// a site with no H.264 ladder has nothing left to play. h264ify has done this
-// for years without that: it answers "no" to VP8, VP9 and AV1 inside the page,
-// on YouTube only, and YouTube picks H.264 out of the ladder it was going to
-// offer anyway. That is in the vendored config now; the hosts it does it on
-// are gecko.h264ify.hosts, and everywhere else the browser keeps every codec
-// Firefox ships with.
+// Not by switching the codecs off browser-wide, though (media.av1.enabled,
+// media.webm.enabled): that takes them, and WebM audio, from every site,
+// including ones with nothing else to fall back to. The two Media Source
+// prefs below are not browser-wide switches. Under GECKO_W10M they act only
+// on Media Source players (dom/media/mediasource/MediaSource.cpp):
+// isTypeSupported, addSourceBuffer, changeType and decodingInfo for
+// media-source turn VP9 and AV1 down on every site, and the site plays the
+// H.264 ladder it carries for Safari and older phones anyway. Plain
+// <video src>, canPlayType and WebRTC keep both codecs, and a phone with no
+// H.264 decoder at all keeps them in Media Source too. VP9 off in Media
+// Source is Firefox for Android's own default. Always the pair, and in the
+// same appx as the engine change: VP9 off with AV1 on would move sites that
+// offer AV1 from VP9 to the heavier codec.
+//
+// The YouTube page hook stays, on gecko.h264ify.hosts: h264ify without the
+// extension, answering no to VP8, VP9 and AV1 inside the page before the
+// engine is asked. It carries the 720p30 ceiling and the fullscreen gear fix,
+// and it still steers with privacy.resistFingerprinting on, where the engine
+// stays quiet.
+pref("media.mediasource.vp9.enabled", false);
+pref("media.mediasource.av1.enabled", false);
 pref("gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");
 // PlayReady through the phone, offered to these hosts only: their page
 // script sees a com.microsoft.playready key system whose license exchange
@@ -607,6 +630,20 @@ pref("media.wmf.dxva.max-videos", 1);
 // what kept it off here, and the blocklist has never heard of this GPU.
 pref("gfx.direct3d11.reuse-decoder-device", true);
 pref("gfx.direct3d11.reuse-decoder-device.force-enabled", true);
+// Old frames flashing up in video on the Lumias (feature level 9_3: decoded
+// and converted on the compositor's own device, nothing shared). 2 makes the
+// decoder's thread wait for the decode before the video processor reads the
+// NV12 surface, as well as for the conversion after it; 1 waits for the
+// conversion only (the earlier builds); 0 waits for nothing -- a diagnostic,
+// the old frames come back. To compare: 2 against 1 with
+// gfx.webrender.gecko-w10m.video-whole-window true first, then
+// media.wmf.low-latency.enabled false if the notes say frames came out of
+// order ("came out earlier than one before them" above 0).
+pref("media.wmf.gecko-w10m.frame-sync", 2);
+// Partial redraw while a video plays: WebRender's dirty area plus the video's
+// rect, instead of the whole window on every video frame. True goes back to
+// the whole window.
+pref("gfx.webrender.gecko-w10m.video-whole-window", false);
 
 // The URL classifier's local database. The browser went silent for 79 seconds
 // shortly after a cold start -- render thread included, taps queuing up and
@@ -662,9 +699,28 @@ pref("sidebar.revamp", false);
 pref("sidebar.visibility", "hide-on-close");
 pref("sidebar.verticalTabs", false);
 
+// Accelerated canvas 2D. In this single-process build the flag decides
+// nothing: CanvasRenderingContext2D only accelerates in a content process,
+// and there is none, so the engine log says "ON (inert: single process)".
+// The prefs stay for the day there is one. At Direct3D feature level 9_3
+// (Lumia 550, 650, 950) the engine turns the feature off itself, since it
+// draws through WebGL 2 and ANGLE offers only ES 2 there.
 pref("gfx.canvas.accelerated", true);
 pref("gfx.canvas.accelerated.allow-in-parent", true);
 pref("gfx.canvas.accelerated.force-enabled", true);
+
+// A page that asks for WebGL with failIfMajorPerformanceCaveat gets an
+// honest "no" when the compositor is software WebRender -- the Lumias at
+// feature level 9_3 -- decided in the page's process, before any IPC and
+// with nothing loaded. Upstream ignores the flag by default. The X3
+// composites in hardware and is not affected.
+pref("webgl.disable-fail-if-major-performance-caveat", false);
+
+// A cap on live WebGL contexts, against the 390 MB ceiling: each one holds
+// its own buffers (about 28 MB for a full-screen canvas at 9_3). Upstream
+// allows 1000, 300 per site.
+pref("webgl.max-contexts", 16);
+pref("webgl.max-contexts-per-principal", 8);
 PREFS
     echo "    app default preferences staged"
   fi

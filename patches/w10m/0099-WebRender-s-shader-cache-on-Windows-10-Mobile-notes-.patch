@@ -1,0 +1,893 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 16:52:42 +0400
+Subject: [PATCH] WebRender's shader cache on Windows 10 Mobile: notes, a
+ refused binary stored again, the startup list kept
+
+The program binary cache already works on the hardware path (HP Elite x3):
+a cold compile costs about a second on the second frame, a warm one does
+not. Notes now say where the cache is, how many binaries were read and
+linked, how long compiles took and what was refused. Fixed upstream bug:
+when ANGLE refused a binary the stale entry stayed, so the fresh binary
+from the recompile was never stored and the refusal repeated every launch.
+The startup list is no longer replaced by an empty one written before any
+program is linked. An early warmup in the render thread's idle window is
+there behind gfx.webrender.gecko-w10m.shader-warmup-early, off: its gain is
+unproven and it competes with the main thread's startup.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/thebes/gfxUtils.cpp                     |  29 +++
+ gfx/webrender_bindings/RenderThread.cpp     |  85 +++++-
+ gfx/webrender_bindings/RenderThread.h       |  34 +++
+ gfx/webrender_bindings/src/bindings.rs      |   6 +-
+ gfx/webrender_bindings/src/program_cache.rs | 272 ++++++++++++++++++--
+ gfx/wr/webrender/src/device/gl.rs           | 125 +++++++++
+ gfx/wr/webrender/src/lib.rs                 |   2 +
+ 7 files changed, 527 insertions(+), 26 deletions(-)
+
+diff --git a/gfx/thebes/gfxUtils.cpp b/gfx/thebes/gfxUtils.cpp
+index 9f5bf72c27..6545e1a1bb 100644
+--- a/gfx/thebes/gfxUtils.cpp
++++ b/gfx/thebes/gfxUtils.cpp
+@@ -60,6 +60,11 @@
+ #  include "gfxWindowsPlatform.h"
+ #endif
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ using namespace mozilla;
+ using namespace mozilla::image;
+ using namespace mozilla::layers;
+@@ -1701,10 +1706,34 @@ void gfxUtils::RemoveShaderCacheFromDiskIfNecessary() {
+   if (!wr::remove_program_binary_disk_cache(&path)) {
+     // Failed to remove program binary disk cache. The disk cache might have
+     // invalid data. Disable program binary disk cache usage.
++#if defined(GECKO_W10M)
++    // Every shader of this run is then compiled from source, on every
++    // launch until the folder can be emptied -- say so, or the slow second
++    // frame looks like a cache that simply has not filled yet.
++    GeckoW10mNote("gfx: shader cache could not be emptied, off this run");
++#endif
+     gfxVars::SetUseWebRenderProgramBinaryDisk(false);
+     return;
+   }
+ 
++#if defined(GECKO_W10M)
++  {
++    // Emptying the cache is why the first launch of an engine build compiles
++    // every shader again (about a second more on the second frame). Note it,
++    // so a relaunch of the same build that still prints this -- the check
++    // prefs below were not saved before the app was killed -- stands out.
++    // This runs once per process, from InitWebRenderConfig.
++    const bool gpuChanged =
++        !deviceIDChecked.IsEmpty() &&
++        (deviceID != deviceIDChecked || driverVersion != driverVersionChecked);
++    char note[256];
++    SprintfLiteral(note, "gfx: shader cache emptied -- build %s -> %s%s",
++                   buildIDChecked.IsEmpty() ? "none" : buildIDChecked.get(),
++                   buildID.get(), gpuChanged ? ", GPU or driver changed" : "");
++    GeckoW10mNote(note);
++  }
++#endif
++
+   Preferences::SetCString(GFX_SHADER_CHECK_BUILD_VERSION_PREF, buildID);
+   Preferences::SetInt(GFX_SHADER_CHECK_PTR_SIZE_PREF, ptrSize);
+   Preferences::SetString(GFX_SHADER_CHECK_DEVICE_ID_PREF, deviceID);
+diff --git a/gfx/webrender_bindings/RenderThread.cpp b/gfx/webrender_bindings/RenderThread.cpp
+index b2c031a80b..389428a42c 100644
+--- a/gfx/webrender_bindings/RenderThread.cpp
++++ b/gfx/webrender_bindings/RenderThread.cpp
+@@ -60,6 +60,12 @@
+ #  include "mozilla/webrender/MetalDeviceManager.h"
+ #endif
+ 
++#if defined(GECKO_W10M)
++#  include "mozilla/Sprintf.h"
++#  include "mozilla/StaticPrefs_gfx.h"
++extern "C" void GeckoW10mNote(const char* text);
++#endif
++
+ using namespace mozilla;
+ 
+ static already_AddRefed<gl::GLContext> CreateGLContext(nsACString& aError);
+@@ -1332,12 +1338,34 @@ void RenderThread::InitDeviceTask() {
+   nsAutoCString err;
+   CreateSingletonGL(err);
+   if (gfx::gfxVars::UseWebRenderProgramBinaryDisk()) {
++#if defined(GECKO_W10M)
++    // The cache's file writes go to the low-priority pool, which only
++    // rasterises low-priority blobs, so they never wait in line with the
++    // glyph rasterisation on the main pool. Shutdown drops the cache before
++    // either pool.
++    mProgramCache = MakeUnique<WebRenderProgramCache>(ThreadPoolLP().Raw());
++#else
+     mProgramCache = MakeUnique<WebRenderProgramCache>(ThreadPool().Raw());
++#endif
+   }
+   // Query the shared GL context to force the
+   // lazy initialization to happen now.
+   SingletonGL();
+ 
++#if defined(GECKO_W10M)
++  // Hand the program binaries just read from the profile's shader-cache to
++  // ANGLE now, in the second or more before the window's compositor exists,
++  // rather than once the renderer is made: ANGLE makes the D3D shaders on its
++  // own compile pool, and the second frame's links then find them ready. It
++  // is the same warmup as upstream, only earlier, and it does nothing when
++  // nothing was read. The later call from WebRenderAPI is then a no-op.
++  if (mShaders &&
++      StaticPrefs::gfx_webrender_gecko_w10m_shader_warmup_early_AtStartup()) {
++    mShaders->SetWarmupEarly();
++    BeginShaderWarmupIfNeeded();
++  }
++#endif
++
+ #ifdef MOZ_WIDGET_ANDROID
+   // On Android we must report the GL context's strings to gfxInfo. This allows
+   // gfxInfo to avoid creating a GL context during startup.
+@@ -1365,9 +1393,26 @@ void RenderThread::InitDeviceTask() {
+ }
+ 
+ void RenderThread::BeginShaderWarmupIfNeeded() {
+-  if (mShaders && gfx::gfxVars::ShouldWarmUpWebRenderProgramBinaries()) {
+-    PostResumeShaderWarmupRunnable();
++  if (!mShaders || !gfx::gfxVars::ShouldWarmUpWebRenderProgramBinaries()) {
++    return;
++  }
++#if defined(GECKO_W10M)
++  // An asynchronous warmup step only creates the program and hands it a
++  // binary that is already in memory. With no startup binaries read (the
++  // first launch of an engine build), every step would make an empty program
++  // object -- a hundred runnables for nothing. With precache-shaders on, the
++  // steps compile from source, so they are always worth running.
++  if (!StaticPrefs::gfx_webrender_precache_shaders_AtStartup() &&
++      (!mProgramCache || mProgramCache->StartupPrograms() == 0)) {
++    return;
++  }
++  // Called from InitDeviceTask and again for every renderer made; only the
++  // first call starts a chain of steps.
++  if (!mShaders->BeginWarmupOnce()) {
++    return;
+   }
++#endif
++  PostResumeShaderWarmupRunnable();
+ }
+ 
+ void RenderThread::PostResumeShaderWarmupRunnable() {
+@@ -1379,7 +1424,14 @@ void RenderThread::PostResumeShaderWarmupRunnable() {
+ 
+ void RenderThread::ResumeShaderWarmup() {
+   if (mShaders) {
++#if defined(GECKO_W10M)
++    const auto stepStart = TimeStamp::Now();
++#endif
+     bool needAnotherWarmupStep = mShaders->ResumeWarmup();
++#if defined(GECKO_W10M)
++    mShaders->CountWarmupStep(TimeStamp::Now() - stepStart,
++                              !needAnotherWarmupStep);
++#endif
+     if (needAnotherWarmupStep) {
+       PostResumeShaderWarmupRunnable();
+     }
+@@ -1624,6 +1676,33 @@ bool WebRenderShaders::ResumeWarmup() {
+   return wr_shaders_resume_warmup(mShaders);
+ }
+ 
++#if defined(GECKO_W10M)
++void WebRenderShaders::CountWarmupStep(TimeDuration aStep, bool aLast) {
++  mWarmupTime += aStep;
++  mWarmupSteps += 1;
++  if (!aLast) {
++    return;
++  }
++  // How long the render thread spent on warmup, and when it started: with
++  // the early start this time is spent before the compositor exists. Capped
++  // at two, so a warmup run again after a device reset still says so. Only
++  // the render thread gets here.
++  static uint32_t sNoted = 0;
++  if (sNoted >= 2) {
++    return;
++  }
++  sNoted++;
++  char note[200];
++  SprintfLiteral(note,
++                 "gfx: shader warmup done -- %u steps, %u ms on the render "
++                 "thread, started %s",
++                 mWarmupSteps, uint32_t(mWarmupTime.ToMilliseconds()),
++                 mWarmupEarly ? "early, before the compositor"
++                              : "with the renderer");
++  GeckoW10mNote(note);
++}
++#endif
++
+ WebRenderThreadPool::WebRenderThreadPool(bool low_priority) {
+   mThreadPool = wr_thread_pool_new(low_priority);
+ }
+@@ -1660,7 +1739,7 @@ WebRenderProgramCache::WebRenderProgramCache(wr::WrThreadPool* aThreadPool) {
+   }
+   mProgramCache = wr_program_cache_new(&path, aThreadPool);
+   if (gfx::gfxVars::UseWebRenderProgramBinaryDisk()) {
+-    wr_try_load_startup_shaders_from_disk(mProgramCache);
++    mStartupPrograms = wr_try_load_startup_shaders_from_disk(mProgramCache);
+   }
+ }
+ 
+diff --git a/gfx/webrender_bindings/RenderThread.h b/gfx/webrender_bindings/RenderThread.h
+index 10c5528ecb..f216f1e156 100644
+--- a/gfx/webrender_bindings/RenderThread.h
++++ b/gfx/webrender_bindings/RenderThread.h
+@@ -93,8 +93,14 @@ class WebRenderProgramCache final {
+ 
+   wr::WrProgramCache* Raw() { return mProgramCache; }
+ 
++  // The number of program binaries read from the profile's shader-cache when
++  // this was made. With none, shader warmup has no binary to hand to the
++  // driver and would only make empty program objects.
++  uint32_t StartupPrograms() const { return mStartupPrograms; }
++
+  protected:
+   wr::WrProgramCache* mProgramCache;
++  uint32_t mStartupPrograms = 0;
+ };
+ 
+ class WebRenderShaders final {
+@@ -105,11 +111,39 @@ class WebRenderShaders final {
+   // Returns true if ResumeWarmup() should be called again
+   bool ResumeWarmup();
+ 
++  // True the first time only. Every chain of warmup steps pops from the same
++  // list of shaders, so a second chain does no extra work -- it only keeps
++  // two steps queued on the render thread instead of one.
++  bool BeginWarmupOnce() {
++    if (mWarmupStarted) {
++      return false;
++    }
++    mWarmupStarted = true;
++    return true;
++  }
++
+   wr::WrShaders* RawShaders() { return mShaders; }
+ 
++#if defined(GECKO_W10M)
++  // Warmup was started from InitDeviceTask, before the window's compositor
++  // exists, rather than when the renderer was made.
++  void SetWarmupEarly() { mWarmupEarly = true; }
++  // Adds one warmup step's render-thread time; after the last step, notes
++  // the total once.
++  void CountWarmupStep(TimeDuration aStep, bool aLast);
++#endif
++
+  protected:
+   RefPtr<gl::GLContext> mGL;
+   wr::WrShaders* mShaders;
++  bool mWarmupStarted = false;
++#if defined(GECKO_W10M)
++  // These live with the shaders, so they start again when SingletonGL()
++  // rebuilds this object after a device reset.
++  TimeDuration mWarmupTime;
++  uint32_t mWarmupSteps = 0;
++  bool mWarmupEarly = false;
++#endif
+ };
+ 
+ class WebRenderPipelineInfo final {
+diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
+index 2c8dac45c8..66423c2b04 100644
+--- a/gfx/webrender_bindings/src/bindings.rs
++++ b/gfx/webrender_bindings/src/bindings.rs
+@@ -1340,9 +1340,11 @@ pub unsafe extern "C" fn wr_program_cache_delete(program_cache: *mut WrProgramCa
+     mem::drop(Box::from_raw(program_cache));
+ }
+ 
++/// Returns the number of startup programs read into memory: none means the
++/// shader warmup would have no binary to hand to the driver.
+ #[no_mangle]
+-pub unsafe extern "C" fn wr_try_load_startup_shaders_from_disk(program_cache: *mut WrProgramCache) {
+-    (*program_cache).try_load_startup_shaders_from_disk();
++pub unsafe extern "C" fn wr_try_load_startup_shaders_from_disk(program_cache: *mut WrProgramCache) -> u32 {
++    (*program_cache).try_load_startup_shaders_from_disk()
+ }
+ 
+ #[no_mangle]
+diff --git a/gfx/webrender_bindings/src/program_cache.rs b/gfx/webrender_bindings/src/program_cache.rs
+index 1f01017251..b663e4453e 100644
+--- a/gfx/webrender_bindings/src/program_cache.rs
++++ b/gfx/webrender_bindings/src/program_cache.rs
+@@ -13,9 +13,43 @@ use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ use std::sync::Arc;
+ use webrender::{ProgramBinary, ProgramCache, ProgramCacheObserver, ProgramSourceDigest};
++#[cfg(windows)]
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++#[cfg(windows)]
++use webrender::{gecko_w10m_note_always, gecko_w10m_shader_stats};
+ 
+ const MAX_LOAD_TIME_MS: u64 = 400;
+ 
++// GeckoW10m: a relaunch of the same engine build links its shaders from the
++// binaries kept here instead of compiling them again, and that is about a
++// second of the second frame on the phone. These say what the cache did this
++// run -- programs read on demand, files written, whether the startup list
++// went out -- for the few shader-cache notes below. Each note is capped per
++// run, and none of this is touched per frame.
++#[cfg(windows)]
++static DISK_READS: AtomicU32 = AtomicU32::new(0);
++#[cfg(windows)]
++static WRITTEN: AtomicU32 = AtomicU32::new(0);
++#[cfg(windows)]
++static STARTUP_LIST_WRITTEN: AtomicBool = AtomicBool::new(false);
++#[cfg(windows)]
++static NOTED_LIST: AtomicU32 = AtomicU32::new(0);
++#[cfg(windows)]
++static LATE: AtomicU32 = AtomicU32::new(0);
++
++// A program file or the startup list could not be written. Only the first
++// failure of the run is noted: the rest are almost always the same cause.
++#[cfg(windows)]
++fn gecko_w10m_write_failed(file_name: &str, err: &dyn std::fmt::Display) {
++    static NOTED: AtomicU32 = AtomicU32::new(0);
++    if NOTED.fetch_add(1, Ordering::Relaxed) == 0 {
++        gecko_w10m_note_always(&format!(
++            "gfx: shader cache -- could not write {}: {}",
++            file_name, err
++        ));
++    }
++}
++
+ fn hash_bytes(v: &[u8]) -> u64 {
+     use rustc_hash::FxHasher;
+     use std::hash::{Hash, Hasher};
+@@ -24,7 +58,7 @@ fn hash_bytes(v: &[u8]) -> u64 {
+     state.finish()
+ }
+ 
+-fn deserialize_program_binary(path: &Path) -> Result<Arc<ProgramBinary>, Error> {
++fn deserialize_program_binary(path: &Path) -> Result<(Arc<ProgramBinary>, usize), Error> {
+     let mut buf = vec![];
+     let mut file = File::open(path)?;
+     file.read_to_end(&mut buf)?;
+@@ -63,7 +97,7 @@ fn deserialize_program_binary(path: &Path) -> Result<Arc<ProgramBinary>, Error>
+         },
+     };
+ 
+-    Ok(Arc::new(binary))
++    Ok((Arc::new(binary), buf.len()))
+ }
+ 
+ #[cfg(target_os = "windows")]
+@@ -132,6 +166,8 @@ impl WrProgramBinaryDiskCache {
+     /// Saves the specified binaries to the on-disk shader cache.
+     fn save_shaders_to_disk(&mut self, entries: Vec<Arc<ProgramBinary>>) {
+         info!("Saving binaries to on-disk shader cache");
++        #[cfg(windows)]
++        let count = entries.len();
+ 
+         // Write the entries to disk on a worker thread.
+         for entry in entries {
+@@ -145,39 +181,96 @@ impl WrProgramBinaryDiskCache {
+                     use std::time::Instant;
+                     let start = Instant::now();
+ 
+-                    let data: Vec<u8> =
+-                        bincode::serialize(&*entry).map_err(|e| error!("shader-cache: Failed to serialize: {}", e))?;
++                    let data: Vec<u8> = bincode::serialize(&*entry).map_err(|e| {
++                        error!("shader-cache: Failed to serialize: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(&file_name, &e);
++                    })?;
+ 
+-                    let mut file =
+-                        File::create(&file_path).map_err(|e| error!("shader-cache: Failed to create file: {}", e))?;
++                    let mut file = File::create(&file_path).map_err(|e| {
++                        error!("shader-cache: Failed to create file: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(&file_name, &e);
++                    })?;
+ 
+                     // Write magic + version.
+                     let mv = MAGIC_AND_VERSION;
+                     let mv = bincode::serialize(&mv).unwrap();
+                     assert!(mv.len() == 4);
+-                    file.write_all(&mv)
+-                        .map_err(|e| error!("shader-cache: Failed to write magic + version: {}", e))?;
++                    file.write_all(&mv).map_err(|e| {
++                        error!("shader-cache: Failed to write magic + version: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(&file_name, &e);
++                    })?;
+ 
+                     // Write hash
+                     let hash = hash_bytes(&data);
+                     let hash = bincode::serialize(&hash).unwrap();
+                     assert!(hash.len() == 8);
+-                    file.write_all(&hash)
+-                        .map_err(|e| error!("shader-cache: Failed to write hash: {}", e))?;
++                    file.write_all(&hash).map_err(|e| {
++                        error!("shader-cache: Failed to write hash: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(&file_name, &e);
++                    })?;
+ 
+                     // Write serialized data
+-                    file.write_all(&data)
+-                        .map_err(|e| error!("shader-cache: Failed to write program binary: {}", e))?;
++                    file.write_all(&data).map_err(|e| {
++                        error!("shader-cache: Failed to write program binary: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(&file_name, &e);
++                    })?;
+ 
+                     info!("Wrote shader {} in {:?}", file_name, start.elapsed());
++                    #[cfg(windows)]
++                    WRITTEN.fetch_add(1, Ordering::Relaxed);
+                     Ok(())
+                 })
+             });
+         }
++
++        // GeckoW10m: programs first drawn after the startup list went out --
++        // blur, gradients, video -- are compiled from source this run and come
++        // from disk on the next one. The note is queued behind the writes on
++        // the same pool, a few times a run at most.
++        #[cfg(windows)]
++        {
++            if count > 0
++                && STARTUP_LIST_WRITTEN.load(Ordering::Relaxed)
++                && LATE.fetch_add(1, Ordering::Relaxed) < 4
++            {
++                self.workers.spawn(move || {
++                    let stats = gecko_w10m_shader_stats();
++                    gecko_w10m_note_always(&format!(
++                        "gfx: shader cache -- {} more programs compiled after startup and saved (this run {} compiled in {} ms; {} read from disk on demand)",
++                        count,
++                        stats.compiled,
++                        stats.compiled_ms,
++                        DISK_READS.load(Ordering::Relaxed)
++                    ));
++                });
++            }
++        }
+     }
+ 
+     /// Writes the whitelist containing the set of startup shaders to disk.
+     fn set_startup_shaders(&mut self, entries: Vec<Arc<ProgramBinary>>) {
++        // GeckoW10m: every device writes this list at its tenth frame, and
++        // that includes the shader-warmup device, whose frames are warmup
++        // steps. When those run before anything has been linked, the list is
++        // empty -- and File::create below would truncate the good list from
++        // the last run, so a kill before the renderer's own tenth frame left
++        // the next launch with nothing to preload. An empty list says nothing
++        // a missing one does not, so it is not written.
++        #[cfg(windows)]
++        {
++            if entries.is_empty() {
++                return;
++            }
++            STARTUP_LIST_WRITTEN.store(true, Ordering::Relaxed);
++        }
++        #[cfg(windows)]
++        let count = entries.len();
++
+         let whitelist = entries
+             .iter()
+             .map(|e| e.source_digest().to_string())
+@@ -191,13 +284,47 @@ impl WrProgramBinaryDiskCache {
+                 info!("Writing startup shader whitelist");
+                 File::create(&whitelist_path)
+                     .and_then(|mut file| file.write_all(whitelist.as_bytes()))
+-                    .map_err(|e| error!("shader-cache: Failed to write startup whitelist: {}", e))?;
++                    .map_err(|e| {
++                        error!("shader-cache: Failed to write startup whitelist: {}", e);
++                        #[cfg(windows)]
++                        gecko_w10m_write_failed(WHITELIST_FILENAME, &e);
++                    })?;
++                // GeckoW10m: one line on what the cache did for the first
++                // frames -- linked from binaries or compiled from source, and
++                // how long the render thread waited for each. Written here,
++                // on the pool, after the list is on disk.
++                #[cfg(windows)]
++                {
++                    if NOTED_LIST.fetch_add(1, Ordering::Relaxed) < 2 {
++                        let stats = gecko_w10m_shader_stats();
++                        let slowest = if stats.compiled > 0 {
++                            format!(" (slowest {} ms, {})", stats.slowest_ms, stats.slowest)
++                        } else {
++                            String::new()
++                        };
++                        gecko_w10m_note_always(&format!(
++                            "gfx: shader cache -- startup list written, {} programs; {} linked from binaries in {} ms, {} compiled from source in {} ms{}, {} binaries refused, {} without a binary; {} read from disk on demand, {} written so far",
++                            count,
++                            stats.from_binary,
++                            stats.from_binary_ms,
++                            stats.compiled,
++                            stats.compiled_ms,
++                            slowest,
++                            stats.refused,
++                            stats.no_binary,
++                            DISK_READS.load(Ordering::Relaxed),
++                            WRITTEN.load(Ordering::Relaxed)
++                        ));
++                    }
++                }
+                 Ok(())
+             })
+         });
+     }
+ 
+-    pub fn try_load_shader_from_disk(&mut self, filename: &str, program_cache: &Rc<ProgramCache>) {
++    /// Returns the size of the program binary read into `program_cache`, or
++    /// None when there was none to read or it could not be read.
++    pub fn try_load_shader_from_disk(&mut self, filename: &str, program_cache: &Rc<ProgramCache>) -> Option<usize> {
+         if let Some(index) = self.cached_shader_filenames.iter().position(|e| e == filename) {
+             let mut path = self.cache_path.clone();
+             path.push(filename);
+@@ -207,19 +334,36 @@ impl WrProgramBinaryDiskCache {
+             info!("Loading shader: {}", filename);
+ 
+             match deserialize_program_binary(&path) {
+-                Ok(program) => {
++                Ok((program, size)) => {
+                     program_cache.load_program_binary(program);
++                    return Some(size);
+                 },
+                 Err(err) => {
+                     error!("shader-cache: Failed to deserialize program binary: {}", err);
++                    // GeckoW10m: an error path. The program is compiled from
++                    // source when it is first drawn, and its new binary
++                    // overwrites this file. Noted once a run.
++                    #[cfg(windows)]
++                    {
++                        static NOTED: AtomicU32 = AtomicU32::new(0);
++                        if NOTED.fetch_add(1, Ordering::Relaxed) == 0 {
++                            gecko_w10m_note_always(&format!(
++                                "gfx: shader cache -- {} could not be read ({}); compiled from source and saved again",
++                                filename, err
++                            ));
++                        }
++                    }
+                 },
+             };
+         } else {
+             info!("shader-cache: Program binary not found in disk cache");
+         }
++        None
+     }
+ 
+-    pub fn try_load_startup_shaders_from_disk(&mut self, program_cache: &Rc<ProgramCache>) {
++    /// Returns the number of startup programs read into `program_cache`.
++    #[cfg_attr(not(windows), allow(unused_variables, unused_assignments))]
++    pub fn try_load_startup_shaders_from_disk(&mut self, program_cache: &Rc<ProgramCache>) -> u32 {
+         use std::time::Instant;
+         let start = Instant::now();
+ 
+@@ -252,9 +396,18 @@ impl WrProgramBinaryDiskCache {
+             .filter(|filename| filename != WHITELIST_FILENAME)
+             .collect::<Vec<OsString>>();
+ 
++        // An empty list file still splits into one empty name.
++        let listed = whitelist.iter().filter(|name| !name.is_empty()).count();
++        let mut loaded: u32 = 0;
++        let mut loaded_bytes: usize = 0;
++        let mut timed_out = false;
++
+         // Load whitelisted program binaries if they exist
+         for entry in &whitelist {
+-            self.try_load_shader_from_disk(&entry, program_cache);
++            if let Some(size) = self.try_load_shader_from_disk(&entry, program_cache) {
++                loaded += 1;
++                loaded_bytes += size;
++            }
+ 
+             let elapsed = start.elapsed();
+             info!("Loaded shader in {:?}", elapsed);
+@@ -265,10 +418,50 @@ impl WrProgramBinaryDiskCache {
+                 // Additionally clear the list of remaining shaders cached on disk,
+                 // so that we do not attempt to load any on demand during rendering.
+                 error!("shader-cache: Timed out before finishing loads");
++                // GeckoW10m: not cleared. Reading one more file when its
++                // program is first drawn costs a few milliseconds on the
++                // phone's eMMC; compiling it from source instead costs a few
++                // hundred, and turning on-demand loads off for the whole run
++                // made a slow preload the most expensive outcome of all.
++                #[cfg(not(windows))]
+                 self.cached_shader_filenames.clear();
++                timed_out = true;
+                 break;
+             }
+         }
++
++        // GeckoW10m: once a run, on the render thread inside InitDeviceTask --
++        // before the window's compositor exists, so nothing waits on it.
++        #[cfg(windows)]
++        {
++            let ms = start.elapsed().as_millis();
++            let rest = self.cached_shader_filenames.len();
++            let dir = self.cache_path.display();
++            let note = if listed == 0 && rest == 0 {
++                format!(
++                    "gfx: shader cache at {} -- empty (first run, or emptied); programs are saved as they are compiled",
++                    dir
++                )
++            } else if timed_out {
++                format!(
++                    "gfx: shader cache at {} -- stopped reading after {} of {} at {} ms; the rest load when first drawn",
++                    dir, loaded, listed, ms
++                )
++            } else {
++                format!(
++                    "gfx: shader cache at {} -- {} of {} startup programs read in {} ms ({} KB), {} more on disk for later",
++                    dir,
++                    loaded,
++                    listed,
++                    ms,
++                    (loaded_bytes + 1023) / 1024,
++                    rest
++                )
++            };
++            gecko_w10m_note_always(&note);
++        }
++
++        loaded
+     }
+ }
+ 
+@@ -294,9 +487,19 @@ impl ProgramCacheObserver for WrProgramCacheObserver {
+ 
+     fn try_load_shader_from_disk(&self, digest: &ProgramSourceDigest, program_cache: &Rc<ProgramCache>) {
+         let filename = digest.to_string();
+-        self.disk_cache
++        let loaded = self
++            .disk_cache
+             .borrow_mut()
+             .try_load_shader_from_disk(&filename, program_cache);
++        // GeckoW10m: a program that was not preloaded, read when first drawn.
++        #[cfg(windows)]
++        {
++            if loaded.is_some() {
++                DISK_READS.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++        #[cfg(not(windows))]
++        let _ = loaded;
+     }
+ 
+     fn notify_program_binary_failed(&self, _program_binary: &Arc<ProgramBinary>) {
+@@ -312,7 +515,32 @@ pub struct WrProgramCache {
+ impl WrProgramCache {
+     pub fn new(prof_path: &nsAString, workers: &Arc<ThreadPool>) -> Self {
+         let cache_path = get_cache_path_from_prof_path(prof_path);
+-        let use_disk_cache = cache_path.as_ref().map_or(false, |p| create_dir_all(p).is_ok());
++        let use_disk_cache = cache_path.as_ref().map_or(false, |p| match create_dir_all(p) {
++            Ok(()) => true,
++            Err(_err) => {
++                // GeckoW10m: without the folder every shader is compiled
++                // from source on every launch; say why. Once a process.
++                #[cfg(windows)]
++                {
++                    static NOTED: AtomicBool = AtomicBool::new(false);
++                    if !NOTED.swap(true, Ordering::Relaxed) {
++                        gecko_w10m_note_always(&format!(
++                            "gfx: shader cache off -- could not make {}: {}",
++                            p.display(),
++                            _err
++                        ));
++                    }
++                }
++                false
++            },
++        });
++        #[cfg(windows)]
++        {
++            static NOTED: AtomicBool = AtomicBool::new(false);
++            if cache_path.is_none() && !NOTED.swap(true, Ordering::Relaxed) {
++                gecko_w10m_note_always("gfx: shader cache off -- no profile directory");
++            }
++        }
+         let (disk_cache, program_cache_observer) = if use_disk_cache {
+             let cache = Rc::new(RefCell::new(WrProgramBinaryDiskCache::new(
+                 cache_path.unwrap(),
+@@ -335,13 +563,15 @@ impl WrProgramCache {
+         &self.program_cache
+     }
+ 
+-    pub fn try_load_startup_shaders_from_disk(&self) {
++    /// Returns the number of startup programs read into memory.
++    pub fn try_load_startup_shaders_from_disk(&self) -> u32 {
+         if let Some(ref disk_cache) = self.disk_cache {
+             disk_cache
+                 .borrow_mut()
+-                .try_load_startup_shaders_from_disk(&self.program_cache);
++                .try_load_startup_shaders_from_disk(&self.program_cache)
+         } else {
+             error!("shader-cache: Shader disk cache is not supported");
++            0
+         }
+     }
+ }
+diff --git a/gfx/wr/webrender/src/device/gl.rs b/gfx/wr/webrender/src/device/gl.rs
+index ed0746f329..036877d75b 100644
+--- a/gfx/wr/webrender/src/device/gl.rs
++++ b/gfx/wr/webrender/src/device/gl.rs
+@@ -52,6 +52,64 @@ static GECKO_W10M_BLITS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
+ static GECKO_W10M_TARGETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+ static GECKO_W10M_UPLOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+ static GECKO_W10M_LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++// What the program-binary cache did for this run's links: how many programs
++// came from a binary and how many were compiled from source, and how long the
++// render thread waited for each kind. The shader-cache summary in
++// webrender_bindings (program_cache.rs) reads these when it writes the
++// startup list, so one line says whether the cache paid off. Relaxed atomic
++// adds inside link_program only, which runs a few dozen times a run; nothing
++// here is touched per frame.
++#[cfg(windows)]
++static SH_FROM_BINARY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_FROM_BINARY_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_COMPILED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_COMPILED_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_SLOWEST_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++#[cfg(windows)]
++static SH_NO_BINARY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++// The base name of the slowest compile so far. A &'static str from the
++// program's source info, so recording it allocates nothing; the lock is only
++// taken when a compile beats the slowest one.
++#[cfg(windows)]
++static SH_SLOWEST: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
++
++/// A snapshot of the program-binary cache counters above.
++#[derive(Debug, Copy, Clone, Default)]
++pub struct GeckoW10mShaderStats {
++    pub from_binary: u32,
++    pub from_binary_ms: u32,
++    pub compiled: u32,
++    pub compiled_ms: u32,
++    pub slowest_ms: u32,
++    pub slowest: &'static str,
++    pub refused: u32,
++    pub no_binary: u32,
++}
++
++#[cfg(windows)]
++pub fn gecko_w10m_shader_stats() -> GeckoW10mShaderStats {
++    use std::sync::atomic::Ordering::Relaxed;
++    GeckoW10mShaderStats {
++        from_binary: SH_FROM_BINARY.load(Relaxed),
++        from_binary_ms: SH_FROM_BINARY_MS.load(Relaxed),
++        compiled: SH_COMPILED.load(Relaxed),
++        compiled_ms: SH_COMPILED_MS.load(Relaxed),
++        slowest_ms: SH_SLOWEST_MS.load(Relaxed),
++        slowest: SH_SLOWEST.lock().map(|name| *name).unwrap_or(""),
++        refused: SH_REFUSED.load(Relaxed),
++        no_binary: SH_NO_BINARY.load(Relaxed),
++    }
++}
++#[cfg(not(windows))]
++pub fn gecko_w10m_shader_stats() -> GeckoW10mShaderStats {
++    GeckoW10mShaderStats::default()
++}
+ fn gecko_w10m_count(counter: &std::sync::atomic::AtomicU32, first: u32) -> Option<u32> {
+     let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+     GECKO_W10M_PULSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+@@ -2604,6 +2662,12 @@ impl Device {
+                 }
+             }
+ 
++            // Set when the driver refuses the binary. GeckoW10m: upstream
++            // leaves the refused entry in `entries`, so the `contains_key`
++            // check after the compile below skips storing the fresh binary
++            // and the refused file stays on disk -- refused, and compiled from
++            // source again, on every launch until the cache is next emptied.
++            let mut refused = false;
+             if let Some(entry) = cached_programs.entries.borrow_mut().get_mut(&info.digest) {
+                 let mut link_status = [0];
+                 unsafe {
+@@ -2617,6 +2681,24 @@ impl Device {
+                       self.capabilities.renderer_name,
+                       error_log
+                     );
++                    refused = true;
++                    #[cfg(windows)]
++                    {
++                        // An error path: the first refusal of the run is
++                        // noted, with the start of ANGLE's reason (a device or
++                        // version change says so in it).
++                        if SH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
++                            let reason: String = error_log
++                                .chars()
++                                .map(|c| if c.is_control() { ' ' } else { c })
++                                .take(160)
++                                .collect();
++                            gecko_w10m_note_always(&format!(
++                                "gfx: shader cache -- ANGLE refused the binary of {}: {}; compiled from source and saved again",
++                                info.full_name(), reason.trim()
++                            ));
++                        }
++                    }
+                     if let Some(ref program_cache_handler) = cached_programs.program_cache_handler {
+                         program_cache_handler.notify_program_binary_failed(&entry.binary);
+                     }
+@@ -2625,6 +2707,24 @@ impl Device {
+                     build_program = false;
+                 }
+             }
++            // With the refused entry gone, the compile below stores its binary
++            // under the same digest, and the save overwrites the file of that
++            // name. Only this error path changes.
++            if refused && cfg!(windows) {
++                cached_programs.entries.borrow_mut().remove(&info.digest);
++            }
++        }
++
++        #[cfg(windows)]
++        {
++            if !build_program {
++                // Linked from a binary: the wait is for ANGLE to finish the
++                // load it started in glProgramBinary (and, for a program not
++                // in the startup list, the read of its file).
++                let ms = gecko_w10m_link_started.elapsed().as_millis() as u32;
++                SH_FROM_BINARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                SH_FROM_BINARY_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
++            }
+         }
+ 
+         gecko_w10m_note(&format!(
+@@ -2710,12 +2810,37 @@ impl Device {
+                 return Err(ShaderError::Link(info.base_filename.to_owned(), error_log));
+             }
+ 
++            #[cfg(windows)]
++            {
++                use std::sync::atomic::Ordering::Relaxed;
++                let ms = gecko_w10m_link_started.elapsed().as_millis() as u32;
++                SH_COMPILED.fetch_add(1, Relaxed);
++                SH_COMPILED_MS.fetch_add(ms, Relaxed);
++                if ms > SH_SLOWEST_MS.fetch_max(ms, Relaxed) {
++                    if let Ok(mut slowest) = SH_SLOWEST.lock() {
++                        *slowest = info.base_filename;
++                    }
++                }
++            }
++
+             if let Some(ref cached_programs) = self.cached_programs {
+                 if !cached_programs.entries.borrow().contains_key(&info.digest) {
+                     let (buffer, format) = self.gl.get_program_binary(program.id);
+                     if buffer.len() > 0 {
+                         let binary = Arc::new(ProgramBinary::new(buffer, format, info.digest.clone()));
+                         cached_programs.add_new_program_binary(binary);
++                    } else {
++                        #[cfg(windows)]
++                        {
++                            // Without a binary this program is compiled from
++                            // source on every launch; the first one is noted.
++                            if SH_NO_BINARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
++                                gecko_w10m_note_always(&format!(
++                                    "gfx: shader cache -- ANGLE gave no binary for {}; nothing can be saved",
++                                    info.full_name()
++                                ));
++                            }
++                        }
+                     }
+                 }
+             }
+diff --git a/gfx/wr/webrender/src/lib.rs b/gfx/wr/webrender/src/lib.rs
+index 596848071b..f4d3fde30b 100644
+--- a/gfx/wr/webrender/src/lib.rs
++++ b/gfx/wr/webrender/src/lib.rs
+@@ -233,6 +233,8 @@ pub use crate::composite::{NativeSurfaceId, NativeTileId, NativeSurfaceInfo, Par
+ pub use crate::composite::{MappableCompositor, MappedTileInfo, SWGLCompositeSurfaceInfo, WindowVisibility, WindowProperties};
+ pub use crate::device::{UploadMethod, VertexUsageHint, get_gl_target, get_unoptimized_shader_source};
+ pub use crate::device::{ProgramBinary, ProgramCache, ProgramCacheObserver, FormatDesc, ShaderError};
++// GeckoW10m: the shader-cache notes in webrender_bindings' program_cache.rs.
++pub use crate::device::{gecko_w10m_note_always, gecko_w10m_shader_stats, GeckoW10mShaderStats};
+ pub use crate::device::Device;
+ pub use crate::profiler::{ProfilerHooks, set_profiler_hooks};
+ pub use crate::renderer::{

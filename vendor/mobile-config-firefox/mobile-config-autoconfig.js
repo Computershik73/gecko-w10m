@@ -734,18 +734,6 @@ function gecko_spotify() {
     Services.obs.addObserver(observer, "document-element-inserted");
 }
 
-// h264ify, without the extension.
-//
-// The extension does not touch the browser's codec support at all -- it hooks
-// MediaSource.isTypeSupported, HTMLMediaElement.canPlayType and
-// mediaCapabilities.decodingInfo inside the page and answers "no" for VP8, VP9
-// and AV1. YouTube then picks H.264 from a ladder it was going to offer
-// anyway, which is why h264ify users get ordinary videos and not an error.
-//
-// Turning the codecs off with prefs looks like the same thing from the page's
-// side, but it is browser-wide: every other site loses them too, with nothing
-// to fall back to. So the prefs are back to what Firefox ships and this does
-// the refusing, on the hosts named by gecko.h264ify.hosts and nowhere else.
 // The settings gear in the fullscreen player.
 //
 // Measured, not guessed: the tap reaches
@@ -792,6 +780,34 @@ const GECKO_FULLSCREEN_MENU = `
 })();
 `;
 
+// h264ify, without the extension.
+//
+// Windows 10 Mobile ships no VP9 or AV1 decoder, so those codecs land on the
+// phone's cores, and sites that offer a choice are steered to H.264 in two
+// layers.
+//
+// The engine does most of it, on every site (MediaSource.cpp, under
+// GECKO_W10M). While media.mediasource.vp9.enabled and
+// media.mediasource.av1.enabled are false, Media Source -- isTypeSupported,
+// addSourceBuffer, changeType and decodingInfo for media-source -- turns VP9
+// and AV1 down, and the site picks the H.264 ladder it carries for Safari and
+// older phones anyway. Plain <video src>, canPlayType and WebRTC keep both
+// codecs, and a phone with no H.264 decoder at all keeps them in Media Source
+// as well. The browser-wide switches (media.av1.enabled, media.webm.enabled)
+// stay as Firefox ships them: they would take the codecs, and WebM audio,
+// from every site with nothing to fall back to.
+//
+// This is the second layer: a page hook on the hosts named by
+// gecko.h264ify.hosts and nowhere else. Like the extension it does not touch
+// the browser's codec support -- it hooks MediaSource.isTypeSupported,
+// HTMLMediaElement.canPlayType and mediaCapabilities.decodingInfo inside the
+// page and answers "no" for VP8, VP9 and AV1, with no conditions. YouTube then
+// picks H.264 from a ladder it was going to offer anyway; the hook answers
+// first, so the engine never sees YouTube's VP9 questions. It still steers
+// with privacy.resistFingerprinting on, where the engine stays quiet, and it
+// carries what the engine does not: the video ceiling (gecko.video.max-height
+// and -framerate, 720p30 on a phone with 1.5 GB or less) and, with it, the
+// fullscreen settings gear above.
 const H264IFY_SOURCE = `
 (function () {
   var BAD = ["vp8", "vp9", "vp08", "vp09", "av01", "av1"];
@@ -982,11 +998,10 @@ function gecko_low_memory_prefs() {
         Object.keys(PREFS).length + " set");
 }
 
-// What the tabs actually are, a few seconds after a window opens. The first
-// tab after a crash loads forever and comes right the moment it is closed, and
-// which of these fields is wrong says why: a tab left pending by session
-// restore, a browser with no docShell, a load that was started and never
-// finished, or a remoteness the frame loader could not honour.
+// Puts the page hooks above -- the fullscreen gear, the video ceiling and
+// H264IFY_SOURCE -- into every document on the hosts in gecko.h264ify.hosts,
+// before the page's own scripts run. An empty list turns the hook off; the
+// engine's Media Source gate goes on steering by itself.
 function gecko_h264ify() {
     const setting = Services.prefs.getStringPref(
         "gecko.h264ify.hosts", "youtube.com,youtube-nocookie.com");

@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 16:52:45 +0400
+Subject: [PATCH] Media Source on Windows 10 Mobile: VP9 and AV1 turned down
+ where H.264 can play
+
+There is no VP9 or AV1 decoder on the phone: ffvpx decodes VP9 in plain C
+and dav1d has no assembly in this build. media.mediasource.vp9.enabled and
+the new media.mediasource.av1.enabled, both false in the package, turn the
+two down in Media Source (isTypeSupported, addSourceBuffer, changeType,
+decodingInfo) on every site, unless the phone has no H.264 decoder at all.
+Plain <video src>, canPlayType and WebRTC keep them. Upstream's
+hardware-decoding exceptions are left out: a WMF 'hardware' claim for VP9 is
+not to be trusted here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/media/mediasource/MediaSource.cpp | 89 ++++++++++++++++++++++++++-
+ 1 file changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/dom/media/mediasource/MediaSource.cpp b/dom/media/mediasource/MediaSource.cpp
+index 172ee9e0e7..ecf3b2a39e 100644
+--- a/dom/media/mediasource/MediaSource.cpp
++++ b/dom/media/mediasource/MediaSource.cpp
+@@ -32,6 +32,12 @@
+ #include "nsPIDOMWindow.h"
+ #include "nsString.h"
+ #include "nsThreadUtils.h"
++#if defined(GECKO_W10M)
++#  include "PDMFactorySupport.h"
++#  include "mozilla/Atomics.h"
++// The shell's diagnostics log.
++extern "C" void GeckoW10mNote(const char* aText);
++#endif
+ 
+ struct JSContext;
+ class JSObject;
+@@ -58,6 +64,7 @@ static const unsigned int MAX_SOURCE_BUFFERS = 16;
+ 
+ namespace mozilla {
+ 
++#if !defined(GECKO_W10M)
+ // Returns true if we should enable MSE webm regardless of preferences.
+ // 1. If MP4/H264 isn't supported:
+ //   * N/KN editions (Europe and Korea) of Windows 10/11 without the optional
+@@ -68,12 +75,66 @@ static bool IsVP9Forced(DecoderDoctorDiagnostics* aDiagnostics) {
+   bool mp4supported = MP4Decoder::IsSupportedType(
+       MediaContainerType(MEDIAMIMETYPE(VIDEO_MP4)), aDiagnostics);
+   bool hwsupported = gfx::gfxVars::CanUseHardwareVideoDecoding();
+-#ifdef MOZ_WIDGET_ANDROID
++#  ifdef MOZ_WIDGET_ANDROID
+   return !mp4supported || !hwsupported || gfx::gfxVars::UseVP9HwDecode();
+-#else
++#  else
+   return !mp4supported || !hwsupported;
++#  endif
++}
+ #endif
++
++#if defined(GECKO_W10M)
++// Windows 10 Mobile has no hardware decoder for VP9 or AV1, and this build's
++// ffvpx and dav1d run without their assembly, so either codec is decoded in
++// plain C on four phone cores -- about 360p, with software reference frames
++// the app's memory ceiling can ill afford. Media Source sites nearly always
++// carry an H.264 ladder as well, for Safari and older phones, and DXVA
++// decodes that one. So while media.mediasource.vp9.enabled (or .av1.enabled)
++// is false, Media Source turns the codec down and the site plays its H.264:
++// on every site, as the YouTube page hook in the autoconfig does on YouTube.
++// Plain <video src> and canPlayType keep both codecs.
++//
++// Upstream's IsVP9Forced is not used here. With hardware decoding off,
++// Microsoft's software H.264 decoder is still far cheaper than ffvpx or
++// dav1d, and the codec staying the same keeps that comparison fair. Its "no
++// mp4" test never fires on this build either, since dav1d alone makes mp4
++// count as supported. And a "hardware" VP9 answer from WMF is not taken at
++// its word: WMF reports hardware for any decoder it can create once DXVA is
++// on, without asking the GPU for a VP9 profile. The one way back is a phone
++// with no H.264 decoder at all, where VP9 or AV1 is all a site could play.
++static bool GeckoW10mMseRefuses(bool aVP9, bool aAV1) {
++  const bool vp9 = aVP9 && !StaticPrefs::media_mediasource_vp9_enabled();
++  const bool av1 = aAV1 && !StaticPrefs::media_mediasource_av1_enabled();
++  if (!vp9 && !av1) {
++    return false;
++  }
++  // PDMFactorySupport keeps one factory per process and rebuilds it when a
++  // decoder pref or the hardware-decoding gfxVar changes: a lock and a walk
++  // of the cached decoder modules, and it follows about:config without a
++  // restart.
++  const bool h264 =
++      !PDMFactorySupport::IsTypeSupported("video/avc"_ns).isEmpty();
++  // One line per codec per run, on the first query that names it.
++  static Atomic<bool> sNotedVP9{false};
++  static Atomic<bool> sNotedAV1{false};
++  if (vp9) {
++    if (!sNotedVP9.exchange(true)) {
++      GeckoW10mNote(h264 ? "media: MSE turns down vp9 -- no hardware decoder "
++                           "for it; sites are left their H.264 "
++                           "(media.mediasource.vp9.enabled)"
++                         : "media: MSE keeps vp9 -- no H.264 decoder to "
++                           "offer instead");
++    }
++  } else if (!sNotedAV1.exchange(true)) {
++    GeckoW10mNote(h264 ? "media: MSE turns down av1 -- no hardware decoder "
++                         "for it; sites are left their H.264 "
++                         "(media.mediasource.av1.enabled)"
++                       : "media: MSE keeps av1 -- no H.264 decoder to "
++                         "offer instead");
++  }
++  return h264;
+ }
++#endif
+ 
+ namespace dom {
+ 
+@@ -147,12 +208,22 @@ void MediaSource::IsTypeSupported(const nsAString& aType,
+   }
+ 
+   bool hasVP9 = false;
++#if defined(GECKO_W10M)
++  // The phone's gate below asks about AV1 as well, so every codec in the
++  // type is looked at, not only those up to the first VP9.
++  bool hasAV1 = false;
++#endif
+   const MediaCodecs& codecs = containerType->ExtendedType().Codecs();
+   for (const auto& codec : codecs.Range()) {
++#if defined(GECKO_W10M)
++    hasVP9 = hasVP9 || IsVP9CodecString(codec);
++    hasAV1 = hasAV1 || IsAV1CodecString(codec);
++#else
+     if (IsVP9CodecString(codec)) {
+       hasVP9 = true;
+       break;
+     }
++#endif
+   }
+ 
+   // Now we know that this media type could be played.
+@@ -165,25 +236,39 @@ void MediaSource::IsTypeSupported(const nsAString& aType,
+           : nsContentUtils::ShouldResistFingerprinting(
+                 "Couldn't drill down ShouldResistFingerprinting",
+                 RFPTarget::MediaCapabilities);
++#if defined(GECKO_W10M)
++  // Before the containers are told apart, so that every container is covered
++  // -- audio/webm with an av01 codec included, which the branch for it would
++  // otherwise let through. isTypeSupported, addSourceBuffer, changeType and
++  // decodingInfo for media-source all come through here.
++  if (!shouldResistFingerprinting && GeckoW10mMseRefuses(hasVP9, hasAV1)) {
++    // As upstream: act as if it cannot be played, saying nothing of why.
++    return aRv.ThrowNotSupportedError("Can't play type");
++  }
++#endif
+   const MediaMIMEType& mimeType = containerType->Type();
+   if (mimeType == MEDIAMIMETYPE("video/mp4") ||
+       mimeType == MEDIAMIMETYPE("audio/mp4")) {
++#if !defined(GECKO_W10M)
+     if (!StaticPrefs::media_mediasource_vp9_enabled() && hasVP9 &&
+         !IsVP9Forced(aDiagnostics) && !shouldResistFingerprinting) {
+       // Don't leak information about the fact that it's pref-disabled; just act
+       // like we can't play it.  Or should this throw "Unknown type"?
+       return aRv.ThrowNotSupportedError("Can't play type");
+     }
++#endif
+ 
+     return;
+   }
+   if (mimeType == MEDIAMIMETYPE("video/webm")) {
++#if !defined(GECKO_W10M)
+     if (!StaticPrefs::media_mediasource_vp9_enabled() && hasVP9 &&
+         !IsVP9Forced(aDiagnostics) && !shouldResistFingerprinting) {
+       // Don't leak information about the fact that it's pref-disabled; just act
+       // like we can't play it.  Or should this throw "Unknown type"?
+       return aRv.ThrowNotSupportedError("Can't play type");
+     }
++#endif
+     return;
+   }
+   if (mimeType == MEDIAMIMETYPE("audio/webm")) {

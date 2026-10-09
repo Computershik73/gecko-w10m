@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Fri, 9 Oct 2026 16:52:30 +0400
+Subject: [PATCH] Prefs on Windows 10 Mobile for the shader probe, video sync,
+ DXVA probe, shader warmup, WebGL at 9_3 and AV1 in Media Source
+
+The static prefs the following changes read, all under GECKO_W10M:
+gfx.webrender.software.d3d11.gpu-shading.warmup (2) and .warmup-delay-ms
+(4000); gfx.webrender.gecko-w10m.video-whole-window (false);
+gfx.webrender.gecko-w10m.shader-warmup-early (false, for an A/B test);
+media.wmf.gecko-w10m.frame-sync (2), .capabilities-from-probe (true),
+.h264-query-size-cap (true), .reorder-guard (true), .output-error-retries
+(0); webgl.gecko-w10m.feature-level-9 (false until measured on a Lumia) and
+webgl.gecko-w10m.angle-fl93-test (debug); media.mediasource.av1.enabled
+(true here, shipped false by the package).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/libpref/init/StaticPrefList.yaml | 125 +++++++++++++++++++++++
+ 1 file changed, 125 insertions(+)
+
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index 592b84bc09..38d7296208 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -8750,6 +8750,47 @@
+   type: bool
+   value: true
+   mirror: once
++
++# Software WebRender with GPU shading (gfx.webrender.software.d3d11.gpu-shading):
++# a pixel shader is otherwise created on its program's first draw, inside that
++# frame. Some seconds after the first GPU-shaded frame, at idle, the 9_3 pixel
++# shaders no draw has needed yet are created a few milliseconds at a time
++# between frames (gfx/webrender_bindings/RenderCompositorD3D11SWGL.cpp).
++# 0 off; 1 probe, note what the device refuses and release the rest; 2 probe
++# and keep what the device accepts.
++- name: gfx.webrender.software.d3d11.gpu-shading.warmup
++  type: int32_t
++  value: 2
++  mirror: once
++
++# How long after the first GPU-shaded frame that probe first looks for idle.
++- name: gfx.webrender.software.d3d11.gpu-shading.warmup-delay-ms
++  type: uint32_t
++  value: 4000
++  mirror: once
++
++# A composite after a frame that drew a video covers the whole window when
++# true. False: WebRender's dirty area plus where the video is drawn now and
++# where it was drawn last time. WebRender already counts the video's rect as
++# dirty and CompositorD3D11 copies what did not change forward, so partial
++# redraw stays on while a video plays. Software WebRender with the D3D11
++# compositor (feature level 9_3) only.
++- name: gfx.webrender.gecko-w10m.video-whole-window
++  type: RelaxedAtomicBool
++  value: false
++  mirror: always
++
++# Shader warmup starts on the render thread as soon as it has its GL context,
++# in the idle time before the window's compositor exists, instead of after the
++# renderer is made: the program binaries read from the profile's shader-cache
++# go to ANGLE early, and the second frame's links find them ready. Nothing
++# happens when nothing was read. Off for now, for an A/B test: the gain is
++# unproven, and the early warmup competes with the main thread's startup.
++# False keeps upstream's timing (warmup once the renderer is made).
++- name: gfx.webrender.gecko-w10m.shader-warmup-early
++  type: bool
++  value: false
++  mirror: once
+ #endif
+ 
+ #if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
+@@ -12345,6 +12386,20 @@
+   value: @IS_NOT_MOBILE@
+   mirror: always
+ 
++#if defined(GECKO_W10M)
++# AV1 in Media Source, as media.mediasource.vp9.enabled is for VP9. False
++# turns av01 down in Media Source (isTypeSupported, addSourceBuffer,
++# changeType, decodingInfo for media-source) unless the phone has no H.264
++# decoder at all; plain <video src> keeps it. Under GECKO_W10M the VP9 pref
++# works the same way, without upstream's hardware-decoding exceptions
++# (dom/media/mediasource/MediaSource.cpp). The default keeps Firefox's
++# behaviour; tools/build-appx.sh ships false.
++- name: media.mediasource.av1.enabled
++  type: RelaxedAtomicBool
++  value: true
++  mirror: always
++#endif
++
+ # Whether to enable MediaSource v2 support.
+ - name: media.mediasource.experimental.enabled
+   type: RelaxedAtomicBool
+@@ -12958,6 +13013,55 @@
+     value: true
+     mirror: always
+ 
++#if defined(GECKO_W10M)
++# Video frames that stay on the GPU at feature level 9_3 (Windows 10 Mobile:
++# decoded and converted on the compositor's own device, nothing shared): what
++# the decoder's thread waits for before a converted frame goes on to the
++# compositor. 1 waits for the video processor's conversion; 2 also waits,
++# before the conversion, for the decode into the NV12 surface it reads -- the
++# fix for an old frame flashing up now and then; 0 waits for nothing, a
++# diagnostic that brings the old frames back. Nothing waits anywhere else.
++-   name: media.wmf.gecko-w10m.frame-sync
++    type: RelaxedAtomicInt32
++    value: 2
++    mirror: always
++
++# H.264 mediaCapabilities.decodingInfo answered from what the GPU's video
++# decoder said once per process (DXVA2Manager.cpp), instead of building a
++# decoder for every query. Configs the probe cannot answer for -- a profile
++# other than Baseline, Main or High, not 4:2:0 or 8-bit, past 4096x2304, or
++# asked before the first hardware decoder has run the probe -- still build one.
++-   name: media.wmf.gecko-w10m.capabilities-from-probe
++    type: RelaxedAtomicBool
++    value: true
++    mirror: always
++
++# Page queries (isTypeSupported, canPlayType, the support step of
++# decodingInfo) answer no for H.264 at or above the smallest size the GPU's
++# decoder refused. Decoder creation is never affected. With this and
++# capabilities-from-probe both false the probe does not run at all.
++-   name: media.wmf.gecko-w10m.h264-query-size-cap
++    type: RelaxedAtomicBool
++    value: true
++    mirror: always
++
++# Drop a decoded frame that comes out less than a second before one already
++# handed out (a flush or a seek starts over). After three in a decoder that
++# had CODECAPI_AVLowLatencyMode set, later decoders of the run go without it,
++# unless low latency was asked for explicitly (WebRTC).
++-   name: media.wmf.gecko-w10m.reorder-guard
++    type: RelaxedAtomicBool
++    value: true
++    mirror: always
++
++# Unexpected ProcessOutput failures retried in a row on a hardware decoder
++# before the error is handed on. 0 is upstream's behaviour.
++-   name: media.wmf.gecko-w10m.output-error-retries
++    type: RelaxedAtomicUint32
++    value: 0
++    mirror: always
++#endif
++
+ -   name: media.wmf.skip-blacklist
+     type: RelaxedAtomicBool
+     value: false
+@@ -20278,6 +20382,27 @@
+   value: 0
+   mirror: always
+ 
++#if defined(GECKO_W10M)
++# WebGL 1 at Direct3D feature level 9_3 (Lumia 550, 650 and 950, Adreno 3xx):
++# ANGLE's own 9_3 device, ES 2 only, frames read back to the compositor.
++# False, the default until the cost of the per-page WebGL probes is measured
++# on a Lumia, turns WebGL off there at startup: getContext fails at once,
++# before any IPC, and nothing is loaded. WebGL 2 is never offered at 9_3. No
++# effect at feature level 10_0 and above. Read once; restart after changing.
++- name: webgl.gecko-w10m.feature-level-9
++  type: bool
++  value: false
++  mirror: once
++
++# Debug only: ANGLE's WebGL device capped at feature level 9_3 on any GPU, so
++# the level 9 path can be tried on the X3. Read on the CanvasRenderer thread
++# each time a WebGL display is made.
++- name: webgl.gecko-w10m.angle-fl93-test
++  type: RelaxedAtomicBool
++  value: false
++  mirror: always
++#endif
++
+ - name: webgl.gl_khr_no_error
+   type: RelaxedAtomicBool
+ #ifdef XP_WIN

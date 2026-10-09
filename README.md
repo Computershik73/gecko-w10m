@@ -28,6 +28,7 @@ app/GeckoW10m/        C++/WinRT UWP shell (the browser UI)
   ├─ client/          core models (preferences, search, tabs)
   ├─ engine/          GeckoEngine wrapper + gecko_capi C ABI
   └─ Package.appxmanifest   declares codeGeneration + restricted capabilities
+docs/                 porting notes, build status, w10m-ab-kit.md (about:config switches to compare on a Lumia)
 mozconfig/            the engine's build configuration (arm-uwp, single-process, JIT)
 patches/w10m/         the engine port as git format-patch files over the release tag
 tools/                build scripts (build-all.sh runs the whole chain)
