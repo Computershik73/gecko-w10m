@@ -311,8 +311,11 @@ function gecko_note_memory(when) {
             ", virtual " + read("vsize") +
             // The 32-bit address space runs out in pieces long before it
             // runs out in total; this is the biggest one left. A walk of the
-            // whole address space, so not for every pressure notice.
-            (when === "under pressure" ? "" :
+            // whole address space on the main thread -- 49 ms on a Lumia 650,
+            // more as it fills -- so once, at the start; after that the
+            // engine's watcher says it every two minutes ("vm watch: last
+            // 120 s") from a thread of its own.
+            (when !== "session restored" ? "" :
                 ", largest free piece " + read("vsizeMaxContiguous")) +
             ", heap " + read("heapAllocated") +
             ", js gc heap " + read("JSMainRuntimeGCHeap") +
@@ -382,7 +385,13 @@ function gecko_watch_memory() {
         observe(subject, topic, data) {
             Services.console.logStringMessage(
                 "gecko: memory-pressure (" + data + ")");
-            gecko_note_memory("under pressure");
+            // Only for a fresh one: the heap figure walks every arena of the
+            // allocator (9 ms on a small heap, 222 ms on Discord's), and an
+            // "ongoing" can come every ten seconds. The engine's own
+            // "mem: let go" note says what each fresh one freed.
+            if (data === "low-memory") {
+                gecko_note_memory("under pressure");
+            }
         }
     }, "memory-pressure");
 }

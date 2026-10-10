@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sat, 10 Oct 2026 23:48:02 +0400
+Subject: [PATCH] Upstream's watcher of the system's memory is not started on
+ Windows 10 Mobile
+
+When the system runs short of commit nsAvailableMemoryWatcher unloads a
+background tab, and failing that tells the engine "low-memory", and later
+that it is over. In a single process no tab can be unloaded (tabbrowser
+discards remote browsers only), so all it did here was drive the engine's
+memory-pressure state beside the port's own code, which rations what a
+"low-memory" costs on the only main thread: a stop from the watcher would
+turn the next cheap "ongoing" into a fresh "low-memory" with its full
+collection. CreateAvailableMemoryWatcher returns the inert base under
+GECKO_W10M, as upstream does on platforms without a watcher.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xpcom/base/AvailableMemoryWatcherWin.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/xpcom/base/AvailableMemoryWatcherWin.cpp b/xpcom/base/AvailableMemoryWatcherWin.cpp
+index 8b625c68c9..c526dbacfe 100644
+--- a/xpcom/base/AvailableMemoryWatcherWin.cpp
++++ b/xpcom/base/AvailableMemoryWatcherWin.cpp
+@@ -392,11 +392,22 @@ nsAvailableMemoryWatcher::Observe(nsISupports* aSubject, const char* aTopic,
+ }
+ 
+ already_AddRefed<nsAvailableMemoryWatcherBase> CreateAvailableMemoryWatcher() {
++#if defined(GECKO_W10M)
++  // Not on Windows 10 Mobile. What this watcher does when the system runs
++  // short of commit is unload a background tab, which in a single process
++  // never succeeds (tabbrowser discards remote browsers only), and failing
++  // that tell the engine "low-memory", and later that it is over. There the
++  // engine is told both by one place that rations what a "low-memory" costs
++  // on the only main thread (widget/headless/GeckoW10mMemoryPressure.cpp,
++  // from the phone's own limit on the app); a second voice would undo it.
++  return do_AddRef(new nsAvailableMemoryWatcherBase);
++#else
+   RefPtr watcher(new nsAvailableMemoryWatcher);
+   if (NS_FAILED(watcher->Init())) {
+     return do_AddRef(new nsAvailableMemoryWatcherBase);  // fallback
+   }
+   return watcher.forget();
++#endif
+ }
+ 
+ }  // namespace mozilla

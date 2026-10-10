@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sat, 10 Oct 2026 23:48:01 +0400
+Subject: [PATCH] The JS engine and its workers hear memory-pressure-stop on
+ Windows 10 Mobile
+
+nsJSEnvironmentObserver and the workers' RuntimeService each have a branch
+for "memory-pressure-stop" that takes the JS runtime out of its low-memory
+state, and neither was ever registered for the topic. After the first
+"low-memory" of a run the nursery stayed at its minimum (256 KB) until the
+end of it, whatever was sent afterwards. On Windows 10 Mobile the pressure
+does end now, and a 1 GB phone meets its first "low-memory" seconds after
+it starts. Both are registered under GECKO_W10M.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/base/nsJSEnvironment.cpp   |  9 +++++++++
+ dom/workers/RuntimeService.cpp | 17 +++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/dom/base/nsJSEnvironment.cpp b/dom/base/nsJSEnvironment.cpp
+index 2da511a657..799058279c 100644
+--- a/dom/base/nsJSEnvironment.cpp
++++ b/dom/base/nsJSEnvironment.cpp
+@@ -1998,6 +1998,15 @@ void nsJSContext::EnsureStatics() {
+ 
+   nsIObserver* observer = new nsJSEnvironmentObserver();
+   obs->AddObserver(observer, "memory-pressure", false);
++#if defined(GECKO_W10M)
++  // The observer has a branch for "memory-pressure-stop" that takes the JS
++  // engine out of its low-memory state, and was never registered for the
++  // topic: after the first "low-memory" of a run the nursery stayed at its
++  // minimum (256 KB) until the end of it, whatever was sent. On Windows 10
++  // Mobile the pressure does end (widget/headless/GeckoW10mMemoryPressure.cpp)
++  // and a 1 GB phone meets its first "low-memory" seconds after it starts.
++  obs->AddObserver(observer, "memory-pressure-stop", false);
++#endif
+   obs->AddObserver(observer, "user-interaction-inactive", false);
+   obs->AddObserver(observer, "user-interaction-active", false);
+   obs->AddObserver(observer, "quit-application", false);
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+index 32e39162d3..f4b6116035 100644
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -1578,6 +1578,16 @@ nsresult RuntimeService::Init() {
+     NS_WARNING("Failed to register for memory pressure notifications!");
+   }
+ 
++#if defined(GECKO_W10M)
++  // Observe() has a branch for the stop that takes every worker's runtime out
++  // of its low-memory state, and nothing registered for it (the same in
++  // dom/base/nsJSEnvironment.cpp). On Windows 10 Mobile the stop is sent.
++  if (NS_FAILED(
++          obs->AddObserver(this, MEMORY_PRESSURE_STOP_OBSERVER_TOPIC, false))) {
++    NS_WARNING("Failed to register for the end of memory pressure!");
++  }
++#endif
++
+   if (NS_FAILED(
+           obs->AddObserver(this, NS_IOSERVICE_OFFLINE_STATUS_TOPIC, false))) {
+     NS_WARNING("Failed to register for offline notification event!");
+@@ -1884,6 +1894,13 @@ void RuntimeService::Cleanup() {
+         NS_WARNING("Failed to unregister for memory pressure notifications!");
+       }
+ 
++#if defined(GECKO_W10M)
++      if (NS_FAILED(
++              obs->RemoveObserver(this, MEMORY_PRESSURE_STOP_OBSERVER_TOPIC))) {
++        NS_WARNING("Failed to unregister for the end of memory pressure!");
++      }
++#endif
++
+       if (NS_FAILED(
+               obs->RemoveObserver(this, NS_IOSERVICE_OFFLINE_STATUS_TOPIC))) {
+         NS_WARNING("Failed to unregister for offline notification event!");

@@ -177,31 +177,22 @@ MainPage::MainPage() {
       Log::Write(L"mem: the limit is changing from " + mb(args.OldLimit()) +
                  L" to " + mb(args.NewLimit()));
     });
-    // When the engine was last told the phone's level went up. Shared with
-    // the fall to Low below, which starts a new spell of pressure.
-    static std::atomic<unsigned long long> lastSent{0};
     MemoryManager::AppMemoryUsageIncreased([mb](auto&&, auto&&) {
       const auto level = MemoryManager::AppMemoryUsageLevel();
       Log::Write(L"mem: the system says usage went UP a level -- now " +
                  std::to_wstring(static_cast<int>(level)) +
                  L" at " + mb(MemoryManager::AppMemoryUsage()) + L" of " +
                  mb(MemoryManager::AppMemoryUsageLimit()));
-      // Low is 0, Medium 1, High 2, OverLimit 3. From Medium on, the engine
-      // is told to let go of what it can -- but not every time. On a 1 GB
-      // phone Medium is half the limit, the system repeats it several times a
-      // second, and each one is a full GC, a cycle collection and a cache
-      // purge on a CPU that is already 90% busy: the cure was the illness.
-      // Medium goes through once in thirty seconds, High and over once in
-      // five.
-      const unsigned long long now = ::GetTickCount64();
-      // Past the limit (OverLimit, 3) the app is about to be ended, so that
-      // one always goes through.
-      const unsigned long long gap = static_cast<int>(level) >= 3   ? 0ull
-                                     : static_cast<int>(level) >= 2 ? 5000ull
-                                                                    : 30000ull;
-      const unsigned long long last = lastSent.load();
-      if (static_cast<int>(level) >= 1 && (!last || now - last >= gap)) {
-        lastSent.store(now);
+      // Low is 0, Medium 1, High 2, OverLimit 3. Every rise goes to the
+      // engine, as every fall does below: it has to know the level the
+      // phone is at, and it decides itself what a rise is worth -- one
+      // collection when the pressure comes on, and after that a cache purge
+      // at most every ten seconds and a collection only when it is cheap and
+      // pays (GeckoW10mMemoryPressure.cpp). This used to be rate-limited
+      // here, when every call was a full GC and a cycle collection; with the
+      // falls passed on as well, a rise held back here would leave the
+      // engine at a lower level than the phone.
+      if (static_cast<int>(level) >= 1) {
         if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
           using PressureFn = void(__cdecl*)(int32_t);
           if (auto fn = reinterpret_cast<PressureFn>(
@@ -237,20 +228,14 @@ MainPage::MainPage() {
       Log::Write(L"mem: usage went down a level -- now " +
                  std::to_wstring(static_cast<int>(level)) +
                  L" at " + mb(MemoryManager::AppMemoryUsage()));
-      // Back to Low: the engine is told, so that its memory pressure ends --
-      // it holds it from the first Medium on, and from High up collects
-      // afresh every half minute. Not rate-limited: a fall to Low is rare,
-      // and the engine does nothing for a Low it already had. The next rise
-      // is a new spell and goes through at once, not after the gap the last
-      // Medium left: the engine spaces its collections itself now.
-      if (static_cast<int>(level) == 0) {
-        lastSent.store(0);
-        if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
-          using PressureFn = void(__cdecl*)(int32_t);
-          if (auto fn = reinterpret_cast<PressureFn>(
-                  ::GetProcAddress(xul, "gecko_w10m_memory_pressure"))) {
-            fn(0);
-          }
+      // Every fall goes to the engine: at Low its memory pressure ends, and
+      // below High it is no longer serious, so the engine stops telling
+      // itself again. A fall costs the engine nothing but a look.
+      if (HMODULE xul = ::GetModuleHandleW(L"xul.dll")) {
+        using PressureFn = void(__cdecl*)(int32_t);
+        if (auto fn = reinterpret_cast<PressureFn>(
+                ::GetProcAddress(xul, "gecko_w10m_memory_pressure"))) {
+          fn(static_cast<int32_t>(level));
         }
       }
     });

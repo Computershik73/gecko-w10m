@@ -449,15 +449,19 @@ pref("media.mediasource.eviction_threshold.audio", 4194304);
 // 8, and all of them together no more than 24 MB.
 pref("media.memory_cache_max_size", 4096);
 pref("media.memory_caches_combined_limit_kb", 24576);
-// Tabs in the background are unloaded when memory is tight, and the phone
-// says when that is (gecko_w10m_memory_pressure).
+// Does nothing on this port as it stands: Firefox unloads a background tab
+// only when the tab runs in a process of its own, and here they all share
+// one; and the watcher that would ask for it is not started
+// (xpcom/base/AvailableMemoryWatcherWin.cpp). The phone's limit on the app
+// reaches the engine through gecko_w10m_memory_pressure and unloads nothing.
 pref("browser.tabs.unloadOnLowMemory", true);
 // While memory stays critical (the phone at High or over its limit) the
-// engine is told afresh every thirty seconds -- memory-pressure-stop, then a
-// new low-memory and another shrinking GC -- instead of low-memory-ongoing,
-// which the JS engine ignores. And the address
-// space is watched: when its largest free piece falls under 96 MB the engine
-// is put under pressure as well, until the piece is back above 144 MB
+// engine is told again every thirty seconds: a fresh low-memory and another
+// shrinking GC when that is cheap and pays for itself, the cache purge of
+// low-memory-ongoing otherwise. And the address space is watched: when its
+// largest free piece falls under 96 MB the engine is put under pressure for
+// a short while -- one collection, the caches dropped -- and again only once
+// the piece has been back above 144 MB
 // (widget/headless/GeckoW10mMemoryPressure.cpp). These are the defaults;
 // 0 turns either off.
 // pref("memory.gecko-w10m.pressure-rearm-ms", 30000);
