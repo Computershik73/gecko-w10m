@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 11 Oct 2026 03:49:17 +0400
+Subject: [PATCH] The JS string builder asks for less in one piece on Windows
+ 10 Mobile
+
+GrowEltsAggressively multiplies a string builder's space by eight until it
+reaches 128 million elements. On a phone the 2 GB address space is in
+pieces: an HP Elite x3 with Discord open had 350 MB free and nothing over
+27 MB in one piece, and the policy turned strings of 4-15 million
+characters into single requests of 64, 128 and 256 MB. 33 of the 46 failed
+JS allocations in its logs were one extension's Array.join. Under
+GECKO_W10M the eightfold growth stops at 4 million elements and doubling
+takes over.
+
+ExtractWellSized threw a finished string away when its shrink-to-fit
+realloc failed: mozjemalloc shrinks a large block by making a new one and
+copying, and there was no room for the smaller copy beside the original.
+Under GECKO_W10M the string stays in the buffer it was built in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ js/src/util/StringBuilder.cpp | 13 +++++++++++++
+ js/src/util/StringBuilder.h   | 10 ++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/js/src/util/StringBuilder.cpp b/js/src/util/StringBuilder.cpp
+index 08b54c99c6..41c721b4cb 100644
+--- a/js/src/util/StringBuilder.cpp
++++ b/js/src/util/StringBuilder.cpp
+@@ -39,12 +39,25 @@ static CharT* ExtractWellSized(Buffer& cb) {
+   constexpr size_t minCharsToReclaim = 80 / sizeof(CharT);
+   if (capacity - length >= minCharsToReclaim &&
+       capacity - length > capacity / 4) {
++#if defined(GECKO_W10M)
++    // On Windows 10 Mobile a shrink that fails leaves the string in the
++    // buffer it was built in. For a large block mozjemalloc shrinks by making
++    // a new one and copying, and in an address space in pieces there is often
++    // no room for the smaller copy beside the larger original -- which threw
++    // away a finished string of 35 MB for want of a place to put 35 MB while
++    // 64 MB were held. The quiet realloc: the other one reports out of memory
++    // and collects before it gives up.
++    if (CharT* tmp = allocPolicy.maybe_pod_realloc<CharT>(buf, capacity, length)) {
++      buf = tmp;
++    }
++#else
+     CharT* tmp = allocPolicy.pod_realloc<CharT>(buf, capacity, length);
+     if (!tmp) {
+       allocPolicy.free_(buf);
+       return nullptr;
+     }
+     buf = tmp;
++#endif
+   }
+ 
+   return buf;
+diff --git a/js/src/util/StringBuilder.h b/js/src/util/StringBuilder.h
+index bad6ce196f..01c782cca4 100644
+--- a/js/src/util/StringBuilder.h
++++ b/js/src/util/StringBuilder.h
+@@ -29,7 +29,17 @@ namespace detail {
+ // avoid very expensive memcpys for large strings (eg giant toJSON output for
+ // sessionstore.js). Drop back to the normal expansion policy once the buffer
+ // hits 128MB.
++#if defined(GECKO_W10M)
++// On Windows 10 Mobile once it hits 4 million characters. A 32-bit process has
++// 2 GB of address space, and on the phones it is in pieces: the largest free
++// one was 13-200 MB at the 33 failed allocations a uBlock Origin made there,
++// which this policy had turned into single requests of 64, 128 and 256 MB for
++// strings of 4-15 million characters. Doubling asks for a quarter to an
++// eighth of that, at the price of one more copy of at most the final size.
++static constexpr size_t AggressiveLimit = 4 << 20;
++#else
+ static constexpr size_t AggressiveLimit = 128 << 20;
++#endif
+ 
+ template <size_t EltSize>
+ inline size_t GrowEltsAggressively(size_t aOldElts, size_t aIncr) {

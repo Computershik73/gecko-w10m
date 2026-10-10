@@ -1360,6 +1360,17 @@ void AutopsyRendererThread(const wchar_t* tag) {
     Log::WriteFromFault(t + L" the renderer thread has not reported an id yet");
     return;
   }
+  if (tid == ::GetCurrentThreadId()) {
+    // The fault is the renderer thread's own, and this runs on it. Suspending
+    // it from here suspends this function with it, and nothing is left to
+    // resume it: twice that turned a fault into a browser that went on taking
+    // taps behind a frozen picture, with the report cut off at this line and
+    // ANGLE's lock held. Its registers and stack are the fault's own, which
+    // the caller writes next.
+    Log::WriteFromFault(t + L" renderer thread " + std::to_wstring(tid) +
+                        L" is the thread that faulted");
+    return;
+  }
   HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
   auto openThread = k32 ? reinterpret_cast<OpenThreadFn>(::GetProcAddress(k32, "OpenThread")) : nullptr;
   if (!openThread || !ResolveSamplingApis()) {

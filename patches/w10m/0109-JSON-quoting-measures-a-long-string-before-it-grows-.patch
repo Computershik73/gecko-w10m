@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 11 Oct 2026 03:49:18 +0400
+Subject: [PATCH] JSON quoting measures a long string before it grows the
+ buffer, on Windows 10 Mobile
+
+QuoteJSONString grew the builder by six times the string's length plus two,
+the most it could ever need, and shrank it afterwards. For one long string
+in the session file that was a single 32 MB request with 27 MB the largest
+free piece of the address space, and SessionWriter's IOUtils.writeJSON
+failed five times in a minute: the session was not being saved.
+
+Under GECKO_W10M a string of 4096 characters or more is measured first
+(QuotedJSONStringLength: the writer's decisions, counted instead of
+written) and the builder grows by exactly that. The escape table moves to
+file scope so that both use the same one; the writer itself is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ js/src/builtin/JSON.cpp | 83 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 70 insertions(+), 13 deletions(-)
+
+diff --git a/js/src/builtin/JSON.cpp b/js/src/builtin/JSON.cpp
+index 2c3e1bc0e5..c16715d63a 100644
+--- a/js/src/builtin/JSON.cpp
++++ b/js/src/builtin/JSON.cpp
+@@ -56,18 +56,10 @@ using mozilla::Variant;
+ 
+ using JS::AutoStableStringChars;
+ 
+-/* https://262.ecma-international.org/14.0/#sec-quotejsonstring
+- * Requires that the destination has enough space allocated for src after
+- * escaping (that is, `2 + 6 * (srcEnd - srcBegin)` characters).
+- */
+-template <typename SrcCharT, typename DstCharT>
+-static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
+-    RangedPtr<const SrcCharT> srcBegin, RangedPtr<const SrcCharT> srcEnd,
+-    RangedPtr<DstCharT> dstPtr) {
+-  // Maps characters < 256 to the value that must follow the '\\' in the quoted
+-  // string. Entries with 'u' are handled as \\u00xy, and entries with 0 are not
+-  // escaped in any way. Characters >= 256 are all assumed to be unescaped.
+-  static const Latin1Char escapeLookup[256] = {
++// Maps characters < 256 to the value that must follow the '\\' in the quoted
++// string. Entries with 'u' are handled as \\u00xy, and entries with 0 are not
++// escaped in any way. Characters >= 256 are all assumed to be unescaped.
++static const Latin1Char JSONEscapeLookup[256] = {
+       // clang-format off
+         'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'b', 't',
+         'n', 'u', 'f', 'r', 'u', 'u', 'u', 'u', 'u', 'u',
+@@ -80,7 +72,55 @@ static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
+         0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+         0,   0,  '\\', // rest are all zeros
+       // clang-format on
+-  };
++};
++
++#if defined(GECKO_W10M)
++// How many characters InfallibleQuoteJSONString below writes for a string:
++// the same decisions in the same order, counted instead of written. Used for
++// long strings only (QuoteJSONString), so that the buffer is grown by what the
++// string needs rather than by six times its length.
++template <typename SrcCharT>
++static uint64_t QuotedJSONStringLength(const SrcCharT* src, size_t len) {
++  const SrcCharT* const end = src + len;
++  // The two quotes.
++  uint64_t count = 2;
++  while (src != end) {
++    const SrcCharT c = *src++;
++
++    if (MOZ_LIKELY(size_t(c) < sizeof(JSONEscapeLookup))) {
++      const Latin1Char escaped = JSONEscapeLookup[c];
++      count += escaped == 0 ? 1 : (escaped == 'u' ? 6 : 2);
++      continue;
++    }
++
++    if (!unicode::IsSurrogate(c)) {
++      count += 1;
++      continue;
++    }
++
++    if (MOZ_LIKELY(unicode::IsLeadSurrogate(c) && src < end &&
++                   unicode::IsTrailSurrogate(*src))) {
++      ++src;
++      count += 2;
++      continue;
++    }
++
++    count += 6;
++  }
++  return count;
++}
++#endif
++
++/* https://262.ecma-international.org/14.0/#sec-quotejsonstring
++ * Requires that the destination has enough space allocated for src after
++ * escaping (that is, `2 + 6 * (srcEnd - srcBegin)` characters).
++ */
++template <typename SrcCharT, typename DstCharT>
++static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
++    RangedPtr<const SrcCharT> srcBegin, RangedPtr<const SrcCharT> srcEnd,
++    RangedPtr<DstCharT> dstPtr) {
++  // The table is JSONEscapeLookup, above.
++  const Latin1Char (&escapeLookup)[256] = JSONEscapeLookup;
+ 
+   /* Step 1. */
+   *dstPtr++ = '"';
+@@ -183,6 +223,23 @@ static bool QuoteJSONString(JSContext* cx, StringBuilder& sb, JSString* str) {
+   size_t sbInitialLen = sb.length();
+ 
+   CheckedInt<size_t> reservedLen = CheckedInt<size_t>(len) * 6 + 2;
++#if defined(GECKO_W10M)
++  // On Windows 10 Mobile a long string is measured first. Six times its
++  // length is what it could need at the very worst, and for one string of a
++  // couple of million characters in the session file that was a single
++  // request of 32 MB, in an address space whose largest free piece was 27 MB:
++  // the file was not written five times in a minute. One more pass over the
++  // string costs far less than the buffer did.
++  static constexpr size_t MeasureFromLength = 4096;
++  if (len >= MeasureFromLength) {
++    JS::AutoCheckCannotGC nogc;
++    const uint64_t exact =
++        linear->hasTwoByteChars()
++            ? QuotedJSONStringLength(linear->twoByteChars(nogc), len)
++            : QuotedJSONStringLength(linear->latin1Chars(nogc), len);
++    reservedLen = CheckedInt<size_t>(exact);
++  }
++#endif
+   if (MOZ_UNLIKELY(!reservedLen.isValid())) {
+     ReportAllocationOverflow(cx);
+     return false;

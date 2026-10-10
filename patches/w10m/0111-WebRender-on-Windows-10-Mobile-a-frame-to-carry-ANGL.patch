@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 11 Oct 2026 03:49:21 +0400
+Subject: [PATCH] WebRender on Windows 10 Mobile: a frame to carry ANGLE's
+ retry, and the surface's own rectangle for a whole frame
+
+ANGLE looks at the panel's size, and makes again a chain it had to give up,
+only inside a present. When a resize was refused, a page standing still
+sent no frame and the picture stayed cut to the old size.
+RenderCompositorEGL now asks for one more frame while a post failed (every
+half second) or left the surface a different size from the window (1, 2,
+4 .. 30 s), through CompositorBridgeParent::GeckoW10mForceComposite, which
+collects the root bridges under the lock and calls them after it.
+
+A whole frame posts the surface's rectangle, not the window's: ANGLE counts
+its rows from the bottom of its own height, and on a surface taller than
+the window the window's rectangle named the wrong rows as changed.
+
+The 'eglPostSubBufferNV failed' note is said once a second at most.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx/layers/ipc/CompositorBridgeParent.cpp     |  22 ++++
+ gfx/layers/ipc/CompositorBridgeParent.h       |   7 ++
+ .../RenderCompositorEGL.cpp                   | 114 +++++++++++++++++-
+ gfx/webrender_bindings/RenderCompositorEGL.h  |   8 ++
+ 4 files changed, 149 insertions(+), 2 deletions(-)
+
+diff --git a/gfx/layers/ipc/CompositorBridgeParent.cpp b/gfx/layers/ipc/CompositorBridgeParent.cpp
+index 89b0220589..31a32ce125 100644
+--- a/gfx/layers/ipc/CompositorBridgeParent.cpp
++++ b/gfx/layers/ipc/CompositorBridgeParent.cpp
+@@ -894,6 +894,28 @@ void CompositorBridgeParent::ScheduleForcedComposition(
+   }
+ }
+ 
++#if defined(GECKO_W10M)
++/* static */ void CompositorBridgeParent::GeckoW10mForceComposite() {
++  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
++  // Found under the lock, called without it: a root bridge is in the table
++  // from the moment it is made, and for one that is not initialised yet
++  // ScheduleForcedGenerateFrame goes through EnsureInitialized, which takes
++  // this lock itself.
++  AutoTArray<RefPtr<WebRenderBridgeParent>, 4> roots;
++  {
++    StaticMonitorAutoLock lock(sIndirectLayerTreesLock);
++    ForEachWebRenderBridgeParent([&](WebRenderBridgeParent* wrBridge) -> void {
++      if (wrBridge->IsRootWebRenderBridgeParent()) {
++        roots.AppendElement(wrBridge);
++      }
++    });
++  }
++  for (const auto& root : roots) {
++    root->ScheduleForcedGenerateFrame(wr::RenderReasons::WIDGET);
++  }
++}
++#endif
++
+ /* static */ void CompositorBridgeParent::DisconnectWrBridge(
+     WebRenderBridgeParent* aWrBridge) {
+   auto layersId = wr::AsLayersId(aWrBridge->PipelineId());
+diff --git a/gfx/layers/ipc/CompositorBridgeParent.h b/gfx/layers/ipc/CompositorBridgeParent.h
+index e4b5f7be74..c785c673bf 100644
+--- a/gfx/layers/ipc/CompositorBridgeParent.h
++++ b/gfx/layers/ipc/CompositorBridgeParent.h
+@@ -384,6 +384,13 @@ class CompositorBridgeParent final : public CompositorBridgeParentBase {
+   static void ScheduleForcedComposition(const LayersId& aLayersId,
+                                         wr::RenderReasons aReasons);
+ 
++#if defined(GECKO_W10M)
++  // One whole new frame from every window, on the compositor thread. Asked
++  // for by RenderCompositorEGL when ANGLE could not give its surface the size
++  // the window has: only a frame makes it try again.
++  static void GeckoW10mForceComposite();
++#endif
++
+   static void DisconnectWrBridge(WebRenderBridgeParent* aWrBridge);
+ 
+   static void DisconnectApzcTreeManager(APZCTreeManagerParent* aTreeManager);
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.cpp b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+index 9d6075afc4..cc4cf4473c 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.cpp
++++ b/gfx/webrender_bindings/RenderCompositorEGL.cpp
+@@ -12,6 +12,10 @@
+ #include "mozilla/gfx/Logging.h"
+ #include "mozilla/gfx/gfxVars.h"
+ #include "mozilla/layers/BuildConstants.h"
++#if defined(GECKO_W10M)
++#  include "mozilla/layers/CompositorBridgeParent.h"
++#  include "mozilla/layers/CompositorThread.h"
++#endif
+ #include "mozilla/webrender/RenderThread.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ 
+@@ -213,8 +217,76 @@ RenderCompositorEGL::RenderCompositorEGL(
+ #endif
+ }
+ 
++#if defined(GECKO_W10M)
++// Render thread only.
++static RenderCompositorEGL* sRetryOwner = nullptr;
++static uint32_t sRetryGen = 0;
++
++// ANGLE looks at the panel's size, and makes again a swap chain it had to
++// give up, only inside a present. When it could not give the surface the size
++// the window has -- refused for want of address space -- the next try needs a
++// frame to carry it, and a page that is standing still sends none: the
++// picture would stay cut to the old size until the user touched something.
++// So one frame is asked for a while later, and later still each time the
++// sizes go on disagreeing. A post that failed outright -- no chain at all --
++// asks again in half a second every time: ANGLE spaces its own tries at
++// making one, a frame that finds it not yet due costs it nothing, and the
++// frame that does make the chain shows nothing itself, so the one after it
++// should not be long.
++void RenderCompositorEGL::ScheduleRetryFrame() {
++  // One at a time -- but a post that failed does not wait behind a retry set
++  // for sizes that disagreed, which can be half a minute away: that one is
++  // put aside (its generation is no longer the current one) for the quick
++  // one.
++  if (mRetryPending && (!mPostFailed || mRetryQuick)) {
++    return;
++  }
++  mRetryPending = true;
++  mRetryQuick = mPostFailed;
++  sRetryOwner = this;
++  const uint32_t gen = ++sRetryGen;
++  RenderCompositorEGL* self = this;
++  uint32_t delayMs = 500;
++  if (!mPostFailed) {
++    delayMs = mRetryDelayMs;
++    mRetryDelayMs = std::min<uint32_t>(mRetryDelayMs * 2, 30000);
++  }
++  (void)NS_DelayedDispatchToCurrentThread(
++      NS_NewRunnableFunction(
++          "RenderCompositorEGL::RetryFrame",
++          [self, gen]() {
++            if (sRetryOwner != self || sRetryGen != gen) {
++              return;
++            }
++            self->mRetryPending = false;
++            if (self->mEGLSurface == EGL_NO_SURFACE) {
++              return;
++            }
++            if (!self->mPostFailed &&
++                self->SurfaceSize() == self->GetBufferSize().ToUnknownSize()) {
++              // They agree by now -- the usual case, the window's own resize
++              // having caught up with the panel's.
++              self->mRetryDelayMs = 1000;
++              return;
++            }
++            if (nsCOMPtr<nsISerialEventTarget> thread =
++                    layers::CompositorThread()) {
++              thread->Dispatch(NS_NewRunnableFunction(
++                  "GeckoW10mForceComposite",
++                  []() { layers::CompositorBridgeParent::GeckoW10mForceComposite(); }));
++            }
++          }),
++      delayMs);
++}
++#endif
++
+ RenderCompositorEGL::~RenderCompositorEGL() {
+   LOG("RenderCompositorEGL::~RenderCompositorEGL()");
++#if defined(GECKO_W10M)
++  if (sRetryOwner == this) {
++    sRetryOwner = nullptr;
++  }
++#endif
+ #ifdef MOZ_WIDGET_ANDROID
+   java::GeckoSurfaceTexture::DestroyUnused((int64_t)gl());
+ #endif
+@@ -291,7 +363,15 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+                                          right - left, bottom - top));
+     }
+     if (whole) {
+-      bounds = gfx::IntRect(0, 0, bufferSize.width, bufferSize.height);
++      // The surface's own rectangle, not the window's. The two differ while
++      // ANGLE has not (or not yet) given the surface the window's size, and
++      // ANGLE counts this rectangle's rows from the bottom of its own height:
++      // the window's, on a taller surface, named the rows at the wrong edge
++      // as changed and left the ones that were drawn as stale.
++      const gfx::IntSize surfaceSize = SurfaceSize();
++      bounds = surfaceSize.IsEmpty()
++                   ? gfx::IntRect(0, 0, bufferSize.width, bufferSize.height)
++                   : gfx::IntRect(0, 0, surfaceSize.width, surfaceSize.height);
+     }
+ 
+     ++mPresentFrames;
+@@ -313,6 +393,19 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+           (TimeStamp::Now() - presentStart).ToMilliseconds();
+       mPresentMs += presentMs;
+       mPresentMaxMs = std::max(mPresentMaxMs, presentMs);
++      mPostFailed = !posted;
++      if (!posted || SurfaceSize() != bufferSize.ToUnknownSize()) {
++        ScheduleRetryFrame();
++      } else {
++        // All is well again. A retry still waiting -- up to half a minute
++        // away, after a long refusal -- is dropped with it, so that the next
++        // trouble starts from one second and not from behind that one.
++        mRetryDelayMs = 1000;
++        if (mRetryPending) {
++          mRetryPending = false;
++          ++sRetryGen;
++        }
++      }
+       if (posted) {
+         mPresentedSize = bufferSize;
+         // ANGLE resizes its buffers after a present, when it sees that the
+@@ -326,7 +419,24 @@ RenderedFrameId RenderCompositorEGL::EndFrame(
+       } else {
+         // Present the next frame whole, whatever went wrong with this one.
+         mFullRender = true;
+-        GeckoW10mNote("gfx: eglPostSubBufferNV failed, next frame whole");
++        // Said at most once a second: a surface whose buffers cannot be made
++        // (ANGLE's SwapChain11, out of address space) fails at every frame
++        // until they can.
++        static TimeStamp sLastSaid;
++        static uint32_t sFailedSince = 0;
++        ++sFailedSince;
++        const TimeStamp failedAt = TimeStamp::Now();
++        if (sLastSaid.IsNull() ||
++            (failedAt - sLastSaid).ToMilliseconds() >= 1000) {
++          char note[112];
++          SprintfLiteral(note,
++                         "gfx: eglPostSubBufferNV failed (%u since last said), "
++                         "next frame whole",
++                         sFailedSince);
++          GeckoW10mNote(note);
++          sLastSaid = failedAt;
++          sFailedSince = 0;
++        }
+       }
+       if (whole) {
+         ++mPresentWhole;
+diff --git a/gfx/webrender_bindings/RenderCompositorEGL.h b/gfx/webrender_bindings/RenderCompositorEGL.h
+index 7b8be38bd6..50d4265c73 100644
+--- a/gfx/webrender_bindings/RenderCompositorEGL.h
++++ b/gfx/webrender_bindings/RenderCompositorEGL.h
+@@ -103,6 +103,14 @@ class RenderCompositorEGL : public RenderCompositor {
+   gfx::IntSize mPresentedSurfaceSize;
+   // What RequestFullRender decided for the frame being drawn.
+   bool mWholeFrame = true;
++  // One more frame a while after a post that failed, or one that left
++  // ANGLE's surface a different size from the window: see ScheduleRetryFrame.
++  void ScheduleRetryFrame();
++  bool mRetryPending = false;
++  // The one pending is the quick kind, for a post that failed.
++  bool mRetryQuick = false;
++  bool mPostFailed = false;
++  uint32_t mRetryDelayMs = 1000;
+   // The surface's rows run top down: WebRender draws into the swap chain's
+   // back buffer directly, with no ANGLE offscreen texture in between.
+   bool mTopLeftOrigin = false;
