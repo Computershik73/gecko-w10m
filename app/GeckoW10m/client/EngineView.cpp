@@ -988,18 +988,46 @@ void EngineView::ApplyInputKind(int32_t kind) {
              L", the keyboard follows");
 }
 
+// Whether the engine wants text, with a short memory. While text is being
+// selected in a field (the address bar most of all) the engine says "no" for
+// 30-50 ms and then "yes" again -- the focus goes to the selection's own
+// machinery and comes back -- and the keyboard was put away and raised for
+// each of those: 51 times in one evening's log, the room resized twice every
+// time. A "no" counts once it has lasted, so a field that is really left
+// loses its keyboard a third of a second later, which nobody sees.
+bool EngineView::TextWanted() {
+  if (!wanted_) {
+    return false;
+  }
+  if (wanted_() == 1) {
+    wantsOffSince_ = 0;
+    return true;
+  }
+  if (!typing_) {
+    return false;
+  }
+  const ULONGLONG now = ::GetTickCount64();
+  if (!wantsOffSince_) {
+    wantsOffSince_ = now;
+  }
+  return now - wantsOffSince_ < 300;
+}
+
 void EngineView::FollowTextInput() {
   if (!wanted_) {
     return;
   }
-  const bool wants = wanted_() == 1;
+  const bool wants = TextWanted();
   const uint32_t state = text_state_ ? text_state_() : 0;
   const uint32_t serial = state >> 8;
   // A field newly focused, or tapped while it has the focus, is someone about
   // to type -- even when the engine wanted text all along and the keyboard was
   // put away. Before this the keyboard only came up when "wanted" changed, so
   // a field tapped a second time after the keyboard was dismissed got none.
-  const bool again = wants && (serial != lastTextSerial_ || forceKeyboard_);
+  // Only while the engine says so itself: a "no" still being waited out is
+  // not a field newly focused.
+  const bool again = wants && wanted_() == 1 &&
+                     (serial != lastTextSerial_ || forceKeyboard_);
   forceKeyboard_ = false;
   if (wants == typing_ && !again) {
     return;
@@ -1363,7 +1391,7 @@ void EngineView::Tick() {
   const bool newField = text_state_ && wanted_ && wanted_() == 1 &&
                         (text_state_() >> 8) != lastTextSerial_;
   if (wanted_ &&
-      ((wanted_() == 1) != typing_ || newField || forceKeyboard_) &&
+      (TextWanted() != typing_ || newField || forceKeyboard_) &&
       !textInputPending_ && !(declinedUntilTouch_ && !touched_)) {
     textInputPending_ = true;
     PostToUi([this]() {

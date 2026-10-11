@@ -137,6 +137,7 @@ class EngineView {
                int32_t* y) const;
 
   void FollowTextInput();
+  bool TextWanted();
   // Tells the engine how much room the picture has, whenever that changes.
   void PushSize();
   // On the hardware path the image above the panel shows only the layer of
@@ -277,6 +278,9 @@ class EngineView {
   double travelled_ = 0;
 
   bool typing_ = false;    // text input is wanted right now
+  // When the engine stopped wanting text while typing_ (TextWanted); 0 if it
+  // wants it.
+  unsigned long long wantsOffSince_ = 0;
   // The engine's focus serial at the last raise, the keyboard the sink was
   // last given, and when to check after a tap whether the keyboard should be
   // up again (0: no check pending).
