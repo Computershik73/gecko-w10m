@@ -729,9 +729,11 @@ pref("gfx.webrender.allow-partial-present-buffer-age", false);
 // off at the bottom. The shell reads the user's choice out of prefs.js before
 // the engine exists and hands it to ANGLE, so it takes effect at the next
 // start. When the picture is too broken to get to about:config, a file
-// swap-chain-capacity.txt in LocalState that begins with the digit decides
-// instead.
-pref("gecko.swapchain.capacity", 1);
+// swap-chain-capacity-N.txt in LocalState decides instead by its name
+// (tools/phone.py swapchain N puts it there). 0 is the default since build
+// 183: on an HP Elite x3 mode 1 showed the page stretched over the whole
+// buffers, its foot under the system's bar.
+pref("gecko.swapchain.capacity", 0);
 
 // The sidebar's launcher strip is off. It is the vertical bar down the left
 // edge with the tab list and the settings cog, and on a phone it is a column

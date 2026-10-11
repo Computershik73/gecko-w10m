@@ -192,17 +192,31 @@ def cmd_logs(a):
 # gecko.swapchain.capacity decides.
 SWAPCHAIN_FOLDER = "\\LocalState"
 SWAPCHAIN_FILE = "swap-chain-capacity.txt"
+# The app is not let read what the portal puts there (the portal says "Update
+# file access failed"), so the mode is in the file's name, which it can see.
+SWAPCHAIN_NAMES = [SWAPCHAIN_FILE] + [f"swap-chain-capacity-{m}.txt" for m in "012"]
 
 
+# The phone's portal writes the file and then answers 500 "Update file access
+# failed. Access is denied." (an HP Elite x3 does, to every form of the
+# request). So the answer is not what says whether it worked: the file is
+# read back, and the portal's complaint is returned for the caller to show.
 def put_file(pfn, folder, name, payload):
     get("/api/os/machinename")  # for the CSRF cookie
     boundary = uuid.uuid4().hex
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
             f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
             ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
-    request("/api/filesystem/apps/file", data=body, method="POST", timeout=60,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            knownfolderid="LocalAppData", packagefullname=pfn, path=folder).close()
+    complaint = None
+    try:
+        request("/api/filesystem/apps/file", data=body, method="POST", timeout=60,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                knownfolderid="LocalAppData", packagefullname=pfn, path=folder).close()
+    except urllib.error.HTTPError as e:
+        complaint = f"HTTP {e.code} {e.read()[:200].decode('utf-8', 'replace').strip()}"
+    if read_file(pfn, folder, name) != payload:
+        sys.exit(f"the phone did not take {name}" + (f": {complaint}" if complaint else ""))
+    return complaint
 
 
 def delete_file(pfn, folder, name):
@@ -222,18 +236,15 @@ def read_file(pfn, folder, name):
 
 def cmd_swapchain(a):
     pfn = package()["PackageFullName"]
-    if a.mode == "clear":
-        if read_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE) is None:
-            print("no override on the phone; the pref gecko.swapchain.capacity decides")
-            return 0
-        delete_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE)
-    else:
-        put_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE, a.mode.encode())
-    now = read_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE)
+    for name in SWAPCHAIN_NAMES:
+        if read_file(pfn, SWAPCHAIN_FOLDER, name) is not None:
+            delete_file(pfn, SWAPCHAIN_FOLDER, name)
+    if a.mode != "clear":
+        put_file(pfn, SWAPCHAIN_FOLDER, f"swap-chain-capacity-{a.mode}.txt", a.mode.encode())
+    now = [n for n in SWAPCHAIN_NAMES if read_file(pfn, SWAPCHAIN_FOLDER, n) is not None]
     print("on the phone now:",
-          "no override, the pref decides" if now is None
-          else f"swap chain capacity mode {now.decode('ascii', 'replace').strip()!r}, "
-               "from the next start of the browser")
+          "no override, the pref gecko.swapchain.capacity decides" if not now
+          else f"{', '.join(now)} -- from the next start of the browser (build 183 on)")
     return 0
 
 

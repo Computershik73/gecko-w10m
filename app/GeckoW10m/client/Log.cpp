@@ -21,7 +21,10 @@ bool g_verbose = false;
 // The swap chain capacity mode (Log.h). Its default is the default of
 // gecko.swapchain.capacity in 00-gecko.js (tools/build-appx.sh), and the two
 // have to stay the same.
-constexpr int kDefaultCapacityMode = 1;
+// 0 since build 183: on an HP Elite x3 mode 1 showed the part of the buffers
+// stretched over all of them, the page too tall and its foot under the
+// system's bar. Mode 2 is the one meant for that and stays to be tried.
+constexpr int kDefaultCapacityMode = 0;
 int g_capacityMode = kDefaultCapacityMode;
 
 // Gecko writes a pref the user changed as
@@ -65,6 +68,29 @@ int ReadSwapChainCapacity(const std::wstring& localState,
         return c - '0';
       }
       break;  // not one of the three: as if the file were not there
+    }
+  }
+
+  // Then a file whose name says it, swap-chain-capacity-0.txt and so on. The
+  // phone's portal puts a file into LocalState that the app is not let read
+  // (it answers "Update file access failed" and the open here fails), but a
+  // name in the app's own folder can always be seen. 0 first: it is the one
+  // somebody with a broken picture wants.
+  static const wchar_t* const kNamed[] = {
+      L"swap-chain-capacity-0.txt in LocalState, by its name",
+      L"swap-chain-capacity-1.txt in LocalState, by its name",
+      L"swap-chain-capacity-2.txt in LocalState, by its name"};
+  for (int named = 0; named <= 2; ++named) {
+    const std::wstring name = localState + L"swap-chain-capacity-" +
+                              std::to_wstring(named) + L".txt";
+    WIN32_FIND_DATAW found{};
+    const HANDLE find = ::FindFirstFileExW(name.c_str(), FindExInfoBasic,
+                                           &found, FindExSearchNameMatch,
+                                           nullptr, 0);
+    if (find != INVALID_HANDLE_VALUE) {
+      ::FindClose(find);
+      *source = kNamed[named];
+      return named;
     }
   }
 
