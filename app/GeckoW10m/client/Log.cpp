@@ -18,6 +18,11 @@ std::wstring g_path;
 std::vector<std::wstring> g_ring;
 std::function<void(std::wstring)> g_handler;
 bool g_verbose = false;
+// The swap chain capacity mode (Log.h). Its default is the default of
+// gecko.swapchain.capacity in 00-gecko.js (tools/build-appx.sh), and the two
+// have to stay the same.
+constexpr int kDefaultCapacityMode = 1;
+int g_capacityMode = kDefaultCapacityMode;
 
 // Gecko writes a pref the user changed as
 //   user_pref("gecko.debug.verbose_logs", true);
@@ -35,6 +40,58 @@ bool ReadVerbosePref(const std::wstring& localState) {
   }
   fclose(f);
   return verbose;
+}
+
+// What the swap chain's capacity is used as (Log.h), and in *source where
+// that was said.
+int ReadSwapChainCapacity(const std::wstring& localState,
+                          const wchar_t** source) {
+  // The file first. It is made on a PC, and what PowerShell's echo writes
+  // there begins with a byte order mark and has a zero after every
+  // character, so the digit is the first byte that is none of those.
+  const std::wstring file = localState + L"swap-chain-capacity.txt";
+  if (FILE* f = _wfopen(file.c_str(), L"rb")) {
+    unsigned char head[8];
+    const size_t got = fread(head, 1, sizeof(head), f);
+    fclose(f);
+    for (size_t i = 0; i < got; ++i) {
+      const unsigned char c = head[i];
+      if (c == 0xEF || c == 0xBB || c == 0xBF || c == 0xFF || c == 0xFE ||
+          c == 0 || c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+        continue;
+      }
+      if (c >= '0' && c <= '2') {
+        *source = L"swap-chain-capacity.txt in LocalState";
+        return c - '0';
+      }
+      break;  // not one of the three: as if the file were not there
+    }
+  }
+
+  // Gecko writes the pref into prefs.js only while it differs from its
+  // default, so no line means the default.
+  int mode = kDefaultCapacityMode;
+  *source = L"the default";
+  const std::wstring prefs = localState + L"profile\\prefs.js";
+  FILE* f = _wfopen(prefs.c_str(), L"rb");
+  if (!f) return mode;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    // user_pref("gecko.swapchain.capacity", 2);
+    const char* name = strstr(line, "\"gecko.swapchain.capacity\"");
+    const char* value = name ? strchr(name, ',') : nullptr;
+    if (!value) continue;
+    do {
+      ++value;
+    } while (*value == ' ' || *value == '\t');
+    if (value[0] >= '0' && value[0] <= '2' &&
+        (value[1] < '0' || value[1] > '9')) {
+      mode = value[0] - '0';
+      *source = L"gecko.swapchain.capacity in prefs.js";
+    }
+  }
+  fclose(f);
+  return mode;
 }
 
 std::wstring Timestamp() {
@@ -101,13 +158,17 @@ void Log::Mirror() {
 
 bool Log::Verbose() { return g_verbose; }
 
+int Log::SwapChainCapacityMode() { return g_capacityMode; }
+
 void Log::Init(std::wstring_view localStatePath) {
-  std::lock_guard<std::mutex> lock(g_mutex);
+  std::unique_lock<std::mutex> lock(g_mutex);
   if (g_file != INVALID_HANDLE_VALUE) return;
 
   g_path.assign(localStatePath);
   if (!g_path.empty() && g_path.back() != L'\\') g_path += L'\\';
   g_verbose = ReadVerbosePref(g_path);
+  const wchar_t* capacitySource = L"";
+  g_capacityMode = ReadSwapChainCapacity(g_path, &capacitySource);
   // For the engine bootstrap, which does not link this file: it decides from
   // this whether Gecko's own logging goes on.
   ::SetEnvironmentVariableW(L"GECKO_W10M_VERBOSE_LOGS",
@@ -130,6 +191,14 @@ void Log::Init(std::wstring_view localStatePath) {
   const char* banner = "\r\n==== Gecko session start ====\r\n";
   DWORD written = 0;
   ::WriteFile(g_file, banner, (DWORD)strlen(banner), &written, nullptr);
+
+  // Which of the three decided is the first thing to know about a picture
+  // that looks wrong. Write takes the mutex itself.
+  const std::wstring capacity =
+      L"swap chain capacity: mode " + std::to_wstring(g_capacityMode) +
+      L", from " + capacitySource;
+  lock.unlock();
+  Write(capacity);
 }
 
 void Log::Write(std::wstring_view line) {

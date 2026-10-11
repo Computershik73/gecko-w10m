@@ -437,6 +437,19 @@ pref("browser.sessionhistory.max_total_viewers", 2);
 pref("browser.cache.memory.capacity", 16384);
 // The JS nursery: 16 MB, not 64.
 pref("javascript.options.mem.nursery.max_kb", 16384);
+// How far the JS heap may grow between collections on a phone with more than
+// 1.5 GB, where the engine's desktop sizes let a heap triple while a page
+// allocates hard and it is the address space that pays (the autoconfig,
+// gecko_gc_economy). 0: the engine's own sizes. 1: less growth for a heap
+// that keeps more than 40 MB. 2: that, and twice instead of three times for a
+// smaller one. 3: the collector settings of the small phones, to see what
+// they cost. The autoconfig reads it once per launch, so a change takes a
+// restart; phones with 1.5 GB or less have their own table and ignore it.
+pref("gecko.gc.economy", 1);
+// The line "gecko: gc (...)" in the note log once a minute: what collection
+// cost in that minute, so that two runs can be compared. Read once per launch
+// too.
+pref("gecko.gc.note", true);
 // Video a page has handed to Media Source Extensions -- every HLS and DASH
 // player, rutube's included -- is kept until a source buffer holds 150 MB of
 // it, and 20 MB of audio beside that. On a 390 MB ceiling that is the whole
@@ -705,6 +718,20 @@ pref("toolkit.telemetry.archive.enabled", false);
 // gfx.webrender.gecko-w10m.tile-partial-update is the other comparison.
 pref("gfx.webrender.max-partial-present-rects", 1);
 pref("gfx.webrender.allow-partial-present-buffer-age", false);
+// The swap chain's buffers made once (hardware WebRender, the X3). The
+// keyboard and the system's bars change the room's size all the time, and
+// each change had the three buffers made again, 13-14 MB apiece in one piece,
+// which the phone's address space can refuse. 1: the buffers are the size of
+// the whole window and only how much of them is shown changes
+// (IDXGISwapChain2::SetSourceSize). 0: buffers the size of the room, made
+// again with it, as before. 2: like 1, with a transform that undoes a stretch
+// of the shown part -- the one to try if 1 shows the page too tall and cut
+// off at the bottom. The shell reads the user's choice out of prefs.js before
+// the engine exists and hands it to ANGLE, so it takes effect at the next
+// start. When the picture is too broken to get to about:config, a file
+// swap-chain-capacity.txt in LocalState that begins with the digit decides
+// instead.
+pref("gecko.swapchain.capacity", 1);
 
 // The sidebar's launcher strip is off. It is the vertical bar down the left
 // edge with the tab list and the settings cog, and on a phone it is a column

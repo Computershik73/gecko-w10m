@@ -62,6 +62,21 @@ class Log {
   // cannot ask Gecko -- so a change takes effect at the next launch. Off by
   // default: the browser then writes what a crash needs and little else.
   static bool Verbose();
+
+  // What ANGLE is to do with the window's size, which EngineView hands it as
+  // the capacity of the swap chain (angle_uwp_set_panel_capacity):
+  //   0  buffers the size of the room, made again each time it changes
+  //   1  buffers the size of the window, made once, the room shown through
+  //      the chain's source size -- the default
+  //   2  the same, with a transform that undoes a stretch of the shown part,
+  //      for a picture that mode 1 shows too tall
+  // Read once, by Init. The file swap-chain-capacity.txt in LocalState decides
+  // if it is there and begins with one of the three digits: a picture that
+  // cannot be used leaves no way to about:config, and a file can be put there
+  // from the PC. Otherwise gecko.swapchain.capacity in the profile's prefs.js
+  // does, like the verbose logs and for the same reason, so a change takes
+  // effect at the next launch.
+  static int SwapChainCapacityMode();
 };
 
 }  // namespace gecko_w10m::client

@@ -6,6 +6,8 @@ Usage:
     python tools/phone.py logs [--dir DIR]       # gecko.log, gecko-notes.log (readable while running)
     python tools/phone.py mem [--watch SEC] [--top N]
                                                  # memory of the browser, the phone and the GPU
+    python tools/phone.py swapchain 0|1|2|clear  # how the swap chain's buffers are sized, for
+                                                 # the next start of the browser (see below)
 
 Over Wi-Fi, name the phone's portal (Settings > Update & security > For
 developers > Device Portal shows it), before the command:
@@ -181,6 +183,60 @@ def cmd_logs(a):
         print(f"{name}: {len(data)} bytes -> {out}")
 
 
+# The shell reads this file before it starts the engine and lets it decide
+# how the swap chain's buffers are sized: 0 as large as the room and resized
+# with it, 1 as large as the window with the room shown through the source
+# size, 2 the same with a transform that undoes a stretch. It is the way to
+# turn the new behaviour off from the PC when the picture on the phone is
+# such that about:config cannot be reached; without the file the pref
+# gecko.swapchain.capacity decides.
+SWAPCHAIN_FOLDER = "\\LocalState"
+SWAPCHAIN_FILE = "swap-chain-capacity.txt"
+
+
+def put_file(pfn, folder, name, payload):
+    get("/api/os/machinename")  # for the CSRF cookie
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+            f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+    request("/api/filesystem/apps/file", data=body, method="POST", timeout=60,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            knownfolderid="LocalAppData", packagefullname=pfn, path=folder).close()
+
+
+def delete_file(pfn, folder, name):
+    get("/api/os/machinename")
+    request("/api/filesystem/apps/file", method="DELETE", timeout=60,
+            knownfolderid="LocalAppData", packagefullname=pfn, filename=name,
+            path=folder).close()
+
+
+def read_file(pfn, folder, name):
+    try:
+        return get("/api/filesystem/apps/file", knownfolderid="LocalAppData",
+                   packagefullname=pfn, filename=name, path=folder)
+    except urllib.error.HTTPError:
+        return None
+
+
+def cmd_swapchain(a):
+    pfn = package()["PackageFullName"]
+    if a.mode == "clear":
+        if read_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE) is None:
+            print("no override on the phone; the pref gecko.swapchain.capacity decides")
+            return 0
+        delete_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE)
+    else:
+        put_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE, a.mode.encode())
+    now = read_file(pfn, SWAPCHAIN_FOLDER, SWAPCHAIN_FILE)
+    print("on the phone now:",
+          "no override, the pref decides" if now is None
+          else f"swap chain capacity mode {now.decode('ascii', 'replace').strip()!r}, "
+               "from the next start of the browser")
+    return 0
+
+
 def mb(v):
     return v / 2**20
 
@@ -233,11 +289,13 @@ def main():
     mp = sub.add_parser("mem")
     mp.add_argument("--watch", type=float, default=0)
     mp.add_argument("--top", type=int, default=10)
+    sp = sub.add_parser("swapchain")
+    sp.add_argument("mode", choices=["0", "1", "2", "clear"])
     a = ap.parse_args()
     if a.portal:
         PORTAL = a.portal.rstrip("/")
     sys.exit({"version": cmd_version, "install": cmd_install, "logs": cmd_logs,
-              "mem": cmd_mem}[a.cmd](a))
+              "mem": cmd_mem, "swapchain": cmd_swapchain}[a.cmd](a))
 
 
 if __name__ == "__main__":

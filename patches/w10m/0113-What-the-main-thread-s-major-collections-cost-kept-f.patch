@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 11 Oct 2026 06:29:08 +0400
+Subject: [PATCH] What the main thread's major collections cost, kept for the
+ note log on Windows 10 Mobile
+
+Two runs with different heap growth settings could be compared by feel and
+no other way: javascript.options.mem.log writes a console line per slice,
+which on this port is a line in the note file, and costs what it measures.
+
+Under GECKO_W10M the DOM's slice callback keeps, at a comparison and an
+addition or two per slice: how many ordinary collections ended, their
+longest slice and how many slices took 50 ms and 250 ms or more; how many
+forced ones (shrinking, memory pressure, last-ditch) and their total time,
+counted apart because no growth setting changes how many there are; and
+the largest JS heap a collection began with. nsJSContext::
+GeckoW10mTakeGCCost returns them and starts again from zero, and
+Components.utils.getJSEngineTelemetryValue carries them to the autoconfig.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dom/base/nsJSEnvironment.cpp       | 78 ++++++++++++++++++++++++++++++
+ dom/base/nsJSEnvironment.h         | 26 ++++++++++
+ js/xpconnect/src/XPCComponents.cpp | 24 +++++++++
+ 3 files changed, 128 insertions(+)
+
+diff --git a/dom/base/nsJSEnvironment.cpp b/dom/base/nsJSEnvironment.cpp
+index 799058279c..bec81de71f 100644
+--- a/dom/base/nsJSEnvironment.cpp
++++ b/dom/base/nsJSEnvironment.cpp
+@@ -1476,6 +1476,31 @@ void nsJSContext::MaybePokeCC() {
+                           nsCycleCollector_suspectedCount());
+ }
+ 
++#if defined(GECKO_W10M)
++// The figures of nsJSContext::GeckoW10mGCCost (nsJSEnvironment.h), and
++// whether the collection now running has had a forced slice. Nothing in the
++// logs timed an ordinary collection: javascript.options.mem.log formats a
++// console line for every slice, which on this port is also a line appended
++// to the note file, and so costs what it is there to measure. These are a
++// comparison and an addition or two per slice, on the main thread only.
++static nsJSContext::GeckoW10mGCCost sGeckoW10mGCCost;
++static bool sGeckoW10mGCForced = false;
++
++// A slice of a shrinking (or shutdown) collection, or one run because
++// memory ran short: the browser or the allocator asked for it, the size of
++// the heap did not. A "low-memory", or the engine's last try before an
++// allocation fails, that meets an ordinary incremental collection keeps
++// that collection's Normal options (GCRuntime::gc sets options only when
++// none is in progress): the running one is wound up and a whole one is run
++// in the same call, both with the request's reason, which is what tells
++// them apart. Such a request then counts as two forced collections.
++static bool GeckoW10mIsForcedGCSlice(const JS::GCDescription& aDesc) {
++  return aDesc.options_ != JS::GCOptions::Normal ||
++         aDesc.reason_ == JS::GCReason::MEM_PRESSURE ||
++         aDesc.reason_ == JS::GCReason::LAST_DITCH;
++}
++#endif
++
+ static void DOMGCSliceCallback(JSContext* aCx, JS::GCProgress aProgress,
+                                const JS::GCDescription& aDesc) {
+   NS_ASSERTION(NS_IsMainThread(), "GCs must run on the main thread");
+@@ -1487,12 +1512,28 @@ static void DOMGCSliceCallback(JSContext* aCx, JS::GCProgress aProgress,
+       // Prevent cycle collections and shrinking during incremental GC.
+       sScheduler->NoteGCBegin(aDesc.reason_);
+       sCurrentGCStartTime = TimeStamp::Now();
++#if defined(GECKO_W10M)
++      sGeckoW10mGCForced = GeckoW10mIsForcedGCSlice(aDesc);
++      // The heap is at its largest when a collection begins, and a reading
++      // taken once a minute misses that: this is the peak a tighter growth
++      // profile is meant to lower. One counter read per collection.
++      sGeckoW10mGCCost.peakBytes = std::max(sGeckoW10mGCCost.peakBytes,
++                                            JS_GetGCParameter(aCx, JSGC_BYTES));
++#endif
+       break;
+     }
+ 
+     case JS::GC_CYCLE_END: {
+       TimeDuration delta = GetCollectionTimeDelta();
+ 
++#if defined(GECKO_W10M)
++      if (sGeckoW10mGCForced) {
++        ++sGeckoW10mGCCost.forced;
++      } else {
++        ++sGeckoW10mGCCost.ordinary;
++      }
++#endif
++
+       if (StaticPrefs::javascript_options_mem_log()) {
+         nsString gcstats;
+         gcstats.Adopt(aDesc.formatSummaryMessage(aCx));
+@@ -1563,6 +1604,33 @@ static void DOMGCSliceCallback(JSContext* aCx, JS::GCProgress aProgress,
+       sScheduler->NoteGCSliceEnd(aDesc.lastSliceStart(aCx),
+                                  aDesc.lastSliceEnd(aCx));
+ 
++#if defined(GECKO_W10M)
++      {
++        // A long slice is the pause somebody feels, and totals alone hide
++        // it. A forced collection under memory pressure is one slice of a
++        // second or more whatever the growth settings are, and would be the
++        // longest of every minute it falls in, so forced slices only add up
++        // -- the short ones of the collection made after the user has gone
++        // idle among them.
++        const double sliceMs =
++            (aDesc.lastSliceEnd(aCx) - aDesc.lastSliceStart(aCx))
++                .ToMilliseconds();
++        if (GeckoW10mIsForcedGCSlice(aDesc)) {
++          sGeckoW10mGCForced = true;
++          sGeckoW10mGCCost.forcedMs += sliceMs;
++        } else {
++          sGeckoW10mGCCost.longestSliceMs =
++              std::max(sGeckoW10mGCCost.longestSliceMs, sliceMs);
++          if (sliceMs >= 50.0) {
++            ++sGeckoW10mGCCost.slicesOf50Ms;
++          }
++          if (sliceMs >= 250.0) {
++            ++sGeckoW10mGCCost.slicesOf250Ms;
++          }
++        }
++      }
++#endif
++
+       if (sShuttingDown) {
+         sScheduler->KillGCRunner();
+       } else {
+@@ -1603,6 +1671,16 @@ static void DOMGCSliceCallback(JSContext* aCx, JS::GCProgress aProgress,
+   }
+ }
+ 
++#if defined(GECKO_W10M)
++// static
++nsJSContext::GeckoW10mGCCost nsJSContext::GeckoW10mTakeGCCost() {
++  MOZ_ASSERT(NS_IsMainThread());
++  GeckoW10mGCCost cost = sGeckoW10mGCCost;
++  sGeckoW10mGCCost = GeckoW10mGCCost();
++  return cost;
++}
++#endif
++
+ void nsJSContext::SetWindowProxy(JS::Handle<JSObject*> aWindowProxy) {
+   mWindowProxy = aWindowProxy;
+ }
+diff --git a/dom/base/nsJSEnvironment.h b/dom/base/nsJSEnvironment.h
+index 8e1d0a0bdf..2f9432bef8 100644
+--- a/dom/base/nsJSEnvironment.h
++++ b/dom/base/nsJSEnvironment.h
+@@ -90,6 +90,32 @@ class nsJSContext : public nsIScriptContext {
+   static uint32_t GetMaxCCSliceTimeSinceClear();
+   static void ClearMaxCCSliceTime();
+ 
++#if defined(GECKO_W10M)
++  // What the main thread's major collections have cost since this was last
++  // asked, kept by the slice callback (nsJSEnvironment.cpp) and written to
++  // the note log once a minute, so that two runs with different heap growth
++  // settings can be compared. A collection that is forced -- a shrinking
++  // one, or one asked for because memory ran short -- is asked for by the
++  // browser and not by the size of the heap, so no growth setting changes
++  // how many of them a run has; the page and the phone do. They are counted
++  // apart, and the ordinary ones are what the comparison is made by. The
++  // ones under memory pressure run in one piece for a second or more; the
++  // one made after the user has gone idle runs in slices like any other,
++  // and its slices are added to the forced total all the same. peakBytes is
++  // the largest JS heap any collection began with.
++  struct GeckoW10mGCCost {
++    uint32_t ordinary = 0;
++    double longestSliceMs = 0;
++    uint32_t slicesOf50Ms = 0;
++    uint32_t slicesOf250Ms = 0;
++    uint32_t forced = 0;
++    double forcedMs = 0;
++    uint32_t peakBytes = 0;
++  };
++  // Returns the figures and starts them again from zero. Main thread only.
++  static GeckoW10mGCCost GeckoW10mTakeGCCost();
++#endif
++
+   // If there is some pending CC or GC timer/runner, this will run it.
+   static void RunNextCollectorTimer(
+       JS::GCReason aReason,
+diff --git a/js/xpconnect/src/XPCComponents.cpp b/js/xpconnect/src/XPCComponents.cpp
+index 6f10331077..6ff612d6b7 100644
+--- a/js/xpconnect/src/XPCComponents.cpp
++++ b/js/xpconnect/src/XPCComponents.cpp
+@@ -2227,7 +2227,31 @@ nsXPCComponents_Utils::GetJSEngineTelemetryValue(JSContext* cx,
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
++#if defined(GECKO_W10M)
++  // The object was empty and nothing in the browser reads it, so it carries
++  // what the main thread's major collections cost since the last call
++  // (nsJSContext::GeckoW10mGCCost) to the autoconfig, which writes it to the
++  // note log once a minute. Reading starts the figures again from zero: the
++  // caller is the only reader there is.
++  nsJSContext::GeckoW10mGCCost cost = nsJSContext::GeckoW10mTakeGCCost();
++  if (!JS_DefineProperty(cx, obj, "gcOrdinary", cost.ordinary,
++                         JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcLongestSliceMs", cost.longestSliceMs,
++                         JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcSlicesOf50Ms", cost.slicesOf50Ms,
++                         JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcSlicesOf250Ms", cost.slicesOf250Ms,
++                         JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcForced", cost.forced, JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcForcedMs", cost.forcedMs,
++                         JSPROP_ENUMERATE) ||
++      !JS_DefineProperty(cx, obj, "gcPeakBytes", cost.peakBytes,
++                         JSPROP_ENUMERATE)) {
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++#else
+   // No JS engine telemetry in use at the moment.
++#endif
+ 
+   rval.setObject(*obj);
+   return NS_OK;

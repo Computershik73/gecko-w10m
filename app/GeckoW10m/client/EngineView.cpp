@@ -759,6 +759,16 @@ bool EngineView::Resolve() {
           ::GetProcAddress(gles, "angle_uwp_set_panel_size"));
       panel_scale_fn_ = reinterpret_cast<PanelScaleFn>(
           ::GetProcAddress(gles, "angle_uwp_set_panel_scale"));
+      // The window's size, as the size the swap chain's buffers are made.
+      // It goes in as soon as ANGLE can be reached: the chain is made with
+      // whatever capacity is there at that moment, and without one it is
+      // made the room's size and resized with it for as long as it lives.
+      panel_capacity_fn_ = reinterpret_cast<PanelCapacityFn>(
+          ::GetProcAddress(gles, "angle_uwp_set_panel_capacity"));
+      if (panel_capacity_fn_ && screenWidth_ > 0) {
+        panel_capacity_fn_(screenWidth_, screenHeight_,
+                           Log::SwapChainCapacityMode());
+      }
       // And somewhere for it to say what it did. Its notes cannot go where
       // Gecko's do -- those live in xul, which ANGLE is not linked against --
       // so they come here, which is also where the crash trace lands, so the
@@ -767,6 +777,8 @@ bool EngineView::Resolve() {
           ::GetProcAddress(gles, "angle_uwp_set_logger"));
       Log::Write(std::wstring(L"view: ANGLE size entry point ") +
                  (panel_size_fn_ ? L"found" : L"MISSING") +
+                 L", capacity entry point " +
+                 (panel_capacity_fn_ ? L"found" : L"MISSING") +
                  L", logging entry point " + (install ? L"found" : L"MISSING"));
       // The mode goes in before the logger, so that ANGLE's own note about it
       // is the first thing it says once it can be heard.
@@ -886,6 +898,12 @@ void EngineView::GivePanelToEngine() {
                  L"no EGL surface, no GPU frames, everything else as usual");
     }
     return;
+  }
+  if (panel_capacity_fn_) {
+    // Before the size: ANGLE acts on a new size at its next frame, and must
+    // not find a room the capacity it has does not cover yet.
+    panel_capacity_fn_(screenWidth_, screenHeight_,
+                       Log::SwapChainCapacityMode());
   }
   if (panel_size_fn_) {
     panel_size_fn_(fullWidth_, fullHeight_);
@@ -1612,6 +1630,18 @@ void EngineView::SetScreen(double viewWidth, double viewHeight) {
   }
   screenWidth_ = width;
   screenHeight_ = height;
+  // The window is the largest the room can be while the phone is held this
+  // way, so it is the size ANGLE makes the swap chain's buffers. When the
+  // phone is turned the window's new size arrives before the room's, and
+  // ANGLE has the new capacity by the time the new room asks it for buffers.
+  const int32_t mode = Log::SwapChainCapacityMode();
+  if (panel_capacity_fn_) {
+    panel_capacity_fn_(width, height, mode);
+  }
+  Log::Write(L"view: the window is " + std::to_wstring(width) + L"x" +
+             std::to_wstring(height) + L", the swap chain's capacity (mode " +
+             std::to_wstring(mode) + L")" +
+             (panel_capacity_fn_ ? L"" : L", for ANGLE once it is reached"));
   if (screen_fn_) {
     screen_fn_(width, height);
   }

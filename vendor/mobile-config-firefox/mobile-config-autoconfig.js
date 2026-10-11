@@ -368,16 +368,267 @@ function gecko_note_memory_top(when) {
     }
 }
 
+// What garbage collection cost, a minute at a time. The memory note says how
+// big the JS heap is and nothing said what keeping it that size takes, so two
+// runs with different growth settings (gecko.gc.economy) could be compared
+// by feel and no other way. Only sources that cost nothing between readings:
+// the engine's own timers for major slices and minor collections (PerfStats,
+// an add per slice once they are switched on), the collector's counters, the
+// cycle collector's longest slice, and the figures the port keeps for long
+// and for forced slices (nsJSEnvironment.cpp). Not
+// javascript.options.mem.log: that writes a console line, which here is also
+// a line in the note file, for every slice. A source this engine does not
+// have is named in the log once and left out of the line from then on.
+// The major figures are the main thread's. The minor collections' timer is
+// one for the whole process, workers' nurseries with the main thread's, and
+// nothing cheap gives the main thread's share of it; so the line gives the
+// main thread's count, and then the count and the time of all threads.
+// gecko.gc.note = false turns all of it off.
+const GECKO_GC = {
+    on: false, param: null, missing: new Set(), last: null, waiting: null,
+};
+
+function gecko_gc_source(name, read) {
+    if (GECKO_GC.missing.has(name)) {
+        return undefined;
+    }
+    try {
+        return read();
+    } catch (e) {
+        GECKO_GC.missing.add(name);
+        Services.console.logStringMessage(
+            "gecko: gc: no " + name + ", the line goes on without -- " + e);
+        return undefined;
+    }
+}
+
+// The collector's settings as the engine reports them, not as the prefs
+// read: a value set by hand in about:config shows here, and so does one the
+// engine refused. With this every log says which growth profile it ran with.
+function gecko_note_gc_tunables() {
+    const p = GECKO_GC.param;
+    Services.console.logStringMessage(
+        "gecko: gc tunables: growth " + p("lowFrequencyHeapGrowth") +
+        "%, while allocating hard " + p("highFrequencySmallHeapGrowth") +
+        "% up to " + p("smallHeapSizeMax") + " MB falling to " +
+        p("highFrequencyLargeHeapGrowth") + "% from " +
+        p("largeHeapSizeMin") + " MB; non-incremental past " +
+        p("smallHeapIncrementalLimit") + "% of the threshold, " +
+        p("largeHeapIncrementalLimit") + "% for a large heap; thresholds " +
+        p("allocationThreshold") + " MB, malloc " +
+        p("mallocThresholdBase") + " MB, urgent " + p("urgentThreshold") +
+        " MB; nursery " + Math.round(p("minNurseryBytes") / 1024) + " to " +
+        Math.round(p("maxNurseryBytes") / 1024) + " KB; parallel marking " +
+        (p("parallelMarkingEnabled") ? "on" : "off") + ", " +
+        p("markingThreadCount") + " marking threads, " +
+        p("helperThreadCount") + " helper threads; slices of " +
+        p("sliceTimeBudgetMS") + " ms");
+}
+
+function gecko_gc_note_start() {
+    try {
+        if (!Services.prefs.getBoolPref("gecko.gc.note", true)) {
+            return;
+        }
+        GECKO_GC.on = true;
+        gecko_gc_source("collector counters", () => {
+            // The testing functions are there in a release build too. Only
+            // this one is kept; the table of the others is garbage at once.
+            const param = Cu.getJSTestingFunctions().gcparam;
+            param("gcBytes");
+            GECKO_GC.param = param;
+        });
+        if (GECKO_GC.param) {
+            gecko_gc_source("collector settings", gecko_note_gc_tunables);
+        }
+        // Switching the timers on also sets them to zero, and would again
+        // every time, so only here.
+        gecko_gc_source("slice times", () => ChromeUtils.setPerfStatsFeatures(
+            ["MajorGC", "NonIdleMajorGC", "MinorGC"]));
+        gecko_note_gc("session restored");
+    } catch (e) {
+        Services.console.logStringMessage("gecko: gc: " + e);
+    }
+}
+
+// One line for the time since the last call; the first call only takes the
+// reading the next one counts from. The counters are read at once and the
+// times come in a promise, so the line is written when that settles.
+function gecko_note_gc(when) {
+    if (!GECKO_GC.on) {
+        return;
+    }
+    // With one process there is nobody to wait for and the promise settles
+    // as soon as the event loop turns. One still open a minute later never
+    // will: the line that waits for it is written without the times, and
+    // they are not asked for again.
+    if (GECKO_GC.waiting) {
+        GECKO_GC.waiting(gecko_gc_source("slice times", () => {
+            throw "the promise for them never settled";
+        }));
+    }
+    const now = { at: Date.now() };
+    gecko_gc_source("collector counters", () => {
+        const p = GECKO_GC.param;
+        Object.assign(now, {
+            major: p("majorGCNumber"),
+            slices: p("sliceNumber"),
+            minor: p("minorGCNumber"),
+            heap: p("gcBytes"),
+            chunks: p("totalChunks"),
+            empty: p("unusedChunks"),
+            nursery: p("nurseryBytes"),
+            hard: p("highFrequencyMode"),
+        });
+    });
+    now.cc = gecko_gc_source("cycle collector slice time", () => {
+        const ms = Cu.getMaxCCSliceTimeSinceClear();
+        Cu.clearMaxCCTime();
+        return ms;
+    });
+    // Reading these starts them again from zero in the engine, which is why
+    // the first call reads them too and throws the answer away.
+    now.cost = gecko_gc_source("figures for long and forced slices", () => {
+        const cost = Cu.getJSEngineTelemetryValue();
+        if (!("gcOrdinary" in cost)) {
+            throw "this engine does not keep them";
+        }
+        return cost;
+    });
+    const finish = times => {
+        if (GECKO_GC.waiting !== finish) {
+            return;
+        }
+        GECKO_GC.waiting = null;
+        try {
+            if (times) {
+                now.majorMs = times.MajorGC;
+                now.busyMs = times.NonIdleMajorGC;
+                now.minorMs = times.MinorGC;
+                now.minorAll = times.minorCount;
+            }
+            const was = GECKO_GC.last;
+            GECKO_GC.last = now;
+            if (!was) {
+                return;
+            }
+            const both = key => key in now && key in was;
+            const d = key => Math.round(now[key] - was[key]);
+            const mb = bytes => Math.round(bytes / 1048576);
+            const parts = [];
+            const major = [];
+            if (both("major")) {
+                major.push(d("major") + " begun", d("slices") + " slices");
+            }
+            if (both("majorMs")) {
+                major.push(d("majorMs") + " ms",
+                           d("busyMs") + " ms of it outside idle time");
+            }
+            if (major.length) {
+                parts.push("major " + major.join(", "));
+            }
+            // The times above are of every slice. These tell the collections
+            // that the heap's size set off apart from the ones the browser
+            // forced, which no growth setting changes the number of: under
+            // memory pressure a second or two each in one piece, after the
+            // user has gone idle in slices like any other.
+            const cost = now.cost;
+            if (cost) {
+                parts.push(
+                    "ordinary " + cost.gcOrdinary + ", longest slice " +
+                    Math.round(cost.gcLongestSliceMs) + " ms, " +
+                    cost.gcSlicesOf50Ms + " of 50 ms or more, " +
+                    cost.gcSlicesOf250Ms + " of 250 ms or more",
+                    "forced " + cost.gcForced + ", " +
+                    Math.round(cost.gcForcedMs) + " ms");
+            }
+            const minor = [];
+            if (both("minor")) {
+                minor.push(d("minor") + " on the main thread");
+            }
+            if (both("minorMs") && both("minorAll")) {
+                minor.push(d("minorAll") + " on all threads in " +
+                           d("minorMs") + " ms");
+            }
+            if (minor.length) {
+                parts.push("minor " + minor.join(", "));
+            }
+            if (now.cc !== undefined) {
+                parts.push("cc longest slice " + now.cc + " ms");
+            }
+            if (both("heap")) {
+                parts.push(
+                    "heap " + mb(was.heap) + " -> " + mb(now.heap) + " MB");
+            }
+            if (cost && cost.gcPeakBytes) {
+                parts.push(mb(cost.gcPeakBytes) +
+                           " MB at its largest, as a collection began");
+            }
+            if ("chunks" in now) {
+                // A chunk is 1 MB, mapped whether or not anything is in it;
+                // their number is "js gc heap" in the memory note.
+                parts.push(
+                    "chunks " + now.chunks + " MB, " + now.empty + " empty",
+                    "nursery " + Math.round(now.nursery / 1024) + " KB",
+                    (now.hard ? "high" : "low") + "-frequency mode");
+            }
+            if (!parts.length) {
+                // Every source is missing and each has said so.
+                GECKO_GC.on = false;
+                return;
+            }
+            Services.console.logStringMessage(
+                "gecko: gc (" + when + ", " +
+                Math.round((now.at - was.at) / 1000) + " s): " +
+                parts.join("; "));
+        } catch (e) {
+            Services.console.logStringMessage("gecko: gc: " + e);
+        }
+    };
+    GECKO_GC.waiting = finish;
+    const pending = gecko_gc_source("slice times",
+                                    () => ChromeUtils.collectPerfStats());
+    if (!pending) {
+        finish(null);
+        return;
+    }
+    pending.then(
+        json => finish(gecko_gc_source("slice times", () => {
+            const times = {};
+            for (const proc of JSON.parse(json).processes) {
+                if (proc.type === "parent") {
+                    for (const m of proc.perfstats.metrics) {
+                        times[m.metric] = m.time;
+                        if (m.metric === "MinorGC") {
+                            times.minorCount = m.count;
+                        }
+                    }
+                }
+            }
+            if (!("MajorGC" in times && "NonIdleMajorGC" in times &&
+                  "MinorGC" in times &&
+                  typeof times.minorCount === "number")) {
+                throw "the timers were switched off";
+            }
+            return times;
+        })),
+        e => finish(gecko_gc_source("slice times", () => { throw e; })));
+}
+
 function gecko_watch_memory() {
     Services.obs.addObserver({
         observe() {
             Services.obs.removeObserver(this, "sessionstore-windows-restored");
             gecko_note_startup_cache("session restored");
             gecko_note_memory("session restored");
+            gecko_gc_note_start();
             // The cache is written a few seconds after the last script lands
             // in it; one more look says whether it got there.
             gecko_after(30000, () => gecko_note_startup_cache("30 s later"));
-            gecko_after(60000, () => gecko_note_memory("periodic"), true);
+            gecko_after(60000, () => {
+                gecko_note_memory("periodic");
+                gecko_note_gc("periodic");
+            }, true);
             gecko_after(45000, () => gecko_note_memory_top("45 s after start"));
         }
     }, "sessionstore-windows-restored");
@@ -877,6 +1128,26 @@ const H264IFY_SOURCE = `
 })();
 `;
 
+// The JavaScript heap on a small phone: collect sooner and let the heap grow
+// less between collections; fewer helper threads, a smaller nursery, no
+// parallel marking (off on Android: each marker thread has its own stacks).
+// These rows belong to the low-memory table below and stand apart from it
+// only because level 3 of gecko.gc.economy gives the same ones, and nothing
+// else of that table, to a phone with more memory: one object for both, so
+// the two cannot drift apart.
+const GECKO_SMALL_PHONE_GC = {
+    "javascript.options.mem.gc_parallel_marking": false,
+    "javascript.options.mem.gc_high_frequency_small_heap_growth": 150,
+    "javascript.options.mem.gc_high_frequency_large_heap_growth": 120,
+    "javascript.options.mem.gc_low_frequency_heap_growth": 120,
+    "javascript.options.mem.gc_small_heap_size_max_mb": 50,
+    "javascript.options.mem.gc_large_heap_size_min_mb": 200,
+    "javascript.options.mem.gc_allocation_threshold_mb": 16,
+    "javascript.options.mem.gc_malloc_threshold_base_mb": 20,
+    "javascript.options.mem.gc_max_helper_threads": 2,
+    "javascript.options.mem.nursery.max_kb": 8192,
+};
+
 // A phone with a gigabyte gives the app 390 MB, and the desktop browser with
 // YouTube open went past that and was killed. On such a phone (1.5 GB or
 // less; gecko.lowmem.enabled = false turns it off) the defaults below take
@@ -896,19 +1167,8 @@ function gecko_low_memory_prefs() {
     }
     const defaults = Services.prefs.getDefaultBranch("");
     const PREFS = {
-        // JavaScript heap: collect sooner and let the heap grow less between
-        // collections; fewer helper threads, a smaller nursery, no parallel
-        // marking (off on Android: each marker thread has its own stacks).
-        "javascript.options.mem.gc_parallel_marking": false,
-        "javascript.options.mem.gc_high_frequency_small_heap_growth": 150,
-        "javascript.options.mem.gc_high_frequency_large_heap_growth": 120,
-        "javascript.options.mem.gc_low_frequency_heap_growth": 120,
-        "javascript.options.mem.gc_small_heap_size_max_mb": 50,
-        "javascript.options.mem.gc_large_heap_size_min_mb": 200,
-        "javascript.options.mem.gc_allocation_threshold_mb": 16,
-        "javascript.options.mem.gc_malloc_threshold_base_mb": 20,
-        "javascript.options.mem.gc_max_helper_threads": 2,
-        "javascript.options.mem.nursery.max_kb": 8192,
+        // JavaScript heap: the ten rows of GECKO_SMALL_PHONE_GC, above.
+        ...GECKO_SMALL_PHONE_GC,
 
         // Back/forward cache: no previous pages kept alive, and short
         // histories (Android keeps viewers 360 s; here none at all).
@@ -1005,6 +1265,79 @@ function gecko_low_memory_prefs() {
         "gecko: low-memory defaults for a " +
         Math.round(memory / (1024 * 1024)) + " MB phone -- " + set + " of " +
         Object.keys(PREFS).length + " set");
+}
+
+// A phone with more memory is not short of the 390 MB. What runs out there
+// is the 32-bit address space, in pieces, and the JS heap is one of the
+// things that takes it: while a page allocates hard the engine lets a heap
+// grow to three times what the last collection left before it collects
+// again, and only a heap that keeps more than 100 MB gets less -- a
+// desktop's sizes. On a phone with 3.2 GB the heap was 119 MB after a
+// collection and 365 MB of chunks 39 seconds later. gecko.gc.economy says
+// how much of that to take back on a phone with more than 1.5 GB (a smaller
+// one has the table above and does not look at it): 0 nothing; 1 the factor
+// starts to fall at 40 MB and is at its lowest from 160, and a large heap
+// gets more room past its threshold before the collection gives up being
+// incremental, since collecting sooner must not turn into one long pause;
+// 2 that, and twice instead of three times for a small heap; 3 the small
+// phone's collector settings whole, nursery and marker thread included, to
+// see what they cost here. Defaults like the others, set once per launch:
+// another level takes a restart, and a value somebody set by hand in
+// about:config still wins over any of them; the line names those.
+function gecko_gc_economy() {
+    const level = Services.prefs.getIntPref("gecko.gc.economy", 1);
+    let memory = 0;
+    try {
+        memory = Services.sysinfo.getProperty("memsize");
+    } catch (e) {}
+    if (!(memory > 1536 * 1024 * 1024)) {
+        // A size that could not be read gets neither profile, as before.
+        if (!(memory > 0)) {
+            Services.console.logStringMessage(
+                "gecko: gc economy level " + level +
+                " -- the phone's memory size could not be read, nothing set");
+        }
+        return;
+    }
+    const CLASSES = {
+        "javascript.options.mem.gc_small_heap_size_max_mb": 40,
+        "javascript.options.mem.gc_large_heap_size_min_mb": 160,
+        "javascript.options.mem.gc_large_heap_incremental_limit": 130,
+    };
+    const LEVELS = [
+        ["off", {}],
+        ["size classes 40 and 160 MB", CLASSES],
+        ["size classes 40 and 160 MB, small-heap growth 200%", {
+            ...CLASSES,
+            "javascript.options.mem.gc_high_frequency_small_heap_growth": 200,
+        }],
+        ["the small phone's collector settings", GECKO_SMALL_PHONE_GC],
+    ];
+    const [what, prefs] = LEVELS[level] || ["no such level, 0 to 3", {}];
+    const defaults = Services.prefs.getDefaultBranch("");
+    const byHand = [];
+    let set = 0;
+    for (const [name, value] of Object.entries(prefs)) {
+        try {
+            if (typeof value === "boolean") {
+                defaults.setBoolPref(name, value);
+            } else {
+                defaults.setIntPref(name, value);
+            }
+            set++;
+        } catch (e) {
+            log("gc economy: " + name + " not set: " + e);
+        }
+        if (Services.prefs.prefHasUserValue(name)) {
+            byHand.push(name.replace("javascript.options.mem.", ""));
+        }
+    }
+    Services.console.logStringMessage(
+        "gecko: gc economy level " + level + " (" + what + ") for a " +
+        Math.round(memory / (1024 * 1024)) + " MB phone -- " + set + " of " +
+        Object.keys(prefs).length + " set" +
+        (byHand.length ? "; set by hand in about:config, which wins: " +
+                         byHand.join(", ") : ""));
 }
 
 // Puts the page hooks above -- the fullscreen gear, the video ceiling and
@@ -1835,6 +2168,7 @@ try {
     gecko_note_phases();
     gecko_fix_homepage();
     gecko_low_memory_prefs();
+    gecko_gc_economy();
     gecko_note_startup();
     gecko_reset_crash_guards();
     gecko_watch_memory();

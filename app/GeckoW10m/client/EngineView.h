@@ -170,6 +170,8 @@ class EngineView {
   using PanelFn = void (*)(void* panel);
   using PanelPresentingFn = int32_t (*)();
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
+  using PanelCapacityFn = void (*)(int32_t width, int32_t height,
+                                   int32_t mode);
   using PanelScaleFn = void (*)(float x, float y);
   using AngleLogFn = void (*)(void (*)(const char*));
   using AngleModeFn = void (*)(int32_t);
@@ -236,6 +238,12 @@ class EngineView {
   PanelFn panel_fn_ = nullptr;
   PanelPresentingFn panel_presenting_fn_ = nullptr;
   PanelSizeFn panel_size_fn_ = nullptr;
+  // ANGLE's entry point for the largest size the panel can have, which is the
+  // window's (screenWidth_ x screenHeight_): the swap chain's buffers are
+  // made that size once, and the keyboard and the system's bars then only
+  // change how much of them is shown (Log::SwapChainCapacityMode). Null with
+  // an engine that has no such export; its buffers follow the room.
+  PanelCapacityFn panel_capacity_fn_ = nullptr;
   PanelScaleFn panel_scale_fn_ = nullptr;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};

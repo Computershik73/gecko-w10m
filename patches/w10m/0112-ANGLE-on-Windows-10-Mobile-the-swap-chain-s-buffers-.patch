@@ -1,0 +1,841 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Vysotsky <il.mohoff2016@yandex.ru>
+Date: Sun, 11 Oct 2026 06:29:07 +0400
+Subject: [PATCH] ANGLE on Windows 10 Mobile: the swap chain's buffers are made
+ once, at the window's size
+
+The keyboard and the system's bars change the panel's size all the time,
+and every change was a ResizeBuffers: three buffers of 13-14 MB, each
+wanted in one piece of address space, which an HP Elite x3 with 27 MB the
+largest free piece refused. Build 181 made the refusal survivable; this
+takes the request away.
+
+The shell hands over the window's size as a capacity
+(angle_uwp_set_panel_capacity, with a mode). A chain of a window drawn into
+directly is made with buffers that size, the surface is their top-left
+part, and a change of size that the buffers hold only changes how much of
+them is shown: IDXGISwapChain2::SetSourceSize, given to the chain right
+before the next present, which is a whole one. The back buffer is cleared
+when the surface grows. mWidth and mHeight stay the surface's size;
+mBufferWidth and mBufferHeight are the buffers'. Mode 2 adds a transform
+that undoes a stretch of the shown part, for a Windows that turns out to
+stretch it; mode 0, or no capacity, is the chain as it was.
+
+What can be refused is survived: buffers at the capacity that cannot be
+made are made at the surface's size; a ResizeBuffers that fails is tried
+again, then at the surface's size, then put back; a source size that is
+refused ends the use of one for that surface, and when the buffers are
+larger than the surface the chain is made again at once at the surface's
+size, so that no frame is drawn without a render target. Where a chain
+cannot be made again at once (this path, or build 181's after a failed
+resize) the frames drawn meanwhile no longer hand Direct3D a null view to
+clear: Clear11 skips a window's surface that has no chain.
+
+The panel's size and the capacity are each one atomic value: as two, a read
+between the stores at rotation gave a size no window has, and buffers made
+that size would now be kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libANGLE/renderer/d3d/d3d11/Clear11.cpp   |  20 +-
+ .../renderer/d3d/d3d11/SwapChain11.cpp        | 367 +++++++++++++++++-
+ .../libANGLE/renderer/d3d/d3d11/SwapChain11.h |  23 ++
+ .../d3d/d3d11/winrt/NativeWindow11WinRT.cpp   | 159 +++++++-
+ .../d3d/d3d11/winrt/NativeWindow11WinRT.h     |  28 ++
+ 5 files changed, 567 insertions(+), 30 deletions(-)
+
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
+index 59d5ed5b7d..b8f5e5043f 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Clear11.cpp
+@@ -535,6 +535,17 @@ angle::Result Clear11::clearFramebuffer(const gl::Context *context,
+ 
+         const auto &framebufferRTV = renderTarget->getRenderTargetView();
+         ASSERT(framebufferRTV.valid());
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        if (!framebufferRTV.valid())
++        {
++            // A window's surface whose swap chain was given up after a failure
++            // and has not been made again yet (SwapChain11::remakeAfterFailure
++            // keeps trying). The frames drawn meanwhile go nowhere: a draw
++            // binds no target and is harmless, but a clear would hand
++            // Direct3D the null view, which it reads through.
++            continue;
++        }
++#endif
+ 
+         bool canClearView = mRenderer->getRenderer11DeviceCaps().supportsClearView;
+         if (canClearView &&
+@@ -664,7 +675,14 @@ angle::Result Clear11::clearFramebuffer(const gl::Context *context,
+             const FLOAT depthClear   = gl::clamp01(clearParams.depthValue);
+             const UINT8 stencilClear = clearParams.stencilValue & 0xFF;
+ 
+-            deviceContext->ClearDepthStencilView(dsv, clearFlags, depthClear, stencilClear);
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++            // The depth buffer of a surface without a swap chain is gone with
++            // it; see the colour buffers above.
++            if (dsv != nullptr)
++#endif
++            {
++                deviceContext->ClearDepthStencilView(dsv, clearFlags, depthClear, stencilClear);
++            }
+ 
+             dsv = nullptr;
+         }
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+index eb53fe76d4..22b1cdc51d 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.cpp
+@@ -147,6 +147,11 @@ void SwapChain11::release()
+ #if defined(ANGLE_ENABLE_WINDOWS_UWP)
+     // They are made again with the chain, if it is (remakeAfterFailure).
+     mPassThroughResourcesInit = false;
++    // No chain, no buffers for a new size to be measured against, and nothing
++    // to give a source size to.
++    mBufferWidth     = 0;
++    mBufferHeight    = 0;
++    mSourceSizeDirty = false;
+ #endif
+ 
+     if (!mAppCreatedShareHandle)
+@@ -160,8 +165,46 @@ namespace
+ {
+ constexpr ULONGLONG kFirstBackoffMs = 1000;
+ constexpr ULONGLONG kMaxBackoffMs   = 30000;
++
++// How much a run says about sizes changed by source size: every one of them
++// while the keyboard and the bars of one session are being read from the log,
++// and then no more, since a phone in use changes size all day. The source
++// sizes the chain took are said for the first few only; one it refuses is
++// always said. Only the panel's chain gets here, on the renderer's thread.
++constexpr int kMaxSourceSizeResizeNotes = 40;
++constexpr int kFirstSourceSizeNotes     = 12;
++int sSourceSizeResizeNotes              = 0;
++int sSourceSizeNotes                    = 0;
+ }  // anonymous namespace
+ 
++// The size buffers are asked to be when buffers have to be made: the shell's
++// capacity, so that no later size of the panel needs them made again, and
++// otherwise the size wanted itself. The capacity has to cover that size --
++// right after the phone is turned it may still be the one for the other way
++// up -- and it is only for a window drawn into directly: with an offscreen
++// texture the back buffer is a copy at the surface's size and stays that.
++void SwapChain11::bufferSizeFor(EGLint width,
++                                EGLint height,
++                                EGLint *bufferWidth,
++                                EGLint *bufferHeight) const
++{
++    *bufferWidth  = width;
++    *bufferHeight = height;
++    if (mCapacityMode == 0 || mSourceSizeBroken || mAvoidCapacity || mNeedsOffscreenTexture ||
++        !mNativeWindow->getNativeWindow())
++    {
++        return;
++    }
++    LONG capacityWidth  = 0;
++    LONG capacityHeight = 0;
++    if (AngleUwpPanelCapacity(&capacityWidth, &capacityHeight) && capacityWidth >= width &&
++        capacityHeight >= height)
++    {
++        *bufferWidth  = static_cast<EGLint>(capacityWidth);
++        *bufferHeight = static_cast<EGLint>(capacityHeight);
++    }
++}
++
+ // The chain of a window's surface was given up after a failure and is made
+ // again here -- not more often than the back-off allows, which doubles while
+ // it keeps failing. Stock ANGLE never made it again: the surface stayed
+@@ -244,7 +287,23 @@ EGLint SwapChain11::resetOffscreenBuffers(DisplayD3D *displayD3D,
+         }
+     }
+ 
+-    EGLint result = resetOffscreenDepthBuffer(displayD3D, backbufferWidth, backbufferHeight);
++    int depthWidth  = backbufferWidth;
++    int depthHeight = backbufferHeight;
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // Drawn into directly, the back buffer's own view is the render target,
++    // and the depth buffer is bound beside it and has to be its size -- the
++    // buffers' size, which with a capacity is not the surface's. One the size
++    // of the surface beside larger buffers would bind nothing, and the picture
++    // would be black with every call having succeeded. mWidth and mHeight
++    // below are the surface's size all the same.
++    if (!mNeedsOffscreenTexture && mBufferWidth > 0 && mBufferHeight > 0)
++    {
++        depthWidth  = mBufferWidth;
++        depthHeight = mBufferHeight;
++    }
++#endif
++
++    EGLint result = resetOffscreenDepthBuffer(displayD3D, depthWidth, depthHeight);
+     if (result != EGL_SUCCESS)
+     {
+         return result;
+@@ -575,6 +634,59 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+         // Given up after a failure. The code below would read through it.
+         return remakeAfterFailure(displayD3D, backbufferWidth, backbufferHeight);
+     }
++    if (mCapacityMode != 0 && !mSourceSizeBroken && !mNeedsOffscreenTexture &&
++        backbufferWidth <= mBufferWidth && backbufferHeight <= mBufferHeight)
++    {
++        // The buffers that exist hold this size, so they stay as they are: the
++        // surface is their top-left part, and all that changes is how much of
++        // them is shown, which present() tells the chain before the next
++        // frame. This is where the keyboard and the system's bars end up, and
++        // nothing here can be refused for want of address space. The size is
++        // measured against the buffers and not against the capacity, so that
++        // buffers that had to be made smaller than it are kept just the same
++        // for every size they hold.
++        const EGLint oldWidth  = mWidth;
++        const EGLint oldHeight = mHeight;
++        const bool grew        = backbufferWidth > mWidth || backbufferHeight > mHeight;
++        mWidth                 = backbufferWidth;
++        mHeight                = backbufferHeight;
++        // Presented whole, like the first frame after a ResizeBuffers.
++        mFirstSwap       = true;
++        mSourceSizeDirty = true;
++        if (grew && mBackBufferRTView.valid())
++        {
++            // The rows and columns that come into view still hold what was
++            // drawn there when the surface was last that large, and the next
++            // frame may be drawn for a window that has not heard of the new
++            // size yet and leave them alone. After a ResizeBuffers they were
++            // blank, so they are made blank here. The whole buffer is, since
++            // the frame that follows is drawn whole.
++            const float blank[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++            mRenderer->getDeviceContext()->ClearRenderTargetView(mBackBufferRTView.get(), blank);
++        }
++        if (mRefusedAt != 0 && backbufferWidth == mRefusedWidth &&
++            backbufferHeight == mRefusedHeight)
++        {
++            // The size that had been refused is the one it has now.
++            mRefusedAt        = 0;
++            mRefusedBackoffMs = kFirstBackoffMs;
++        }
++        if (sSourceSizeResizeNotes < kMaxSourceSizeResizeNotes)
++        {
++            ++sSourceSizeResizeNotes;
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: swap chain resized to %dx%d from %dx%d by source size, buffers "
++                     "stay %dx%d%s%s",
++                     backbufferWidth, backbufferHeight, oldWidth, oldHeight, mBufferWidth,
++                     mBufferHeight, grew ? ", back buffer cleared" : "",
++                     sSourceSizeResizeNotes == kMaxSourceSizeResizeNotes
++                         ? " (the last such line of this run)"
++                         : "");
++            AngleUwpNote(note);
++        }
++        return EGL_SUCCESS;
++    }
+     if (mRefusedAt != 0 && backbufferWidth == mRefusedWidth &&
+         backbufferHeight == mRefusedHeight &&
+         ::GetTickCount64() - mRefusedAt < mRefusedBackoffMs)
+@@ -612,15 +724,29 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+         return EGL_BAD_ALLOC;
+     }
+ 
+-    hr = mSwapChain->ResizeBuffers(desc.BufferCount, backbufferWidth, backbufferHeight,
++    EGLint bufferWidth  = backbufferWidth;
++    EGLint bufferHeight = backbufferHeight;
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++    // With a capacity, only a size the buffers do not hold gets this far: the
++    // phone was turned, or the buffers were made no larger than the surface.
++    // They are then asked for at the capacity, so that this is the last time
++    // for as long as the phone is held this way. Without one every change of
++    // size comes here, as it always did, and asks for the surface's own size.
++    bufferSizeFor(backbufferWidth, backbufferHeight, &bufferWidth, &bufferHeight);
++#endif
++
++    hr = mSwapChain->ResizeBuffers(desc.BufferCount, bufferWidth, bufferHeight,
+                                    getSwapChainNativeFormat(), 0);
+ #if defined(ANGLE_ENABLE_WINDOWS_UWP)
+     const ULONGLONG resizeBuffersMs = ::GetTickCount64() - resizeStart;
+     if (FAILED(hr))
+     {
+-        char note[128];
+-        snprintf(note, sizeof(note), "angle: swap chain resize to %dx%d failed -> 0x%08lx",
+-                 backbufferWidth, backbufferHeight, static_cast<unsigned long>(hr));
++        char note[256];
++        snprintf(note, sizeof(note),
++                 "angle: swap chain resize to %dx%d failed -> 0x%08lx (buffers of %dx%d asked "
++                 "for, they were %dx%d)",
++                 backbufferWidth, backbufferHeight, static_cast<unsigned long>(hr), bufferWidth,
++                 bufferHeight, mBufferWidth, mBufferHeight);
+         AngleUwpNote(note);
+     }
+     // Refused for want of memory: on these phones that is address space, three
+@@ -633,24 +759,43 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+         // Once more. The old buffers went with the first try (the maps of the
+         // address space show them gone), so there is more room now than there
+         // was a moment ago.
+-        hr = mSwapChain->ResizeBuffers(desc.BufferCount, backbufferWidth, backbufferHeight,
++        hr = mSwapChain->ResizeBuffers(desc.BufferCount, bufferWidth, bufferHeight,
+                                        getSwapChainNativeFormat(), 0);
+         if (SUCCEEDED(hr))
+         {
+             AngleUwpNote("angle: swap chain resize that failed was taken on the second try");
+         }
+-        else if (mWidth > 0 && mHeight > 0)
++        else if (bufferWidth != backbufferWidth || bufferHeight != backbufferHeight)
++        {
++            // Then buffers no larger than the surface: less than the capacity,
++            // and all that was ever asked for before there was one. The
++            // picture is right with them, and a later size they do not hold
++            // asks for the capacity again.
++            hr = mSwapChain->ResizeBuffers(desc.BufferCount, backbufferWidth, backbufferHeight,
++                                           getSwapChainNativeFormat(), 0);
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: swap chain resize to buffers of %dx%d failed twice, the surface's "
++                     "own %dx%d -> 0x%08lx",
++                     bufferWidth, bufferHeight, backbufferWidth, backbufferHeight,
++                     static_cast<unsigned long>(hr));
++            AngleUwpNote(note);
++        }
++        if (FAILED(hr) && mBufferWidth > 0 && mBufferHeight > 0)
+         {
+-            // Then back to the size it had, which fitted; the new size is
+-            // asked for again later.
+-            const HRESULT back = mSwapChain->ResizeBuffers(desc.BufferCount, mWidth, mHeight,
+-                                                           getSwapChainNativeFormat(), 0);
+-            char note[160];
++            // Then back to the size the buffers had, which fitted; the new
++            // size is asked for again later. It is the buffers' size that is
++            // put back and not the surface's: with a capacity the two differ,
++            // and buffers the size of the surface would be smaller than this
++            // class goes on believing they are.
++            const HRESULT back = mSwapChain->ResizeBuffers(
++                desc.BufferCount, mBufferWidth, mBufferHeight, getSwapChainNativeFormat(), 0);
++            char note[256];
+             snprintf(note, sizeof(note),
+-                     "angle: swap chain resize failed twice, back to %dx%d -> 0x%08lx; %dx%d "
+-                     "will be asked for again",
+-                     mWidth, mHeight, static_cast<unsigned long>(back), backbufferWidth,
+-                     backbufferHeight);
++                     "angle: swap chain resize failed at every size, buffers back to %dx%d -> "
++                     "0x%08lx; %dx%d will be asked for again",
++                     mBufferWidth, mBufferHeight, static_cast<unsigned long>(back),
++                     backbufferWidth, backbufferHeight);
+             AngleUwpNote(note);
+             if (SUCCEEDED(back))
+             {
+@@ -735,6 +880,15 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+         mRemakeBackoffMs = kFirstBackoffMs;
+         return EGL_BAD_ALLOC;
+     }
++
++    // The size the buffers have now, read off the buffer itself: the one that
++    // was asked for, the surface's own, or the one they had before.
++    mBufferWidth  = mBackBufferTexture.getExtents().width;
++    mBufferHeight = mBackBufferTexture.getExtents().height;
++    // Nothing says whether ResizeBuffers leaves the chain's source size as it
++    // was, so the surface's size is given to the chain again before the next
++    // present -- the size it keeps, where the buffers were only put back.
++    mSourceSizeDirty = mCapacityMode != 0;
+ #endif
+ 
+     mFirstSwap = true;
+@@ -764,12 +918,17 @@ EGLint SwapChain11::resize(DisplayD3D *displayD3D, EGLint backbufferWidth, EGLin
+     const EGLint offscreenResult =
+         resetOffscreenBuffers(displayD3D, backbufferWidth, backbufferHeight);
+     {
+-        char note[160];
++        LONG capacityWidth  = 0;
++        LONG capacityHeight = 0;
++        AngleUwpPanelCapacity(&capacityWidth, &capacityHeight);
++        char note[256];
+         snprintf(note, sizeof(note),
+-                 "angle: swap chain resized to %dx%d in %llu ms (ResizeBuffers %llu ms)",
++                 "angle: swap chain resized to %dx%d in %llu ms (ResizeBuffers %llu ms), "
++                 "buffers %dx%d, capacity %ldx%ld, mode %d",
+                  backbufferWidth, backbufferHeight,
+                  static_cast<unsigned long long>(::GetTickCount64() - resizeStart),
+-                 static_cast<unsigned long long>(resizeBuffersMs));
++                 static_cast<unsigned long long>(resizeBuffersMs), mBufferWidth, mBufferHeight,
++                 capacityWidth, capacityHeight, mCapacityMode);
+         AngleUwpNote(note);
+     }
+     return offscreenResult;
+@@ -849,9 +1008,68 @@ EGLint SwapChain11::reset(DisplayD3D *displayD3D,
+ 
+     if (mNativeWindow->getNativeWindow())
+     {
++        EGLint bufferWidth  = backbufferWidth;
++        EGLint bufferHeight = backbufferHeight;
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        // The mode is the shell's as it is now, and this chain's for as long
++        // as it lives or until it refuses a source size (present(), which
++        // makes it 0). Only a window drawn into directly has one: with an
++        // offscreen texture everything stays as it was. So does a surface
++        // whose chain refused a source size once: its chains are made as they
++        // were before there was a capacity, this one and any after it.
++        mCapacityMode =
++            (mNeedsOffscreenTexture || mSourceSizeBroken) ? 0 : AngleUwpCapacityMode();
++        bufferSizeFor(backbufferWidth, backbufferHeight, &bufferWidth, &bufferHeight);
++#endif
++
+         HRESULT hr = mNativeWindow->createSwapChain(
+-            device, mRenderer->getDxgiFactory(), getSwapChainNativeFormat(), backbufferWidth,
+-            backbufferHeight, mNeedsOffscreenTexture ? 1 : getD3DSamples(), &mSwapChain);
++            device, mRenderer->getDxgiFactory(), getSwapChainNativeFormat(), bufferWidth,
++            bufferHeight, mNeedsOffscreenTexture ? 1 : getD3DSamples(), &mSwapChain);
++
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        if (bufferWidth != backbufferWidth || bufferHeight != backbufferHeight)
++        {
++            // Asked for at the capacity. This is also how a chain is made
++            // again after a failure (remakeAfterFailure), which is when memory
++            // is at its shortest, and the capacity is more than was ever asked
++            // for then. So when the chain cannot be made that size, or is made
++            // and has no buffer to give, it is made once more at the surface's
++            // own size before this is given up, and the capacity is left alone
++            // from then on. A lost device is not helped by a smaller chain.
++            // (A chain that was made and had no buffer to give is the panel's
++            // by then, and stays mapped until the panel is given the second.)
++            HRESULT atCapacity = hr;
++            if (SUCCEEDED(atCapacity))
++            {
++                ID3D11Texture2D *buffer = nullptr;
++                atCapacity = mSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
++                                                   reinterpret_cast<LPVOID *>(&buffer));
++                if (SUCCEEDED(atCapacity) && buffer == nullptr)
++                {
++                    atCapacity = E_FAIL;
++                }
++                SafeRelease(buffer);
++            }
++            if (FAILED(atCapacity) && !d3d11::isDeviceLostError(atCapacity))
++            {
++                char note[256];
++                snprintf(note, sizeof(note),
++                         "angle: new swap chain with buffers of %dx%d failed -> 0x%08lx at %s, "
++                         "making it with the surface's own %dx%d",
++                         bufferWidth, bufferHeight, static_cast<unsigned long>(atCapacity),
++                         SUCCEEDED(hr) ? "GetBuffer" : "creation", backbufferWidth,
++                         backbufferHeight);
++                AngleUwpNote(note);
++                SafeRelease(mSwapChain);
++                mAvoidCapacity = true;
++                bufferWidth    = backbufferWidth;
++                bufferHeight   = backbufferHeight;
++                hr             = mNativeWindow->createSwapChain(
++                    device, mRenderer->getDxgiFactory(), getSwapChainNativeFormat(), bufferWidth,
++                    bufferHeight, mNeedsOffscreenTexture ? 1 : getD3DSamples(), &mSwapChain);
++            }
++        }
++#endif
+ 
+         if (FAILED(hr))
+         {
+@@ -906,6 +1124,32 @@ EGLint SwapChain11::reset(DisplayD3D *displayD3D,
+                                                    &mBackBufferSRView);
+         ASSERT(result != angle::Result::Stop);
+         mBackBufferSRView.setInternalName("BackBufferSRV");
++
++#if defined(ANGLE_ENABLE_WINDOWS_UWP)
++        // The size the buffers really have, read off the buffer itself. A new
++        // chain shows all of them; the surface's part is given to it right
++        // before the first present, which is also where it turns out whether
++        // this chain takes a source size at all.
++        mBufferWidth     = mBackBufferTexture.getExtents().width;
++        mBufferHeight    = mBackBufferTexture.getExtents().height;
++        mSourceSizeDirty = mCapacityMode != 0;
++        {
++            // It says "reset" for the shell's quiet log, like the notes of
++            // remakeAfterFailure. Everything the later notes about sizes are
++            // read against is in this one line.
++            LONG capacityWidth  = 0;
++            LONG capacityHeight = 0;
++            AngleUwpPanelCapacity(&capacityWidth, &capacityHeight);
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: swap chain reset, buffers %dx%d for a surface of %dx%d, capacity "
++                     "%ldx%ld, mode %d%s",
++                     mBufferWidth, mBufferHeight, backbufferWidth, backbufferHeight,
++                     capacityWidth, capacityHeight, mCapacityMode,
++                     mAvoidCapacity ? ", capacity given up" : "");
++            AngleUwpNote(note);
++        }
++#endif
+     }
+ 
+     mFirstSwap = true;
+@@ -1181,6 +1425,83 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+         mRenderer->getStateManager()->invalidateRenderTarget();
+         return EGL_SUCCESS;
+     }
++    if (mSourceSizeDirty && mCapacityMode != 0 && !mSourceSizeBroken)
++    {
++        // How much of the buffers is shown, the surface not being all of
++        // them. The chain is told here, right before the frame that was drawn
++        // for the new size is handed over, and not at the moment the size
++        // changed: nobody knows whether Windows acts on it with the next
++        // present or at once, and a heavy page can take a second to draw its
++        // next frame, a second in which the old frame would be on the screen
++        // cut short, or showing rows nothing has drawn. This present is a
++        // whole one; mFirstSwap was set wherever this was.
++        mSourceSizeDirty      = false;
++        UINT sourceWidth      = 0;
++        UINT sourceHeight     = 0;
++        const HRESULT sourced = AngleUwpSetSourceSize(
++            mSwapChain, static_cast<UINT>(mWidth), static_cast<UINT>(mHeight),
++            static_cast<UINT>(mBufferWidth), static_cast<UINT>(mBufferHeight), mCapacityMode,
++            &sourceWidth, &sourceHeight);
++        if (FAILED(sourced))
++        {
++            // This Windows will not have it. This surface asks for no source
++            // size again, of this chain or of one made later, and buffers are
++            // the surface's size from now on, resized with it as they always
++            // were: a Windows that took the whole of the buffers for a source
++            // size and refused a part of them would otherwise have the chain
++            // made again every time the keyboard came up.
++            mSourceSizeBroken = true;
++            mAvoidCapacity    = true;
++            const bool larger = mBufferWidth > mWidth || mBufferHeight > mHeight;
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: source size %dx%d of buffers %dx%d failed -> 0x%08lx, reads back "
++                     "%ux%u, mode %d; %s",
++                     mWidth, mHeight, mBufferWidth, mBufferHeight,
++                     static_cast<unsigned long>(sourced), sourceWidth, sourceHeight, mCapacityMode,
++                     larger ? "the swap chain is made again with buffers the surface's size"
++                            : "the buffers are the surface's size and are resized with it now");
++            AngleUwpNote(note);
++            // From here on this is a chain without a capacity, and says so in
++            // its notes; the one above has named the mode that was refused.
++            mCapacityMode = 0;
++            if (larger)
++            {
++                // All of the buffers would be shown, and the surface is only a
++                // part of them. The chain is given up and made again here, at
++                // the surface's size (mAvoidCapacity), and not at the next
++                // present: the frame in between would be drawn with no render
++                // target and lost like this one (Clear11 leaves a surface
++                // without a chain alone, so it would be no worse than lost).
++                // This frame goes nowhere and the caller draws the next one
++                // whole. It is Present that takes a frame's render target off
++                // the device, so it is taken off here, and what the context
++                // holds of the buffers is let go of. The panel keeps the chain
++                // itself, buffers and all, until it is given the new one, so
++                // the new buffers are made beside the old; where there is no
++                // room for that, the presents that follow try again.
++                mRenderer->getStateManager()->setRenderTarget(nullptr, nullptr);
++                release();
++                mRenderer->getDeviceContext()->Flush();
++                mRemakeTriedAt   = 0;
++                mRemakeBackoffMs = kFirstBackoffMs;
++                remakeAfterFailure(displayD3D, mWidth, mHeight);
++                return EGL_BAD_ALLOC;
++            }
++        }
++        else if (sSourceSizeNotes < kFirstSourceSizeNotes)
++        {
++            ++sSourceSizeNotes;
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: swap chain resized to %dx%d of its buffers %dx%d, SetSourceSize -> "
++                     "0x%08lx, reads back %ux%u, mode %d",
++                     mWidth, mHeight, mBufferWidth, mBufferHeight,
++                     static_cast<unsigned long>(sourced), sourceWidth, sourceHeight,
++                     mCapacityMode);
++            AngleUwpNote(note);
++        }
++    }
+ #endif
+ 
+     // Use IDXGISwapChain1::Present1 with a dirty rect if DXGI 1.2 is available.
+@@ -1195,6 +1516,10 @@ EGLint SwapChain11::present(DisplayD3D *displayD3D, EGLint x, EGLint y, EGLint w
+         }
+         else
+         {
++            // Rows are turned over against the surface's height, also where
++            // the chain's buffers are larger than the surface (Windows 10
++            // Mobile, mBufferHeight): the surface is the top-left of the
++            // buffers, so its rows are the buffers' rows.
+             RECT rect = {static_cast<LONG>(x), static_cast<LONG>(mHeight - y - height),
+                          static_cast<LONG>(x + width), static_cast<LONG>(mHeight - y)};
+             DXGI_PRESENT_PARAMETERS params = {1, &rect, nullptr, nullptr};
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.h
+index 5fbbf5611b..f0f8655d36 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.h
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/SwapChain11.h
+@@ -90,6 +90,10 @@ class SwapChain11 final : public SwapChainD3D
+     UINT getD3DSamples() const;
+ #if defined(ANGLE_ENABLE_WINDOWS_UWP)
+     EGLint remakeAfterFailure(DisplayD3D *displayD3D, EGLint width, EGLint height);
++    void bufferSizeFor(EGLint width,
++                       EGLint height,
++                       EGLint *bufferWidth,
++                       EGLint *bufferHeight) const;
+ #endif
+ 
+     Renderer11 *mRenderer;
+@@ -148,6 +152,25 @@ class SwapChain11 final : public SwapChainD3D
+     // The same for a chain that had to be given up altogether (release()).
+     ULONGLONG mRemakeTriedAt   = 0;
+     ULONGLONG mRemakeBackoffMs = 1000;
++
++    // The buffers made once (AngleUwpCapacityMode in NativeWindow11WinRT.h).
++    // mWidth and mHeight above stay the surface's size, which is all GL, EGL
++    // and present() ever see; these are the size of the chain's buffers, which
++    // may be larger, with the surface their top-left part, and 0 while there
++    // is no chain. The mode is read when the chain is made and is 0 for
++    // anything but a window drawn into directly.
++    EGLint mBufferWidth  = 0;
++    EGLint mBufferHeight = 0;
++    int mCapacityMode    = 0;
++    // A chain of this surface would not take a source size. None is asked to
++    // again: the chains made after that have mode 0.
++    bool mSourceSizeBroken = false;
++    // Buffers at the capacity are not asked for any more: a source size
++    // failed on them, or a chain could not be made with them.
++    bool mAvoidCapacity = false;
++    // The surface's size is not yet the source size of the chain; it is set
++    // right before the next present, see present().
++    bool mSourceSizeDirty = false;
+ #endif
+ };
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+index 6fbfa04a01..8350098f72 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.cpp
+@@ -29,15 +29,42 @@ namespace
+ // The size of the panel, which belongs to the UI thread while everything here
+ // runs on the renderer's. So it is handed over rather than asked for: the shell
+ // already measures the room it has and tells the engine, and this is the same
+-// number arriving by a shorter road. Written rarely, read every resize.
+-std::atomic<LONG> sPanelWidth{0};
+-std::atomic<LONG> sPanelHeight{0};
++// number arriving by a shorter road. Written rarely, read every resize. One
++// value, the width in its upper half: as two, a read between the two stores
++// when the phone is turned gave a size as wide as the new one and as tall as
++// the old, larger than the window either way up, and buffers made that size
++// hold every size after it and are kept (SwapChain11::resize).
++std::atomic<int64_t> sPanelSize{0};
+ // The panel's composition scale, times 1000. XAML shows a swap chain's pixels
+ // as logical units unless told otherwise; on a 350% phone that is a picture
+ // three and a half times too big. The shell reads the scale from the panel
+ // and it goes onto the chain as an inverse matrix transform.
+ std::atomic<int> sPanelScaleX{1000};
+ std::atomic<int> sPanelScaleY{1000};
++// The largest size the panel can have while the phone is held as it is, which
++// is the window's, and what the shell wants done with it (AngleUwpCapacityMode
++// in the header). One value like the panel's above: read between two stores
++// when the phone turns it would be 2560x2560, which covers every panel and
++// would be taken for the capacity -- three buffers of 25 MB.
++std::atomic<int64_t> sPanelCapacity{0};
++std::atomic<int> sCapacityMode{0};
++
++// A size as one value, and 0 for a size that is not one.
++int64_t PackSize(int32_t width, int32_t height)
++{
++    if (width <= 0 || height <= 0)
++    {
++        return 0;
++    }
++    return (static_cast<int64_t>(width) << 32) | static_cast<uint32_t>(height);
++}
++
++bool UnpackSize(int64_t size, LONG *width, LONG *height)
++{
++    *width  = static_cast<LONG>(size >> 32);
++    *height = static_cast<LONG>(size & 0xffffffff);
++    return *width > 0 && *height > 0;
++}
+ 
+ // Where this says what it did. The notes Gecko writes live in xul, which this
+ // library is not linked against, so the shell hands over somewhere to write --
+@@ -117,8 +144,7 @@ HRESULT RunOnUIThread(std::function<HRESULT()> &&work,
+ extern "C" __declspec(dllexport) void angle_uwp_set_panel_size(int32_t width,
+                                                                int32_t height)
+ {
+-    sPanelWidth  = width;
+-    sPanelHeight = height;
++    sPanelSize = PackSize(width, height);
+ }
+ 
+ extern "C" __declspec(dllexport) void angle_uwp_set_panel_scale(float x, float y)
+@@ -127,6 +153,17 @@ extern "C" __declspec(dllexport) void angle_uwp_set_panel_scale(float x, float y
+     sPanelScaleY = static_cast<int>((y > 0 ? y : 1.0f) * 1000.0f + 0.5f);
+ }
+ 
++// The window's size, at the start and each time the phone is turned, and the
++// mode with it. A shell that does not know of this never calls it, and then
++// there is no capacity and nothing here differs from what it was.
++extern "C" __declspec(dllexport) void angle_uwp_set_panel_capacity(int32_t width,
++                                                                   int32_t height,
++                                                                   int32_t mode)
++{
++    sPanelCapacity = PackSize(width, height);
++    sCapacityMode  = (mode == 1 || mode == 2) ? mode : 0;
++}
++
+ extern "C" __declspec(dllexport) void angle_uwp_set_mode(int32_t mode)
+ {
+     sMode = mode;
+@@ -160,6 +197,112 @@ void AngleUwpNote(const char *text)
+     Note(text);
+ }
+ 
++bool AngleUwpPanelCapacity(LONG *width, LONG *height)
++{
++    LONG capacityWidth  = 0;
++    LONG capacityHeight = 0;
++    if (!UnpackSize(sPanelCapacity.load(), &capacityWidth, &capacityHeight))
++    {
++        return false;
++    }
++    if (width)
++    {
++        *width = capacityWidth;
++    }
++    if (height)
++    {
++        *height = capacityHeight;
++    }
++    return true;
++}
++
++int AngleUwpCapacityMode()
++{
++    // Without a capacity there is nothing for a mode to act on, and a chain
++    // made then has to be exactly the chain it always was.
++    return AngleUwpPanelCapacity(nullptr, nullptr) ? sCapacityMode.load() : 0;
++}
++
++HRESULT AngleUwpSetSourceSize(IDXGISwapChain *chain,
++                              UINT width,
++                              UINT height,
++                              UINT bufferWidth,
++                              UINT bufferHeight,
++                              int mode,
++                              UINT *readBackWidth,
++                              UINT *readBackHeight)
++{
++    if (readBackWidth)
++    {
++        *readBackWidth = 0;
++    }
++    if (readBackHeight)
++    {
++        *readBackHeight = 0;
++    }
++    if (chain == nullptr || width == 0 || height == 0 || bufferWidth == 0 || bufferHeight == 0)
++    {
++        return E_INVALIDARG;
++    }
++
++    IDXGISwapChain2 *chain2 = nullptr;
++    if (FAILED(chain->QueryInterface(__uuidof(IDXGISwapChain2),
++                                     reinterpret_cast<void **>(&chain2))) ||
++        !chain2)
++    {
++        return E_NOINTERFACE;
++    }
++
++    // Like the matrix in createSwapChain, this is a call on the chain and not
++    // on the panel, so it is made on the renderer's thread. Whether Windows
++    // takes it there is one of the things the result is noted for.
++    HRESULT result = chain2->SetSourceSize(width, height);
++    if (SUCCEEDED(result) && mode == 2)
++    {
++        // A swap chain made with DXGI_SCALING_STRETCH may have its shown part
++        // stretched to the size of the buffers; a composition chain has no
++        // other size to stretch to. If that is what Windows does, the picture
++        // is as much too large as the buffers are larger than the part, and
++        // this takes that off again, on top of the composition scale. The
++        // matrix replaces the one set when the chain was made; where the part
++        // is all of the buffers it is the same matrix.
++        const float scaleX          = sPanelScaleX.load() / 1000.0f;
++        const float scaleY          = sPanelScaleY.load() / 1000.0f;
++        DXGI_MATRIX_3X2_F transform = {};
++        transform._11               = (static_cast<float>(width) / bufferWidth) / scaleX;
++        transform._22               = (static_cast<float>(height) / bufferHeight) / scaleY;
++        result                      = chain2->SetMatrixTransform(&transform);
++        if (FAILED(result))
++        {
++            // The caller's note has only the one result, so which of the two
++            // calls it came from is said here.
++            char note[256];
++            snprintf(note, sizeof(note),
++                     "angle: source size %ux%u was taken, its transform %.4fx%.4f failed -> "
++                     "0x%08lx",
++                     width, height, transform._11, transform._22,
++                     static_cast<unsigned long>(result));
++            Note(note);
++        }
++    }
++
++    UINT sourceWidth  = 0;
++    UINT sourceHeight = 0;
++    if (SUCCEEDED(chain2->GetSourceSize(&sourceWidth, &sourceHeight)))
++    {
++        if (readBackWidth)
++        {
++            *readBackWidth = sourceWidth;
++        }
++        if (readBackHeight)
++        {
++            *readBackHeight = sourceHeight;
++        }
++    }
++    chain2->Release();
++    return result;
++}
++
+ NativeWindow11WinRT::NativeWindow11WinRT(EGLNativeWindowType window, bool hasAlpha)
+     : NativeWindow11(window),
+       mPanel(nullptr),
+@@ -222,9 +365,9 @@ bool NativeWindow11WinRT::getClientRect(LPRECT rect) const
+     {
+         return false;
+     }
+-    const LONG width  = sPanelWidth.load();
+-    const LONG height = sPanelHeight.load();
+-    if (width <= 0 || height <= 0)
++    LONG width  = 0;
++    LONG height = 0;
++    if (!UnpackSize(sPanelSize.load(), &width, &height))
+     {
+         return false;
+     }
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+index 3eb2789726..65e13891ca 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h
+@@ -56,6 +56,34 @@ namespace rx
+ int AngleUwpMode();
+ void AngleUwpNote(const char *text);
+ 
++// The swap chain's buffers made once. The keyboard and the system's bars
++// change the panel's size many times a minute, and stock ANGLE answers each
++// change with ResizeBuffers: three new buffers of 13-14 MB each, wanted in one
++// piece apiece, which a phone's address space may not have. The shell hands
++// over the largest size the panel can have while the phone is held as it is
++// (the window's), the buffers are made that size, and a smaller panel is shown
++// through IDXGISwapChain2::SetSourceSize, which presents the top-left of them.
++//
++//   0  buffers the size of the panel, resized with it -- as it was
++//   1  buffers at the capacity, the panel's part shown by source size
++//   2  the same, and with every source size a transform that undoes a stretch
++//      of the shown part to the buffers' size, should Windows do that
++//
++// The mode is 0 for as long as no capacity has been handed over.
++int AngleUwpCapacityMode();
++// False when there is none.
++bool AngleUwpPanelCapacity(LONG *width, LONG *height);
++// Shows width x height of the chain's buffers, and reads back what the chain
++// then says its source size is. E_NOINTERFACE without IDXGISwapChain2.
++HRESULT AngleUwpSetSourceSize(IDXGISwapChain *chain,
++                              UINT width,
++                              UINT height,
++                              UINT bufferWidth,
++                              UINT bufferHeight,
++                              int mode,
++                              UINT *readBackWidth,
++                              UINT *readBackHeight);
++
+ class NativeWindow11WinRT : public NativeWindow11
+ {
+   public:
