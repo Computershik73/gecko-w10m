@@ -151,6 +151,49 @@ void LogStackScan(const wchar_t* tag, DWORD sp) {
   }
 }
 
+// A stack that overflowed is full of the recursion that filled it, and the
+// two walks above start at its top: every line they write is the same pair of
+// functions, and who called into them -- the only thing worth knowing -- is at
+// the other end. This reads from the stack's base towards its top, so the
+// thread's first callers come first, and writes each address once, so the
+// recursion is two lines and not ten thousand. Candidates like the scan
+// above, in call order, outermost first.
+void LogStackFromBase(const wchar_t* tag) {
+  if (!gLookupFunctionEntry) return;
+  const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(::NtCurrentTeb());
+  const uintptr_t* base = reinterpret_cast<const uintptr_t*>(tib->StackBase);
+  const uintptr_t* limit = reinterpret_cast<const uintptr_t*>(tib->StackLimit);
+  if (!base || !limit || base <= limit) return;
+  // The callers are within the first stretch; the rest is the recursion.
+  const uintptr_t* stop = base - (256 * 1024 / sizeof(uintptr_t));
+  if (stop < limit) stop = limit;
+
+  Log::WriteFromFault(std::wstring(tag) +
+                      L"   -- from the stack's base, outermost first, each "
+                      L"address once (candidates) --");
+  uintptr_t seen[96];
+  int count = 0;
+  for (const uintptr_t* word = base - 1; word >= stop && count < 96; --word) {
+    const uintptr_t value = *word;
+    if (value < 0x10000) continue;
+    bool repeat = false;
+    for (int i = 0; i < count; ++i) {
+      if (seen[i] == value) {
+        repeat = true;
+        break;
+      }
+    }
+    if (repeat) continue;
+    DWORD imageBase = 0;
+    if (!gLookupFunctionEntry(static_cast<DWORD>(value), &imageBase, nullptr)) {
+      continue;
+    }
+    seen[count++] = value;
+    Log::WriteFromFault(std::wstring(tag) + L"   ?? " +
+               DescribeAddress(reinterpret_cast<void*>(value)));
+  }
+}
+
 // For the hooks, which have no exception context of their own.
 // A phone gives an app a hard memory ceiling, and 132 MB of engine plus
 // everything Gecko allocates on startup is a real candidate for reaching it.
@@ -666,6 +709,9 @@ LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
   LogInstruction(L"first-chance:", info->ExceptionRecord->ExceptionAddress);
   LogStack(L"first-chance:", *info->ContextRecord);
   LogStackScan(L"first-chance:", info->ContextRecord->Sp);
+  if (code == 0xC00000FD) {
+    LogStackFromBase(L"first-chance:");
+  }
   Log::FlushFromFault();
 
   if (mendable) {
